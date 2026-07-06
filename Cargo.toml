@@ -24,6 +24,10 @@ unsafe_code = "forbid"
 missing_docs = "deny"
 
 [workspace.lints.clippy]
+# clippy's default-on groups (correctness/suspicious/style/complexity/perf).
+# Pinned to deny at the manifest level so a bare `cargo clippy` fails the same
+# way CI's `-D warnings` does, rather than only warning locally.
+all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
