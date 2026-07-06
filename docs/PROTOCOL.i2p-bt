@@ -94,17 +94,22 @@ Status legend:
     outbound + naming paths on the shared Session (behind a Mutex); the
     inbound topology is deferred (see 2.5).
 
-2.5 [open] Inbound streams. Two SAM options:
-      (a) STREAM ACCEPT — one accept per inbound stream, &mut self, blocks;
-      (b) STREAM FORWARD — router forwards inbound streams to a loopback TCP
-          listener we run (an allowed loopback IP socket in i2pnet).
-    (b) matches the "one PRIMARY session + forwarded listener" topology in
-    SCOPE §4 and avoids serializing on the session, but requires parsing the
-    forwarded peer's destination out of the SAM handshake line ourselves
-    (unless SILENT). clove will almost certainly use (b), but the exact
-    framing and the dest-hash derivation from a forwarded connection must be
-    confirmed against a live router before it is written. This is the first
-    task of the R2 stress harness / M1.
+2.5 [assumed] Inbound streams use STREAM FORWARD, not STREAM ACCEPT. ACCEPT
+    is one accept per inbound stream on &mut self and serializes every
+    inbound peer on the one session; FORWARD has the router push each inbound
+    stream as a fresh TCP connection to a loopback listener we own (an
+    allowed Layer-1 IP socket), so inbound concurrency is a plain accept loop,
+    not a lock. This matches the "one PRIMARY session + forwarded listener"
+    topology in SCOPE §4. Implemented in i2pnet::sam (SamListener /
+    ForwardedStream), decision recorded in LIVE-TESTING.md §3.
+    With SILENT=false (yosemite's default, set explicitly) the router prepends
+    each forwarded connection with the peer's base64 destination line,
+    optionally followed by FROM_PORT/TO_PORT params, terminated by '\n'; we
+    read up to that newline one byte at a time (so the peer's stream payload
+    is left untouched) and derive the DestHash via §1.3. The split/parse logic
+    is unit-tested over loopback TCP; the exact forwarded framing and that a
+    forwarded peer's derived hash reconciles with its dialed hash are the
+    first things confirmed against a live router (LIVE-TESTING.md §6.1, M1).
 
 2.6 [open] R2 — i2pd SAM behavior under many concurrent streams on one
     session is the suspected root of XD-style flakiness. The reconnect

@@ -1,22 +1,26 @@
 //! `SAMv3` backend over `yosemite` (Phase D, `docs/PLAN.md`).
 //!
 //! This wraps `yosemite`'s synchronous API behind the crate's traits. It is
-//! the *only* code here that talks to a real router, and it is the one part
-//! of clove that cannot be verified without one — so its scope is drawn at
-//! what is structurally sound to write against the API as reviewed
-//! (`docs/PROTOCOL.i2p-bt`):
+//! the *only* code here that talks to a real router. Its runtime behavior
+//! against a live router is verified out-of-CI (`docs/LIVE-TESTING.md`); the
+//! logic that does not need a router — address derivation and the forwarded
+//! destination-line parse — is unit-tested here over loopback TCP.
 //!
 //! - [`SamSession`] implements [`I2pDialer`] (SAM `STREAM CONNECT`, via the
 //!   peer's `.b32.i2p` address) and [`I2pNamingLookup`] (SAM `NAMING
 //!   LOOKUP`), and wraps yosemite [`yosemite::Stream`] as [`SamStream`],
 //!   whose [`I2pStream::split`] maps straight onto yosemite's own
 //!   `Stream::split`.
-//! - **Inbound accept is deliberately not implemented here yet.** yosemite's
-//!   `Session::accept`/`forward` take `&mut self` and block, so the
-//!   inbound-stream topology (SAM `FORWARD` to a loopback listener, deriving
-//!   each peer's dest-hash from the forwarded handshake) and the
-//!   concurrency question R2 raises both need a live router to settle. That
-//!   is M1 / R2-harness work; see `docs/PROTOCOL.i2p-bt`.
+//! - [`SamListener`] implements [`I2pListener`] for **inbound** streams via
+//!   SAM `STREAM FORWARD` to a loopback [`TcpListener`] we own (an allowed
+//!   Layer-1 IP socket, bound to `127.0.0.1`). This is the topology chosen
+//!   over `STREAM ACCEPT` in `docs/LIVE-TESTING.md` §3: `accept` takes
+//!   `&mut self` and serializes every inbound stream on the one session,
+//!   whereas `forward` lets the router fan connections into a plain accept
+//!   loop. With `SILENT=false` (yosemite's default) the router prepends each
+//!   forwarded connection with the peer's base64 destination line, from
+//!   which we derive its [`DestHash`] (`docs/PROTOCOL.i2p-bt` §1.3, §2.5).
+//!   The exact framing is confirmed against a live router at M1.
 //!
 //! yosemite hardcodes the SAM host to `127.0.0.1` (only the port is
 //! configurable), which happens to match Layer 1's loopback-only rule; the
@@ -24,12 +28,13 @@
 //! through this backend and is noted as such.
 
 use std::io::{self, Read, Write};
-use std::sync::Mutex;
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use yosemite::{DestinationKind, Session, SessionOptions, style};
 
-use crate::{DestHash, I2pDialer, I2pNamingLookup, I2pStream};
+use crate::{DestHash, I2pDialer, I2pListener, I2pNamingLookup, I2pStream};
 
 /// Standard `SAMv3` control port.
 pub const DEFAULT_SAM_PORT: u16 = 7656;
@@ -82,6 +87,10 @@ impl SamSession {
             nickname: config.nickname.clone(),
             destination,
             samv3_tcp_port: config.samv3_tcp_port,
+            // Inbound forwarding relies on the router prepending each
+            // connection with the peer's destination line; keep it explicit
+            // rather than inheriting yosemite's default (see [`SamListener`]).
+            silent_forward: false,
             ..Default::default()
         };
         let session = Session::<style::Stream>::new(options).map_err(map_err)?;
@@ -103,6 +112,148 @@ impl SamSession {
     #[must_use]
     pub fn local_dest(&self) -> DestHash {
         self.local
+    }
+}
+
+/// Upper bound on the forwarded destination line (bytes). A full I2P
+/// destination is ~516 base64 chars plus a few `FROM_PORT`/`TO_PORT` params;
+/// anything past this from a misbehaving router is refused rather than read
+/// unboundedly.
+const MAX_DEST_LINE: usize = 4096;
+
+/// How long `accept` waits for a forwarded connection's destination line
+/// before giving up on it. Guards the acceptor thread against a router that
+/// forwards a connection but never sends the (`SILENT=false`) header.
+const DEST_LINE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// An inbound listener: the router forwards peer streams (SAM `STREAM
+/// FORWARD`) to a loopback [`TcpListener`] this owns. Holds an [`Arc`] to the
+/// [`SamSession`] so the forwarding stays live for the listener's lifetime.
+///
+/// One session backs both dialing ([`SamSession`] as [`I2pDialer`]) and this
+/// listener; `forward` and `connect` are independent SAM operations on the
+/// same nickname, so a client both seeds and leeches on one destination.
+pub struct SamListener {
+    listener: TcpListener,
+    local: DestHash,
+    // Keeps the SAM session (and thus the router-side forwarding) alive.
+    _session: Arc<SamSession>,
+}
+
+impl SamListener {
+    /// Ask the router to forward inbound streams for `session`'s destination
+    /// to a fresh loopback listener, and return it.
+    ///
+    /// # Errors
+    ///
+    /// The loopback listener cannot be bound, or the router refuses the
+    /// `STREAM FORWARD` request.
+    pub fn forward(session: Arc<SamSession>) -> io::Result<SamListener> {
+        // The one inbound IP-socket construction site: loopback by
+        // construction (Layer 1, SCOPE §5), ephemeral port.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        {
+            let mut sam = session
+                .session
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            sam.forward(port).map_err(map_err)?;
+        }
+        let local = session.local;
+        Ok(SamListener {
+            listener,
+            local,
+            _session: session,
+        })
+    }
+}
+
+impl I2pListener for SamListener {
+    type Stream = ForwardedStream;
+
+    fn local_dest(&self) -> DestHash {
+        self.local
+    }
+
+    fn accept(&self) -> io::Result<(ForwardedStream, DestHash)> {
+        let (mut stream, _addr) = self.listener.accept()?;
+        // Bound the header read so a silent/misbehaving router cannot wedge
+        // the acceptor; then hand a blocking socket to the reader thread.
+        stream.set_read_timeout(Some(DEST_LINE_TIMEOUT))?;
+        let dest = read_dest_line(&mut stream, MAX_DEST_LINE)?;
+        stream.set_read_timeout(None)?;
+        Ok((ForwardedStream { inner: stream }, dest))
+    }
+}
+
+/// Read the `SILENT=false` destination header the router prepends to a
+/// forwarded connection — the peer's base64 destination, optionally followed
+/// by space-separated `FROM_PORT`/`TO_PORT` params — up to the `\n`, and
+/// derive the peer's [`DestHash`]. Reads one byte at a time so the stream
+/// payload after the newline is left untouched for the peer's reader.
+fn read_dest_line<R: Read>(reader: &mut R, max_len: usize) -> io::Result<DestHash> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if reader.read(&mut byte)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "forwarded stream closed before its destination line",
+            ));
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if line.len() >= max_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "forwarded destination line exceeds the maximum length",
+            ));
+        }
+        line.push(byte[0]);
+    }
+    let text = std::str::from_utf8(&line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "destination line is not UTF-8"))?;
+    DestHash::from_b64_destination(text).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "forwarded destination line is not a parseable I2P destination",
+        )
+    })
+}
+
+/// An inbound SAM stream: the loopback TCP connection the router forwarded to
+/// us, carrying the tunneled peer stream after its destination header was
+/// consumed. Split via `TcpStream::try_clone` (both halves are the same
+/// socket), matching the reader-thread/writer-thread model (Q5).
+pub struct ForwardedStream {
+    inner: TcpStream,
+}
+
+impl Read for ForwardedStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Write for ForwardedStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl I2pStream for ForwardedStream {
+    type Reader = TcpStream;
+    type Writer = TcpStream;
+
+    fn split(self) -> io::Result<(TcpStream, TcpStream)> {
+        let reader = self.inner.try_clone()?;
+        Ok((reader, self.inner))
     }
 }
 
@@ -172,5 +323,77 @@ fn map_err(e: yosemite::Error) -> io::Error {
     match e {
         yosemite::Error::IoError(io) => io,
         other => io::Error::other(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Router-free coverage: the SAM session itself needs a live router
+    //! (exercised via `docs/LIVE-TESTING.md`), but the inbound path's two
+    //! bits of pure logic — splitting the forwarded socket and parsing the
+    //! `SILENT=false` destination header — are tested here over loopback TCP
+    //! and in-memory readers.
+
+    use super::*;
+    use crate::addr::i2p_base64_encode;
+    use std::io::Cursor;
+
+    #[test]
+    fn forwarded_stream_splits_and_carries_both_directions() {
+        // A real loopback TCP pair stands in for the router-forwarded socket.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let mut client = ForwardedStream { inner: client };
+        let server = ForwardedStream { inner: server };
+        let (mut srv_read, mut srv_write) = server.split().unwrap();
+
+        client.write_all(b"ping").unwrap();
+        let mut buf = [0u8; 4];
+        srv_read.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+
+        srv_write.write_all(b"pong").unwrap();
+        let mut buf = [0u8; 4];
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"pong");
+    }
+
+    #[test]
+    fn read_dest_line_parses_dest_and_leaves_payload() {
+        let dest_bytes = [0x42u8; 48];
+        let b64 = i2p_base64_encode(&dest_bytes);
+        let expected = DestHash::from_b64_destination(&b64).unwrap();
+
+        // The router's SILENT=false header, then the peer's BT handshake.
+        let mut input = Vec::new();
+        input.extend_from_slice(b64.as_bytes());
+        input.extend_from_slice(b" FROM_PORT=6881 TO_PORT=0\n");
+        input.extend_from_slice(b"the-bittorrent-handshake");
+        let mut cursor = Cursor::new(input);
+
+        let got = read_dest_line(&mut cursor, MAX_DEST_LINE).unwrap();
+        assert_eq!(got, expected);
+
+        // The payload after the newline must be intact for the peer reader.
+        let mut rest = Vec::new();
+        cursor.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"the-bittorrent-handshake");
+    }
+
+    #[test]
+    fn read_dest_line_rejects_overlong_line() {
+        let mut cursor = Cursor::new(vec![b'A'; 128]); // no newline, no dest
+        let err = read_dest_line(&mut cursor, 32).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_dest_line_eof_before_newline() {
+        let mut cursor = Cursor::new(b"partial-no-newline".to_vec());
+        let err = read_dest_line(&mut cursor, MAX_DEST_LINE).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }
