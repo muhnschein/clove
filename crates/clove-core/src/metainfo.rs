@@ -65,6 +65,10 @@ pub struct MetaInfo {
     /// How many non-I2P announce URLs were dropped. The only trace they
     /// leave: callers may log "skipped N non-I2P trackers", nothing more.
     pub skipped_trackers: usize,
+    /// The raw bencoded `info` dictionary these fields came from — the exact
+    /// bytes the info-hash covers. Kept so we can serve BEP 9 metadata to
+    /// magnet peers and re-emit the torrent without re-encoding.
+    pub raw_info: Vec<u8>,
 }
 
 /// Why a .torrent was rejected.
@@ -139,7 +143,8 @@ impl MetaInfo {
         // change the identity i2psnark peers agreed on.
         let info_range =
             bencode::raw_entry(input, b"info")?.ok_or(Error::Invalid("missing info dictionary"))?;
-        let info_hash = InfoHash(Sha1::digest(&input[info_range]).into());
+        let raw_info = input[info_range].to_vec();
+        let info_hash = InfoHash(Sha1::digest(&raw_info).into());
 
         let name = info
             .get(b"name")
@@ -191,6 +196,7 @@ impl MetaInfo {
             private,
             trackers,
             skipped_trackers,
+            raw_info,
         })
     }
 }

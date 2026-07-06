@@ -282,6 +282,7 @@ mod tests {
             private: true,
             trackers: vec![],
             skipped_trackers: 0,
+            raw_info: Vec::new(),
         }
     }
 

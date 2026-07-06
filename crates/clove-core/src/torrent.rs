@@ -31,11 +31,14 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use i2pnet::I2pStream;
+use i2pnet::{DestHash, I2pStream};
 
 use crate::bitfield::{self, Bitfield};
 use crate::choker::{Choker, PeerSnapshot};
+use crate::extension::{self, I2P_PEX, UT_METADATA};
+use crate::metadata::{self, METADATA_PIECE_LEN, MetadataMessage};
 use crate::metainfo::MetaInfo;
+use crate::pex::PexMessage;
 use crate::picker::{Mode, Picker};
 use crate::storage::Storage;
 use crate::wire::{self, BLOCK_LEN, BlockRequest, Extensions, Handshake, Message};
@@ -43,6 +46,12 @@ use crate::wire::{self, BLOCK_LEN, BlockRequest, Extensions, Handshake, Message}
 /// Outstanding block requests a peer may have in flight before we wait for
 /// data. Config-tunable later (R5).
 pub const PIPELINE_DEPTH: usize = 16;
+
+/// The extended-message ids clove advertises (peers send these ids back to
+/// us). Fixed, since we control both ends by default; a peer tells us its
+/// own ids in its handshake and we use those when sending to it.
+const OUR_PEX_ID: u8 = 1;
+const OUR_METADATA_ID: u8 = 2;
 
 /// Outgoing message queue depth per peer before the writer applies
 /// backpressure. Bounded — no unbounded channels in the engine (SCOPE §4).
@@ -64,6 +73,9 @@ struct Shared {
     storage: Arc<Storage>,
     num_pieces: u32,
     max_frame: u32,
+    /// Raw `info` dictionary bytes, for serving BEP 9 metadata to magnet
+    /// peers. Empty if unknown (a synthetic test torrent).
+    raw_info: Vec<u8>,
     state: Mutex<State>,
     done: Mutex<bool>,
     done_cv: Condvar,
@@ -74,6 +86,9 @@ struct State {
     choker: Choker,
     peers: Vec<Peer>,
     next_id: u64,
+    /// Peer destinations we know about (from connections, PEX, or the
+    /// tracker), for peer exchange and future dialing.
+    known_peers: HashSet<DestHash>,
 }
 
 // The four flags are the canonical BEP 3 per-connection choke/interest
@@ -82,6 +97,8 @@ struct State {
 #[allow(clippy::struct_excessive_bools, clippy::struct_field_names)]
 struct Peer {
     id: u64,
+    /// The peer's I2P destination, for peer exchange.
+    dest: DestHash,
     out: SyncSender<Message>,
     /// Their piece set.
     has: Bitfield,
@@ -97,6 +114,10 @@ struct Peer {
     in_flight: HashSet<(u32, u32)>,
     /// Bytes served to them, the choker's ranking signal.
     uploaded: u64,
+    /// The message id the peer listens on for `i2p_pex`, once it handshakes.
+    pex_id: Option<u8>,
+    /// The message id the peer listens on for `ut_metadata`.
+    metadata_id: Option<u8>,
 }
 
 /// A message queued to a specific peer, collected under the lock and sent
@@ -120,21 +141,27 @@ impl Torrent {
         for index in initial_have.iter_present() {
             picker.set_have(index);
         }
+        // Frame ceiling must cover the largest message: a bitfield, a piece
+        // block, or a ut_metadata data message (16 KiB + bencode/extension
+        // overhead). 256 bytes of slack covers the headers.
         let max_frame = u32::try_from(bitfield::byte_len(num_pieces))
             .unwrap_or(u32::MAX)
-            .max(BLOCK_LEN + 13)
-            .saturating_add(16);
+            .max(BLOCK_LEN)
+            .max(u32::try_from(METADATA_PIECE_LEN).unwrap_or(u32::MAX))
+            .saturating_add(256);
         let shared = Arc::new(Shared {
             info_hash: meta.info_hash.0,
             peer_id,
             storage,
             num_pieces,
             max_frame,
+            raw_info: meta.raw_info.clone(),
             state: Mutex::new(State {
                 picker,
                 choker: Choker::default(),
                 peers: Vec::new(),
                 next_id: 0,
+                known_peers: HashSet::new(),
             }),
             done: Mutex::new(false),
             done_cv: Condvar::new(),
@@ -167,20 +194,46 @@ impl Torrent {
         *done
     }
 
-    /// Perform the handshake on `stream` and, on success, register the peer
-    /// and spawn its reader/writer threads. Used for both dialed and
-    /// accepted connections.
+    /// Note peers we could dial (from the tracker, or seeded in tests). They
+    /// join the set advertised over peer exchange.
+    pub fn add_peers(&self, peers: &[DestHash]) {
+        let mut st = lock(&self.shared.state);
+        for &p in peers {
+            st.known_peers.insert(p);
+        }
+    }
+
+    /// The peer destinations this torrent currently knows about.
+    #[must_use]
+    pub fn known_peers(&self) -> Vec<DestHash> {
+        lock(&self.shared.state)
+            .known_peers
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Perform the handshake on `stream` (with `remote` the peer's known
+    /// destination) and, on success, register the peer and spawn its
+    /// reader/writer threads. Used for both dialed and accepted connections.
     ///
     /// # Errors
     ///
     /// Handshake I/O failure or an info-hash mismatch (wrong torrent).
-    pub fn attach<S: I2pStream + 'static>(&self, mut stream: S) -> std::io::Result<()> {
+    pub fn attach<S: I2pStream + 'static>(
+        &self,
+        mut stream: S,
+        remote: DestHash,
+    ) -> std::io::Result<()> {
         let ours = Handshake {
             info_hash: self.shared.info_hash,
             peer_id: self.shared.peer_id,
-            // Plain BEP 3 for the lab demo; the codec supports fast/extended
-            // and Phase E turns them on with their semantics.
-            extensions: Extensions::default(),
+            // Advertise the BEP 10 extension protocol (i2p_pex, ut_metadata).
+            // Fast (BEP 6) stays off until its semantics are wired.
+            extensions: Extensions {
+                extended: true,
+                fast: false,
+            },
         };
         stream.write_all(&ours.encode())?;
         let mut buf = [0u8; wire::HANDSHAKE_LEN];
@@ -199,14 +252,21 @@ impl Torrent {
         let (reader, writer) = stream.split()?;
         let (tx, rx) = sync_channel::<Message>(OUTGOING_QUEUE);
 
-        let id = self.shared.register_peer(tx.clone());
+        let id = self.shared.register_peer(tx.clone(), remote);
 
-        // Announce our piece set immediately (empty bitfield is legal).
+        // Announce our piece set, then our extension handshake if the peer
+        // speaks BEP 10.
         let bitfield = {
             let st = lock(&self.shared.state);
             Message::Bitfield(st.picker.have_field().as_bytes().to_vec())
         };
         let _ = tx.try_send(bitfield);
+        if theirs.extensions.extended {
+            let _ = tx.try_send(Message::Extended {
+                id: 0,
+                payload: self.shared.our_extension_handshake(),
+            });
+        }
 
         let writer_handle = spawn_writer(writer, rx);
         let reader_handle = spawn_reader(Arc::clone(&self.shared), id, reader);
@@ -247,12 +307,14 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
 }
 
 impl Shared {
-    fn register_peer(&self, out: SyncSender<Message>) -> u64 {
+    fn register_peer(&self, out: SyncSender<Message>, dest: DestHash) -> u64 {
         let mut st = lock(&self.state);
         let id = st.next_id;
         st.next_id += 1;
+        st.known_peers.insert(dest);
         st.peers.push(Peer {
             id,
+            dest,
             out,
             has: Bitfield::empty(self.num_pieces),
             peer_choking: true,
@@ -261,8 +323,25 @@ impl Shared {
             we_interested: false,
             in_flight: HashSet::new(),
             uploaded: 0,
+            pex_id: None,
+            metadata_id: None,
         });
         id
+    }
+
+    /// Our BEP 10 handshake payload: advertise `i2p_pex` and `ut_metadata`, and
+    /// the metadata size if we hold the info dictionary.
+    fn our_extension_handshake(&self) -> Vec<u8> {
+        let mut ids = std::collections::BTreeMap::new();
+        ids.insert(I2P_PEX.to_owned(), OUR_PEX_ID);
+        ids.insert(UT_METADATA.to_owned(), OUR_METADATA_ID);
+        let metadata_size = (!self.raw_info.is_empty()).then_some(self.raw_info.len());
+        extension::Handshake {
+            ids,
+            metadata_size,
+            client: Some("clove/0.1".to_owned()),
+        }
+        .encode()
     }
 
     fn remove_peer(&self, id: u64) {
@@ -297,14 +376,18 @@ impl Shared {
         };
         match msg {
             // No-ops here: keep-alive, a cancel we serve synchronously so
-            // never have queued, and fast/extended messages negotiated off
-            // this phase.
+            // never have queued, and fast-extension messages (BEP 6 off).
             Message::KeepAlive
             | Message::Cancel(_)
             | Message::RejectRequest(_)
             | Message::SuggestPiece(_)
-            | Message::AllowedFast(_)
-            | Message::Extended { .. } => {}
+            | Message::AllowedFast(_) => {}
+            Message::Extended {
+                id: ext_id,
+                payload,
+            } => {
+                self.on_extended(st, idx, *ext_id, payload, out);
+            }
             Message::Choke => {
                 let peer = &mut st.peers[idx];
                 peer.peer_choking = true;
@@ -359,6 +442,97 @@ impl Shared {
                 self.on_block(st, idx, *index, *begin, block, out);
             }
         }
+    }
+
+    /// Route a BEP 10 extended message: id 0 is the handshake, otherwise the
+    /// id is one we advertised (`i2p_pex` or `ut_metadata`).
+    fn on_extended(
+        &self,
+        st: &mut State,
+        idx: usize,
+        ext_id: u8,
+        payload: &[u8],
+        out: &mut Vec<Outgoing>,
+    ) {
+        match ext_id {
+            0 => {
+                let Ok(hs) = extension::Handshake::parse(payload) else {
+                    return;
+                };
+                st.peers[idx].pex_id = hs.id_for(I2P_PEX);
+                st.peers[idx].metadata_id = hs.id_for(UT_METADATA);
+                // Now that we know their pex id, send them the peers we know.
+                Self::send_pex(st, idx, out);
+            }
+            OUR_PEX_ID => {
+                if let Ok(pex) = PexMessage::parse(payload) {
+                    for dest in pex.added {
+                        st.known_peers.insert(dest);
+                    }
+                }
+            }
+            OUR_METADATA_ID => {
+                if let Ok(MetadataMessage::Request { piece }) = MetadataMessage::parse(payload) {
+                    self.serve_metadata(st, idx, piece, out);
+                }
+            }
+            _ => {} // an id we never advertised
+        }
+    }
+
+    /// Send `idx`'s peer the destinations we know (minus its own), if it
+    /// supports peer exchange. State-only, so an associated function.
+    fn send_pex(st: &mut State, idx: usize, out: &mut Vec<Outgoing>) {
+        let Some(pex_id) = st.peers[idx].pex_id else {
+            return;
+        };
+        let peer_dest = st.peers[idx].dest;
+        let added: Vec<DestHash> = st
+            .known_peers
+            .iter()
+            .copied()
+            .filter(|&d| d != peer_dest)
+            .collect();
+        let msg = PexMessage {
+            added,
+            dropped: Vec::new(),
+        };
+        if msg.is_empty() {
+            return;
+        }
+        out.push((
+            st.peers[idx].out.clone(),
+            Message::Extended {
+                id: pex_id,
+                payload: msg.encode(),
+            },
+        ));
+    }
+
+    /// Serve one metadata piece (or reject it) in response to a request.
+    fn serve_metadata(&self, st: &mut State, idx: usize, piece: u32, out: &mut Vec<Outgoing>) {
+        let Some(metadata_id) = st.peers[idx].metadata_id else {
+            return;
+        };
+        let total = self.raw_info.len();
+        let start = piece as usize * METADATA_PIECE_LEN;
+        let reply = if self.raw_info.is_empty() || start >= total {
+            MetadataMessage::Reject { piece }
+        } else {
+            let end = (start + METADATA_PIECE_LEN).min(total);
+            MetadataMessage::Data {
+                piece,
+                total_size: u32::try_from(total).unwrap_or(u32::MAX),
+                data: self.raw_info[start..end].to_vec(),
+            }
+        };
+        out.push((
+            st.peers[idx].out.clone(),
+            Message::Extended {
+                id: metadata_id,
+                payload: reply.encode(),
+            },
+        ));
     }
 
     /// A peer sent us a block: validate, persist, advance the picker, and on
@@ -500,6 +674,117 @@ fn run_choker(st: &mut State, out: &mut Vec<Outgoing>) {
     }
 }
 
+/// Frame ceiling for the metadata-fetch handshake flow: a `ut_metadata` data
+/// message is one 16 KiB piece plus small header/extension overhead.
+const METADATA_FRAME: u32 = 16 * 1024 + 256; // METADATA_PIECE_LEN + overhead
+
+/// Fetch and verify a torrent's `info` dictionary from one peer over BEP 9
+/// (`ut_metadata`) — the magnet bootstrap. Blocking and sequential, so it
+/// runs on the dialing thread against a duplex stream before the full peer
+/// connection (and storage/picker) exist.
+///
+/// The reassembled bytes are checked against `info_hash` inside the
+/// assembler, so a peer cannot serve a different torrent.
+///
+/// # Errors
+///
+/// Handshake failure, a peer that does not offer metadata, a rejected
+/// piece, verification failure, or any I/O error.
+pub fn fetch_metadata<S: I2pStream>(
+    mut stream: S,
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+) -> std::io::Result<MetaInfo> {
+    let invalid = |m: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
+
+    let ours = Handshake {
+        info_hash,
+        peer_id,
+        extensions: Extensions {
+            extended: true,
+            fast: false,
+        },
+    };
+    stream.write_all(&ours.encode())?;
+    let mut buf = [0u8; wire::HANDSHAKE_LEN];
+    stream.read_exact(&mut buf)?;
+    let theirs = Handshake::parse(&buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if theirs.info_hash != info_hash {
+        return Err(invalid("peer handshaked a different torrent"));
+    }
+    if !theirs.extensions.extended {
+        return Err(invalid("peer does not speak the extension protocol"));
+    }
+
+    // Advertise ut_metadata and send our handshake.
+    let mut ids = std::collections::BTreeMap::new();
+    ids.insert(UT_METADATA.to_owned(), OUR_METADATA_ID);
+    let our_ext = extension::Handshake {
+        ids,
+        metadata_size: None,
+        client: Some("clove/0.1".to_owned()),
+    };
+    wire::write_message(
+        &mut stream,
+        &Message::Extended {
+            id: 0,
+            payload: our_ext.encode(),
+        },
+    )?;
+
+    // Wait for the peer's handshake, which carries its ut_metadata id and the
+    // total metadata size.
+    let (their_meta_id, total_size) = loop {
+        let body = wire::read_frame(&mut stream, METADATA_FRAME)?;
+        if let Ok(Message::Extended { id: 0, payload }) = Message::parse(&body) {
+            let hs =
+                extension::Handshake::parse(&payload).map_err(|_| invalid("bad ext handshake"))?;
+            match (hs.id_for(UT_METADATA), hs.metadata_size) {
+                (Some(mid), Some(size)) => break (mid, size),
+                _ => return Err(invalid("peer does not serve metadata")),
+            }
+        }
+        // Ignore anything else (bitfield, etc.) until the handshake arrives.
+    };
+
+    let mut asm =
+        metadata::MetadataAssembler::new(total_size).map_err(|_| invalid("bad metadata size"))?;
+    for piece in 0..asm.num_pieces() {
+        let req = MetadataMessage::Request { piece };
+        wire::write_message(
+            &mut stream,
+            &Message::Extended {
+                id: their_meta_id,
+                payload: req.encode(),
+            },
+        )?;
+    }
+    while !asm.is_complete() {
+        let body = wire::read_frame(&mut stream, METADATA_FRAME)?;
+        let Ok(Message::Extended { id, payload }) = Message::parse(&body) else {
+            continue;
+        };
+        if id != OUR_METADATA_ID {
+            continue; // peers reply using the id we advertised
+        }
+        match MetadataMessage::parse(&payload) {
+            Ok(MetadataMessage::Data { piece, data, .. }) => {
+                let _ = asm.add_piece(piece, &data);
+            }
+            Ok(MetadataMessage::Reject { .. }) => {
+                return Err(invalid("peer rejected a metadata piece"));
+            }
+            _ => {}
+        }
+    }
+    let bytes = asm
+        .finish(info_hash)
+        .ok_or_else(|| invalid("metadata failed info-hash verification"))?;
+    MetaInfo::from_info_dict(&bytes)
+        .map_err(|_| invalid("fetched metadata is not a valid info dict"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,7 +829,132 @@ mod tests {
             private: true,
             trackers: vec![],
             skipped_trackers: 0,
+            raw_info: Vec::new(),
         }
+    }
+
+    /// Build a real single-file torrent via bencode+parse, so `raw_info` is
+    /// the genuine info-dict bytes (needed to serve BEP 9 metadata).
+    fn real_meta(content: &[u8]) -> MetaInfo {
+        use crate::bencode::{Value, encode};
+        use std::collections::BTreeMap;
+        let pieces: Vec<u8> = content
+            .chunks(BLOCK_LEN as usize)
+            .flat_map(|c| <[u8; 20]>::from(Sha1::digest(c)))
+            .collect();
+        let mut info = BTreeMap::new();
+        info.insert(b"name".to_vec(), Value::Bytes(b"demo".to_vec()));
+        info.insert(b"piece length".to_vec(), Value::Int(i64::from(BLOCK_LEN)));
+        info.insert(b"pieces".to_vec(), Value::Bytes(pieces));
+        info.insert(
+            b"length".to_vec(),
+            Value::Int(i64::try_from(content.len()).unwrap()),
+        );
+        let mut root = BTreeMap::new();
+        root.insert(b"info".to_vec(), Value::Dict(info));
+        MetaInfo::parse(&encode(&Value::Dict(root))).unwrap()
+    }
+
+    /// Two instances negotiate BEP 10 and one learns a third peer via
+    /// `i2p_pex`.
+    #[test]
+    fn peers_exchange_via_i2p_pex() {
+        let net = MockNet::new();
+        let content = vec![7u8; 100];
+        let meta = real_meta(&content);
+        let peer_id = *b"-CV0001-pexpexpexpex";
+
+        let dir_a = TempDir::new("pex-a");
+        let dir_b = TempDir::new("pex-b");
+        let a = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir_a.0, false).unwrap()),
+            &Bitfield::empty(1),
+            Mode::RarestFirst,
+            peer_id,
+        );
+        let b = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir_b.0, false).unwrap()),
+            &Bitfield::empty(1),
+            Mode::RarestFirst,
+            peer_id,
+        );
+
+        // A already knows a third peer X, which B has never seen.
+        let x = DestHash([0xAB; 32]);
+        a.add_peers(&[x]);
+
+        let ep_a = net.endpoint();
+        let ep_b = net.endpoint();
+        let a_dest = ep_a.dest();
+        let b_dest = ep_b.dest();
+
+        let a_bg = Arc::clone(&a);
+        let accept = std::thread::spawn(move || {
+            let (stream, from) = ep_a.accept().unwrap();
+            a_bg.attach(stream, from).unwrap();
+        });
+        let stream = ep_b.dial(a_dest, Duration::from_secs(5)).unwrap();
+        b.attach(stream, a_dest).unwrap();
+        accept.join().unwrap();
+        let _ = b_dest;
+
+        // B should learn X over PEX within a moment.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if b.known_peers().contains(&x) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            b.known_peers().contains(&x),
+            "B never learned peer X via i2p_pex"
+        );
+    }
+
+    /// A magnet client fetches and verifies the info dictionary over BEP 9
+    /// from a peer that holds it.
+    #[test]
+    fn fetches_metadata_over_bep9() {
+        let net = MockNet::new();
+        // Metadata spanning two 16 KiB pieces exercises reassembly.
+        let content: Vec<u8> = (0..(3 * BLOCK_LEN))
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let meta = real_meta(&content);
+        let info_hash = meta.info_hash.0;
+        assert!(!meta.raw_info.is_empty());
+
+        // Server holds the metadata; storage is irrelevant to serving it.
+        let dir = TempDir::new("meta-server");
+        let server = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(meta.pieces.len().try_into().unwrap()),
+            Mode::RarestFirst,
+            *b"-CV0001-serverserver",
+        );
+
+        let ep_s = net.endpoint();
+        let ep_c = net.endpoint();
+        let s_dest = ep_s.dest();
+
+        let server_bg = Arc::clone(&server);
+        let accept = std::thread::spawn(move || {
+            let (stream, from) = ep_s.accept().unwrap();
+            server_bg.attach(stream, from).unwrap();
+        });
+
+        let stream = ep_c.dial(s_dest, Duration::from_secs(5)).unwrap();
+        let fetched = fetch_metadata(stream, info_hash, *b"-CV0001-clientclient").unwrap();
+        accept.join().unwrap();
+
+        assert_eq!(fetched.info_hash.0, info_hash);
+        assert_eq!(fetched.name, "demo");
+        assert_eq!(fetched.pieces, meta.pieces);
+        assert_eq!(fetched.total_length, content.len() as u64);
     }
 
     /// The M2 demo: a seeder and a leecher over the mock network complete a
@@ -606,16 +1016,18 @@ mod tests {
         let seed_ep = net.endpoint();
         let leech_ep = net.endpoint();
         let seed_dest = seed_ep.dest();
+        let leech_dest = leech_ep.dest();
 
         let seeder_bg = Arc::clone(&seeder);
         let accept_thread = std::thread::spawn(move || {
-            let (stream, _from) = seed_ep.accept().unwrap();
-            seeder_bg.attach(stream).unwrap();
+            let (stream, from) = seed_ep.accept().unwrap();
+            seeder_bg.attach(stream, from).unwrap();
         });
 
         let stream = leech_ep.dial(seed_dest, Duration::from_secs(5)).unwrap();
-        leecher.attach(stream).unwrap();
+        leecher.attach(stream, seed_dest).unwrap();
         accept_thread.join().unwrap();
+        let _ = leech_dest;
 
         assert!(
             leecher.wait_complete(Duration::from_secs(20)),

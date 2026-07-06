@@ -150,7 +150,12 @@ Status legend:
     total_size} header immediately followed by the raw piece bytes.
     Reassembled bytes are SHA-1-verified against the info-hash before use,
     so a lying peer cannot substitute a different torrent. `total_size`
-    over 8 MiB is refused up front.
+    over 8 MiB is refused up front. Extension ids: clove advertises
+    i2p_pex=1, ut_metadata=2 and replies to a peer using the ids that peer
+    advertised (peers reply to us using ours). fetch_metadata drives the
+    magnet bootstrap: BT+extension handshake, request all pieces, verify,
+    then MetaInfo::from_info_dict. Verified in-tree over the mock (a client
+    fetches an info dict from a serving instance).
 
 4.5 [decided] Magnet links (clove-core::magnet): `magnet:?xt=urn:btih:<hex
     40 | base32 32>`; `dn` and `tr` are percent-decoded, `tr` filtered to
