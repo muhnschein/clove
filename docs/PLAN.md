@@ -63,9 +63,12 @@ mock network, including mid-transfer fault injection.
 - **R2 stress harness** (bin target, run manually against local i2pd and
   emissary): many concurrent streams on one session; findings recorded in
   `PROTOCOL.i2p-bt` notes.
+- Inbound topology settled as SAM `FORWARD` to a loopback listener, not
+  `ACCEPT` (avoids the `&mut self` serialization point) — see `LIVE-TESTING.md`.
 
 Exit (M1): loopback download between two instances over a real local i2pd;
-survives router restart.
+survives router restart. Live sign-off checklist and the podman-quadlet test
+environment are in `LIVE-TESTING.md` §6.1.
 
 ## Phase E — Swarm citizen (`clove-core`)
 
@@ -78,6 +81,7 @@ survives router restart.
 - Naming cache with negative backoff (R6) wired into peer acquisition.
 
 Exit (M3 demo): download from and sustained seed to a live i2psnark swarm.
+Live sign-off checklist in `LIVE-TESTING.md` §6.2.
 
 ## Phase F — Operable (`cloved`, `clove`)
 
