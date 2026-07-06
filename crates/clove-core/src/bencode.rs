@@ -142,6 +142,21 @@ pub fn decode(input: &[u8]) -> Result<Value, Error> {
     }
 }
 
+/// Decode one bencode value from the start of `input`, returning it and the
+/// number of bytes consumed. Unlike [`decode`], trailing bytes are allowed —
+/// for framings where a bencoded header is followed by raw data (BEP 9
+/// `ut_metadata` data messages, `crate::metadata`).
+///
+/// # Errors
+///
+/// Any syntax violation, truncation, duplicate key, or over-deep nesting in
+/// the leading value.
+pub fn decode_prefix(input: &[u8]) -> Result<(Value, usize), Error> {
+    let mut d = Decoder { input, pos: 0 };
+    let value = d.value(0)?;
+    Ok((value, d.pos))
+}
+
 /// Byte range of the raw encoded value stored under `key` in the top-level
 /// dictionary — e.g. the exact `info` bytes an info-hash is computed over.
 ///

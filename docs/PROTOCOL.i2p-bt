@@ -137,7 +137,25 @@ Status legend:
 4.2 [decided] Block size is fixed at 16 KiB (BLOCK_LEN); requests and piece
     blocks over that are rejected. Matches i2psnark.
 
-4.3 [open] i2p_pex flag semantics (R4) are underspecified upstream
-    ("review libtorrent source"). To be pinned down against i2psnark in
-    Phase E; i2psnark behavior is treated as normative and its observations
-    recorded here.
+4.3 [decided] i2p_pex (clove-core::pex): a bencoded dict with `added` and
+    `dropped` byte strings, each concatenated 32-byte destination hashes.
+    Unlike clearnet ut_pex there are no `added.f` flag bytes and no
+    IPv6/`added6` keys; any extra keys a peer sends are ignored. A message
+    over MAX_PEX_PEERS (512) is rejected as spam. [open] whether i2psnark
+    ever attaches flags we should honor — confirm live, treat i2psnark as
+    normative (R4).
+
+4.4 [decided] ut_metadata (BEP 9, clove-core::metadata): standard 16 KiB
+    metadata pieces; a data message is a bencoded {msg_type,piece,
+    total_size} header immediately followed by the raw piece bytes.
+    Reassembled bytes are SHA-1-verified against the info-hash before use,
+    so a lying peer cannot substitute a different torrent. `total_size`
+    over 8 MiB is refused up front.
+
+4.5 [decided] Magnet links (clove-core::magnet): `magnet:?xt=urn:btih:<hex
+    40 | base32 32>`; `dn` and `tr` are percent-decoded, `tr` filtered to
+    I2P-only like .torrent announce URLs.
+
+4.6 [open] I2P `maggot://` links are a distinct, underspecified format.
+    Not parsed yet — we will not guess a grammar we cannot verify against
+    real examples. Add support (and the grammar) here once confirmed.

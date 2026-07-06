@@ -1,0 +1,179 @@
+//! Magnet link parsing (BEP 9 `xt=urn:btih:` form).
+//!
+//! A magnet gives us an info-hash but no metadata; the [`crate::metadata`]
+//! exchange fetches the info dictionary from peers, and the `tr=` trackers
+//! (I2P-only, filtered like `.torrent` announce URLs) plus PEX supply peers.
+//!
+//! The btih value is accepted as 40 hex characters (v1) or 32 base32
+//! characters (both encode the same 20-byte hash). I2P's own `maggot://`
+//! links are a separate, underspecified format left [open] in
+//! `docs/PROTOCOL.i2p-bt` until confirmed against real examples — we do not
+//! guess at a grammar we cannot verify.
+
+use crate::http;
+use crate::metainfo::is_i2p_tracker;
+
+/// A parsed magnet link.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Magnet {
+    /// The 20-byte info-hash from `xt=urn:btih:`.
+    pub info_hash: [u8; 20],
+    /// The display name (`dn=`), if given.
+    pub display_name: Option<String>,
+    /// I2P announce URLs (`tr=`); non-I2P trackers are dropped.
+    pub trackers: Vec<String>,
+}
+
+/// Why a magnet link could not be parsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// Not a `magnet:?` URI.
+    NotMagnet,
+    /// No `xt=urn:btih:` parameter.
+    NoInfoHash,
+    /// The btih value was not 40 hex or 32 base32 characters.
+    BadInfoHash,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::NotMagnet => f.write_str("magnet: not a magnet: URI"),
+            Error::NoInfoHash => f.write_str("magnet: no xt=urn:btih: info-hash"),
+            Error::BadInfoHash => f.write_str("magnet: info-hash is not 40 hex or 32 base32 chars"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl Magnet {
+    /// Parse a `magnet:?…` link.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotMagnet`] if the scheme is wrong, [`Error::NoInfoHash`] if
+    /// there is no btih parameter, [`Error::BadInfoHash`] if it is malformed.
+    pub fn parse(uri: &str) -> Result<Magnet, Error> {
+        let query = uri.strip_prefix("magnet:?").ok_or(Error::NotMagnet)?;
+        let mut info_hash = None;
+        let mut display_name = None;
+        let mut trackers = Vec::new();
+
+        for pair in query.split('&') {
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            match key {
+                "xt" => {
+                    if let Some(hash) = value.strip_prefix("urn:btih:") {
+                        info_hash = Some(parse_btih(hash)?);
+                    }
+                }
+                "dn" => {
+                    display_name =
+                        Some(String::from_utf8_lossy(&http::percent_decode(value)).into_owned());
+                }
+                "tr" => {
+                    let url = String::from_utf8_lossy(&http::percent_decode(value)).into_owned();
+                    if is_i2p_tracker(&url) {
+                        trackers.push(url);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Magnet {
+            info_hash: info_hash.ok_or(Error::NoInfoHash)?,
+            display_name,
+            trackers,
+        })
+    }
+}
+
+/// Decode a btih value: 40 hex chars or 32 base32 chars, to 20 bytes.
+fn parse_btih(value: &str) -> Result<[u8; 20], Error> {
+    if value.len() == 40 {
+        let mut out = [0u8; 20];
+        for (i, byte) in out.iter_mut().enumerate() {
+            let hi = hex_nibble(value.as_bytes()[i * 2])?;
+            let lo = hex_nibble(value.as_bytes()[i * 2 + 1])?;
+            *byte = (hi << 4) | lo;
+        }
+        Ok(out)
+    } else if value.len() == 32 {
+        // BitTorrent magnet base32 is uppercase RFC 4648; our decoder is
+        // lowercase, so normalize first.
+        let lower = value.to_ascii_lowercase();
+        let bytes = i2pnet::addr::base32_decode(&lower).ok_or(Error::BadInfoHash)?;
+        bytes.try_into().map_err(|_| Error::BadInfoHash)
+    } else {
+        Err(Error::BadInfoHash)
+    }
+}
+
+fn hex_nibble(b: u8) -> Result<u8, Error> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(Error::BadInfoHash),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hex_infohash_with_name_and_trackers() {
+        let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567\
+                   &dn=Some%20Torrent\
+                   &tr=http%3A%2F%2Ftracker.postman.i2p%2Fannounce\
+                   &tr=http%3A%2F%2Fclearnet.example.org%2Fannounce";
+        let m = Magnet::parse(uri).unwrap();
+        assert_eq!(
+            m.info_hash,
+            [
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+                0xcd, 0xef, 0x01, 0x23, 0x45, 0x67
+            ]
+        );
+        assert_eq!(m.display_name.as_deref(), Some("Some Torrent"));
+        // Only the I2P tracker survives.
+        assert_eq!(m.trackers, vec!["http://tracker.postman.i2p/announce"]);
+    }
+
+    #[test]
+    fn parses_base32_infohash() {
+        // base32 of 20 zero bytes = 32 'a's (uppercase in the wild).
+        let uri = format!("magnet:?xt=urn:btih:{}", "A".repeat(32));
+        let m = Magnet::parse(&uri).unwrap();
+        assert_eq!(m.info_hash, [0u8; 20]);
+    }
+
+    #[test]
+    fn hex_and_base32_agree() {
+        let hex = "magnet:?xt=urn:btih:ffffffffffffffffffffffffffffffffffffffff";
+        let b32 = format!("magnet:?xt=urn:btih:{}", "7".repeat(32)); // base32 all-ones
+        let a = Magnet::parse(hex).unwrap().info_hash;
+        let b = Magnet::parse(&b32).unwrap().info_hash;
+        assert_eq!(a, [0xFF; 20]);
+        assert_eq!(b, [0xFF; 20]);
+    }
+
+    #[test]
+    fn rejects_bad_input() {
+        assert_eq!(Magnet::parse("http://x"), Err(Error::NotMagnet));
+        assert_eq!(Magnet::parse("magnet:?dn=x"), Err(Error::NoInfoHash));
+        assert_eq!(
+            Magnet::parse("magnet:?xt=urn:btih:tooshort"),
+            Err(Error::BadInfoHash)
+        );
+        assert_eq!(
+            Magnet::parse("magnet:?xt=urn:btih:zzzz456789abcdef0123456789abcdef01234567"),
+            Err(Error::BadInfoHash)
+        );
+    }
+}

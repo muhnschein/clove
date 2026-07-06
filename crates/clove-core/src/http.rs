@@ -229,6 +229,38 @@ pub fn percent_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Percent-decode a URL-encoded string to raw bytes (`%XX` → byte). Other
+/// characters, including `+`, pass through unchanged — magnet URIs use
+/// `%20` for spaces, so treating `+` as space would corrupt names.
+#[must_use]
+pub fn percent_decode(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +331,16 @@ mod tests {
         assert_eq!(percent_encode(&[0x00, 0xFF, b' ', b'/']), "%00%FF%20%2F");
         // A realistic 20-byte info_hash of zeros.
         assert_eq!(percent_encode(&[0u8; 3]), "%00%00%00");
+    }
+
+    #[test]
+    fn percent_decode_round_trips_and_passes_plus() {
+        assert_eq!(percent_decode("hello%20world"), b"hello world");
+        assert_eq!(percent_decode("a+b"), b"a+b"); // '+' is literal
+        assert_eq!(
+            percent_decode(&percent_encode(&[0u8, 0xFF, b'/'])),
+            vec![0, 0xFF, b'/']
+        );
+        assert_eq!(percent_decode("%zz"), b"%zz"); // invalid escape passes through
     }
 }

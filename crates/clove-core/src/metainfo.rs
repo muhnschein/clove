@@ -94,6 +94,30 @@ impl From<bencode::Error> for Error {
 }
 
 impl MetaInfo {
+    /// Build a [`MetaInfo`] from a bare `info` dictionary — the bytes fetched
+    /// over BEP 9 for a magnet link, which have no surrounding torrent dict
+    /// or trackers.
+    ///
+    /// The info-hash is computed over `info_bytes` exactly (so it matches the
+    /// magnet's `btih`); the caller should compare it to the expected hash.
+    /// The result has no trackers (peers come from the magnet's `tr=` list,
+    /// PEX, or DHT later).
+    ///
+    /// # Errors
+    ///
+    /// The same structural errors as [`parse`](Self::parse); the bytes must
+    /// be a valid, self-consistent info dictionary.
+    pub fn from_info_dict(info_bytes: &[u8]) -> Result<Self, Error> {
+        // Wrap as `d4:info<info_bytes>e` and reuse the validated path. The
+        // wrapper's raw `info` span is exactly `info_bytes`, so the info-hash
+        // is unchanged.
+        let mut torrent = Vec::with_capacity(info_bytes.len() + 8);
+        torrent.extend_from_slice(b"d4:info");
+        torrent.extend_from_slice(info_bytes);
+        torrent.push(b'e');
+        Self::parse(&torrent)
+    }
+
     /// Parse and validate a .torrent file.
     ///
     /// # Errors
