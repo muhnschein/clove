@@ -12,6 +12,12 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.94"
 license = "ISC"
+# Not published to crates.io: these are workspace-internal crates wired by
+# path. (This also lets cargo-deny treat the internal path deps as private,
+# not wildcard — see deny.toml `allow-wildcard-paths`.) Revisit if/when
+# i2pnet or clove-core is published, at which point the path deps gain
+# explicit versions.
+publish = false
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

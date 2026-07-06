@@ -16,7 +16,11 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
+# Forbid wildcard version requirements on real (crates.io) dependencies, but
+# exempt our own workspace-internal `{ path = ... }` deps, which legitimately
+# carry no version and are not wildcards in the risky sense.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [advisories]
 yanked = "deny"
