@@ -21,6 +21,7 @@
 
 pub mod bencode;
 pub mod bitfield;
+pub mod choker;
 pub mod config;
 pub mod metainfo;
 pub mod picker;
