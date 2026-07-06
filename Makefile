@@ -1,0 +1,64 @@
+# clove — developer targets.
+#
+# Tier 1 (router-free) is `make test` and runs anywhere, including CI.
+# Tier 2 (live router) is `make test-live` + `make sam-stress` and needs a
+# local I2P router exposing SAMv3 — bring one up with `make router-up`
+# (rootless podman quadlet). See docs/LIVE-TESTING.md.
+
+# SAM control port; override to point at an existing router.
+SAM_PORT ?= 7656
+# Concurrency for the R2 stress harness: make sam-stress N=128
+N ?= 32
+# Seconds router-wait polls for the SAM port before giving up.
+WAIT ?= 180
+
+QUADLET_DIR := $(HOME)/.config/containers/systemd
+
+.PHONY: test test-live sam-stress router-up router-down router-wait fmt lint
+
+## Tier 1: unit + engine tests over the mock network. No router needed.
+test:
+	cargo test --workspace
+
+## Tier 2: the router-gated tests (#[ignore]d, keyed on CLOVE_SAM_PORT).
+## Waits for SAM first so a cold router doesn't produce spurious failures.
+test-live: router-wait
+	CLOVE_SAM_PORT=$(SAM_PORT) cargo test --workspace -- --ignored --nocapture
+
+## R2 stress harness: N concurrent streams on one session (docs/PROTOCOL §2.6).
+sam-stress:
+	CLOVE_SAM_PORT=$(SAM_PORT) cargo run --release -p i2pnet --bin sam-stress -- $(N)
+
+## Install and start the i2pd quadlet (rootless). Give it a few minutes on a
+## cold start to reseed and build tunnels before running the live targets.
+router-up:
+	mkdir -p $(QUADLET_DIR)
+	cp contrib/podman/i2pd.container $(QUADLET_DIR)/
+	systemctl --user daemon-reload
+	systemctl --user start i2pd
+	@echo "i2pd starting; a cold router needs a few minutes for tunnels."
+
+## Stop the router and remove the quadlet unit (the data volume is kept;
+## `podman volume rm clove-i2pd-data` to wipe netDb and keys).
+router-down:
+	-systemctl --user stop i2pd
+	-rm -f $(QUADLET_DIR)/i2pd.container
+	systemctl --user daemon-reload
+
+## Block until the SAM port answers (or WAIT seconds elapse). Port-open does
+## not prove tunnels are built — the live tests tolerate early connect churn.
+router-wait:
+	@echo "waiting up to $(WAIT)s for SAM on 127.0.0.1:$(SAM_PORT)…"
+	@for i in $$(seq 1 $(WAIT)); do \
+		if timeout 1 bash -c '</dev/tcp/127.0.0.1/$(SAM_PORT)' 2>/dev/null; then \
+			echo "SAM is answering."; exit 0; \
+		fi; sleep 1; \
+	done; \
+	echo "SAM did not come up on 127.0.0.1:$(SAM_PORT) within $(WAIT)s" >&2; exit 1
+
+## CI-parity convenience.
+fmt:
+	cargo fmt --all --check
+
+lint:
+	cargo clippy --workspace --all-targets -- -D warnings
