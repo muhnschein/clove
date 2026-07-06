@@ -4,9 +4,11 @@ description = "clove engine: BitTorrent-over-I2P protocol, piece picking, storag
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 i2pnet = { path = "../i2pnet" }
+sha1 = "0.10"
 
 [lints]
 workspace = true

@@ -4,6 +4,7 @@ description = "clove daemon: engine host, local HTTP API over unix socket"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 clove-core = { path = "../clove-core" }

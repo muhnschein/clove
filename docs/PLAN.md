@@ -107,7 +107,8 @@ Exit: 0.1 release criteria per SCOPE §9 (signed tag, green interop matrix).
 
 | Phase | New direct deps |
 |---|---|
-| A–C | none (`sha1` + `getrandom` enter at C for verification/peer-id) |
+| A | `sha1` (info-hash at parse time) |
+| B–C | `getrandom` (peer-id / token randomness, at C) |
 | D | `yosemite` (features = `sync`) — also added to `ci/check-net-deps.sh` allowlist |
 | E–F | none |
 | G | `landlock`, `seccompiler` |

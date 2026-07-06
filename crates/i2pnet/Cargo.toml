@@ -4,6 +4,7 @@ description = "I2P network access layer for clove: the only socket-capable crate
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [lints]
 workspace = true

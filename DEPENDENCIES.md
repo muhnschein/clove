@@ -8,14 +8,16 @@ commit. Closure sizes are recorded when the dependency is actually added.
 
 ## Current
 
-*(none — the bootstrap workspace is dependency-free; internal path
-dependencies between workspace crates don't count.)*
+- **`sha1` 0.10** (RustCrypto) — entered Phase A (info-hash needs it at
+  .torrent parse time, ahead of Phase C piece verification). SHA-1 is by
+  protocol; rolling our own cryptographic hash is the one place
+  hand-rolling is *worse* engineering. Small, `no_std`-capable, no proc
+  macros. Transitive closure: 7 crates (`digest`, `block-buffer`,
+  `crypto-common`, `generic-array`, `typenum`, `cpufeatures`, `cfg-if`),
+  all RustCrypto-adjacent, none socket-capable.
 
 ## Approved, enters at the scheduled phase (docs/PLAN.md)
 
-- **`sha1`** (RustCrypto) — Phase C. Piece verification is SHA-1 by
-  protocol; rolling our own cryptographic hash is the one place hand-rolling
-  is *worse* engineering. Small, `no_std`-capable, no proc macros.
 - **`getrandom`** — Phase C. Peer-ID randomness and API token generation
   straight from the OS RNG; the alternative (`rand`) pulls a larger tree we
   don't need.
