@@ -27,6 +27,8 @@
 use std::io::{self, Read, Write};
 use std::time::Duration;
 
+pub mod mock;
+
 /// A peer address: the 32-byte SHA-256 hash of an I2P destination.
 ///
 /// This is the only peer-identity type in clove. It is what appears in
@@ -35,24 +37,42 @@ use std::time::Duration;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct DestHash(pub [u8; 32]);
 
+/// A bidirectional I2P stream. Blocking `Read`/`Write` per the Q5 decision
+/// (sync thread-per-peer, `docs/DECISIONS.md`), plus handle cloning so a
+/// peer connection can run separate reader and writer threads over one
+/// stream, `TcpStream::try_clone`-style.
+pub trait I2pStream: Read + Write + Send + Sized {
+    /// A second handle to the same underlying stream. Reads and writes on
+    /// either handle affect the one stream; dropping the last handle
+    /// closes it.
+    ///
+    /// # Errors
+    /// Resource exhaustion in the underlying implementation.
+    fn try_clone(&self) -> io::Result<Self>;
+}
+
 /// Outbound I2P stream connections (SAM `STREAM CONNECT`).
 pub trait I2pDialer {
-    /// The connected-stream type. `Read + Write` blocking I/O per the Q5
-    /// decision (sync thread-per-peer, `docs/DECISIONS.md`).
-    type Stream: Read + Write + Send;
+    /// The connected-stream type.
+    type Stream: I2pStream;
 
     /// Connect to a peer by destination hash, failing after `timeout`.
     ///
     /// # Errors
-    /// Session down, lease-set lookup failure, or timeout. Errors carry
-    /// operator-readable text (a log line at 2 a.m. must make sense).
+    /// Session down, lease-set lookup failure, refusal, or timeout. Errors
+    /// carry operator-readable text (a log line at 2 a.m. must make sense).
     fn dial(&self, peer: DestHash, timeout: Duration) -> io::Result<Self::Stream>;
 }
 
-/// Inbound I2P stream connections (SAM `STREAM ACCEPT`/`FORWARD`).
+/// Inbound I2P stream connections (SAM `STREAM ACCEPT`/`FORWARD`), bound to
+/// one local destination — which is why the local identity lives here.
 pub trait I2pListener {
-    /// The accepted-stream type; see [`I2pDialer::Stream`].
-    type Stream: Read + Write + Send;
+    /// The accepted-stream type.
+    type Stream: I2pStream;
+
+    /// The destination hash peers reach this session at: the identity used
+    /// in handshakes and tracker announces.
+    fn local_dest(&self) -> DestHash;
 
     /// Block until a peer connects; returns the stream and who dialed us.
     ///
@@ -74,10 +94,3 @@ pub trait I2pNamingLookup {
     /// rejected here, never resolved via DNS.
     fn lookup(&self, name: &str) -> io::Result<DestHash>;
 }
-
-/// In-memory implementation of the `i2pnet` traits for engine tests.
-///
-/// Implemented in Phase B (`docs/PLAN.md`): a process-local "network" where
-/// mock destinations connect to each other over piped streams, with fault
-/// injection (session drop, stalled streams, lookup failure) for chaos tests.
-pub mod mock {}
