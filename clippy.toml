@@ -15,6 +15,7 @@ disallowed-types = [
 
 disallowed-methods = [
     { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "no DNS resolution paths (Layer 1, SCOPE §5)" },
+    { path = "std::sync::mpsc::channel", reason = "no unbounded channels (SCOPE §4); use sync_channel with an explicit bound" },
 ]
 
 allow-unwrap-in-tests = true

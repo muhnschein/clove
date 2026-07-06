@@ -543,7 +543,7 @@ mod tests {
 
         let mut stream = alice.dial(bob.dest(), LONG).unwrap();
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
         let acceptor = thread::spawn(move || {
             let (pair, _) = bob.accept().unwrap();
             drop(pair); // keep the first, then block on the next accept
@@ -601,7 +601,7 @@ mod tests {
 
         ours.set_read_stalled(true);
         let mut reader = ours.try_clone();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
         let handle = thread::spawn(move || {
             let got = read_exact_string(&mut reader, 4);
             tx.send(()).unwrap();
