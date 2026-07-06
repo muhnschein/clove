@@ -1,10 +1,24 @@
 # Live-Router Testing Plan — closing M1 and M3
 
-**Status:** Plan (rev 1). No code in this document has landed yet; this is the
-agreed approach for paying down the biggest outstanding risk in the project —
-that nothing has run against a real I2P router. It operationalizes the [open]
-items in `PROTOCOL.i2p-bt` (§2.5 inbound topology, §2.6 R2 concurrency, §5.1
-and §5.4 announce quirks) and the exit criteria for M1 and M3 in `SCOPE.md` §8.
+**Status:** Rev 2 — Bucket 1 (the router-free half) has landed; Bucket 2 (the
+live sign-off) is the operator's to run. This is the agreed approach for paying
+down the biggest outstanding risk in the project — that nothing has run against
+a real I2P router. It operationalizes the [open] items in `PROTOCOL.i2p-bt`
+(§2.5 inbound topology, §2.6 R2 concurrency, §5.1 and §5.4 announce quirks) and
+the exit criteria for M1 and M3 in `SCOPE.md` §8.
+
+**What's implemented (Bucket 1):** the inbound SAM path (`i2pnet::sam`
+`SamListener`/`ForwardedStream`), the R2 stress harness (`i2pnet` bin
+`sam-stress`), the router-gated loopback download test
+(`clove-core` `torrent::tests::two_instances_download_over_sam`, `#[ignore]`d),
+and the environment (`contrib/podman/i2pd.container` + `Makefile`). Run it:
+
+```
+make router-up        # start a local i2pd (rootless podman quadlet)
+                      # …give a cold router a few minutes to build tunnels…
+make sam-stress N=64  # R2 harness: 64 concurrent streams on one session
+make test-live        # the router-gated loopback download + waits for SAM
+```
 
 ## 1. The debt, stated plainly
 
@@ -63,10 +77,16 @@ When this lands, `PROTOCOL.i2p-bt` §2.5 moves from [open] to [assumed] (written
 pending a live run), and flips to [decided] the first time Bucket 2 confirms a
 forwarded peer's dest-hash reconciles with its dialed hash.
 
-## 4. Bucket 1 — buildable now, no router
+## 4. Bucket 1 — buildable now, no router (landed)
 
-Ordered by leverage. All of this is verifiable in CI (compiles, unit-tests, the
-harness runs and reports "no router" cleanly when SAM is absent).
+All four items below have shipped; file pointers and the run commands are in the
+status block at the top. They are verifiable in CI (compile, unit-tests, and the
+harness runs and reports "no router" cleanly when SAM is absent). One deliberate
+scope call: item 3's **kill-router-mid-transfer** chaos check stays a *manual*
+procedure (§6.1) rather than an automated test — orchestrating a router restart
+from inside `cargo test` is brittle, the supervisor's reconnect logic is already
+unit-tested against a fake factory, and the live restart is a nightly-runner
+candidate (§7). Ordered by leverage:
 
 1. **Inbound path** (`i2pnet::sam`): implement `I2pListener` via `forward` +
    the loopback listener helper, per §3.

@@ -1046,4 +1046,114 @@ mod tests {
             );
         }
     }
+
+    /// The M1 loopback download: the same seeder/leecher exchange as the mock
+    /// test, but over a **real** local router via the SAM backend — a seeder
+    /// that `STREAM FORWARD`s and a leecher that dials its destination.
+    ///
+    /// Router-gated: `#[ignore]`d so tier-1 `cargo test` skips it; run it with
+    /// `make test-live` (which sets `CLOVE_SAM_PORT` and waits for SAM). See
+    /// `docs/LIVE-TESTING.md` §6.1 — this is the automatable half of M1's exit
+    /// criteria; the router-restart chaos step there stays a manual procedure.
+    #[test]
+    #[ignore = "needs a live I2P router; run via `make test-live` (CLOVE_SAM_PORT)"]
+    fn two_instances_download_over_sam() {
+        use i2pnet::sam::{SamConfig, SamListener, SamSession};
+
+        let port: u16 = std::env::var("CLOVE_SAM_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .expect("set CLOVE_SAM_PORT (e.g. 7656) — run via `make test-live`");
+
+        // ~5 pieces, last one short. Single file keeps the test focused on the
+        // transport; the mock test already covers multi-file piece mapping.
+        let content: Vec<u8> = (0..(4 * BLOCK_LEN + 500))
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let files = vec![FileEntry {
+            path: vec!["demo".into(), "a.bin".into()],
+            length: content.len() as u64,
+        }];
+        let meta = meta_for(files, BLOCK_LEN, &content);
+
+        // Seeder: storage pre-filled and verified complete.
+        let seed_dir = TempDir::new("sam-seed");
+        let seed_storage = Arc::new(Storage::create(&meta, &seed_dir.0, false).unwrap());
+        for p in 0..seed_storage.num_pieces() {
+            let start = p as usize * BLOCK_LEN as usize;
+            let end = (start + seed_storage.piece_len(p) as usize).min(content.len());
+            seed_storage
+                .write_block(p, 0, &content[start..end])
+                .unwrap();
+        }
+        let seed_have = seed_storage.verify_all().unwrap();
+        assert!(seed_have.is_full(), "seed must start complete");
+        let seeder = Torrent::new(
+            &meta,
+            seed_storage,
+            &seed_have,
+            Mode::RarestFirst,
+            *b"-CV0001-seedseedseed",
+        );
+
+        // Leecher: empty storage.
+        let leech_dir = TempDir::new("sam-leech");
+        let leech_storage = Arc::new(Storage::create(&meta, &leech_dir.0, false).unwrap());
+        let leecher = Torrent::new(
+            &meta,
+            Arc::clone(&leech_storage),
+            &Bitfield::empty(meta.pieces.len().try_into().unwrap()),
+            Mode::RarestFirst,
+            *b"-CV0001-leechleechle",
+        );
+
+        // Bring up both sessions on the one router; the seeder forwards.
+        let seed_session = Arc::new(
+            SamSession::connect(&SamConfig {
+                samv3_tcp_port: port,
+                nickname: "clove-it-seed".to_owned(),
+                persistent_key: None,
+            })
+            .expect("seeder SAM session (is the router up with tunnels built?)"),
+        );
+        let seed_listener =
+            SamListener::forward(Arc::clone(&seed_session)).expect("seeder STREAM FORWARD");
+        let seed_dest = seed_listener.local_dest();
+        let leech_session = SamSession::connect(&SamConfig {
+            samv3_tcp_port: port,
+            nickname: "clove-it-leech".to_owned(),
+            persistent_key: None,
+        })
+        .expect("leecher SAM session");
+
+        // Seeder accepts one inbound peer for this test and attaches it.
+        let seeder_bg = Arc::clone(&seeder);
+        let accept = std::thread::spawn(move || {
+            let (stream, from) = seed_listener.accept().expect("seeder accept");
+            seeder_bg.attach(stream, from).expect("seeder attach");
+        });
+
+        // I2P connects are slow; be generous with both timeouts.
+        let stream = leech_session
+            .dial(seed_dest, Duration::from_secs(120))
+            .expect("leecher dial to seeder destination");
+        leecher.attach(stream, seed_dest).expect("leecher attach");
+        assert!(
+            leecher.wait_complete(Duration::from_secs(180)),
+            "leecher did not complete the download over SAM within 180s"
+        );
+        accept.join().unwrap();
+
+        // Bytes on disk match, end to end, through real tunnels.
+        assert!(leech_storage.verify_all().unwrap().is_full());
+        for p in 0..leech_storage.num_pieces() {
+            let len = leech_storage.piece_len(p);
+            let start = p as usize * BLOCK_LEN as usize;
+            assert_eq!(
+                leech_storage.read_block(p, 0, len).unwrap(),
+                &content[start..start + len as usize],
+                "piece {p} mismatch"
+            );
+        }
+    }
 }
