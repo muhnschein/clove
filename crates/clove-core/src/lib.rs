@@ -23,6 +23,7 @@ pub mod bencode;
 pub mod bitfield;
 pub mod config;
 pub mod metainfo;
+pub mod picker;
 pub mod resume;
 pub mod storage;
 pub mod wire;
