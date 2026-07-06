@@ -34,7 +34,36 @@ Status legend:
 
 1.4 [decided] Compact tracker peer lists on I2P are concatenated 32-byte
     destination hashes, no port (unlike clearnet's 6-byte ip:port). Non-
-    compact responses give full base64 destinations. (Consumed in Phase E.)
+    compact responses give full base64 destinations under each peer dict's
+    `ip` key. Both parsed in clove-core::tracker.
+
+
+5. HTTP tracker announces (clove-core::tracker, M3)
+---------------------------------------------------
+
+5.1 [assumed] An announce is an HTTP/1.1 GET to the tracker's I2P
+    destination. clove sends the standard BEP 3 query params plus:
+      - `compact=1` (we require the 32-byte-hash compact form, §1.4);
+      - `port=6881` as a placeholder — I2P has no port, but trackers/params
+        parsers expect the key;
+      - `ip=<our base64 destination>` — the I2P convention for telling the
+        tracker our destination, since there is no IP to observe. This is
+        what i2psnark does; verify the exact value form (bare base64 vs.
+        with a suffix) against a live postman/opentracker announce. [open]
+
+5.2 [decided] Any query already present in the announce URL (e.g. postman's
+    `/announce.php?...`) is preserved; clove appends its params with the
+    correct `?`/`&` separator.
+
+5.3 [decided] Announce timing: honor the tracker's `interval`, floored at a
+    local 60s minimum so a misconfigured tracker cannot make us hammer.
+    On failure, exponential backoff from 30s capped at 30 min. A tracker
+    `failure reason` is surfaced to the operator, not retried as if
+    transient.
+
+5.4 [open] Whether i2psnark/opentracker expect `event=started` on the very
+    first announce only, and any tracker-specific quirks (numwant caps,
+    `&supportcrypto`, etc.), to be confirmed live at M3 and recorded here.
 
 
 2. SAM / yosemite behavior (from the 0.7.0 API review, M0/M1)

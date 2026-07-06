@@ -23,11 +23,13 @@ pub mod bencode;
 pub mod bitfield;
 pub mod choker;
 pub mod config;
+pub mod http;
 pub mod metainfo;
 pub mod picker;
 pub mod resume;
 pub mod storage;
 pub mod torrent;
+pub mod tracker;
 pub mod wire;
 
 // i2pnet is not consumed yet (that starts with `wire`/`supervisor`), but
