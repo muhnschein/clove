@@ -24,6 +24,7 @@ pub mod bitfield;
 pub mod config;
 pub mod metainfo;
 pub mod resume;
+pub mod storage;
 pub mod wire;
 
 // i2pnet is not consumed yet (that starts with `wire`/`supervisor`), but
