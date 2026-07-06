@@ -20,9 +20,11 @@
 //! - `supervisor` — torrent lifecycle + "waiting for router" state.
 
 pub mod bencode;
+pub mod bitfield;
 pub mod config;
 pub mod metainfo;
 pub mod resume;
+pub mod wire;
 
 // i2pnet is not consumed yet (that starts with `wire`/`supervisor`), but
 // the dependency edge pins the direction: engine -> i2pnet, never reverse.
