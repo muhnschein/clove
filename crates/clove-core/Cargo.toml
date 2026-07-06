@@ -1,0 +1,12 @@
+[package]
+name = "clove-core"
+description = "clove engine: BitTorrent-over-I2P protocol, piece picking, storage, persistence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+i2pnet = { path = "../i2pnet" }
+
+[lints]
+workspace = true

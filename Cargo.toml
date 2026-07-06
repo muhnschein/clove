@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/i2pnet",
+    "crates/clove-core",
+    "crates/cloved",
+    "crates/clove",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.94"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+disallowed_types = "deny"
+disallowed_methods = "deny"

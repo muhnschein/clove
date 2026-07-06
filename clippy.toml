@@ -1,0 +1,21 @@
+# Layer 1 no-clearnet enforcement (docs/SCOPE.md §5): the engine has no
+# IP/port vocabulary. Only crates/i2pnet may touch sockets, and it carries
+# an explicit, commented crate-root #![allow] for these lints.
+disallowed-types = [
+    { path = "std::net::TcpStream", reason = "sockets only in i2pnet (Layer 1, SCOPE §5)" },
+    { path = "std::net::TcpListener", reason = "sockets only in i2pnet (Layer 1, SCOPE §5)" },
+    { path = "std::net::UdpSocket", reason = "sockets only in i2pnet (Layer 1, SCOPE §5)" },
+    { path = "std::net::IpAddr", reason = "no IP vocabulary in the engine (SCOPE §3)" },
+    { path = "std::net::Ipv4Addr", reason = "no IP vocabulary in the engine (SCOPE §3)" },
+    { path = "std::net::Ipv6Addr", reason = "no IP vocabulary in the engine (SCOPE §3)" },
+    { path = "std::net::SocketAddr", reason = "no IP vocabulary in the engine (SCOPE §3)" },
+    { path = "std::net::SocketAddrV4", reason = "no IP vocabulary in the engine (SCOPE §3)" },
+    { path = "std::net::SocketAddrV6", reason = "no IP vocabulary in the engine (SCOPE §3)" },
+]
+
+disallowed-methods = [
+    { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "no DNS resolution paths (Layer 1, SCOPE §5)" },
+]
+
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
