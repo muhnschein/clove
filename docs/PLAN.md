@@ -108,9 +108,10 @@ Exit: 0.1 release criteria per SCOPE §9 (signed tag, green interop matrix).
 | Phase | New direct deps |
 |---|---|
 | A | `sha1` (info-hash at parse time) |
-| B–C | `getrandom` (peer-id / token randomness, at C) |
-| D | `yosemite` (features = `sync`) — also added to `ci/check-net-deps.sh` allowlist |
-| E–F | none |
+| B–C | none |
+| D | `yosemite` (features = `sync`, allowlisted in `ci/check-net-deps.sh`) + `sha2` (dest-hash) |
+| E | none |
+| F | `getrandom` (API token randomness) |
 | G | `landlock`, `seccompiler` |
 
-Total: 5 of the ≤15 budget (`DEPENDENCIES.md` is authoritative).
+Total: 6 of the ≤15 budget (`DEPENDENCIES.md` is authoritative).

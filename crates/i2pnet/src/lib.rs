@@ -27,7 +27,10 @@
 use std::io::{self, Read, Write};
 use std::time::Duration;
 
+pub mod addr;
 pub mod mock;
+pub mod sam;
+pub mod supervisor;
 
 /// A peer address: the 32-byte SHA-256 hash of an I2P destination.
 ///
@@ -38,17 +41,26 @@ pub mod mock;
 pub struct DestHash(pub [u8; 32]);
 
 /// A bidirectional I2P stream. Blocking `Read`/`Write` per the Q5 decision
-/// (sync thread-per-peer, `docs/DECISIONS.md`), plus handle cloning so a
-/// peer connection can run separate reader and writer threads over one
-/// stream, `TcpStream::try_clone`-style.
+/// (sync thread-per-peer, `docs/DECISIONS.md`).
+///
+/// A connection is used duplex for the handshake, then [`split`](Self::split)
+/// into independent read and write halves so a peer's reader and writer run
+/// on separate threads. This mirrors `yosemite`'s `Stream::split` (the real
+/// backend cannot hand out two duplex clones — see `docs/PROTOCOL.i2p-bt`),
+/// so the abstraction stays honest across the mock and SAM implementations.
 pub trait I2pStream: Read + Write + Send + Sized {
-    /// A second handle to the same underlying stream. Reads and writes on
-    /// either handle affect the one stream; dropping the last handle
-    /// closes it.
+    /// The read half yielded by [`split`](Self::split).
+    type Reader: Read + Send + 'static;
+    /// The write half yielded by [`split`](Self::split).
+    type Writer: Write + Send + 'static;
+
+    /// Consume the stream, splitting it into independent read and write
+    /// halves. Both must reference the same underlying connection; closing
+    /// or dropping one ends the stream.
     ///
     /// # Errors
-    /// Resource exhaustion in the underlying implementation.
-    fn try_clone(&self) -> io::Result<Self>;
+    /// The underlying implementation cannot produce independent halves.
+    fn split(self) -> io::Result<(Self::Reader, Self::Writer)>;
 }
 
 /// Outbound I2P stream connections (SAM `STREAM CONNECT`).

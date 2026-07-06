@@ -194,7 +194,9 @@ impl Torrent {
             ));
         }
 
-        let writer = stream.try_clone()?;
+        // Handshake done duplex; now split into independent halves so the
+        // reader and writer run on separate threads (Q5 sync model).
+        let (reader, writer) = stream.split()?;
         let (tx, rx) = sync_channel::<Message>(OUTGOING_QUEUE);
 
         let id = self.shared.register_peer(tx.clone());
@@ -207,7 +209,7 @@ impl Torrent {
         let _ = tx.try_send(bitfield);
 
         let writer_handle = spawn_writer(writer, rx);
-        let reader_handle = spawn_reader(Arc::clone(&self.shared), id, stream);
+        let reader_handle = spawn_reader(Arc::clone(&self.shared), id, reader);
         let mut threads = lock(&self.threads);
         threads.push(writer_handle);
         threads.push(reader_handle);
@@ -215,7 +217,10 @@ impl Torrent {
     }
 }
 
-fn spawn_writer<S: I2pStream + 'static>(mut writer: S, rx: Receiver<Message>) -> JoinHandle<()> {
+fn spawn_writer<W: std::io::Write + Send + 'static>(
+    mut writer: W,
+    rx: Receiver<Message>,
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         while let Ok(msg) = rx.recv() {
             if wire::write_message(&mut writer, &msg).is_err() {
@@ -225,10 +230,10 @@ fn spawn_writer<S: I2pStream + 'static>(mut writer: S, rx: Receiver<Message>) ->
     })
 }
 
-fn spawn_reader<S: I2pStream + 'static>(
+fn spawn_reader<R: std::io::Read + Send + 'static>(
     shared: Arc<Shared>,
     id: u64,
-    mut reader: S,
+    mut reader: R,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         while let Ok(body) = wire::read_frame(&mut reader, shared.max_frame) {

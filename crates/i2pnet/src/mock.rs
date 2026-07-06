@@ -261,7 +261,8 @@ impl I2pNamingLookup for Endpoint {
 }
 
 /// One in-memory stream endpoint. Cloned handles (via
-/// [`I2pStream::try_clone`]) share the stream; the last drop closes it.
+/// [`MockStream::try_clone`] or [`I2pStream::split`]) share the stream; the
+/// last drop closes it.
 pub struct MockStream {
     read: Arc<Pipe>,
     write: Arc<Pipe>,
@@ -297,6 +298,17 @@ impl MockStream {
     pub fn set_read_stalled(&self, on: bool) {
         self.read.set_stalled(on);
     }
+
+    /// Another handle to the same stream. Infallible for the mock; used by
+    /// its own tests and to build the [`I2pStream::split`] halves.
+    #[must_use]
+    pub fn try_clone(&self) -> MockStream {
+        MockStream {
+            read: Arc::clone(&self.read),
+            write: Arc::clone(&self.write),
+            closer: Arc::clone(&self.closer),
+        }
+    }
 }
 
 impl Read for MockStream {
@@ -316,12 +328,12 @@ impl Write for MockStream {
 }
 
 impl I2pStream for MockStream {
-    fn try_clone(&self) -> io::Result<Self> {
-        Ok(MockStream {
-            read: Arc::clone(&self.read),
-            write: Arc::clone(&self.write),
-            closer: Arc::clone(&self.closer),
-        })
+    type Reader = MockStream;
+    type Writer = MockStream;
+
+    fn split(self) -> io::Result<(MockStream, MockStream)> {
+        let reader = self.try_clone();
+        Ok((reader, self))
     }
 }
 
@@ -588,7 +600,7 @@ mod tests {
         theirs.write_all(b"data").unwrap();
 
         ours.set_read_stalled(true);
-        let mut reader = ours.try_clone().unwrap();
+        let mut reader = ours.try_clone();
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let got = read_exact_string(&mut reader, 4);
@@ -610,7 +622,7 @@ mod tests {
         let bob = net.endpoint();
 
         let mut writer = alice.dial(bob.dest(), LONG).unwrap();
-        let mut reader = writer.try_clone().unwrap();
+        let mut reader = writer.try_clone();
         let (mut theirs, _) = bob.accept().unwrap();
 
         writer.write_all(b"ab").unwrap();
