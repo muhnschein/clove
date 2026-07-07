@@ -1,0 +1,42 @@
+# Quadlet unit for an i2pd router exposing SAMv3 to clove's live tests.
+#
+# Rootless install (Debian stable, podman >= 4.4 with quadlet):
+#   cp contrib/podman/i2pd.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload
+#   systemctl --user start i2pd
+# or just: make router-up
+#
+# SAM is published on 127.0.0.1 only — the router is never reachable off-box,
+# matching Layer 1's loopback rule (docs/SCOPE.md §5). yosemite connects to
+# 127.0.0.1:7656 (it hardcodes the host), which this satisfies. The web
+# console is published on 127.0.0.1:7070 for inspecting router health (peer
+# count, tunnels) — indispensable when a live test reports CantReachPeer.
+#
+# First bring-up needs a few minutes to reseed and build tunnels before SAM
+# sessions succeed; `make test-live` waits for the port but you should still
+# give a cold router time. Watch the console's "Routers" count climb into the
+# hundreds — that means reseed worked and tunnels can build. The named volume
+# persists netDb and the router's keys, so a restart (the M1 chaos test)
+# resurrects a warm router instead of reseeding from scratch.
+
+[Unit]
+Description=i2pd router for clove live tests (SAMv3 on loopback)
+
+[Container]
+Image=docker.io/purplei2p/i2pd:latest
+PublishPort=127.0.0.1:7656:7656
+PublishPort=127.0.0.1:7070:7070
+Volume=clove-i2pd-data:/home/i2pd/data
+# Run as container-root. Under rootless podman that maps to *your* user — the
+# owner of the named volume — so i2pd can write its reseed certificates. Left
+# as the image's non-root user, it hits "certificates: Permission denied",
+# reseed fails, the router gets no peers, and every dial is CantReachPeer.
+User=0
+Group=0
+# Enable the SAM bridge (off by default) and the web console. Bind them to
+# 0.0.0.0 *inside* the container; PublishPort pins the host sides to loopback.
+Exec=--sam.enabled=true --sam.address=0.0.0.0 --sam.port=7656 \
+     --http.enabled=true --http.address=0.0.0.0 --http.port=7070
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,190 @@
+clove PROTOCOL notes — the I2P BitTorrent dialect and SAM interop
+=================================================================
+
+OpenSSH keeps a PROTOCOL file recording where its implementation pins down
+things the specs leave vague. This is ours. It doubles as the interop lab
+notebook (SCOPE §9): every place the upstream spec is underspecified or a
+library/router behaves surprisingly, the observation and clove's decision
+land here. Entries are dated by milestone, not calendar.
+
+Status legend:
+  [decided]   clove behaves this way; verified in-tree or against a router.
+  [assumed]   clove behaves this way; NOT yet verified against a live router.
+  [open]      unresolved; needs a router or upstream clarification.
+
+
+1. Addresses and peer identity
+------------------------------
+
+1.1 [decided] Peer identity is the 32-byte SHA-256 of a full I2P
+    destination (the "destination hash"). This is the only peer identifier
+    the engine handles; there is no IP/port anywhere (SCOPE §3).
+
+1.2 [decided] Outbound dial: a peer known only by its 32-byte hash is dialed
+    at "<b32>.b32.i2p", where <b32> is RFC 4648 base32 (lowercase, no
+    padding) of the 32 hash bytes. 32 bytes -> 52 base32 chars. The router
+    resolves the b32 to a full destination via its netDb.
+    Implemented in i2pnet::addr, tested against RFC 4648 vectors.
+
+1.3 [decided] Inbound / naming: SAM reports a peer's *full* base64
+    destination (I2P's base64 alphabet is standard base64 with '+'->'-' and
+    '/'->'~'). Its hash is SHA-256 of the decoded destination bytes. These
+    compose: base32(SHA-256(dest)) is exactly the b32 label, so a dialed
+    peer and an accepted peer reconcile to the same DestHash.
+
+1.4 [decided] Compact tracker peer lists on I2P are concatenated 32-byte
+    destination hashes, no port (unlike clearnet's 6-byte ip:port). Non-
+    compact responses give full base64 destinations under each peer dict's
+    `ip` key. Both parsed in clove-core::tracker.
+
+
+5. HTTP tracker announces (clove-core::tracker, M3)
+---------------------------------------------------
+
+5.1 [assumed] An announce is an HTTP/1.1 GET to the tracker's I2P
+    destination. clove sends the standard BEP 3 query params plus:
+      - `compact=1` (we require the 32-byte-hash compact form, §1.4);
+      - `port=6881` as a placeholder — I2P has no port, but trackers/params
+        parsers expect the key;
+      - `ip=<our base64 destination>` — the I2P convention for telling the
+        tracker our destination, since there is no IP to observe. This is
+        what i2psnark does; verify the exact value form (bare base64 vs.
+        with a suffix) against a live postman/opentracker announce. [open]
+
+5.2 [decided] Any query already present in the announce URL (e.g. postman's
+    `/announce.php?...`) is preserved; clove appends its params with the
+    correct `?`/`&` separator.
+
+5.3 [decided] Announce timing: honor the tracker's `interval`, floored at a
+    local 60s minimum so a misconfigured tracker cannot make us hammer.
+    On failure, exponential backoff from 30s capped at 30 min. A tracker
+    `failure reason` is surfaced to the operator, not retried as if
+    transient.
+
+5.4 [open] Whether i2psnark/opentracker expect `event=started` on the very
+    first announce only, and any tracker-specific quirks (numwant caps,
+    `&supportcrypto`, etc.), to be confirmed live at M3 and recorded here.
+
+
+2. SAM / yosemite behavior (from the 0.7.0 API review, M0/M1)
+------------------------------------------------------------
+
+2.1 [decided] yosemite hardcodes the SAM host to 127.0.0.1; only the TCP
+    port is configurable. This happens to enforce Layer 1's loopback-only
+    rule for free. Consequence: the documented `--i-know-sam-is-remote`
+    escape hatch (SCOPE §5) is NOT expressible through the yosemite backend
+    as it stands — a remote SAM bridge would need a different backend or an
+    upstream change. Noted rather than worked around.
+
+2.2 [decided] yosemite's synchronous Stream exposes `split(self) ->
+    (ReadHalf, WriteHalf)`, not a duplicating `try_clone`. clove's
+    `I2pStream` trait was corrected to a split-based shape (Phase D) so the
+    mock and the SAM backend share one honest abstraction, and it matches
+    the reader-thread/writer-thread model (Q5) directly.
+
+2.3 [assumed] yosemite's `Session::connect` (sync) has no timeout parameter
+    and blocks until the STREAM CONNECT resolves. clove's dial() takes a
+    timeout for the trait's sake but cannot enforce it at this layer; the
+    timeout is a supervision-layer concern. Whether long connects need a
+    watchdog is an [open] R2 question for the stress harness.
+
+2.4 [assumed] `Session::connect`/`accept`/`forward` all take `&mut self` and
+    block. A single Session shared between the dial path and an accept path
+    therefore serializes. clove's SAM backend currently implements only the
+    outbound + naming paths on the shared Session (behind a Mutex); the
+    inbound topology is deferred (see 2.5).
+
+2.5 [assumed] Inbound streams use STREAM FORWARD, not STREAM ACCEPT. ACCEPT
+    is one accept per inbound stream on &mut self and serializes every
+    inbound peer on the one session; FORWARD has the router push each inbound
+    stream as a fresh TCP connection to a loopback listener we own (an
+    allowed Layer-1 IP socket), so inbound concurrency is a plain accept loop,
+    not a lock. This matches the "one PRIMARY session + forwarded listener"
+    topology in SCOPE §4. Implemented in i2pnet::sam (SamListener /
+    ForwardedStream), decision recorded in LIVE-TESTING.md §3.
+    With SILENT=false (yosemite's default, set explicitly) the router prepends
+    each forwarded connection with the peer's base64 destination line,
+    optionally followed by FROM_PORT/TO_PORT params, terminated by '\n'; we
+    read up to that newline one byte at a time (so the peer's stream payload
+    is left untouched) and derive the DestHash via §1.3. The split/parse logic
+    is unit-tested over loopback TCP; the exact forwarded framing and that a
+    forwarded peer's derived hash reconciles with its dialed hash are the
+    first things confirmed against a live router (LIVE-TESTING.md §6.1, M1).
+
+2.6 [open] R2 — i2pd SAM behavior under many concurrent streams on one
+    session is the suspected root of XD-style flakiness. The reconnect
+    supervisor (i2pnet::supervisor) is built and unit-tested against a fake
+    factory; its behavior against a *real* router mid-restart, and the
+    concurrency ceiling of one session, are the harness's job. First live
+    observations against i2pd (M1, in progress):
+
+    2.6a [decided] Outbound dial *initiation* serializes per session. yosemite's
+      sync `connect` takes `&mut self` and blocks until the router resolves the
+      stream, so SamSession::dial holds the session mutex for the whole connect.
+      Established streams run concurrently (each is an independent socket once
+      connected); only the setup step is serial. Consequence for the engine:
+      one dial session initiates peers one-at-a-time. Whether that needs
+      multiple dial sessions, or is fine because connects are quick once warm,
+      is the N-scaling question the harness still has to answer.
+
+    2.6b [assumed] A freshly created transient destination is briefly
+      unreachable: a dial to it returns STREAM STATUS RESULT=CANT_REACH_PEER
+      (surfaced as Protocol(Router(CantReachPeer))) for the ~seconds it takes
+      the destination to build tunnels and publish its leaseSet. This is normal
+      warmup, not a fault; the live test and sam-stress retry the dial through
+      it, as the real peer-acquisition path must. Distinct from a *cold router*
+      (reseed incomplete → no peers → CantReachPeer indefinitely), which is an
+      operator/setup problem (see LIVE-TESTING.md troubleshooting).
+
+
+3. Reconnect discipline (i2pnet::supervisor, M1)
+------------------------------------------------
+
+3.1 [decided] On session loss the whole session tree is rebuilt on an
+    exponential backoff (default 1s doubling to 60s) with jitter (default
+    0.2) to avoid a thundering-herd reconnect across many torrents. Torrents
+    see a visible "waiting for router" state, never a hard failure.
+
+3.2 [decided] A healthy session that dies once retries promptly: only failed
+    *rebuilds* grow the backoff counter, not the loss itself. This keeps a
+    one-off router blip from imposing a long stall.
+
+
+4. Wire protocol (clove-core::wire, M2)
+---------------------------------------
+
+4.1 [decided] The peer wire protocol above the I2P stream is byte-identical
+    to clearnet BEP 3 — no ports appear in any message; the peer is an I2P
+    destination at the layer below. BEP 6 (fast) and BEP 10 (extended) are
+    fully framed by the codec.
+
+4.2 [decided] Block size is fixed at 16 KiB (BLOCK_LEN); requests and piece
+    blocks over that are rejected. Matches i2psnark.
+
+4.3 [decided] i2p_pex (clove-core::pex): a bencoded dict with `added` and
+    `dropped` byte strings, each concatenated 32-byte destination hashes.
+    Unlike clearnet ut_pex there are no `added.f` flag bytes and no
+    IPv6/`added6` keys; any extra keys a peer sends are ignored. A message
+    over MAX_PEX_PEERS (512) is rejected as spam. [open] whether i2psnark
+    ever attaches flags we should honor — confirm live, treat i2psnark as
+    normative (R4).
+
+4.4 [decided] ut_metadata (BEP 9, clove-core::metadata): standard 16 KiB
+    metadata pieces; a data message is a bencoded {msg_type,piece,
+    total_size} header immediately followed by the raw piece bytes.
+    Reassembled bytes are SHA-1-verified against the info-hash before use,
+    so a lying peer cannot substitute a different torrent. `total_size`
+    over 8 MiB is refused up front. Extension ids: clove advertises
+    i2p_pex=1, ut_metadata=2 and replies to a peer using the ids that peer
+    advertised (peers reply to us using ours). fetch_metadata drives the
+    magnet bootstrap: BT+extension handshake, request all pieces, verify,
+    then MetaInfo::from_info_dict. Verified in-tree over the mock (a client
+    fetches an info dict from a serving instance).
+
+4.5 [decided] Magnet links (clove-core::magnet): `magnet:?xt=urn:btih:<hex
+    40 | base32 32>`; `dn` and `tr` are percent-decoded, `tr` filtered to
+    I2P-only like .torrent announce URLs.
+
+4.6 [open] I2P `maggot://` links are a distinct, underspecified format.
+    Not parsed yet — we will not guess a grammar we cannot verify against
+    real examples. Add support (and the grammar) here once confirmed.

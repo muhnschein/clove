@@ -1,0 +1,15 @@
+[package]
+name = "clove"
+description = "clove control CLI: talks to cloved over the local HTTP API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clove-core = { path = "../clove-core" }
+i2pnet = { path = "../i2pnet" }
+
+[lints]
+workspace = true

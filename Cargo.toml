@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/i2pnet",
+    "crates/clove-core",
+    "crates/cloved",
+    "crates/clove",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.94"
+license = "ISC"
+# Not published to crates.io: these are workspace-internal crates wired by
+# path. (This also lets cargo-deny treat the internal path deps as private,
+# not wildcard — see deny.toml `allow-wildcard-paths`.) Revisit if/when
+# i2pnet or clove-core is published, at which point the path deps gain
+# explicit versions.
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[workspace.lints.clippy]
+# clippy's default-on groups (correctness/suspicious/style/complexity/perf).
+# Pinned to deny at the manifest level so a bare `cargo clippy` fails the same
+# way CI's `-D warnings` does, rather than only warning locally.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+disallowed_types = "deny"
+disallowed_methods = "deny"

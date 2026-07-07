@@ -1,0 +1,30 @@
+# cargo-deny config (docs/SCOPE.md §5 Layer 1: dependency budget).
+# Run: cargo deny check
+
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+# Forbid wildcard version requirements on real (crates.io) dependencies, but
+# exempt our own workspace-internal `{ path = ... }` deps, which legitimately
+# carry no version and are not wildcards in the risky sense.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[advisories]
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

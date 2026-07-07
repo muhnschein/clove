@@ -1,0 +1,16 @@
+[package]
+name = "cloved"
+description = "clove daemon: engine host, local HTTP API over unix socket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clove-core = { path = "../clove-core" }
+i2pnet = { path = "../i2pnet" }
+getrandom = "0.2"
+
+[lints]
+workspace = true

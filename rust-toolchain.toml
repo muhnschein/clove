@@ -1,0 +1,8 @@
+# Pinned toolchain so lint results are reproducible everywhere (SCOPE §10:
+# reproducible builds, "regress runnable by anyone"). Local, CI, and
+# contributors all get the same rustc + clippy, so a new lint in a later
+# stable can never fail CI out from under a green local run. Bump this
+# deliberately (a reviewed MSRV change), never implicitly via `rustup update`.
+[toolchain]
+channel = "1.94.1"
+components = ["clippy", "rustfmt"]
