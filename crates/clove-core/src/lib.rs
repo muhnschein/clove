@@ -25,6 +25,7 @@ pub mod choker;
 pub mod config;
 pub mod extension;
 pub mod http;
+pub mod json;
 pub mod magnet;
 pub mod metadata;
 pub mod metainfo;

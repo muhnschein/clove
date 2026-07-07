@@ -15,6 +15,7 @@ built per the phase plan.
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — resolved design questions Q1–Q7
 - [`docs/PLAN.md`](docs/PLAN.md) — implementation phases and milestones
 - [`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) — closing M1/M3 against a real router (podman/quadlet)
+- [`docs/PHASE-F.md`](docs/PHASE-F.md) — daemon/CLI/API design, and the TUI decision
 - [`DEPENDENCIES.md`](DEPENDENCIES.md) — the dependency allowlist
 
 Man pages (`cloved(8)`, `clove(1)`, `clove.conf(5)`) become the primary user

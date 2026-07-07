@@ -1,15 +1,17 @@
 //! Minimal hand-rolled HTTP/1.1 (Q6, `docs/DECISIONS.md`).
 //!
-//! Just the subset clove needs, hostile-input hardened. Used first by the
-//! tracker client (announces are HTTP GETs over an I2P stream); the local
-//! API server (Phase F) reuses the same request/response primitives, so
-//! this stays transport-agnostic — it encodes to and parses from any
-//! `Read`/`Write`, an `i2pnet` stream in production, a cursor in tests.
+//! Just the subset clove needs, hostile-input hardened, both ends:
 //!
-//! No chunked transfer encoding, no keep-alive reuse: clove opens a stream,
-//! sends one request, reads one `Content-Length`-delimited (or
-//! close-delimited) response, done. Anything fancier a tracker sends is a
-//! parse error, not a silent guess.
+//! - **Client** ([`Request::encode`], [`read_response`]) — the tracker client
+//!   (announces are HTTP GETs over an I2P stream).
+//! - **Server** ([`read_request`], [`Response::encode`]) — the local `/v1/`
+//!   API in `cloved` (Phase F), served over a unix socket / loopback TCP.
+//!
+//! It stays transport-agnostic: everything reads from and writes to any
+//! `Read`/`Write` — an `i2pnet` stream, a unix socket, or a cursor in tests.
+//! No chunked transfer encoding, no keep-alive reuse: one request, one
+//! `Content-Length`-delimited (or close-delimited) response, connection
+//! closed. Anything fancier is a parse error, not a silent guess.
 
 use std::io::{self, Read};
 
@@ -83,6 +85,8 @@ pub enum Error {
     Io(io::Error),
     /// The response head was malformed or exceeded [`MAX_HEADER_BYTES`].
     BadResponse(&'static str),
+    /// The request head (server side) was malformed or too large.
+    BadRequest(&'static str),
     /// A `Content-Length` larger than the caller's `max_body`.
     BodyTooLarge,
 }
@@ -92,7 +96,8 @@ impl std::fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "http: {e}"),
             Error::BadResponse(what) => write!(f, "http: malformed response: {what}"),
-            Error::BodyTooLarge => write!(f, "http: response body exceeds the allowed size"),
+            Error::BadRequest(what) => write!(f, "http: malformed request: {what}"),
+            Error::BodyTooLarge => write!(f, "http: body exceeds the allowed size"),
         }
     }
 }
@@ -208,6 +213,157 @@ fn parse_status(line: &str) -> Result<u16, Error> {
     let code = parts.next().ok_or(Error::BadResponse("no status code"))?;
     code.parse()
         .map_err(|_| Error::BadResponse("non-numeric status code"))
+}
+
+impl Response {
+    /// Build a response with a single `Content-Type` header and a body;
+    /// `Content-Length` and `Connection: close` are added by [`encode`].
+    ///
+    /// [`encode`]: Response::encode
+    #[must_use]
+    pub fn new(status: u16, content_type: &str, body: Vec<u8>) -> Response {
+        Response {
+            status,
+            headers: vec![("content-type".to_owned(), content_type.to_owned())],
+            body,
+        }
+    }
+
+    /// Serialize to on-wire bytes: status line, the response's headers, a
+    /// `Content-Length` (unless one is already present) and `Connection:
+    /// close`, then the body.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(
+            format!("HTTP/1.1 {} {}\r\n", self.status, reason(self.status)).as_bytes(),
+        );
+        let mut has_length = false;
+        for (name, value) in &self.headers {
+            if name.eq_ignore_ascii_case("content-length") {
+                has_length = true;
+            }
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        if !has_length {
+            out.extend_from_slice(format!("Content-Length: {}\r\n", self.body.len()).as_bytes());
+        }
+        out.extend_from_slice(b"Connection: close\r\n\r\n");
+        out.extend_from_slice(&self.body);
+        out
+    }
+}
+
+/// The reason phrase for a status code, for the response's status line. Empty
+/// for codes clove does not itself emit (a valid, if terse, status line).
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        500 => "Internal Server Error",
+        _ => "",
+    }
+}
+
+/// An inbound HTTP/1.1 request, parsed by [`read_request`] (server side).
+#[derive(Clone, Debug)]
+pub struct ServerRequest {
+    /// Request method, e.g. `GET`, `POST`, `DELETE`.
+    pub method: String,
+    /// Raw request target, e.g. `/v1/torrents?verbose=1`.
+    pub target: String,
+    /// Request headers, names lowercased.
+    pub headers: Vec<(String, String)>,
+    /// Request body (`Content-Length` bytes; empty if none).
+    pub body: Vec<u8>,
+}
+
+impl ServerRequest {
+    /// First header value matching `name` (case-insensitive).
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The path portion of the target (before any `?`).
+    #[must_use]
+    pub fn path(&self) -> &str {
+        self.target.split('?').next().unwrap_or(&self.target)
+    }
+
+    /// The raw query string after `?`, if present.
+    #[must_use]
+    pub fn query(&self) -> Option<&str> {
+        self.target.split_once('?').map(|(_, q)| q)
+    }
+}
+
+/// Read and parse one HTTP request from `reader`, capping the body at
+/// `max_body` bytes.
+///
+/// # Errors
+///
+/// I/O errors, a malformed request line or headers, a header section past
+/// [`MAX_HEADER_BYTES`], or a `Content-Length` over `max_body`.
+pub fn read_request<R: Read>(reader: &mut R, max_body: usize) -> Result<ServerRequest, Error> {
+    let (head, _leftover) = read_head(reader)?;
+    let text = std::str::from_utf8(&head).map_err(|_| Error::BadRequest("non-UTF-8 head"))?;
+    let mut lines = text.split("\r\n");
+
+    let request_line = lines.next().ok_or(Error::BadRequest("empty request"))?;
+    let mut parts = request_line.split(' ');
+    let method = parts.next().ok_or(Error::BadRequest("no method"))?;
+    let target = parts.next().ok_or(Error::BadRequest("no target"))?;
+    let version = parts.next().ok_or(Error::BadRequest("no version"))?;
+    if !version.starts_with("HTTP/1.") {
+        return Err(Error::BadRequest("not HTTP/1.x"));
+    }
+
+    let mut headers = Vec::new();
+    let mut content_length = 0usize;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or(Error::BadRequest("header without a colon"))?;
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_owned();
+        if name == "content-length" {
+            let n: usize = value
+                .parse()
+                .map_err(|_| Error::BadRequest("bad content-length"))?;
+            if n > max_body {
+                return Err(Error::BodyTooLarge);
+            }
+            content_length = n;
+        }
+        headers.push((name, value));
+    }
+
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body)?;
+    Ok(ServerRequest {
+        method: method.to_owned(),
+        target: target.to_owned(),
+        headers,
+        body,
+    })
 }
 
 /// Percent-encode raw bytes for a URL query value (RFC 3986): unreserved
@@ -342,5 +498,55 @@ mod tests {
             vec![0, 0xFF, b'/']
         );
         assert_eq!(percent_decode("%zz"), b"%zz"); // invalid escape passes through
+    }
+
+    #[test]
+    fn reads_a_get_request() {
+        let raw =
+            b"GET /v1/torrents?verbose=1 HTTP/1.1\r\nHost: clove\r\nX-Clove-Token: secret\r\n\r\n";
+        let mut cur = Cursor::new(raw.to_vec());
+        let req = read_request(&mut cur, 1024).unwrap();
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path(), "/v1/torrents");
+        assert_eq!(req.query(), Some("verbose=1"));
+        assert_eq!(req.header("x-clove-token"), Some("secret"));
+        assert!(req.body.is_empty());
+    }
+
+    #[test]
+    fn reads_a_request_body() {
+        let body = b"magnet:?xt";
+        let mut bytes = format!(
+            "POST /v1/torrents HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(body);
+        let mut cur = Cursor::new(bytes);
+        let req = read_request(&mut cur, 1024).unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.body, body);
+    }
+
+    #[test]
+    fn rejects_a_bad_request_line() {
+        let mut cur = Cursor::new(b"NOPE\r\n\r\n".to_vec());
+        assert!(matches!(
+            read_request(&mut cur, 1024),
+            Err(Error::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn response_encode_round_trips_through_the_parser() {
+        let resp = Response::new(200, "application/json", b"{\"ok\":true}".to_vec());
+        let bytes = resp.encode();
+        // What we encode, the client-side parser reads back equivalently.
+        let mut cur = Cursor::new(bytes);
+        let parsed = read_response(&mut cur, 1024).unwrap();
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.header("content-type"), Some("application/json"));
+        assert_eq!(parsed.header("content-length"), Some("11"));
+        assert_eq!(parsed.body, b"{\"ok\":true}");
     }
 }
