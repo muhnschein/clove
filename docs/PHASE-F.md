@@ -118,10 +118,16 @@ budget-spending decision — not smuggled in with M4.
    rendering waits on the JSON parser in step 3.
 3. **JSON parser + table rendering — landed:** a hand-rolled, hostile-input
    -hardened JSON *parser* in `clove-core::json` (depth cap, surrogate pairs,
-   strict numbers), and `clove status` now renders an aligned key/value table
-   (`--json` passes the raw body). Still to do in this step: the **engine
-   host** — torrent registry, `add`/`list`/`remove`, resume persistence +
-   `STATE-FORMAT.md`.
+   strict numbers), and `clove status` renders an aligned key/value table
+   (`--json` passes the raw body).
+3b. **Engine host — landed:** a torrent registry in `cloved` (`registry.rs`)
+   with `POST/GET/DELETE /v1/torrents` and `clove add`/`list`/`remove [--data]`.
+   `.torrent` add parses → lays out and verifies storage → persists; state is
+   the atomic write-temp-rename resume/`.torrent` files documented in
+   `STATE-FORMAT.md`, reloaded on restart. Deferred to the SAM-wiring slice:
+   magnet add (needs metadata fetch) and actually **downloading** (creating a
+   live `Torrent` and attaching peers) — hosted torrents currently show the
+   progress that verified on disk.
 4. **Remaining commands**: detail view, pause/resume/verify/announce,
    priorities, stats; completions; `cloved -C` config check.
 5. **`clove watch`**: the hand-rolled live view (§6).
