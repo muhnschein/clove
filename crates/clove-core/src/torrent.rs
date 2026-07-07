@@ -1133,10 +1133,22 @@ mod tests {
             seeder_bg.attach(stream, from).expect("seeder attach");
         });
 
-        // I2P connects are slow; be generous with both timeouts.
-        let stream = leech_session
-            .dial(seed_dest, Duration::from_secs(120))
-            .expect("leecher dial to seeder destination");
+        // A fresh transient destination needs time to build tunnels and
+        // publish its leaseSet before it is reachable, so an immediate dial
+        // gets `CantReachPeer`. Retry through that warmup window. A failed
+        // connect establishes nothing, so the seeder's single accept still
+        // pairs with the one dial that succeeds.
+        let deadline = std::time::Instant::now() + Duration::from_secs(240);
+        let stream = loop {
+            match leech_session.dial(seed_dest, Duration::from_secs(60)) {
+                Ok(stream) => break stream,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    eprintln!("leecher dial not ready yet ({e}); retrying in 5s…");
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+                Err(e) => panic!("leecher dial to seeder destination: {e}"),
+            }
+        };
         leecher.attach(stream, seed_dest).expect("leecher attach");
         assert!(
             leecher.wait_complete(Duration::from_secs(180)),

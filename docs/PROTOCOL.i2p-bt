@@ -115,7 +115,26 @@ Status legend:
     session is the suspected root of XD-style flakiness. The reconnect
     supervisor (i2pnet::supervisor) is built and unit-tested against a fake
     factory; its behavior against a *real* router mid-restart, and the
-    concurrency ceiling of one session, are the harness's job.
+    concurrency ceiling of one session, are the harness's job. First live
+    observations against i2pd (M1, in progress):
+
+    2.6a [decided] Outbound dial *initiation* serializes per session. yosemite's
+      sync `connect` takes `&mut self` and blocks until the router resolves the
+      stream, so SamSession::dial holds the session mutex for the whole connect.
+      Established streams run concurrently (each is an independent socket once
+      connected); only the setup step is serial. Consequence for the engine:
+      one dial session initiates peers one-at-a-time. Whether that needs
+      multiple dial sessions, or is fine because connects are quick once warm,
+      is the N-scaling question the harness still has to answer.
+
+    2.6b [assumed] A freshly created transient destination is briefly
+      unreachable: a dial to it returns STREAM STATUS RESULT=CANT_REACH_PEER
+      (surfaced as Protocol(Router(CantReachPeer))) for the ~seconds it takes
+      the destination to build tunnels and publish its leaseSet. This is normal
+      warmup, not a fault; the live test and sam-stress retry the dial through
+      it, as the real peer-acquisition path must. Distinct from a *cold router*
+      (reseed incomplete → no peers → CantReachPeer indefinitely), which is an
+      operator/setup problem (see LIVE-TESTING.md troubleshooting).
 
 
 3. Reconnect discipline (i2pnet::supervisor, M1)

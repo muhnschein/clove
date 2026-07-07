@@ -217,6 +217,33 @@ A once-run manual pass rots. Two commitments keep M1/M3 *closed*:
    designed for — nothing in Bucket 1 blocks adding it, since the harness and
    tests are already env-driven and non-interactive.
 
+## 7a. Troubleshooting (live-run findings)
+
+**`CantReachPeer` on every dial, immediately after `router-up`.** Two causes,
+distinguish them at the i2pd console (`http://127.0.0.1:7070`, published by the
+quadlet):
+
+- **Cold router (setup problem).** If the console's **Routers** count is ~0–10,
+  reseed never completed and the router has no peers to build tunnels through —
+  so *nothing* is reachable. The usual cause under rootless podman is a data
+  volume i2pd can't write: `podman logs systemd-i2pd` shows
+  `certificates/i2pd_certificates: Permission denied`, reseed's TLS certs are
+  missing, and reseed fails. The quadlet runs the container as `User=0` (which
+  under rootless podman maps to *your* user, the volume's owner) to fix exactly
+  this. If you started a router before this fix, wipe the half-initialized
+  volume and restart: `make router-down && podman volume rm clove-i2pd-data &&
+  make router-up`, then wait for **Routers** to climb into the hundreds.
+- **Warmup (normal).** On a healthy router, a *freshly created* destination is
+  unreachable for the few seconds it takes to build tunnels and publish its
+  leaseSet (`PROTOCOL.i2p-bt` §2.6b). The live test and `sam-stress` retry the
+  dial through this window, so a transient `CantReachPeer` that clears on retry
+  is expected, not a failure.
+
+**`sam-stress` seems to hang at "driving N concurrent streams".** Dial
+*initiation* serializes on the one session (`PROTOCOL.i2p-bt` §2.6a), so on a
+cold router N attempts run back-to-back at ~60s each. Confirm reachability with
+`make sam-stress N=1` first, then scale N up once the router is warm.
+
 ## 8. Sequencing
 
 Bucket 1 lands in-tree in the order of §4 (inbound path → harness → gated tests

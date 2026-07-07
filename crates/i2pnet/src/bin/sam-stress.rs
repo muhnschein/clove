@@ -30,8 +30,16 @@ use i2pnet::{DestHash, I2pDialer, I2pListener};
 /// real round-trip through tunnels, small enough not to dominate timing.
 const PAYLOAD_LEN: usize = 64 * 1024;
 
-/// Per-stream dial + echo timeout. I2P connects are slow; be generous.
-const STREAM_TIMEOUT: Duration = Duration::from_secs(120);
+/// Per-attempt dial timeout passed to the trait (yosemite ignores it; the
+/// router's own `CANT_REACH_PEER` timeout governs — see `PROTOCOL.i2p-bt` 2.3).
+const STREAM_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a dialer keeps retrying while the target's leaseSet is still
+/// propagating (a fresh destination is briefly unreachable — `CantReachPeer`).
+const WARMUP_DEADLINE: Duration = Duration::from_secs(240);
+
+/// Pause between dial retries during warmup.
+const RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
 fn main() -> ExitCode {
     match run() {
@@ -86,11 +94,13 @@ fn run() -> io::Result<()> {
     let mut connects = Vec::with_capacity(n);
     let mut rtts = Vec::with_capacity(n);
     let mut failures = Vec::new();
+    let mut attempts = 0u32;
     for handle in dialers {
         match handle.join() {
             Ok(Ok(sample)) => {
                 connects.push(sample.connect);
                 rtts.push(sample.rtt);
+                attempts += sample.attempts;
             }
             Ok(Err(e)) => failures.push(e.to_string()),
             Err(_) => failures.push("dialer thread panicked".to_owned()),
@@ -99,7 +109,7 @@ fn run() -> io::Result<()> {
     let wall = start.elapsed();
     let _ = acceptor.join();
 
-    report(n, wall, &mut connects, &mut rtts, &failures);
+    report(n, wall, attempts, &mut connects, &mut rtts, &failures);
     if connects.is_empty() {
         return Err(io::Error::other(
             "every stream failed — see the failures above",
@@ -116,16 +126,27 @@ fn sam_port() -> u16 {
         .unwrap_or(DEFAULT_SAM_PORT)
 }
 
-/// One dial + echo exchange, timed.
+/// One dial + echo exchange, timed. `attempts` counts dial tries (>1 means the
+/// target was still warming up); `connect`/`rtt` are measured from the
+/// successful attempt, so warmup retries do not inflate the reported latency.
 struct Sample {
     connect: Duration,
     rtt: Duration,
+    attempts: u32,
 }
 
 fn dial_once(dialer: &SamSession, target: DestHash) -> io::Result<Sample> {
-    let start = Instant::now();
-    let mut stream = dialer.dial(target, STREAM_TIMEOUT)?;
-    let connect = start.elapsed();
+    let deadline = Instant::now() + WARMUP_DEADLINE;
+    let mut attempts = 0u32;
+    let (mut stream, connect, start) = loop {
+        attempts += 1;
+        let start = Instant::now();
+        match dialer.dial(target, STREAM_TIMEOUT) {
+            Ok(stream) => break (stream, start.elapsed(), start),
+            Err(_) if Instant::now() < deadline => thread::sleep(RETRY_BACKOFF),
+            Err(e) => return Err(e),
+        }
+    };
 
     let payload = vec![0xA5u8; PAYLOAD_LEN];
     stream.write_all(&payload)?;
@@ -134,12 +155,13 @@ fn dial_once(dialer: &SamSession, target: DestHash) -> io::Result<Sample> {
     let rtt = start.elapsed();
 
     if back != payload {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "echoed bytes did not match what was sent",
-        ));
+        return Err(io::Error::other("echoed bytes did not match what was sent"));
     }
-    Ok(Sample { connect, rtt })
+    Ok(Sample {
+        connect,
+        rtt,
+        attempts,
+    })
 }
 
 /// Accept `n` inbound streams and echo `PAYLOAD_LEN` bytes on each, one
@@ -171,6 +193,7 @@ fn echo_server(listener: &SamListener, n: usize) {
 fn report(
     n: usize,
     wall: Duration,
+    attempts: u32,
     connects: &mut [Duration],
     rtts: &mut [Duration],
     failures: &[String],
@@ -182,6 +205,7 @@ fn report(
     println!("── sam-stress: {n} concurrent streams ──");
     println!("  succeeded : {ok}/{n}");
     println!("  failed    : {}", failures.len());
+    println!("  dial tries: {attempts} (> succeeded ⇒ leaseSet-warmup retries)");
     println!("  wall clock: {:.2}s", wall.as_secs_f64());
     if !connects.is_empty() {
         println!(
