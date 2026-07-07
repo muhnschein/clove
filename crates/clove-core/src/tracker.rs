@@ -139,6 +139,7 @@ pub fn build_announce(url: &str, params: &AnnounceParams) -> Result<(String, Vec
         target: &target,
         host: parsed.host,
         headers: &[],
+        body: &[],
     };
     Ok((parsed.host.to_owned(), request.encode()))
 }

@@ -130,6 +130,35 @@ impl Value {
         }
     }
 
+    /// This value as `u64` if it is a non-negative integer. Note that a whole
+    /// number encodes and re-parses as an integer even if it began as a float
+    /// (e.g. `1.0` → `1`), so numeric fields should be read through this or
+    /// [`as_f64`](Value::as_f64), not matched on a specific variant.
+    #[must_use]
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Value::UInt(n) => Some(*n),
+            Value::Int(n) => u64::try_from(*n).ok(),
+            _ => None,
+        }
+    }
+
+    /// This value as `f64` if it is any number (for display; large integers
+    /// may lose precision).
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "used for formatting; exact precision is not required"
+    )]
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Int(n) => Some(*n as f64),
+            Value::UInt(n) => Some(*n as f64),
+            Value::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+
     /// The fields, if this is an [`Object`](Value::Object).
     #[must_use]
     pub fn as_object(&self) -> Option<&[(String, Value)]> {

@@ -29,11 +29,13 @@ pub struct Request<'a> {
     pub host: &'a str,
     /// Extra headers as `(name, value)`.
     pub headers: &'a [(&'a str, &'a str)],
+    /// Request body (empty for a `GET`).
+    pub body: &'a [u8],
 }
 
 impl Request<'_> {
-    /// Serialize to on-wire bytes. `Host`, `Connection: close`, and a
-    /// zero-length `Content-Length` are always emitted; no body.
+    /// Serialize to on-wire bytes. `Host`, an accurate `Content-Length`, and
+    /// `Connection: close` are always emitted, followed by the body.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -50,7 +52,9 @@ impl Request<'_> {
             out.extend_from_slice(value.as_bytes());
             out.extend_from_slice(b"\r\n");
         }
+        out.extend_from_slice(format!("Content-Length: {}\r\n", self.body.len()).as_bytes());
         out.extend_from_slice(b"Connection: close\r\n\r\n");
+        out.extend_from_slice(self.body);
         out
     }
 }
@@ -429,11 +433,12 @@ mod tests {
             target: "/announce?x=1",
             host: "tracker.i2p",
             headers: &[("User-Agent", "clove/0.1")],
+            body: &[],
         };
         let s = String::from_utf8(req.encode()).unwrap();
         assert_eq!(
             s,
-            "GET /announce?x=1 HTTP/1.1\r\nHost: tracker.i2p\r\nUser-Agent: clove/0.1\r\nConnection: close\r\n\r\n"
+            "GET /announce?x=1 HTTP/1.1\r\nHost: tracker.i2p\r\nUser-Agent: clove/0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
     }
 

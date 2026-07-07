@@ -6,10 +6,12 @@
 //! this slice serves `GET /v1/status` with token auth — the transport, end to
 //! end. Layer-2 self-restriction (Landlock/seccomp) is Phase G.
 
+mod registry;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use clove_core::config::{Config, Defaults};
@@ -17,8 +19,14 @@ use clove_core::http::{self, Response};
 use clove_core::json::Value;
 use i2pnet::api::{ApiListener, ApiStream};
 
+use crate::registry::{AddError, Registry, RemoveError};
+
 /// Cap on an API request body (a `.torrent` or magnet; generous for status).
 const MAX_REQUEST_BODY: usize = 2 * 1024 * 1024;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -86,6 +94,10 @@ fn run() -> Result<(), String> {
     }
     let token = load_or_create_token(&config.data_dir).map_err(|e| e.to_string())?;
 
+    let registry = Registry::open(&config.data_dir)
+        .map_err(|e| format!("opening registry in {}: {e}", config.data_dir.display()))?;
+    eprintln!("cloved: {} torrent(s) loaded", registry.count());
+
     let listener = ApiListener::bind_unix(&config.api_socket)
         .map_err(|e| format!("binding {}: {e}", config.api_socket.display()))?;
     eprintln!("cloved: listening on {}", config.api_socket.display());
@@ -94,16 +106,17 @@ fn run() -> Result<(), String> {
         start: Instant::now(),
         sam_address: config.sam_address,
         token,
+        registry: Mutex::new(registry),
     });
     serve(&listener, &daemon)
 }
 
-/// Daemon state shared across connection threads. The engine host (torrent
-/// registry, persistence) attaches here in the next slice.
+/// Daemon state shared across connection threads.
 struct Daemon {
     start: Instant,
     sam_address: String,
     token: String,
+    registry: Mutex<Registry>,
 }
 
 /// Accept loop: one thread per connection (Q5; API load is tiny). Only a fatal
@@ -143,11 +156,63 @@ fn handle(mut stream: ApiStream, daemon: &Daemon) -> std::io::Result<()> {
 }
 
 fn route(request: &http::ServerRequest, daemon: &Daemon) -> Response {
-    match (request.method.as_str(), request.path()) {
+    let path = request.path();
+    match (request.method.as_str(), path) {
         ("GET", "/v1/status") => Response::new(200, "application/json", status_json(daemon)),
+        ("GET", "/v1/torrents") => {
+            let body = lock(&daemon.registry).list().encode().into_bytes();
+            Response::new(200, "application/json", body)
+        }
+        ("POST", "/v1/torrents") => add_torrent(request, daemon),
+        ("DELETE", p) if p.starts_with("/v1/torrents/") => remove_torrent(request, daemon, p),
         ("GET", _) => error(404, "no such resource"),
         _ => error(405, "method not allowed"),
     }
+}
+
+fn add_torrent(request: &http::ServerRequest, daemon: &Daemon) -> Response {
+    if request.body.starts_with(b"magnet:") {
+        return error(
+            501,
+            "magnet links need a running SAM session (a later slice)",
+        );
+    }
+    match lock(&daemon.registry).add_torrent(&request.body) {
+        Ok(info_hash) => {
+            let body = Value::Object(vec![(
+                "info_hash".to_owned(),
+                Value::from(registry::hex(&info_hash)),
+            )])
+            .encode()
+            .into_bytes();
+            Response::new(201, "application/json", body)
+        }
+        Err(AddError::Parse(e)) => error(400, &e.to_string()),
+        Err(AddError::Duplicate) => error(409, "torrent already added"),
+        Err(AddError::Io(e)) => error(500, &format!("adding torrent: {e}")),
+    }
+}
+
+fn remove_torrent(request: &http::ServerRequest, daemon: &Daemon, path: &str) -> Response {
+    let hex = &path["/v1/torrents/".len()..];
+    let Some(info_hash) = registry::parse_info_hash(hex) else {
+        return error(400, "info-hash must be 40 lowercase-hex characters");
+    };
+    let delete_data = request.query().is_some_and(query_has_data);
+    match lock(&daemon.registry).remove(&info_hash, delete_data) {
+        Ok(()) => Response::new(200, "application/json", b"{\"ok\":true}".to_vec()),
+        Err(RemoveError::NotFound) => error(404, "no such torrent"),
+        Err(RemoveError::Io(e)) => error(500, &format!("removing torrent: {e}")),
+    }
+}
+
+/// Whether a query string carries a truthy `data` flag (`data`, `data=1`,
+/// `data=true`, `data=yes`).
+fn query_has_data(query: &str) -> bool {
+    query.split('&').any(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, "1"));
+        key == "data" && matches!(value, "1" | "true" | "yes")
+    })
 }
 
 fn status_json(daemon: &Daemon) -> Vec<u8> {
@@ -161,8 +226,11 @@ fn status_json(daemon: &Daemon) -> Vec<u8> {
             "sam_address".to_owned(),
             Value::from(daemon.sam_address.clone()),
         ),
-        // Placeholders until the engine host and SAM supervisor are wired.
-        ("torrents".to_owned(), Value::UInt(0)),
+        (
+            "torrents".to_owned(),
+            Value::UInt(u64::try_from(lock(&daemon.registry).count()).unwrap_or(u64::MAX)),
+        ),
+        // Placeholder until the SAM supervisor is wired.
         ("router".to_owned(), Value::from("not-connected")),
     ])
     .encode()
@@ -194,7 +262,7 @@ fn load_or_create_token(data_dir: &Path) -> std::io::Result<String> {
             let mut raw = [0u8; 32];
             getrandom::getrandom(&mut raw)
                 .map_err(|e| std::io::Error::other(format!("getrandom: {e}")))?;
-            let token = hex(&raw);
+            let token = registry::hex(&raw);
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -205,16 +273,6 @@ fn load_or_create_token(data_dir: &Path) -> std::io::Result<String> {
         }
         Err(e) => Err(e),
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(char::from(HEX[(b >> 4) as usize]));
-        out.push(char::from(HEX[(b & 0x0f) as usize]));
-    }
-    out
 }
 
 /// Length-independent byte comparison, so token checks don't leak length or a
