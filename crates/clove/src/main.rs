@@ -6,12 +6,14 @@
 //! the JSON parser), and `clove watch` arrive in later Phase-F slices
 //! (`docs/PHASE-F.md`).
 
-use std::io::Write;
+use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clove_core::config::{Config, Defaults};
 use clove_core::http::{self, Request};
+use clove_core::json::{self, Value};
 use i2pnet::api;
 
 /// Cap on a response body read from the (trusted, local) daemon.
@@ -83,12 +85,29 @@ fn run() -> Result<(), Fail> {
 fn cmd_status(socket: Option<PathBuf>, json: bool) -> Result<(), Fail> {
     let (socket, token) = resolve(socket)?;
     let body = request(&socket, &token, "GET", "/v1/status")?;
-    // Table rendering needs the JSON parser (next slice); for now the status
-    // blob is printed as-is, and `--json` is the same body verbatim.
-    let _ = json;
-    let text = String::from_utf8_lossy(&body);
-    println!("{}", text.trim_end());
+    if json {
+        println!("{}", String::from_utf8_lossy(&body).trim_end());
+        return Ok(());
+    }
+    let text = std::str::from_utf8(&body)
+        .map_err(|_| Fail::Failed("daemon response was not UTF-8".to_owned()))?;
+    let value = json::parse(text).map_err(|e| Fail::Failed(format!("parsing response: {e}")))?;
+    print!("{}", render_object(&value));
     Ok(())
+}
+
+/// Render a JSON object as an aligned `key   value` table; a non-object value
+/// is printed on one line.
+fn render_object(value: &Value) -> String {
+    let Some(fields) = value.as_object() else {
+        return format!("{}\n", value.to_line());
+    };
+    let width = fields.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for (key, val) in fields {
+        let _ = writeln!(out, "{key:<width$}  {}", val.to_line());
+    }
+    out
 }
 
 /// Resolve the API socket path and token: an explicit `--socket` wins,

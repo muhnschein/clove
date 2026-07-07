@@ -116,9 +116,12 @@ budget-spending decision — not smuggled in with M4.
    `cloved -C` and `clove status`. Proven end to end over a unix socket, no
    router needed. `clove` prints the raw status JSON for now — human table
    rendering waits on the JSON parser in step 3.
-3. **Engine host + JSON parser**: a hand-rolled JSON *parser* (so `clove`
-   renders aligned tables, `--json` passing the raw body); torrent registry,
-   `add`/`list`/`remove`, resume persistence + `STATE-FORMAT.md`.
+3. **JSON parser + table rendering — landed:** a hand-rolled, hostile-input
+   -hardened JSON *parser* in `clove-core::json` (depth cap, surrogate pairs,
+   strict numbers), and `clove status` now renders an aligned key/value table
+   (`--json` passes the raw body). Still to do in this step: the **engine
+   host** — torrent registry, `add`/`list`/`remove`, resume persistence +
+   `STATE-FORMAT.md`.
 4. **Remaining commands**: detail view, pause/resume/verify/announce,
    priorities, stats; completions; `cloved -C` config check.
 5. **`clove watch`**: the hand-rolled live view (§6).
