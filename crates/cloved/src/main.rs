@@ -19,7 +19,7 @@ use clove_core::http::{self, Response};
 use clove_core::json::Value;
 use i2pnet::api::{ApiListener, ApiStream};
 
-use crate::registry::{AddError, Registry, RemoveError};
+use crate::registry::{ActionError, AddError, Registry, RemoveError};
 
 /// Cap on an API request body (a `.torrent` or magnet; generous for status).
 const MAX_REQUEST_BODY: usize = 2 * 1024 * 1024;
@@ -156,15 +156,18 @@ fn handle(mut stream: ApiStream, daemon: &Daemon) -> std::io::Result<()> {
 }
 
 fn route(request: &http::ServerRequest, daemon: &Daemon) -> Response {
+    let method = request.method.as_str();
     let path = request.path();
-    match (request.method.as_str(), path) {
+    match (method, path) {
         ("GET", "/v1/status") => Response::new(200, "application/json", status_json(daemon)),
         ("GET", "/v1/torrents") => {
             let body = lock(&daemon.registry).list().encode().into_bytes();
             Response::new(200, "application/json", body)
         }
         ("POST", "/v1/torrents") => add_torrent(request, daemon),
-        ("DELETE", p) if p.starts_with("/v1/torrents/") => remove_torrent(request, daemon, p),
+        (_, p) if p.starts_with("/v1/torrents/") => {
+            torrent_action(method, request, daemon, &p["/v1/torrents/".len()..])
+        }
         ("GET", _) => error(404, "no such resource"),
         _ => error(405, "method not allowed"),
     }
@@ -193,17 +196,99 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Daemon) -> Response {
     }
 }
 
-fn remove_torrent(request: &http::ServerRequest, daemon: &Daemon, path: &str) -> Response {
-    let hex = &path["/v1/torrents/".len()..];
+/// Route a request against a specific torrent: `<info-hash>` or
+/// `<info-hash>/<action>`.
+fn torrent_action(
+    method: &str,
+    request: &http::ServerRequest,
+    daemon: &Daemon,
+    rest: &str,
+) -> Response {
+    let (hex, action) = match rest.split_once('/') {
+        Some((hex, action)) => (hex, Some(action)),
+        None => (rest, None),
+    };
     let Some(info_hash) = registry::parse_info_hash(hex) else {
         return error(400, "info-hash must be 40 lowercase-hex characters");
     };
-    let delete_data = request.query().is_some_and(query_has_data);
-    match lock(&daemon.registry).remove(&info_hash, delete_data) {
-        Ok(()) => Response::new(200, "application/json", b"{\"ok\":true}".to_vec()),
-        Err(RemoveError::NotFound) => error(404, "no such torrent"),
-        Err(RemoveError::Io(e)) => error(500, &format!("removing torrent: {e}")),
+
+    match (method, action) {
+        ("GET", None) => match lock(&daemon.registry).detail(&info_hash) {
+            Some(value) => Response::new(200, "application/json", value.encode().into_bytes()),
+            None => error(404, "no such torrent"),
+        },
+        ("DELETE", None) => {
+            let delete_data = request.query().is_some_and(query_has_data);
+            match lock(&daemon.registry).remove(&info_hash, delete_data) {
+                Ok(()) => ok_json(),
+                Err(RemoveError::NotFound) => error(404, "no such torrent"),
+                Err(RemoveError::Io(e)) => error(500, &format!("removing torrent: {e}")),
+            }
+        }
+        ("POST", Some("pause")) => {
+            action_result(lock(&daemon.registry).set_paused(&info_hash, true))
+        }
+        ("POST", Some("resume")) => {
+            action_result(lock(&daemon.registry).set_paused(&info_hash, false))
+        }
+        ("POST", Some("verify")) => match lock(&daemon.registry).verify(&info_hash) {
+            Ok(verified) => {
+                let body = Value::Object(vec![(
+                    "verified".to_owned(),
+                    Value::UInt(u64::from(verified)),
+                )])
+                .encode()
+                .into_bytes();
+                Response::new(200, "application/json", body)
+            }
+            Err(e) => action_error(&e),
+        },
+        ("PUT", Some("priorities")) => match parse_priorities(&request.body) {
+            Some(priorities) => action_result(
+                lock(&daemon.registry)
+                    .set_priorities(&info_hash, priorities)
+                    .map(|_| ()),
+            ),
+            None => error(
+                400,
+                "priorities body must be comma-separated values of 0, 1, or 2",
+            ),
+        },
+        _ => error(405, "method not allowed"),
     }
+}
+
+fn ok_json() -> Response {
+    Response::new(200, "application/json", b"{\"ok\":true}".to_vec())
+}
+
+fn action_result(result: Result<(), ActionError>) -> Response {
+    match result {
+        Ok(()) => ok_json(),
+        Err(e) => action_error(&e),
+    }
+}
+
+fn action_error(e: &ActionError) -> Response {
+    match e {
+        ActionError::NotFound => error(404, "no such torrent"),
+        ActionError::BadInput(what) => error(400, what),
+        ActionError::Io(io) => error(500, &io.to_string()),
+    }
+}
+
+/// Parse a comma-separated priorities body (`1,0,2`) into per-file bytes.
+fn parse_priorities(body: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut out = Vec::new();
+    for part in text.trim().split(',') {
+        let value: u8 = part.trim().parse().ok()?;
+        if value > 2 {
+            return None;
+        }
+        out.push(value);
+    }
+    Some(out)
 }
 
 /// Whether a query string carries a truthy `data` flag (`data`, `data=1`,

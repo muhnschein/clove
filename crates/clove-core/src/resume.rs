@@ -15,7 +15,10 @@ use std::fmt;
 use crate::bencode::{self, Value};
 
 /// Current resume-format version. Bump on any semantic change.
-pub const VERSION: i64 = 1;
+///
+/// History: v1 initial; v2 added the optional `paused` flag (a v1 file reads
+/// as not paused).
+pub const VERSION: i64 = 2;
 
 /// Everything clove needs to pick a torrent back up after a restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +42,9 @@ pub struct Resume {
     pub downloaded: u64,
     /// Announce tiers in their current (BEP 12 shuffled) order.
     pub trackers: Vec<Vec<String>>,
+    /// Whether the torrent is paused. Optional on disk (added in v2); a v1
+    /// file, or any file omitting it, reads as `false`.
+    pub paused: bool,
 }
 
 /// Why a resume file was refused. Refusal never writes anything.
@@ -79,7 +85,7 @@ pub fn bitfield_len(num_pieces: u32) -> usize {
     num_pieces.div_ceil(8) as usize
 }
 
-const KEYS: [&[u8]; 8] = [
+const KEYS: [&[u8]; 10] = [
     b"version",
     b"info_hash",
     b"num_pieces",
@@ -88,8 +94,9 @@ const KEYS: [&[u8]; 8] = [
     b"priorities",
     b"uploaded",
     b"downloaded",
+    b"trackers",
+    b"paused",
 ];
-const KEY_TRACKERS: &[u8] = b"trackers";
 
 impl Resume {
     /// Canonically encode for writing (the writer is storage's job).
@@ -126,7 +133,8 @@ impl Resume {
                 )
             })
             .collect();
-        put(KEY_TRACKERS, Value::List(tiers));
+        put(b"trackers", Value::List(tiers));
+        put(b"paused", Value::Int(i64::from(self.paused)));
         bencode::encode(&Value::Dict(map))
     }
 
@@ -154,7 +162,7 @@ impl Resume {
             return Err(Error::Invalid("nonsense version"));
         }
         for key in dict.keys() {
-            if !KEYS.contains(&key.as_slice()) && key != KEY_TRACKERS {
+            if !KEYS.contains(&key.as_slice()) {
                 return Err(Error::Invalid("unknown key: version discipline violated"));
             }
         }
@@ -191,7 +199,7 @@ impl Resume {
 
         let mut trackers = Vec::new();
         let tiers = root
-            .get(KEY_TRACKERS)
+            .get(b"trackers")
             .and_then(Value::as_list)
             .ok_or(Error::Invalid("missing trackers"))?;
         for tier in tiers {
@@ -209,6 +217,12 @@ impl Resume {
             trackers.push(urls);
         }
 
+        // Optional since v2: a v1 file (or any omitting it) reads as not paused.
+        let paused = root
+            .get(b"paused")
+            .and_then(Value::as_int)
+            .is_some_and(|n| n != 0);
+
         Ok(Resume {
             info_hash,
             num_pieces,
@@ -218,6 +232,7 @@ impl Resume {
             uploaded,
             downloaded,
             trackers,
+            paused,
         })
     }
 }
@@ -261,6 +276,7 @@ mod tests {
             uploaded: 12345,
             downloaded: 67890,
             trackers: vec![vec!["http://t.i2p/a".into()], vec!["http://u.i2p/a".into()]],
+            paused: true,
         }
     }
 
@@ -271,15 +287,40 @@ mod tests {
     }
 
     #[test]
+    fn paused_round_trips_both_ways() {
+        for paused in [false, true] {
+            let mut r = sample();
+            r.paused = paused;
+            assert_eq!(Resume::decode(&r.encode()).unwrap().paused, paused);
+        }
+    }
+
+    #[test]
+    fn a_file_without_paused_reads_as_not_paused() {
+        // Strip the `paused` entry to simulate a v1 file.
+        let mut r = sample();
+        r.paused = false;
+        let encoded = r.encode();
+        let needle = b"6:pausedi0e";
+        let pos = encoded
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .unwrap();
+        let mut stripped = encoded[..pos].to_vec();
+        stripped.extend_from_slice(&encoded[pos + needle.len()..]);
+        assert!(!Resume::decode(&stripped).unwrap().paused);
+    }
+
+    #[test]
     fn refuses_the_future_cleanly() {
         let mut r = sample().encode();
-        // Bump the version int in place: "7:versioni1e" -> i2e.
+        // Bump the version int in place past the current VERSION (2 -> 3).
         let pos = r.windows(9).position(|w| w == b"7:version").map(|p| p + 10);
         let pos = pos.unwrap();
-        assert_eq!(r[pos], b'1');
-        r[pos] = b'2';
+        assert_eq!(r[pos], b'2');
+        r[pos] = b'3';
         match Resume::decode(&r) {
-            Err(Error::FutureVersion(2)) => {}
+            Err(Error::FutureVersion(3)) => {}
             other => panic!("expected FutureVersion, got {other:?}"),
         }
     }
