@@ -28,6 +28,7 @@ use std::io::{self, Read, Write};
 use std::time::Duration;
 
 pub mod addr;
+pub mod api;
 pub mod mock;
 pub mod sam;
 pub mod supervisor;

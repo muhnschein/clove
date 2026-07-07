@@ -110,11 +110,15 @@ budget-spending decision — not smuggled in with M4.
 
 1. **Foundation — landed:** HTTP/1.1 server primitives (`http`) + JSON encoder
    (`json`), both unit-tested, no new deps.
-2. **`i2pnet` API listener** (unix + loopback-validating TCP) + a `cloved`
-   skeleton serving `GET /v1/status` with token auth + `clove status` rendering
-   it. The thin vertical slice that proves the transport end to end.
-3. **Engine host**: torrent registry, `add`/`list`/`remove`, resume
-   persistence + `STATE-FORMAT.md`.
+2. **Transport slice — landed:** `i2pnet::api` (unix + loopback-validating
+   TCP), a `cloved` that loads config, generates a `0600` token, and serves
+   `GET /v1/status` with token auth (one thread per connection), plus
+   `cloved -C` and `clove status`. Proven end to end over a unix socket, no
+   router needed. `clove` prints the raw status JSON for now — human table
+   rendering waits on the JSON parser in step 3.
+3. **Engine host + JSON parser**: a hand-rolled JSON *parser* (so `clove`
+   renders aligned tables, `--json` passing the raw body); torrent registry,
+   `add`/`list`/`remove`, resume persistence + `STATE-FORMAT.md`.
 4. **Remaining commands**: detail view, pause/resume/verify/announce,
    priorities, stats; completions; `cloved -C` config check.
 5. **`clove watch`**: the hand-rolled live view (§6).

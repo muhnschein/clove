@@ -32,12 +32,14 @@ commit. Closure sizes are recorded when the dependency is actually added.
   the one library that speaks SAM, and it is wrapped so the engine never
   sees it. Reviewed for socket capability: none of the closure beyond
   `yosemite` itself opens sockets.
+- **`getrandom` 0.2** (`cloved`) — entered Phase F. The API token is 32 bytes
+  straight from the OS RNG; `getrandom` is the maintained thin wrapper over
+  `getrandom(2)`/`/dev/urandom`, exactly the syscall access we do not want to
+  hand-roll. (Peer-ID randomness is covered transitively by yosemite's `rand`.)
+  Tiny closure (`cfg-if`, `libc`); not socket-capable.
 
 ## Approved, enters at the scheduled phase (docs/PLAN.md)
 
-- **`getrandom`** — Phase F. API token generation straight from the OS RNG
-  (peer-ID randomness is covered transitively by yosemite's `rand`). The
-  alternative (`rand` directly) pulls a larger tree we don't need.
 - **`landlock`** — Phase G. Landlock ABI probing and ruleset application for
   Layer-2 filesystem self-restriction; the raw syscall interface is unsafe
   and fiddly, and this crate is the maintained reference binding.

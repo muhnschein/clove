@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 clove-core = { path = "../clove-core" }
 i2pnet = { path = "../i2pnet" }
+getrandom = "0.2"
 
 [lints]
 workspace = true
