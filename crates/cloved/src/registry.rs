@@ -36,12 +36,49 @@ pub(crate) struct Registry {
 /// One hosted torrent's in-memory summary.
 struct Hosted {
     meta: MetaInfo,
-    have: u32,
-    total_pieces: u32,
+    have: Bitfield,
     priorities: Vec<u8>,
     uploaded: u64,
     downloaded: u64,
     paused: bool,
+}
+
+impl Hosted {
+    /// The resume record to persist for this torrent's current state.
+    fn resume(&self, info_hash: [u8; 20]) -> Resume {
+        Resume {
+            info_hash,
+            num_pieces: self.have.len(),
+            have: self.have.as_bytes().to_vec(),
+            // We only mark a piece present once it verifies, so verified == have.
+            verified: self.have.as_bytes().to_vec(),
+            priorities: self.priorities.clone(),
+            uploaded: self.uploaded,
+            downloaded: self.downloaded,
+            trackers: self.meta.trackers.clone(),
+            paused: self.paused,
+        }
+    }
+}
+
+/// Why a torrent action (pause, verify, set priorities…) failed.
+pub(crate) enum ActionError {
+    /// No torrent with that info-hash (404).
+    NotFound,
+    /// The request was malformed (400).
+    BadInput(&'static str),
+    /// A filesystem error (500).
+    Io(io::Error),
+}
+
+impl fmt::Display for ActionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ActionError::NotFound => write!(f, "no such torrent"),
+            ActionError::BadInput(what) => write!(f, "{what}"),
+            ActionError::Io(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 /// Why adding a torrent failed (mapped to an HTTP status by the caller).
@@ -124,42 +161,104 @@ impl Registry {
         // Lay out the files and see what (if anything) is already on disk.
         let storage = Storage::create(&meta, &self.downloads_dir, false).map_err(AddError::Io)?;
         let have = storage.verify_all().map_err(AddError::Io)?;
-        let total_pieces = piece_count(&meta);
         let priorities = vec![1u8; meta.files.len()];
 
+        let hosted = Hosted {
+            meta,
+            have,
+            priorities,
+            uploaded: 0,
+            downloaded: 0,
+            paused: false,
+        };
         let hex = hex(&info_hash);
         atomic_write(&self.state_dir.join(format!("{hex}.torrent")), bytes)
             .map_err(AddError::Io)?;
-        let resume = Resume {
-            info_hash,
-            num_pieces: total_pieces,
-            have: have.as_bytes().to_vec(),
-            // verify_all only sets a bit once the piece hashes, so verified == have.
-            verified: have.as_bytes().to_vec(),
-            priorities: priorities.clone(),
-            uploaded: 0,
-            downloaded: 0,
-            trackers: meta.trackers.clone(),
-        };
-        atomic_write(
-            &self.state_dir.join(format!("{hex}.resume")),
-            &resume.encode(),
-        )
-        .map_err(AddError::Io)?;
-
-        self.torrents.insert(
-            info_hash,
-            Hosted {
-                meta,
-                have: have.count(),
-                total_pieces,
-                priorities,
-                uploaded: 0,
-                downloaded: 0,
-                paused: false,
-            },
-        );
+        self.write_resume(&info_hash, &hosted)
+            .map_err(AddError::Io)?;
+        self.torrents.insert(info_hash, hosted);
         Ok(info_hash)
+    }
+
+    /// Pause or resume a torrent, persisting the change.
+    ///
+    /// # Errors
+    ///
+    /// [`ActionError::NotFound`] or a filesystem error.
+    pub(crate) fn set_paused(
+        &mut self,
+        info_hash: &[u8; 20],
+        paused: bool,
+    ) -> Result<(), ActionError> {
+        let hosted = self
+            .torrents
+            .get_mut(info_hash)
+            .ok_or(ActionError::NotFound)?;
+        hosted.paused = paused;
+        let resume = hosted.resume(*info_hash);
+        write_resume_file(&self.state_dir, info_hash, &resume).map_err(ActionError::Io)
+    }
+
+    /// Set per-file priorities (one byte per file, `0` skip / `1` normal /
+    /// `2` high), persisting the change. Returns the number of files.
+    ///
+    /// # Errors
+    ///
+    /// [`ActionError::NotFound`], [`ActionError::BadInput`] if the count or a
+    /// value is wrong, or a filesystem error.
+    pub(crate) fn set_priorities(
+        &mut self,
+        info_hash: &[u8; 20],
+        priorities: Vec<u8>,
+    ) -> Result<usize, ActionError> {
+        let hosted = self
+            .torrents
+            .get_mut(info_hash)
+            .ok_or(ActionError::NotFound)?;
+        if priorities.len() != hosted.meta.files.len() {
+            return Err(ActionError::BadInput(
+                "priority count must equal the file count",
+            ));
+        }
+        if priorities.iter().any(|&p| p > 2) {
+            return Err(ActionError::BadInput("priorities must be 0, 1, or 2"));
+        }
+        let count = priorities.len();
+        hosted.priorities = priorities;
+        let resume = hosted.resume(*info_hash);
+        write_resume_file(&self.state_dir, info_hash, &resume).map_err(ActionError::Io)?;
+        Ok(count)
+    }
+
+    /// Re-verify a torrent's data against the piece hashes on disk, updating
+    /// and persisting its have set. Returns the verified piece count.
+    ///
+    /// # Errors
+    ///
+    /// [`ActionError::NotFound`] or a filesystem error.
+    pub(crate) fn verify(&mut self, info_hash: &[u8; 20]) -> Result<u32, ActionError> {
+        let hosted = self
+            .torrents
+            .get_mut(info_hash)
+            .ok_or(ActionError::NotFound)?;
+        let storage =
+            Storage::create(&hosted.meta, &self.downloads_dir, false).map_err(ActionError::Io)?;
+        hosted.have = storage.verify_all().map_err(ActionError::Io)?;
+        let count = hosted.have.count();
+        let resume = hosted.resume(*info_hash);
+        write_resume_file(&self.state_dir, info_hash, &resume).map_err(ActionError::Io)?;
+        Ok(count)
+    }
+
+    /// A torrent's full detail as JSON (files, priorities, trackers), or `None`
+    /// if it is not hosted.
+    pub(crate) fn detail(&self, info_hash: &[u8; 20]) -> Option<Value> {
+        self.torrents.get(info_hash).map(Hosted::to_detail_json)
+    }
+
+    /// Persist `hosted`'s resume record.
+    fn write_resume(&self, info_hash: &[u8; 20], hosted: &Hosted) -> io::Result<()> {
+        write_resume_file(&self.state_dir, info_hash, &hosted.resume(*info_hash))
     }
 
     /// Remove a torrent, deleting its state files and — if `delete_data` — its
@@ -230,17 +329,15 @@ impl Registry {
             return Err("resume file does not match the .torrent".to_owned());
         }
         let have = Bitfield::from_bytes(&resume.have, resume.num_pieces)
-            .map(|b| b.count())
             .map_err(|_| "resume have-bitfield is inconsistent".to_owned())?;
         self.torrents.insert(
             info_hash,
             Hosted {
                 have,
-                total_pieces: piece_count(&meta),
                 priorities: resume.priorities,
                 uploaded: resume.uploaded,
                 downloaded: resume.downloaded,
-                paused: false,
+                paused: resume.paused,
                 meta,
             },
         );
@@ -249,19 +346,27 @@ impl Registry {
 }
 
 impl Hosted {
-    fn to_json(&self) -> Value {
-        let progress = if self.total_pieces == 0 {
-            0.0
-        } else {
-            f64::from(self.have) / f64::from(self.total_pieces)
-        };
-        let state = if self.paused {
+    /// The state string shown in listings.
+    fn state(&self) -> &'static str {
+        if self.paused {
             "paused"
-        } else if self.have == self.total_pieces {
+        } else if self.have.count() == self.have.len() {
             "complete"
         } else {
             "downloading"
-        };
+        }
+    }
+
+    fn progress(&self) -> f64 {
+        if self.have.is_empty() {
+            0.0
+        } else {
+            f64::from(self.have.count()) / f64::from(self.have.len())
+        }
+    }
+
+    /// The summary object shown in `list`.
+    fn to_json(&self) -> Value {
         let priorities = self
             .priorities
             .iter()
@@ -274,16 +379,53 @@ impl Hosted {
             ),
             ("name".to_owned(), Value::from(self.meta.name.clone())),
             ("size".to_owned(), Value::UInt(self.meta.total_length)),
-            (
-                "pieces".to_owned(),
-                Value::UInt(u64::from(self.total_pieces)),
-            ),
-            ("have".to_owned(), Value::UInt(u64::from(self.have))),
-            ("progress".to_owned(), Value::Float(progress)),
+            ("pieces".to_owned(), Value::UInt(u64::from(self.have.len()))),
+            ("have".to_owned(), Value::UInt(u64::from(self.have.count()))),
+            ("progress".to_owned(), Value::Float(self.progress())),
             ("uploaded".to_owned(), Value::UInt(self.uploaded)),
             ("downloaded".to_owned(), Value::UInt(self.downloaded)),
-            ("state".to_owned(), Value::from(state)),
+            ("state".to_owned(), Value::from(self.state())),
             ("priorities".to_owned(), Value::Array(priorities)),
+        ])
+    }
+
+    /// The full detail object shown in `show`, adding per-file and tracker info.
+    fn to_detail_json(&self) -> Value {
+        let files = self
+            .meta
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, file)| {
+                let priority = self.priorities.get(i).copied().unwrap_or(1);
+                Value::Object(vec![
+                    ("path".to_owned(), Value::from(file.path.join("/"))),
+                    ("length".to_owned(), Value::UInt(file.length)),
+                    ("priority".to_owned(), Value::UInt(u64::from(priority))),
+                ])
+            })
+            .collect();
+        let trackers = self
+            .meta
+            .trackers
+            .iter()
+            .flatten()
+            .map(|url| Value::from(url.clone()))
+            .collect();
+        Value::Object(vec![
+            (
+                "info_hash".to_owned(),
+                Value::from(hex(&self.meta.info_hash.0)),
+            ),
+            ("name".to_owned(), Value::from(self.meta.name.clone())),
+            ("size".to_owned(), Value::UInt(self.meta.total_length)),
+            ("pieces".to_owned(), Value::UInt(u64::from(self.have.len()))),
+            ("have".to_owned(), Value::UInt(u64::from(self.have.count()))),
+            ("progress".to_owned(), Value::Float(self.progress())),
+            ("state".to_owned(), Value::from(self.state())),
+            ("private".to_owned(), Value::Bool(self.meta.private)),
+            ("files".to_owned(), Value::Array(files)),
+            ("trackers".to_owned(), Value::Array(trackers)),
         ])
     }
 }
@@ -298,9 +440,12 @@ fn remove_file_ok(path: &Path) -> Result<(), RemoveError> {
     }
 }
 
-/// Piece count of a torrent, saturating (any torrent clove accepts fits u32).
-fn piece_count(meta: &MetaInfo) -> u32 {
-    u32::try_from(meta.pieces.len()).unwrap_or(u32::MAX)
+/// Write a resume record atomically to `state/<info-hash>.resume`.
+fn write_resume_file(state_dir: &Path, info_hash: &[u8; 20], resume: &Resume) -> io::Result<()> {
+    atomic_write(
+        &state_dir.join(format!("{}.resume", hex(info_hash))),
+        &resume.encode(),
+    )
 }
 
 /// Parse a 40-char lowercase-hex info-hash into 20 bytes.

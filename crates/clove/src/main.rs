@@ -1,10 +1,10 @@
 //! `clove(1)` — control CLI for `cloved`.
 //!
 //! A thin client: hand-rolled arg parsing, one request per invocation over the
-//! local API (unix socket), rendering the daemon's JSON. This slice implements
-//! `clove status`; the remaining commands, aligned-table rendering (which needs
-//! the JSON parser), and `clove watch` arrive in later Phase-F slices
-//! (`docs/PHASE-F.md`).
+//! local API (unix socket), rendering the daemon's JSON (`--json` passes it
+//! through). Commands: `status`, `list`, `show`, `add`, `remove`, `pause`,
+//! `resume`, `verify`, `priorities`, `completions`. The live `clove watch` view
+//! is a later Phase-F slice (`docs/PHASE-F.md`).
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -79,6 +79,12 @@ fn run() -> Result<(), Fail> {
         Some("list") => cmd_list(socket, json),
         Some("add") => cmd_add(socket, &operands),
         Some("remove") => cmd_remove(socket, &operands),
+        Some("show") => cmd_show(socket, json, &operands),
+        Some("pause") => cmd_action(socket, &operands, "pause", "paused"),
+        Some("resume") => cmd_action(socket, &operands, "resume", "resumed"),
+        Some("verify") => cmd_verify(socket, &operands),
+        Some("priorities") => cmd_priorities(socket, &operands),
+        Some("completions") => cmd_completions(&operands),
         Some(other) => Err(Fail::Usage(format!(
             "unknown command {other:?} (try --help)"
         ))),
@@ -89,10 +95,25 @@ fn run() -> Result<(), Fail> {
 fn print_help() {
     println!("usage: clove [--socket <path>] <command>");
     println!("commands:");
-    println!("  status [--json]              daemon and router status");
-    println!("  list [--json]                hosted torrents");
-    println!("  add <file.torrent|magnet:…>  add a torrent");
-    println!("  remove <info-hash> [--data]  remove a torrent (--data also deletes files)");
+    println!("  status [--json]                daemon and router status");
+    println!("  list [--json]                  hosted torrents");
+    println!("  show <info-hash> [--json]      one torrent in detail");
+    println!("  add <file.torrent|magnet:…>    add a torrent");
+    println!("  remove <info-hash> [--data]    remove a torrent (--data also deletes files)");
+    println!("  pause <info-hash>              pause a torrent");
+    println!("  resume <info-hash>             resume a torrent");
+    println!("  verify <info-hash>             re-check data on disk");
+    println!("  priorities <info-hash> <spec>  set per-file priorities (e.g. 1,0,2)");
+    println!("  completions <bash|zsh|fish>    print a shell completion script");
+}
+
+/// Extract the single required info-hash operand.
+fn one_info_hash(operands: &[String]) -> Result<&str, Fail> {
+    match operands {
+        [ih] => Ok(ih),
+        [] => Err(Fail::Usage("this command needs an info-hash".to_owned())),
+        _ => Err(Fail::Usage("too many arguments".to_owned())),
+    }
 }
 
 fn cmd_status(socket: Option<PathBuf>, json: bool) -> Result<(), Fail> {
@@ -156,6 +177,168 @@ fn cmd_remove(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> 
     request(&socket, &token, "DELETE", &target, &[])?;
     println!("removed {info_hash}");
     Ok(())
+}
+
+fn cmd_show(socket: Option<PathBuf>, json: bool, operands: &[String]) -> Result<(), Fail> {
+    let info_hash = one_info_hash(operands)?;
+    let (socket, token) = resolve(socket)?;
+    let body = request(
+        &socket,
+        &token,
+        "GET",
+        &format!("/v1/torrents/{info_hash}"),
+        &[],
+    )?;
+    if json {
+        println!("{}", String::from_utf8_lossy(&body).trim_end());
+        return Ok(());
+    }
+    print!("{}", render_detail(&parse_body(&body)?));
+    Ok(())
+}
+
+/// A `POST /v1/torrents/{ih}/{action}` with no body; prints `<done> <ih>`.
+fn cmd_action(
+    socket: Option<PathBuf>,
+    operands: &[String],
+    action: &str,
+    done: &str,
+) -> Result<(), Fail> {
+    let info_hash = one_info_hash(operands)?;
+    let (socket, token) = resolve(socket)?;
+    request(
+        &socket,
+        &token,
+        "POST",
+        &format!("/v1/torrents/{info_hash}/{action}"),
+        &[],
+    )?;
+    println!("{done} {info_hash}");
+    Ok(())
+}
+
+fn cmd_verify(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
+    let info_hash = one_info_hash(operands)?;
+    let (socket, token) = resolve(socket)?;
+    let reply = request(
+        &socket,
+        &token,
+        "POST",
+        &format!("/v1/torrents/{info_hash}/verify"),
+        &[],
+    )?;
+    let verified = parse_body(&reply)?
+        .get("verified")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    println!("verified {verified} piece(s) for {info_hash}");
+    Ok(())
+}
+
+fn cmd_priorities(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
+    let [info_hash, spec] = operands else {
+        return Err(Fail::Usage(
+            "priorities needs <info-hash> and a spec like 1,0,2".to_owned(),
+        ));
+    };
+    let (socket, token) = resolve(socket)?;
+    request(
+        &socket,
+        &token,
+        "PUT",
+        &format!("/v1/torrents/{info_hash}/priorities"),
+        spec.as_bytes(),
+    )?;
+    println!("set priorities for {info_hash}");
+    Ok(())
+}
+
+/// Print a shell completion script (no daemon needed).
+fn cmd_completions(operands: &[String]) -> Result<(), Fail> {
+    let shell = operands
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| Fail::Usage("completions needs a shell: bash, zsh, or fish".to_owned()))?;
+    let script = match shell {
+        "bash" => include_str!("completions/clove.bash"),
+        "zsh" => include_str!("completions/_clove.zsh"),
+        "fish" => include_str!("completions/clove.fish"),
+        other => {
+            return Err(Fail::Usage(format!(
+                "unsupported shell {other:?} (bash, zsh, or fish)"
+            )));
+        }
+    };
+    print!("{script}");
+    Ok(())
+}
+
+/// Render a torrent's detail: scalar fields, then a files table and trackers.
+fn render_detail(value: &Value) -> String {
+    let mut out = String::new();
+    for key in [
+        "name",
+        "info_hash",
+        "size",
+        "pieces",
+        "have",
+        "progress",
+        "state",
+        "private",
+    ] {
+        let Some(field) = value.get(key) else {
+            continue;
+        };
+        let rendered = match key {
+            "size" => field.as_u64().map_or_else(|| field.to_line(), human_size),
+            "progress" => field
+                .as_f64()
+                .map_or_else(|| field.to_line(), |p| format!("{:.0}%", p * 100.0)),
+            _ => field.to_line(),
+        };
+        let _ = writeln!(out, "{key:<9}  {rendered}");
+    }
+    if let Some(files) = value.get("files").and_then(Value::as_array) {
+        out.push_str("\nfiles:\n");
+        let mut rows = Vec::with_capacity(files.len());
+        for file in files {
+            let size = file
+                .get("length")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "-".to_owned(), human_size);
+            let priority = file
+                .get("priority")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "-".to_owned(), priority_name);
+            let path = file
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+                .to_owned();
+            rows.push(vec![size, priority, path]);
+        }
+        out.push_str(&align(&["SIZE", "PRIORITY", "PATH"], &rows));
+    }
+    if let Some(trackers) = value.get("trackers").and_then(Value::as_array)
+        && !trackers.is_empty()
+    {
+        out.push_str("\ntrackers:\n");
+        for tracker in trackers {
+            if let Some(url) = tracker.as_str() {
+                let _ = writeln!(out, "  {url}");
+            }
+        }
+    }
+    out
+}
+
+fn priority_name(priority: u64) -> String {
+    match priority {
+        0 => "skip".to_owned(),
+        1 => "normal".to_owned(),
+        2 => "high".to_owned(),
+        other => other.to_string(),
+    }
 }
 
 /// Parse a daemon response body as JSON.

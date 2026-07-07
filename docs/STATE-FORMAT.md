@@ -3,7 +3,7 @@
 clove's on-disk state is an **API**, not an implementation detail (the SQLite
 doctrine, `SCOPE.md` §3). This file specifies it. The rules:
 
-- Every resume file carries an integer `version` (currently **1**).
+- Every resume file carries an integer `version` (currently **2**).
 - **Newer clove reads older state.** Older clove **refuses newer state
   cleanly** — a clear error, no write, no corruption (worst case: you downgrade
   and re-add the torrent).
@@ -47,6 +47,9 @@ key means version discipline failed somewhere:
 | `uploaded` | int | Lifetime bytes uploaded. |
 | `downloaded` | int | Lifetime bytes downloaded. |
 | `trackers` | list of list of byte-strings | Announce tiers (BEP 12) in current order. |
+| `paused` | int (optional, v2+) | `1` if paused. Absent (a v1 file) reads as `0`. |
+
+Version history: **v1** initial; **v2** added the optional `paused` flag.
 
 `have` and `verified` are stored separately on purpose: a crash between writing
 a piece and verifying it costs a re-verification, never false trust.

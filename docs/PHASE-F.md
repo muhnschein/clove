@@ -128,8 +128,11 @@ budget-spending decision — not smuggled in with M4.
    magnet add (needs metadata fetch) and actually **downloading** (creating a
    live `Torrent` and attaching peers) — hosted torrents currently show the
    progress that verified on disk.
-4. **Remaining commands**: detail view, pause/resume/verify/announce,
-   priorities, stats; completions; `cloved -C` config check.
+4. **Command surface — landed:** `show` (detail view), `pause`/`resume`
+   (persisted via a resume **v2** `paused` field), `verify` (re-check disk),
+   `priorities`, and `completions` (bash/zsh/fish) — the router-free commands,
+   with `POST/PUT /v1/torrents/{ih}/…` endpoints. Deferred to the SAM slice:
+   `announce` (needs the tracker over a live session) and live up/down `stats`.
 5. **`clove watch`**: the hand-rolled live view (§6).
 
 Layer-2 self-restriction (Landlock/seccomp) and man pages are Phase G, not here.
