@@ -70,6 +70,11 @@ pub struct Torrent {
 struct Shared {
     info_hash: [u8; 20],
     peer_id: [u8; 20],
+    /// Lifetime bytes served to peers this run.
+    uploaded: std::sync::atomic::AtomicU64,
+    /// Lifetime payload bytes received this run (counted when a solicited
+    /// block is written, before verification).
+    downloaded: std::sync::atomic::AtomicU64,
     storage: Arc<Storage>,
     num_pieces: u32,
     max_frame: u32,
@@ -152,6 +157,8 @@ impl Torrent {
         let shared = Arc::new(Shared {
             info_hash: meta.info_hash.0,
             peer_id,
+            uploaded: std::sync::atomic::AtomicU64::new(0),
+            downloaded: std::sync::atomic::AtomicU64::new(0),
             storage,
             num_pieces,
             max_frame,
@@ -260,6 +267,18 @@ impl Torrent {
     #[must_use]
     pub fn peer_id(&self) -> [u8; 20] {
         self.shared.peer_id
+    }
+
+    /// Bytes (uploaded, downloaded) since this engine instance started —
+    /// what announces report; lifetime totals are the registry's resume data
+    /// plus these deltas.
+    #[must_use]
+    pub fn stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.shared.uploaded.load(Ordering::Relaxed),
+            self.shared.downloaded.load(Ordering::Relaxed),
+        )
     }
 
     /// Our side of the BEP 3 handshake.
@@ -646,9 +665,12 @@ impl Shared {
         if !was_requested {
             // Unsolicited or already-satisfied block; ignore the payload but
             // still try to keep the pipeline full below.
-        } else if self.storage.write_block(index, begin, block).is_ok()
-            && st.picker.block_received(index, block_no)
-        {
+        } else if self.storage.write_block(index, begin, block).is_ok() {
+            self.downloaded
+                .fetch_add(block.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            if !st.picker.block_received(index, block_no) {
+                return;
+            }
             // Piece complete: verify from disk before trusting it.
             match self.storage.verify_piece(index) {
                 Ok(true) => {
@@ -675,6 +697,8 @@ impl Shared {
             return;
         }
         if let Ok(data) = self.storage.read_block(req.index, req.begin, req.length) {
+            self.uploaded
+                .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let peer = &mut st.peers[idx];
             peer.uploaded += data.len() as u64;
             out.push((

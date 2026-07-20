@@ -217,6 +217,46 @@ impl Announcer {
     }
 }
 
+/// Fire one best-effort `stopped` announce to every URL on a detached
+/// thread — a graceful goodbye on pause/remove/shutdown. Failures are
+/// swallowed: the tracker times us out anyway.
+pub fn announce_stopped<D, N>(
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+    target: AnnounceTarget,
+    dialer: D,
+    naming: N,
+    dial_timeout: Duration,
+) where
+    D: I2pDialer + Send + 'static,
+    N: I2pNamingLookup + Send + 'static,
+{
+    std::thread::spawn(move || {
+        for url in &target.urls {
+            let params = tracker::AnnounceParams {
+                info_hash,
+                peer_id,
+                uploaded: 0,
+                downloaded: 0,
+                left: 0,
+                event: tracker::Event::Stopped,
+                numwant: 0,
+                our_dest_b64: &target.our_dest_b64,
+            };
+            let Ok((host, request)) = tracker::build_announce(url, &params) else {
+                continue;
+            };
+            let Ok(dest) = naming.lookup(&host) else {
+                continue;
+            };
+            let Ok(mut stream) = dialer.dial(dest, dial_timeout) else {
+                continue;
+            };
+            let _ = tracker::announce_over(&mut stream, &request);
+        }
+    });
+}
+
 /// Seconds since the unix epoch — the announce state machine's clock.
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -284,11 +324,12 @@ where
             .total_length
             .saturating_sub(done.min(target.total_length))
     };
+    let (uploaded, downloaded) = torrent.stats();
     let params = tracker::AnnounceParams {
         info_hash: torrent.info_hash(),
         peer_id: torrent.peer_id(),
-        uploaded: 0,   // live stats land with the stats work
-        downloaded: 0, // (documented gap, PHASE-F 5d)
+        uploaded,
+        downloaded,
         left,
         event: state.next_event(complete),
         numwant: config.numwant,

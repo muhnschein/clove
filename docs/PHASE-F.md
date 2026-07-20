@@ -173,10 +173,14 @@ budget-spending decision — not smuggled in with M4.
      tiers (fine for I2P's 1–2-tracker torrents; revisit live). Wired into the
      registry: a live torrent with trackers announces automatically; the
      session's base64 destination is the announce `ip`. Mock-proven: a leecher
-     knowing only a tracker URL bootstraps a full download. Still deferred:
-     BEP 9 **magnet add**, live up/down **stats** (announces report 0),
-     graceful `stopped` announce, naming *cache* (R6 — lookups are per
-     announce for now).
+     knowing only a tracker URL bootstraps a full download. Follow-up commit
+     landed: **live stats** (Torrent counts uploaded/downloaded; announces
+     report per-run deltas; registry persists lifetime totals as base +
+     delta), **graceful `stopped` announce** (best-effort, detached, fired
+     from stop_live), and the **naming cache** (`i2pnet::naming::NamingCache`,
+     R6 — positive results cached forever, negative results back off 30s
+     doubling to 30min; shared per session, wired in front of the announcer).
+     Still deferred: BEP 9 **magnet add** (next increment).
 6. **`clove watch`**: the hand-rolled live view (§6).
 
 Layer-2 self-restriction (Landlock/seccomp) and man pages are Phase G, not here.

@@ -30,6 +30,7 @@ use std::time::Duration;
 pub mod addr;
 pub mod api;
 pub mod mock;
+pub mod naming;
 pub mod sam;
 pub mod supervisor;
 
