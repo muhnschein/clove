@@ -117,3 +117,10 @@ pub trait I2pNamingLookup {
     /// rejected here, never resolved via DNS.
     fn lookup(&self, name: &str) -> io::Result<DestHash>;
 }
+
+/// As with dialing, an `Arc`'d resolver resolves.
+impl<T: I2pNamingLookup> I2pNamingLookup for std::sync::Arc<T> {
+    fn lookup(&self, name: &str) -> io::Result<DestHash> {
+        T::lookup(self, name)
+    }
+}

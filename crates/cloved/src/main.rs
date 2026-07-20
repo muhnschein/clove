@@ -118,7 +118,7 @@ fn run() -> Result<(), String> {
         router: Mutex::new("connecting"),
     });
 
-    spawn_sam_bringup(&daemon, &config.sam_address);
+    spawn_sam_supervisor(&daemon, &config.sam_address);
     spawn_persist_loop(&daemon);
     serve(&listener, &daemon)
 }
@@ -133,11 +133,14 @@ struct Daemon {
     router: Mutex<&'static str>,
 }
 
-/// Bring the SAM session up in the background, retrying on the supervisor's
-/// backoff, then attach the network to the registry. Mid-run session *loss*
-/// re-detection is not wired yet (the demux accept loop just ends) — that is
-/// the supervisor-integration follow-up, exercised in live testing.
-fn spawn_sam_bringup(daemon: &Arc<Daemon>, sam_address: &str) {
+/// How often the SAM session's health is probed once connected.
+const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Supervise the SAM session in the background: connect on the reconnect
+/// policy's backoff, attach the network, then probe health; on session loss,
+/// tear the session tree down (detach the registry, stop and poke the demux's
+/// accept loop) and rebuild — the SCOPE §4 reconnect discipline.
+fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str) {
     // yosemite speaks SAM on 127.0.0.1:<port> only; a unix-socket SAM path
     // cannot be used by this backend.
     let Some(port) = sam_address
@@ -151,48 +154,65 @@ fn spawn_sam_bringup(daemon: &Arc<Daemon>, sam_address: &str) {
     let daemon = Arc::clone(daemon);
     std::thread::spawn(move || {
         let policy = ReconnectPolicy::default();
-        let mut failures = 0u32;
         loop {
-            match SamSession::connect(&SamConfig {
-                samv3_tcp_port: port,
-                nickname: "clove".to_owned(),
-                // Q4 persistent identity lands once key export is confirmed
-                // against a live router; until then every run is transient.
-                persistent_key: None,
-            }) {
-                Ok(session) => {
-                    let session = Arc::new(session);
-                    let dest = session.local_dest();
-                    match SamListener::forward(Arc::clone(&session)) {
-                        Ok(listener) => {
-                            eprintln!("cloved: router connected; we are {}", dest.to_b32());
-                            let demux = InboundDemux::new(SwarmConfig::default().max_peers);
-                            let _accept = demux.run(listener);
-                            lock(&daemon.registry).attach_network(
-                                session,
-                                demux,
-                                build_peer_id(),
-                                SwarmConfig::default(),
-                            );
-                            *lock(&daemon.router) = "connected";
-                            return;
+            let mut failures = 0u32;
+            // Phase 1: bring the session tree up, backing off on failure.
+            let (session, listener) = loop {
+                match connect_session(port) {
+                    Ok(pair) => break pair,
+                    Err(e) => {
+                        if failures == 0 {
+                            eprintln!("cloved: waiting for router (SAM at 127.0.0.1:{port}): {e}");
                         }
-                        Err(e) => {
-                            eprintln!("cloved: STREAM FORWARD failed: {e}; retrying");
-                        }
+                        failures = failures.saturating_add(1);
+                        *lock(&daemon.router) = "waiting-for-router";
+                        std::thread::sleep(policy.base_delay(failures));
                     }
                 }
-                Err(e) => {
-                    if failures == 0 {
-                        eprintln!("cloved: waiting for router (SAM at 127.0.0.1:{port}): {e}");
-                    }
+            };
+            let dest = session.local_dest();
+            let forward_port = listener.local_port();
+            eprintln!("cloved: router connected; we are {}", dest.to_b32());
+            let demux = InboundDemux::new(SwarmConfig::default().max_peers);
+            let _accept = demux.run(listener);
+            lock(&daemon.registry).attach_network(
+                Arc::clone(&session),
+                Arc::clone(&demux),
+                build_peer_id(),
+                SwarmConfig::default(),
+                session.local_dest_b64().to_owned(),
+            );
+            *lock(&daemon.router) = "connected";
+
+            // Phase 2: watch the session until it dies.
+            loop {
+                std::thread::sleep(HEALTH_INTERVAL);
+                if !session.healthy() {
+                    break;
                 }
             }
-            failures = failures.saturating_add(1);
+
+            // Phase 3: teardown, then rebuild from phase 1.
+            eprintln!("cloved: router lost; torrents wait while the session tree rebuilds");
             *lock(&daemon.router) = "waiting-for-router";
-            std::thread::sleep(policy.base_delay(failures));
+            demux.stop();
+            let _ = i2pnet::sam::poke_listener(forward_port);
+            lock(&daemon.registry).detach_network();
         }
     });
+}
+
+/// One session bring-up: connect and establish the forwarded listener.
+fn connect_session(port: u16) -> std::io::Result<(Arc<SamSession>, SamListener)> {
+    let session = Arc::new(SamSession::connect(&SamConfig {
+        samv3_tcp_port: port,
+        nickname: "clove".to_owned(),
+        // Q4 persistent identity lands once key export is confirmed against
+        // a live router; until then every run is transient.
+        persistent_key: None,
+    })?);
+    let listener = SamListener::forward(Arc::clone(&session))?;
+    Ok((session, listener))
 }
 
 /// Periodically snapshot live progress into resume files.

@@ -159,11 +159,24 @@ budget-spending decision — not smuggled in with M4.
      persistence needs live key-export confirmation) and attaches the network
      when it lands. Mock-proven: registry-level download to 100% with
      persistence across reopen; pause/resume lifecycle; waiting-for-router.
-     **Known gaps for live testing:** mid-run session-loss re-detection (the
-     demux accept loop just ends), peer disconnect on pause (existing
-     connections drain), live up/down stats.
-   - **5d. Tracker + magnet over the live session**: announce loop feeding
-     `add_peers`, naming cache, BEP 9 magnet add, live stats.
+     ~~Known gaps~~ both closed in 5d's commit: **session-loss supervision**
+     (SAM `PING` health probe every 30s; on failure the session tree is torn
+     down — demux stopped and poked awake, registry detached, torrents back
+     to waiting-for-router — and rebuilt on the reconnect backoff) and
+     **pause disconnect** (`Torrent::disconnect_all` empties the peer table
+     and stops transfer; idle reader threads reclaim with the R5
+     keep-alive/timeout work).
+   - **5d. Tracker announcer — landed:** `clove-core::swarm::Announcer` — per
+     -torrent announce loop (resolve host via SAM naming → dial → HTTP
+     announce → `add_peers`), scheduled per URL by `AnnounceState` (interval
+     floor, failure backoff). URLs tracked independently, not strict BEP 12
+     tiers (fine for I2P's 1–2-tracker torrents; revisit live). Wired into the
+     registry: a live torrent with trackers announces automatically; the
+     session's base64 destination is the announce `ip`. Mock-proven: a leecher
+     knowing only a tracker URL bootstraps a full download. Still deferred:
+     BEP 9 **magnet add**, live up/down **stats** (announces report 0),
+     graceful `stopped` announce, naming *cache* (R6 — lookups are per
+     announce for now).
 6. **`clove watch`**: the hand-rolled live view (§6).
 
 Layer-2 self-restriction (Landlock/seccomp) and man pages are Phase G, not here.

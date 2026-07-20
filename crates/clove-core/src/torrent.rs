@@ -232,11 +232,34 @@ impl Torrent {
         lock(&self.shared.state).picker.have_field().clone()
     }
 
+    /// Disconnect every attached peer: each is removed from the peer table
+    /// (withdrawing its availability and releasing its in-flight blocks) and
+    /// its outgoing queue is dropped, so its writer thread exits and no
+    /// further data moves in either direction. Reader threads linger inertly
+    /// on their blocking reads until the remote closes — reclaiming them
+    /// needs the keep-alive/read-timeout work (R5).
+    pub fn disconnect_all(&self) {
+        let ids: Vec<u64> = lock(&self.shared.state)
+            .peers
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        for id in ids {
+            self.shared.remove_peer(id);
+        }
+    }
+
     /// This torrent's info-hash — its identity on trackers, the wire, and in
     /// the inbound demux.
     #[must_use]
     pub fn info_hash(&self) -> [u8; 20] {
         self.shared.info_hash
+    }
+
+    /// Our peer id on the wire and in announces (Q7).
+    #[must_use]
+    pub fn peer_id(&self) -> [u8; 20] {
+        self.shared.peer_id
     }
 
     /// Our side of the BEP 3 handshake.

@@ -28,9 +28,10 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use i2pnet::{DestHash, I2pDialer, I2pListener, I2pStream};
+use i2pnet::{DestHash, I2pDialer, I2pListener, I2pNamingLookup, I2pStream};
 
 use crate::torrent::Torrent;
+use crate::tracker;
 use crate::wire::{self, Handshake};
 
 /// Swarm-runner timing and limits. Every field exists to be tuned once live
@@ -127,6 +128,182 @@ impl Swarm {
     }
 }
 
+/// Announcer timing. Tunable (R5); the state machine's own scheduling
+/// ([`AnnounceState`]) governs per-tracker cadence — this is just the poll
+/// tick and transport limits.
+#[derive(Clone, Debug)]
+pub struct AnnouncerConfig {
+    /// How often due-ness is checked.
+    pub poll_interval: Duration,
+    /// Dial timeout for reaching a tracker.
+    pub dial_timeout: Duration,
+    /// Peers requested per announce.
+    pub numwant: u32,
+}
+
+impl Default for AnnouncerConfig {
+    fn default() -> Self {
+        AnnouncerConfig {
+            poll_interval: Duration::from_secs(5),
+            dial_timeout: Duration::from_secs(120),
+            numwant: 50,
+        }
+    }
+}
+
+/// The tracker announce loop for one torrent: resolves each announce URL's
+/// host (SAM naming), dials the tracker over I2P, performs the HTTP announce
+/// (`tracker::announce_over`), and feeds returned peers into
+/// [`Torrent::add_peers`] for the swarm's dial sweep. Scheduling and backoff
+/// per URL follow [`AnnounceState`] (interval floor, exponential failure
+/// backoff — `PROTOCOL.i2p-bt` §5.3).
+///
+/// Each URL is currently tracked independently rather than with strict BEP 12
+/// tier semantics (fine for the one-or-two-tracker torrents typical on I2P;
+/// revisit against live swarms).
+pub struct Announcer {
+    stop: Arc<StopFlag>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// What the announcer announces: the URLs and our torrent-shape facts.
+pub struct AnnounceTarget {
+    /// Announce URLs (flattened tiers; see the tier note on [`Announcer`]).
+    pub urls: Vec<String>,
+    /// Our session's full base64 destination — the announce `ip` parameter.
+    pub our_dest_b64: String,
+    /// The torrent's piece length in bytes, sizing the `left` report.
+    pub piece_length: u64,
+    /// The torrent's total length in bytes.
+    pub total_length: u64,
+}
+
+impl Announcer {
+    /// Start announcing `torrent` per `target`.
+    pub fn spawn<D, N>(
+        torrent: Arc<Torrent>,
+        target: AnnounceTarget,
+        dialer: D,
+        naming: N,
+        config: AnnouncerConfig,
+    ) -> Announcer
+    where
+        D: I2pDialer + Send + 'static,
+        N: I2pNamingLookup + Send + 'static,
+    {
+        let stop = Arc::new(StopFlag::default());
+        let loop_stop = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            announce_loop(&torrent, &target, &dialer, &naming, &config, &loop_stop);
+        });
+        Announcer {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Signal the loop to stop without waiting (it exits after any in-flight
+    /// announce).
+    pub fn request_stop(&self) {
+        self.stop.raise();
+    }
+
+    /// Signal the loop to stop and wait for it to finish.
+    pub fn shutdown(mut self) {
+        self.stop.raise();
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Seconds since the unix epoch — the announce state machine's clock.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn announce_loop<D, N>(
+    torrent: &Arc<Torrent>,
+    target: &AnnounceTarget,
+    dialer: &D,
+    naming: &N,
+    config: &AnnouncerConfig,
+    stop: &StopFlag,
+) where
+    D: I2pDialer,
+    N: I2pNamingLookup,
+{
+    let mut states: Vec<tracker::AnnounceState> = target
+        .urls
+        .iter()
+        .map(|_| tracker::AnnounceState::new())
+        .collect();
+    loop {
+        for (url, state) in target.urls.iter().zip(states.iter_mut()) {
+            if stop.is_raised() {
+                return;
+            }
+            if !state.due(unix_now()) {
+                continue;
+            }
+            match announce_once(torrent, url, state, target, dialer, naming, config) {
+                Ok(interval) => state.on_success(unix_now(), interval),
+                Err(_) => state.on_failure(unix_now()),
+            }
+        }
+        if stop.wait(config.poll_interval) {
+            return;
+        }
+    }
+}
+
+/// One announce to one tracker: build, resolve, dial, exchange, feed peers.
+fn announce_once<D, N>(
+    torrent: &Arc<Torrent>,
+    url: &str,
+    state: &tracker::AnnounceState,
+    target: &AnnounceTarget,
+    dialer: &D,
+    naming: &N,
+    config: &AnnouncerConfig,
+) -> Result<u32, tracker::Error>
+where
+    D: I2pDialer,
+    N: I2pNamingLookup,
+{
+    let have = torrent.have();
+    let complete = have.count() == have.len();
+    let done = u64::from(have.count()).saturating_mul(target.piece_length);
+    let left = if complete {
+        0
+    } else {
+        target
+            .total_length
+            .saturating_sub(done.min(target.total_length))
+    };
+    let params = tracker::AnnounceParams {
+        info_hash: torrent.info_hash(),
+        peer_id: torrent.peer_id(),
+        uploaded: 0,   // live stats land with the stats work
+        downloaded: 0, // (documented gap, PHASE-F 5d)
+        left,
+        event: state.next_event(complete),
+        numwant: config.numwant,
+        our_dest_b64: &target.our_dest_b64,
+    };
+    let (host, request) = tracker::build_announce(url, &params)?;
+    let dest = naming.lookup(&host).map_err(tracker::Error::Io)?;
+    let mut stream = dialer
+        .dial(dest, config.dial_timeout)
+        .map_err(tracker::Error::Io)?;
+    let response = tracker::announce_over(&mut stream, &request)?;
+    torrent.add_peers(&response.peers);
+    Ok(response.interval)
+}
+
 /// One dial sweep after another until stopped, with per-peer retry backoff.
 fn dial_loop<D>(torrent: &Arc<Torrent>, dialer: &D, stop: &StopFlag, config: SwarmConfig)
 where
@@ -215,6 +392,8 @@ pub struct InboundDemux {
     torrents: Mutex<HashMap<[u8; 20], Arc<Torrent>>>,
     /// Per-torrent attached-peer cap, matching [`SwarmConfig::max_peers`].
     max_peers: usize,
+    /// Raised on session teardown; the accept loop exits at its next accept.
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 impl InboundDemux {
@@ -224,6 +403,7 @@ impl InboundDemux {
         Arc::new(InboundDemux {
             torrents: Mutex::new(HashMap::new()),
             max_peers,
+            stopped: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -236,6 +416,14 @@ impl InboundDemux {
     /// attached are unaffected; new inbound connections for it are dropped.
     pub fn unregister(&self, info_hash: &[u8; 20]) {
         lock_map(&self.torrents).remove(info_hash);
+    }
+
+    /// Raise the stop flag: the accept loop exits at its next accept. A
+    /// blocked accept needs a poke (e.g. `sam::poke_listener`) or the
+    /// session's death to wake it.
+    pub fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Run the accept loop on `listener` until its session dies (the
@@ -251,6 +439,9 @@ impl InboundDemux {
             loop {
                 match listener.accept() {
                     Ok((stream, from)) => {
+                        if demux.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
                         let demux = Arc::clone(&demux);
                         // Per-connection thread: the handshake read must
                         // never stall the accept loop.
@@ -579,6 +770,101 @@ mod tests {
         // The demux reads C's handshake, finds no torrent, and drops the
         // stream; the initiator's attach fails reading the reply.
         assert!(leecher_c.attach(stream, seed_dest).is_err());
+    }
+
+    #[test]
+    fn announcer_bootstraps_a_download_from_a_tracker() {
+        let net = MockNet::new();
+        let (seeder, leecher, _sd, _ld) = seed_and_leech();
+
+        // Seeder accepts inbound (core swarm with listener).
+        let seed_ep = net.endpoint();
+        let seed_dest = seed_ep.dest();
+        let seed_swarm = Swarm::spawn(
+            Arc::clone(&seeder),
+            seed_ep.dialer(),
+            Some(seed_ep),
+            quick_config(),
+        );
+
+        // A mock tracker: reads one HTTP request, replies with a compact
+        // bencoded response naming the seeder, forever.
+        let tracker_ep = net.endpoint();
+        net.register_name("tracker.i2p", tracker_ep.dest());
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _from)) = tracker_ep.accept() {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).map(|n| n == 0).unwrap_or(true) {
+                        break;
+                    }
+                    head.push(byte[0]);
+                }
+                let mut body = b"d8:intervali60e5:peers32:".to_vec();
+                body.extend_from_slice(&seed_dest.0);
+                body.push(b'e');
+                let response = crate::http::Response::new(200, "text/plain", body);
+                let _ = stream.write_all(&response.encode());
+            }
+        });
+
+        // The leecher knows only the tracker URL; peers arrive via announce.
+        let leech_ep = net.endpoint();
+        let leech_swarm = Swarm::dial_only(Arc::clone(&leecher), leech_ep.dialer(), quick_config());
+        let announcer = Announcer::spawn(
+            Arc::clone(&leecher),
+            AnnounceTarget {
+                urls: vec!["http://tracker.i2p/announce".to_owned()],
+                our_dest_b64: "leecher-b64-dest".to_owned(),
+                piece_length: u64::from(BLOCK_LEN),
+                total_length: u64::from(3 * BLOCK_LEN + 100),
+            },
+            leech_ep.dialer(),
+            leech_ep.dialer(),
+            AnnouncerConfig {
+                poll_interval: Duration::from_millis(50),
+                dial_timeout: Duration::from_secs(5),
+                numwant: 8,
+            },
+        );
+
+        assert!(
+            leecher.wait_complete(Duration::from_secs(20)),
+            "tracker-bootstrapped download did not complete"
+        );
+        announcer.shutdown();
+        leech_swarm.shutdown();
+        seed_swarm.shutdown();
+    }
+
+    #[test]
+    fn disconnect_all_empties_the_peer_table() {
+        let net = MockNet::new();
+        let (seeder, leecher, _sd, _ld) = seed_and_leech();
+
+        let seed_ep = net.endpoint();
+        let leech_ep = net.endpoint();
+        let seed_dest = seed_ep.dest();
+
+        let seeder_bg = Arc::clone(&seeder);
+        let accept = std::thread::spawn(move || {
+            let (stream, from) = seed_ep.accept().unwrap();
+            seeder_bg.attach(stream, from).unwrap();
+        });
+        let stream = leech_ep
+            .dialer()
+            .dial(seed_dest, Duration::from_secs(5))
+            .unwrap();
+        leecher.attach(stream, seed_dest).unwrap();
+        accept.join().unwrap();
+        assert_eq!(leecher.connected_peers().len(), 1);
+
+        leecher.disconnect_all();
+        assert!(
+            leecher.connected_peers().is_empty(),
+            "peer table must be empty after disconnect_all"
+        );
     }
 
     #[test]
