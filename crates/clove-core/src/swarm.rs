@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use i2pnet::{DestHash, I2pDialer, I2pListener, I2pStream};
 
 use crate::torrent::Torrent;
+use crate::wire::{self, Handshake};
 
 /// Swarm-runner timing and limits. Every field exists to be tuned once live
 /// I2P behavior is measured (R5); the defaults lean generous because tunnel
@@ -192,6 +193,91 @@ where
     }
 }
 
+/// Routes inbound peers to torrents on a shared destination (Q4: one client
+/// identity serves every torrent), which is the daemon's real inbound shape —
+/// [`Swarm::spawn`]'s per-torrent listener fits single-torrent uses and tests.
+///
+/// The demux owns the session's one listener: for each accepted stream it
+/// reads the peer's BEP 3 handshake on a short-lived thread (so a stalling
+/// peer never blocks the accept loop), looks the info-hash up, and hands the
+/// stream to that torrent via [`Torrent::attach_accepted`]. Unknown
+/// info-hashes and torrents at their peer cap are dropped — the dialing side
+/// sees a refusal.
+pub struct InboundDemux {
+    torrents: Mutex<HashMap<[u8; 20], Arc<Torrent>>>,
+    /// Per-torrent attached-peer cap, matching [`SwarmConfig::max_peers`].
+    max_peers: usize,
+}
+
+impl InboundDemux {
+    /// An empty demux with the given per-torrent peer cap.
+    #[must_use]
+    pub fn new(max_peers: usize) -> Arc<InboundDemux> {
+        Arc::new(InboundDemux {
+            torrents: Mutex::new(HashMap::new()),
+            max_peers,
+        })
+    }
+
+    /// Serve `torrent`'s info-hash. Replaces any previous registration.
+    pub fn register(&self, torrent: &Arc<Torrent>) {
+        lock_map(&self.torrents).insert(torrent.info_hash(), Arc::clone(torrent));
+    }
+
+    /// Stop serving an info-hash (torrent removed/paused). Peers already
+    /// attached are unaffected; new inbound connections for it are dropped.
+    pub fn unregister(&self, info_hash: &[u8; 20]) {
+        lock_map(&self.torrents).remove(info_hash);
+    }
+
+    /// Run the accept loop on `listener` until its session dies (the
+    /// supervisor owns re-establishment; a rebuilt session gets a fresh
+    /// `run`). Returns the loop's thread handle.
+    pub fn run<L>(self: &Arc<Self>, listener: L) -> JoinHandle<()>
+    where
+        L: I2pListener + Send + 'static,
+        L::Stream: 'static,
+    {
+        let demux = Arc::clone(self);
+        std::thread::spawn(move || {
+            loop {
+                match listener.accept() {
+                    Ok((stream, from)) => {
+                        let demux = Arc::clone(&demux);
+                        // Per-connection thread: the handshake read must
+                        // never stall the accept loop.
+                        std::thread::spawn(move || demux.route(stream, from));
+                    }
+                    Err(_) => return,
+                }
+            }
+        })
+    }
+
+    /// Read one inbound peer's handshake and attach it to its torrent.
+    fn route<S: I2pStream + 'static>(&self, mut stream: S, from: DestHash) {
+        let mut buf = [0u8; wire::HANDSHAKE_LEN];
+        if stream.read_exact(&mut buf).is_err() {
+            return;
+        }
+        let Ok(theirs) = Handshake::parse(&buf) else {
+            return;
+        };
+        let torrent = lock_map(&self.torrents).get(&theirs.info_hash).cloned();
+        let Some(torrent) = torrent else {
+            return; // unknown info-hash: drop, nothing to say
+        };
+        if torrent.connected_peers().len() >= self.max_peers {
+            return;
+        }
+        let _ = torrent.attach_accepted(stream, from, &theirs);
+    }
+}
+
+fn lock_map<K, V>(m: &Mutex<HashMap<K, V>>) -> std::sync::MutexGuard<'_, HashMap<K, V>> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// A raise-once flag with a timed wait, so `shutdown` interrupts the sweep
 /// pause immediately instead of sleeping it out.
 #[derive(Default)]
@@ -306,16 +392,22 @@ mod tests {
 
     /// A multi-piece torrent plus a complete seeder and an empty leecher.
     fn seed_and_leech() -> (Arc<Torrent>, Arc<Torrent>, TempDir, TempDir) {
+        seed_and_leech_tagged(0x44)
+    }
+
+    /// Like [`seed_and_leech`], but `tag` differentiates both the info-hash
+    /// and the content, so several distinct torrents can coexist in one test.
+    fn seed_and_leech_tagged(tag: u8) -> (Arc<Torrent>, Arc<Torrent>, TempDir, TempDir) {
         let content: Vec<u8> = (0..(3 * BLOCK_LEN + 100))
-            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .map(|i| u8::try_from((i + u32::from(tag)) % 251).unwrap_or(0))
             .collect();
         let pieces: Vec<[u8; 20]> = content
             .chunks(BLOCK_LEN as usize)
             .map(|c| Sha1::digest(c).into())
             .collect();
         let meta = MetaInfo {
-            info_hash: InfoHash([0x44; 20]),
-            name: "swarm-demo".into(),
+            info_hash: InfoHash([tag; 20]),
+            name: format!("swarm-demo-{tag}"),
             piece_length: BLOCK_LEN,
             pieces,
             files: vec![FileEntry {
@@ -423,6 +515,62 @@ mod tests {
         );
         leech_swarm.shutdown();
         seed_swarm.shutdown();
+    }
+
+    #[test]
+    fn demux_routes_two_torrents_on_one_destination() {
+        let net = MockNet::new();
+        let (seeder_a, leecher_a, _sa, _la) = seed_and_leech_tagged(0x21);
+        let (seeder_b, leecher_b, _sb, _lb) = seed_and_leech_tagged(0x22);
+
+        // One seeding endpoint serves both torrents through the demux.
+        let seed_ep = net.endpoint();
+        let seed_dest = seed_ep.dest();
+        let demux = InboundDemux::new(8);
+        demux.register(&seeder_a);
+        demux.register(&seeder_b);
+        let _accept = demux.run(seed_ep);
+
+        // Each leecher dials the same destination for its own torrent.
+        let ep_a = net.endpoint();
+        let ep_b = net.endpoint();
+        leecher_a.add_peers(&[seed_dest]);
+        leecher_b.add_peers(&[seed_dest]);
+        let swarm_a = Swarm::dial_only(Arc::clone(&leecher_a), ep_a.dialer(), quick_config());
+        let swarm_b = Swarm::dial_only(Arc::clone(&leecher_b), ep_b.dialer(), quick_config());
+
+        assert!(
+            leecher_a.wait_complete(Duration::from_secs(20)),
+            "torrent A did not complete through the demux"
+        );
+        assert!(
+            leecher_b.wait_complete(Duration::from_secs(20)),
+            "torrent B did not complete through the demux"
+        );
+        swarm_a.shutdown();
+        swarm_b.shutdown();
+    }
+
+    #[test]
+    fn demux_drops_unknown_info_hash() {
+        let net = MockNet::new();
+        let (seeder_a, _leecher_a, _sa, _la) = seed_and_leech_tagged(0x31);
+        let (_seeder_c, leecher_c, _sc, _lc) = seed_and_leech_tagged(0x33);
+
+        let seed_ep = net.endpoint();
+        let seed_dest = seed_ep.dest();
+        let demux = InboundDemux::new(8);
+        demux.register(&seeder_a); // torrent C is NOT registered
+        let _accept = demux.run(seed_ep);
+
+        let ep_c = net.endpoint();
+        let stream = ep_c
+            .dialer()
+            .dial(seed_dest, Duration::from_secs(5))
+            .unwrap();
+        // The demux reads C's handshake, finds no torrent, and drops the
+        // stream; the initiator's attach fails reading the reply.
+        assert!(leecher_c.attach(stream, seed_dest).is_err());
     }
 
     #[test]
