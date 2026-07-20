@@ -1,10 +1,11 @@
 //! `cloved(8)` — the clove daemon.
 //!
-//! Loads config, opens the data dir, and serves the local `/v1/` HTTP API
-//! (hand-rolled HTTP/1.1 + JSON, Q6) over a unix socket. Engine hosting and
-//! the full command set arrive in later Phase-F slices (`docs/PHASE-F.md`);
-//! this slice serves `GET /v1/status` with token auth — the transport, end to
-//! end. Layer-2 self-restriction (Landlock/seccomp) is Phase G.
+//! Loads config, opens the data dir, hosts the engine (a [`registry::Registry`]
+//! of live torrents over the SAM backend), and serves the local `/v1/` HTTP
+//! API (hand-rolled HTTP/1.1 + JSON, Q6) over a unix socket with token auth.
+//! The SAM session comes up in the background on the supervisor's backoff;
+//! until then torrents wait in "waiting-for-router". Layer-2 self-restriction
+//! (Landlock/seccomp) is Phase G.
 
 mod registry;
 
@@ -12,14 +13,21 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clove_core::config::{Config, Defaults};
 use clove_core::http::{self, Response};
 use clove_core::json::Value;
+use clove_core::swarm::{InboundDemux, SwarmConfig};
+use i2pnet::DestHash;
 use i2pnet::api::{ApiListener, ApiStream};
+use i2pnet::sam::{SamConfig, SamListener, SamSession};
+use i2pnet::supervisor::ReconnectPolicy;
 
 use crate::registry::{ActionError, AddError, Registry, RemoveError};
+
+/// How often live progress is snapshotted to resume files.
+const PERSIST_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Cap on an API request body (a `.torrent` or magnet; generous for status).
 const MAX_REQUEST_BODY: usize = 2 * 1024 * 1024;
@@ -104,10 +112,14 @@ fn run() -> Result<(), String> {
 
     let daemon = Arc::new(Daemon {
         start: Instant::now(),
-        sam_address: config.sam_address,
+        sam_address: config.sam_address.clone(),
         token,
         registry: Mutex::new(registry),
+        router: Mutex::new("connecting"),
     });
+
+    spawn_sam_bringup(&daemon, &config.sam_address);
+    spawn_persist_loop(&daemon);
     serve(&listener, &daemon)
 }
 
@@ -116,7 +128,92 @@ struct Daemon {
     start: Instant,
     sam_address: String,
     token: String,
-    registry: Mutex<Registry>,
+    registry: Mutex<Registry<Arc<SamSession>>>,
+    /// Router connection state shown in `/v1/status`.
+    router: Mutex<&'static str>,
+}
+
+/// Bring the SAM session up in the background, retrying on the supervisor's
+/// backoff, then attach the network to the registry. Mid-run session *loss*
+/// re-detection is not wired yet (the demux accept loop just ends) — that is
+/// the supervisor-integration follow-up, exercised in live testing.
+fn spawn_sam_bringup(daemon: &Arc<Daemon>, sam_address: &str) {
+    // yosemite speaks SAM on 127.0.0.1:<port> only; a unix-socket SAM path
+    // cannot be used by this backend.
+    let Some(port) = sam_address
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+    else {
+        eprintln!("cloved: sam_address {sam_address:?} is not host:port; running without a router");
+        *lock(&daemon.router) = "unsupported-sam-address";
+        return;
+    };
+    let daemon = Arc::clone(daemon);
+    std::thread::spawn(move || {
+        let policy = ReconnectPolicy::default();
+        let mut failures = 0u32;
+        loop {
+            match SamSession::connect(&SamConfig {
+                samv3_tcp_port: port,
+                nickname: "clove".to_owned(),
+                // Q4 persistent identity lands once key export is confirmed
+                // against a live router; until then every run is transient.
+                persistent_key: None,
+            }) {
+                Ok(session) => {
+                    let session = Arc::new(session);
+                    let dest = session.local_dest();
+                    match SamListener::forward(Arc::clone(&session)) {
+                        Ok(listener) => {
+                            eprintln!("cloved: router connected; we are {}", dest.to_b32());
+                            let demux = InboundDemux::new(SwarmConfig::default().max_peers);
+                            let _accept = demux.run(listener);
+                            lock(&daemon.registry).attach_network(
+                                session,
+                                demux,
+                                build_peer_id(),
+                                SwarmConfig::default(),
+                            );
+                            *lock(&daemon.router) = "connected";
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("cloved: STREAM FORWARD failed: {e}; retrying");
+                        }
+                    }
+                }
+                Err(e) => {
+                    if failures == 0 {
+                        eprintln!("cloved: waiting for router (SAM at 127.0.0.1:{port}): {e}");
+                    }
+                }
+            }
+            failures = failures.saturating_add(1);
+            *lock(&daemon.router) = "waiting-for-router";
+            std::thread::sleep(policy.base_delay(failures));
+        }
+    });
+}
+
+/// Periodically snapshot live progress into resume files.
+fn spawn_persist_loop(daemon: &Arc<Daemon>) {
+    let daemon = Arc::clone(daemon);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(PERSIST_INTERVAL);
+            lock(&daemon.registry).persist_progress();
+        }
+    });
+}
+
+/// The daemon's wire identity: the Q7 `-CV0001-` prefix plus 12 random bytes.
+fn build_peer_id() -> [u8; 20] {
+    let mut id = *b"-CV0001-............";
+    let mut tail = [0u8; 12];
+    if getrandom::getrandom(&mut tail).is_ok() {
+        id[8..].copy_from_slice(&tail);
+    }
+    id
 }
 
 /// Accept loop: one thread per connection (Q5; API load is tiny). Only a fatal
@@ -231,6 +328,16 @@ fn torrent_action(
         ("POST", Some("resume")) => {
             action_result(lock(&daemon.registry).set_paused(&info_hash, false))
         }
+        ("POST", Some("peers")) => {
+            let text = String::from_utf8_lossy(&request.body);
+            let Some(peer) = DestHash::from_b32(&text) else {
+                return error(
+                    400,
+                    "body must be a peer's b32 address (52 chars, .b32.i2p optional)",
+                );
+            };
+            action_result(lock(&daemon.registry).add_peer(&info_hash, peer))
+        }
         ("POST", Some("verify")) => match lock(&daemon.registry).verify(&info_hash) {
             Ok(verified) => {
                 let body = Value::Object(vec![(
@@ -315,8 +422,10 @@ fn status_json(daemon: &Daemon) -> Vec<u8> {
             "torrents".to_owned(),
             Value::UInt(u64::try_from(lock(&daemon.registry).count()).unwrap_or(u64::MAX)),
         ),
-        // Placeholder until the SAM supervisor is wired.
-        ("router".to_owned(), Value::from("not-connected")),
+        (
+            "router".to_owned(),
+            Value::from(lock(&daemon.router).clone()),
+        ),
     ])
     .encode()
     .into_bytes()

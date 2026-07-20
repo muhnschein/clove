@@ -225,6 +225,13 @@ impl Torrent {
             .collect()
     }
 
+    /// A snapshot of our verified piece set, for progress display and resume
+    /// persistence.
+    #[must_use]
+    pub fn have(&self) -> Bitfield {
+        lock(&self.shared.state).picker.have_field().clone()
+    }
+
     /// This torrent's info-hash — its identity on trackers, the wire, and in
     /// the inbound demux.
     #[must_use]

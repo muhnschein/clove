@@ -95,6 +95,16 @@ pub trait I2pListener {
     fn accept(&self) -> io::Result<(Self::Stream, DestHash)>;
 }
 
+/// Sharing a dialer across threads: an `Arc`'d dialer dials. This is how the
+/// one SAM session (or a mock) is handed to every torrent's swarm runner.
+impl<T: I2pDialer> I2pDialer for std::sync::Arc<T> {
+    type Stream = T::Stream;
+
+    fn dial(&self, peer: DestHash, timeout: Duration) -> io::Result<Self::Stream> {
+        T::dial(self, peer, timeout)
+    }
+}
+
 /// I2P naming resolution (SAM `NAMING LOOKUP`), e.g. `tracker2.postman.i2p`.
 ///
 /// Implementations cache positive results aggressively and apply

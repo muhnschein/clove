@@ -40,6 +40,7 @@ dependencies = [
  "clove-core",
  "getrandom",
  "i2pnet",
+ "sha1",
 ]
 
 [[package]]

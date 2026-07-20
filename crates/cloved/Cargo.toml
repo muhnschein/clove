@@ -12,5 +12,10 @@ clove-core = { path = "../clove-core" }
 i2pnet = { path = "../i2pnet" }
 getrandom = "0.2"
 
+[dev-dependencies]
+# Tests build real .torrent fixtures, which need SHA-1 piece hashes. Already
+# in the tree via clove-core; dev-only, not part of the runtime budget.
+sha1 = "0.10"
+
 [lints]
 workspace = true

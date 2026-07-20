@@ -36,6 +36,18 @@ impl DestHash {
         s
     }
 
+    /// Parse a b32 peer address — `<52 base32 chars>` with or without the
+    /// `.b32.i2p` suffix — back into its [`DestHash`]. The inverse of
+    /// [`to_b32`](DestHash::to_b32); `None` if the label is not exactly 32
+    /// decoded bytes.
+    #[must_use]
+    pub fn from_b32(text: &str) -> Option<DestHash> {
+        let label = text.trim().strip_suffix(".b32.i2p").unwrap_or(text.trim());
+        let bytes = base32_decode(label)?;
+        let hash: [u8; 32] = bytes.try_into().ok()?;
+        Some(DestHash(hash))
+    }
+
     /// The [`DestHash`] of a full base64 I2P destination (as returned by SAM
     /// naming lookups and inbound streams): SHA-256 of the decoded bytes.
     ///
@@ -207,6 +219,20 @@ mod tests {
         let label = addr.strip_suffix(".b32.i2p").unwrap();
         assert_eq!(label.len(), 52); // 256 bits / 5, rounded up
         assert_eq!(base32_decode(label).unwrap(), hash.0);
+    }
+
+    #[test]
+    fn dest_hash_b32_round_trips() {
+        let hash = DestHash([0xA5; 32]);
+        let addr = hash.to_b32();
+        // With and without the suffix, plus surrounding whitespace.
+        assert_eq!(DestHash::from_b32(&addr), Some(hash));
+        let label = addr.strip_suffix(".b32.i2p").unwrap();
+        assert_eq!(DestHash::from_b32(label), Some(hash));
+        assert_eq!(DestHash::from_b32(&format!(" {addr}\n")), Some(hash));
+        // Wrong length and bad alphabet are rejected.
+        assert!(DestHash::from_b32("abc").is_none());
+        assert!(DestHash::from_b32(&"A".repeat(52)).is_none());
     }
 
     #[test]

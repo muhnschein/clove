@@ -109,6 +109,14 @@ impl Swarm {
         Swarm::spawn::<D, NoListener>(torrent, dialer, None, config)
     }
 
+    /// Signal the dial sweep to stop without waiting: it exits at the next
+    /// check, after any in-flight dial completes. Use when blocking on
+    /// [`shutdown`](Swarm::shutdown) (up to a dial timeout) is unacceptable —
+    /// e.g. an API-driven pause.
+    pub fn request_stop(&self) {
+        self.stop.raise();
+    }
+
     /// Signal the dial sweep to stop and wait for it to finish. The acceptor
     /// thread (if any) ends when its listener's session is torn down.
     pub fn shutdown(mut self) {

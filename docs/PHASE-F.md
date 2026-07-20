@@ -146,11 +146,24 @@ budget-spending decision — not smuggled in with M4.
      inbound peer's torrent is known only from its handshake's info-hash — a
      read-first attach variant plus a dispatcher owning the session's one
      listener, routing to the right torrent.
-   - **5c. Engine bridge in `cloved`**: live `Torrent` + `Swarm` per registry
-     entry over a generic backend (mock-tested), progress persisted
-     periodically; then the real `SamSession`/supervisor plugged in behind the
-     same seam (live sign-off per `LIVE-TESTING.md`). Magnet add + `announce` +
-     live stats ride on this.
+   - **5c. Engine bridge — landed:** the registry is the engine host, generic
+     over the dialer. With a network attached, each unpaused torrent gets
+     storage + a live `Torrent` registered with the session's demux + a
+     dial-only `Swarm`; pause/remove take it offline; progress persists
+     periodically and around transitions; `verify` requires pause. New state
+     `waiting-for-router` for unpaused torrents without a backend, and
+     `seeding` for complete live ones. Operator peer bootstrap:
+     `POST /v1/torrents/{ih}/peers` + `clove peer <ih> <b32>` (the only peer
+     source until the tracker client is wired — 5d). `cloved` brings SAM up in
+     the background on the supervisor's backoff (transient identity; Q4 key
+     persistence needs live key-export confirmation) and attaches the network
+     when it lands. Mock-proven: registry-level download to 100% with
+     persistence across reopen; pause/resume lifecycle; waiting-for-router.
+     **Known gaps for live testing:** mid-run session-loss re-detection (the
+     demux accept loop just ends), peer disconnect on pause (existing
+     connections drain), live up/down stats.
+   - **5d. Tracker + magnet over the live session**: announce loop feeding
+     `add_peers`, naming cache, BEP 9 magnet add, live stats.
 6. **`clove watch`**: the hand-rolled live view (§6).
 
 Layer-2 self-restriction (Landlock/seccomp) and man pages are Phase G, not here.
