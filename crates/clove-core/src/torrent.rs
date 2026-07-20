@@ -213,6 +213,18 @@ impl Torrent {
             .collect()
     }
 
+    /// The peers currently attached (handshaken, threads running). The swarm
+    /// runner uses this to skip live peers when sweeping `known_peers` for
+    /// dial candidates.
+    #[must_use]
+    pub fn connected_peers(&self) -> Vec<DestHash> {
+        lock(&self.shared.state)
+            .peers
+            .iter()
+            .map(|p| p.dest)
+            .collect()
+    }
+
     /// Perform the handshake on `stream` (with `remote` the peer's known
     /// destination) and, on success, register the peer and spawn its
     /// reader/writer threads. Used for both dialed and accepted connections.
