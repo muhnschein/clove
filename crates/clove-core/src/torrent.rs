@@ -225,9 +225,30 @@ impl Torrent {
             .collect()
     }
 
-    /// Perform the handshake on `stream` (with `remote` the peer's known
-    /// destination) and, on success, register the peer and spawn its
-    /// reader/writer threads. Used for both dialed and accepted connections.
+    /// This torrent's info-hash — its identity on trackers, the wire, and in
+    /// the inbound demux.
+    #[must_use]
+    pub fn info_hash(&self) -> [u8; 20] {
+        self.shared.info_hash
+    }
+
+    /// Our side of the BEP 3 handshake.
+    fn our_handshake(&self) -> Handshake {
+        Handshake {
+            info_hash: self.shared.info_hash,
+            peer_id: self.shared.peer_id,
+            // Advertise the BEP 10 extension protocol (i2p_pex, ut_metadata).
+            // Fast (BEP 6) stays off until its semantics are wired.
+            extensions: Extensions {
+                extended: true,
+                fast: false,
+            },
+        }
+    }
+
+    /// Perform the initiator-side handshake on a dialed `stream` (with
+    /// `remote` the peer's known destination) and, on success, register the
+    /// peer and spawn its reader/writer threads: write ours, read theirs.
     ///
     /// # Errors
     ///
@@ -237,17 +258,7 @@ impl Torrent {
         mut stream: S,
         remote: DestHash,
     ) -> std::io::Result<()> {
-        let ours = Handshake {
-            info_hash: self.shared.info_hash,
-            peer_id: self.shared.peer_id,
-            // Advertise the BEP 10 extension protocol (i2p_pex, ut_metadata).
-            // Fast (BEP 6) stays off until its semantics are wired.
-            extensions: Extensions {
-                extended: true,
-                fast: false,
-            },
-        };
-        stream.write_all(&ours.encode())?;
+        stream.write_all(&self.our_handshake().encode())?;
         let mut buf = [0u8; wire::HANDSHAKE_LEN];
         stream.read_exact(&mut buf)?;
         let theirs = Handshake::parse(&buf)
@@ -258,7 +269,43 @@ impl Torrent {
                 "peer handshaked a different torrent",
             ));
         }
+        self.finish_attach(stream, remote, &theirs)
+    }
 
+    /// Attach an **accepted** peer whose handshake was already read by the
+    /// inbound demux (that read is how the torrent was identified — Q4: one
+    /// destination serves every torrent). Validates the info-hash, replies
+    /// with our handshake, then registers the peer as [`attach`] does.
+    ///
+    /// # Errors
+    ///
+    /// An info-hash mismatch (mis-routed peer) or handshake-reply I/O failure.
+    ///
+    /// [`attach`]: Torrent::attach
+    pub fn attach_accepted<S: I2pStream + 'static>(
+        &self,
+        mut stream: S,
+        remote: DestHash,
+        theirs: &Handshake,
+    ) -> std::io::Result<()> {
+        if theirs.info_hash != self.shared.info_hash {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "peer handshaked a different torrent",
+            ));
+        }
+        stream.write_all(&self.our_handshake().encode())?;
+        self.finish_attach(stream, remote, theirs)
+    }
+
+    /// Post-handshake common path: split the stream, register the peer, queue
+    /// the opening messages, spawn the reader/writer threads.
+    fn finish_attach<S: I2pStream + 'static>(
+        &self,
+        stream: S,
+        remote: DestHash,
+        theirs: &Handshake,
+    ) -> std::io::Result<()> {
         // Handshake done duplex; now split into independent halves so the
         // reader and writer run on separate threads (Q5 sync model).
         let (reader, writer) = stream.split()?;
