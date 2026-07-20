@@ -35,10 +35,11 @@ use clove_core::swarm::{
     AnnounceTarget, Announcer, AnnouncerConfig, InboundDemux, Swarm, SwarmConfig,
 };
 use clove_core::torrent::Torrent;
+use i2pnet::naming::NamingCache;
 use i2pnet::{DestHash, I2pDialer, I2pNamingLookup};
 
 /// The set of hosted torrents plus where their state lives.
-pub(crate) struct Registry<D: I2pDialer + I2pNamingLookup + Clone + Send + 'static>
+pub(crate) struct Registry<D: I2pDialer + I2pNamingLookup + Clone + Send + Sync + 'static>
 where
     D::Stream: 'static,
 {
@@ -56,6 +57,8 @@ struct Network<D> {
     swarm_config: SwarmConfig,
     /// Our session's full base64 destination, for announce `ip=`.
     dest_b64: String,
+    /// Shared lookup cache (R6) in front of the session's resolver.
+    naming: NamingCache<D>,
 }
 
 /// One hosted torrent's in-memory summary.
@@ -74,6 +77,9 @@ struct Live {
     torrent: Arc<Torrent>,
     swarm: Swarm,
     announcer: Option<Announcer>,
+    /// Lifetime (uploaded, downloaded) at engine start; the torrent's own
+    /// counters are per-run deltas on top of these.
+    stats_base: (u64, u64),
 }
 
 impl Hosted {
@@ -154,7 +160,7 @@ impl fmt::Display for RemoveError {
     }
 }
 
-impl<D: I2pDialer + I2pNamingLookup + Clone + Send + 'static> Registry<D>
+impl<D: I2pDialer + I2pNamingLookup + Clone + Send + Sync + 'static> Registry<D>
 where
     D::Stream: 'static,
 {
@@ -190,12 +196,14 @@ where
         swarm_config: SwarmConfig,
         dest_b64: String,
     ) {
+        let naming = NamingCache::new(dialer.clone());
         self.network = Some(Network {
             dialer,
             demux,
             peer_id,
             swarm_config,
             dest_b64,
+            naming,
         });
         let hashes: Vec<[u8; 20]> = self.torrents.keys().copied().collect();
         for info_hash in hashes {
@@ -260,7 +268,7 @@ where
                     total_length: hosted.meta.total_length,
                 },
                 network.dialer.clone(),
-                network.dialer.clone(),
+                network.naming.clone(),
                 AnnouncerConfig::default(),
             ))
         };
@@ -268,6 +276,7 @@ where
             torrent,
             swarm,
             announcer,
+            stats_base: (hosted.uploaded, hosted.downloaded),
         });
         Ok(())
     }
@@ -287,18 +296,43 @@ where
             network.demux.unregister(info_hash);
         }
         hosted.have = live.torrent.have();
+        let (up, down) = live.torrent.stats();
+        hosted.uploaded = live.stats_base.0.saturating_add(up);
+        hosted.downloaded = live.stats_base.1.saturating_add(down);
         live.swarm.request_stop();
         if let Some(announcer) = &live.announcer {
             announcer.request_stop();
         }
         live.torrent.disconnect_all();
+        // Graceful goodbye to the trackers, best-effort and detached.
+        if let Some(network) = &self.network {
+            let urls: Vec<String> = hosted.meta.trackers.iter().flatten().cloned().collect();
+            if !urls.is_empty() {
+                clove_core::swarm::announce_stopped(
+                    *info_hash,
+                    network.peer_id,
+                    AnnounceTarget {
+                        urls,
+                        our_dest_b64: network.dest_b64.clone(),
+                        piece_length: u64::from(hosted.meta.piece_length),
+                        total_length: hosted.meta.total_length,
+                    },
+                    network.dialer.clone(),
+                    network.naming.clone(),
+                    network.swarm_config.dial_timeout,
+                );
+            }
+        }
     }
 
-    /// Refresh each live torrent's progress snapshot into its summary.
+    /// Refresh each live torrent's progress and stats snapshot.
     fn refresh(&mut self) {
         for hosted in self.torrents.values_mut() {
             if let Some(live) = &hosted.live {
                 hosted.have = live.torrent.have();
+                let (up, down) = live.torrent.stats();
+                hosted.uploaded = live.stats_base.0.saturating_add(up);
+                hosted.downloaded = live.stats_base.1.saturating_add(down);
             }
         }
     }
