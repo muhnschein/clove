@@ -83,6 +83,7 @@ fn run() -> Result<(), Fail> {
         Some("pause") => cmd_action(socket, &operands, "pause", "paused"),
         Some("resume") => cmd_action(socket, &operands, "resume", "resumed"),
         Some("verify") => cmd_verify(socket, &operands),
+        Some("peer") => cmd_peer(socket, &operands),
         Some("priorities") => cmd_priorities(socket, &operands),
         Some("completions") => cmd_completions(&operands),
         Some(other) => Err(Fail::Usage(format!(
@@ -103,6 +104,7 @@ fn print_help() {
     println!("  pause <info-hash>              pause a torrent");
     println!("  resume <info-hash>             resume a torrent");
     println!("  verify <info-hash>             re-check data on disk");
+    println!("  peer <info-hash> <b32-addr>    hand a running torrent a peer to dial");
     println!("  priorities <info-hash> <spec>  set per-file priorities (e.g. 1,0,2)");
     println!("  completions <bash|zsh|fish>    print a shell completion script");
 }
@@ -232,6 +234,24 @@ fn cmd_verify(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> 
         .and_then(Value::as_u64)
         .unwrap_or(0);
     println!("verified {verified} piece(s) for {info_hash}");
+    Ok(())
+}
+
+fn cmd_peer(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
+    let [info_hash, addr] = operands else {
+        return Err(Fail::Usage(
+            "peer needs <info-hash> and a b32 address".to_owned(),
+        ));
+    };
+    let (socket, token) = resolve(socket)?;
+    request(
+        &socket,
+        &token,
+        "POST",
+        &format!("/v1/torrents/{info_hash}/peers"),
+        addr.as_bytes(),
+    )?;
+    println!("peer added to {info_hash}");
     Ok(())
 }
 
