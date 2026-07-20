@@ -66,6 +66,7 @@ impl Default for SamConfig {
 pub struct SamSession {
     session: Mutex<Session<style::Stream>>,
     local: DestHash,
+    local_b64: String,
     samv3_tcp_port: u16,
 }
 
@@ -100,11 +101,31 @@ impl SamSession {
                 "SAM returned an unparseable destination",
             )
         })?;
+        let local_b64 = session.destination().to_owned();
         Ok(SamSession {
             session: Mutex::new(session),
             local,
+            local_b64,
             samv3_tcp_port: config.samv3_tcp_port,
         })
+    }
+
+    /// Our full base64 destination — what tracker announces carry as `ip`
+    /// (`docs/PROTOCOL.i2p-bt` §5.1).
+    #[must_use]
+    pub fn local_dest_b64(&self) -> &str {
+        &self.local_b64
+    }
+
+    /// Probe the session's control connection with a SAM `PING` (v3.2).
+    /// `false` means the router is gone or the session is dead — time to tear
+    /// down and rebuild the session tree.
+    pub fn healthy(&self) -> bool {
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        session.send_command("PING clove\n").is_ok()
     }
 
     /// This session's own destination hash — the identity peers reach us at
@@ -136,6 +157,7 @@ const DEST_LINE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct SamListener {
     listener: TcpListener,
     local: DestHash,
+    port: u16,
     // Keeps the SAM session (and thus the router-side forwarding) alive.
     _session: Arc<SamSession>,
 }
@@ -164,9 +186,30 @@ impl SamListener {
         Ok(SamListener {
             listener,
             local,
+            port,
             _session: session,
         })
     }
+
+    /// The loopback port the router forwards to. Keep it around to
+    /// [`poke_listener`] a blocked accept during session teardown.
+    #[must_use]
+    pub fn local_port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// Wake a [`SamListener`]'s blocked accept by making one throwaway loopback
+/// connection to it — used after raising the demux stop flag during session
+/// teardown, since a dead router never unblocks the accept itself.
+///
+/// # Errors
+///
+/// The connect fails (listener already gone — which also unblocks nothing
+/// left to unblock).
+pub fn poke_listener(port: u16) -> io::Result<()> {
+    drop(TcpStream::connect((Ipv4Addr::LOCALHOST, port))?);
+    Ok(())
 }
 
 impl I2pListener for SamListener {

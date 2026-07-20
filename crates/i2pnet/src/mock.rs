@@ -273,6 +273,21 @@ impl I2pDialer for MockDialer {
     }
 }
 
+impl I2pNamingLookup for MockDialer {
+    fn lookup(&self, name: &str) -> io::Result<DestHash> {
+        if locked(&self.shared.flags).dead {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "mock: session is down",
+            ));
+        }
+        locked(&self.net.names)
+            .get(name)
+            .copied()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "mock: name not found"))
+    }
+}
+
 impl I2pListener for Endpoint {
     type Stream = MockStream;
 

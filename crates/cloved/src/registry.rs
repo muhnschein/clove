@@ -31,12 +31,14 @@ use clove_core::metainfo::{self, MetaInfo};
 use clove_core::picker::Mode;
 use clove_core::resume::Resume;
 use clove_core::storage::Storage;
-use clove_core::swarm::{InboundDemux, Swarm, SwarmConfig};
+use clove_core::swarm::{
+    AnnounceTarget, Announcer, AnnouncerConfig, InboundDemux, Swarm, SwarmConfig,
+};
 use clove_core::torrent::Torrent;
-use i2pnet::{DestHash, I2pDialer};
+use i2pnet::{DestHash, I2pDialer, I2pNamingLookup};
 
 /// The set of hosted torrents plus where their state lives.
-pub(crate) struct Registry<D: I2pDialer + Clone + Send + 'static>
+pub(crate) struct Registry<D: I2pDialer + I2pNamingLookup + Clone + Send + 'static>
 where
     D::Stream: 'static,
 {
@@ -52,6 +54,8 @@ struct Network<D> {
     demux: Arc<InboundDemux>,
     peer_id: [u8; 20],
     swarm_config: SwarmConfig,
+    /// Our session's full base64 destination, for announce `ip=`.
+    dest_b64: String,
 }
 
 /// One hosted torrent's in-memory summary.
@@ -69,6 +73,7 @@ struct Hosted {
 struct Live {
     torrent: Arc<Torrent>,
     swarm: Swarm,
+    announcer: Option<Announcer>,
 }
 
 impl Hosted {
@@ -149,7 +154,7 @@ impl fmt::Display for RemoveError {
     }
 }
 
-impl<D: I2pDialer + Clone + Send + 'static> Registry<D>
+impl<D: I2pDialer + I2pNamingLookup + Clone + Send + 'static> Registry<D>
 where
     D::Stream: 'static,
 {
@@ -183,12 +188,14 @@ where
         demux: Arc<InboundDemux>,
         peer_id: [u8; 20],
         swarm_config: SwarmConfig,
+        dest_b64: String,
     ) {
         self.network = Some(Network {
             dialer,
             demux,
             peer_id,
             swarm_config,
+            dest_b64,
         });
         let hashes: Vec<[u8; 20]> = self.torrents.keys().copied().collect();
         for info_hash in hashes {
@@ -196,6 +203,18 @@ where
                 eprintln!("cloved: starting {}: {e}", hex(&info_hash));
             }
         }
+    }
+
+    /// Detach the network backend (session lost): every live torrent goes
+    /// offline with its progress snapshotted, and entries fall back to
+    /// "waiting-for-router" until a rebuilt session re-attaches.
+    pub(crate) fn detach_network(&mut self) {
+        let hashes: Vec<[u8; 20]> = self.torrents.keys().copied().collect();
+        for info_hash in hashes {
+            self.stop_live(&info_hash);
+        }
+        self.network = None;
+        self.persist_progress();
     }
 
     /// Bring a hosted, unpaused torrent live: open storage, build the engine
@@ -226,7 +245,30 @@ where
             network.dialer.clone(),
             network.swarm_config,
         );
-        hosted.live = Some(Live { torrent, swarm });
+        // Tracker announces are the swarm's peer feed; a trackerless torrent
+        // relies on operator peers and PEX.
+        let urls: Vec<String> = hosted.meta.trackers.iter().flatten().cloned().collect();
+        let announcer = if urls.is_empty() {
+            None
+        } else {
+            Some(Announcer::spawn(
+                Arc::clone(&torrent),
+                AnnounceTarget {
+                    urls,
+                    our_dest_b64: network.dest_b64.clone(),
+                    piece_length: u64::from(hosted.meta.piece_length),
+                    total_length: hosted.meta.total_length,
+                },
+                network.dialer.clone(),
+                network.dialer.clone(),
+                AnnouncerConfig::default(),
+            ))
+        };
+        hosted.live = Some(Live {
+            torrent,
+            swarm,
+            announcer,
+        });
         Ok(())
     }
 
@@ -246,6 +288,10 @@ where
         }
         hosted.have = live.torrent.have();
         live.swarm.request_stop();
+        if let Some(announcer) = &live.announcer {
+            announcer.request_stop();
+        }
+        live.torrent.disconnect_all();
     }
 
     /// Refresh each live torrent's progress snapshot into its summary.
@@ -787,6 +833,7 @@ mod tests {
             InboundDemux::new(8),
             *b"-CV0001-leechleechle",
             quick_swarm(),
+            "leecher-b64".to_owned(),
         );
 
         let info_hash = registry.add_torrent(&bytes).unwrap();
@@ -821,6 +868,7 @@ mod tests {
             InboundDemux::new(8),
             *b"-CV0001-pausepausepa",
             quick_swarm(),
+            "pause-b64".to_owned(),
         );
         let info_hash = registry.add_torrent(&bytes).unwrap();
 
