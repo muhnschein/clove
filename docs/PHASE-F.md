@@ -133,6 +133,24 @@ budget-spending decision — not smuggled in with M4.
    `priorities`, and `completions` (bash/zsh/fish) — the router-free commands,
    with `POST/PUT /v1/torrents/{ih}/…` endpoints. Deferred to the SAM slice:
    `announce` (needs the tracker over a live session) and live up/down `stats`.
-5. **`clove watch`**: the hand-rolled live view (§6).
+5. **SAM wiring, mock-first.** In sub-steps, each mock-proven in CI:
+   - **5a. Swarm runner — landed:** `clove-core::swarm`, backend-agnostic peer
+     acquisition around one `Torrent` — the dial sweep (known-peers minus
+     connected minus per-peer retry backoff, `max_peers` cap) plus the
+     acceptor loop (exits on session loss; the supervisor owns
+     re-establishment). Mock-proven: full download via two swarms, black-holed
+     dials retried after backoff, prompt shutdown. The mock gained
+     `MockDialer` (a clonable dial handle) so it mirrors the real
+     session/listener split.
+   - **5b. Inbound demux**: one destination serves every torrent (Q4), so an
+     inbound peer's torrent is known only from its handshake's info-hash — a
+     read-first attach variant plus a dispatcher owning the session's one
+     listener, routing to the right torrent.
+   - **5c. Engine bridge in `cloved`**: live `Torrent` + `Swarm` per registry
+     entry over a generic backend (mock-tested), progress persisted
+     periodically; then the real `SamSession`/supervisor plugged in behind the
+     same seam (live sign-off per `LIVE-TESTING.md`). Magnet add + `announce` +
+     live stats ride on this.
+6. **`clove watch`**: the hand-rolled live view (§6).
 
 Layer-2 self-restriction (Landlock/seccomp) and man pages are Phase G, not here.

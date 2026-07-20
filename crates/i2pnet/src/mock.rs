@@ -189,45 +189,87 @@ impl FaultHandle {
     }
 }
 
+/// A clonable, thread-safe outbound-dial handle for an [`Endpoint`] — the
+/// mock's analogue of sharing the real `SamSession` between the swarm's dial
+/// path and other threads while the endpoint itself (the accept queue) stays
+/// with its acceptor.
+#[derive(Clone)]
+pub struct MockDialer {
+    net: Arc<NetInner>,
+    dest: DestHash,
+    shared: Arc<EndpointShared>,
+}
+
+impl Endpoint {
+    /// A dial handle sharing this endpoint's identity and session fate.
+    #[must_use]
+    pub fn dialer(&self) -> MockDialer {
+        MockDialer {
+            net: Arc::clone(&self.net),
+            dest: self.dest,
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+/// Dial `peer` on behalf of the endpoint identified by `dest`/`shared`.
+fn dial_from(
+    net: &Arc<NetInner>,
+    dest: DestHash,
+    shared: &Arc<EndpointShared>,
+    peer: DestHash,
+    timeout: Duration,
+) -> io::Result<MockStream> {
+    if locked(&shared.flags).dead {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "mock: session is down",
+        ));
+    }
+    let target = locked(&net.endpoints)
+        .get(&peer)
+        .map(|r| (r.sender.clone(), Arc::clone(&r.shared)));
+    let Some((sender, target_shared)) = target else {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "mock: no such destination",
+        ));
+    };
+    if locked(&target_shared.flags).black_hole {
+        thread::sleep(timeout);
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "mock: destination unreachable (black-holed)",
+        ));
+    }
+    let capacity = *locked(&net.capacity);
+    let (ours, theirs) = MockStream::pair(capacity);
+    for pipe in [&ours.read, &ours.write] {
+        locked(&shared.pipes).push(Arc::downgrade(pipe));
+        locked(&target_shared.pipes).push(Arc::downgrade(pipe));
+    }
+    if sender.try_send((theirs, dest)).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "mock: destination not accepting (backlog full or session gone)",
+        ));
+    }
+    Ok(ours)
+}
+
 impl I2pDialer for Endpoint {
     type Stream = MockStream;
 
     fn dial(&self, peer: DestHash, timeout: Duration) -> io::Result<MockStream> {
-        if locked(&self.shared.flags).dead {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "mock: session is down",
-            ));
-        }
-        let target = locked(&self.net.endpoints)
-            .get(&peer)
-            .map(|r| (r.sender.clone(), Arc::clone(&r.shared)));
-        let Some((sender, target_shared)) = target else {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                "mock: no such destination",
-            ));
-        };
-        if locked(&target_shared.flags).black_hole {
-            thread::sleep(timeout);
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "mock: destination unreachable (black-holed)",
-            ));
-        }
-        let capacity = *locked(&self.net.capacity);
-        let (ours, theirs) = MockStream::pair(capacity);
-        for pipe in [&ours.read, &ours.write] {
-            locked(&self.shared.pipes).push(Arc::downgrade(pipe));
-            locked(&target_shared.pipes).push(Arc::downgrade(pipe));
-        }
-        if sender.try_send((theirs, self.dest)).is_err() {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                "mock: destination not accepting (backlog full or session gone)",
-            ));
-        }
-        Ok(ours)
+        dial_from(&self.net, self.dest, &self.shared, peer, timeout)
+    }
+}
+
+impl I2pDialer for MockDialer {
+    type Stream = MockStream;
+
+    fn dial(&self, peer: DestHash, timeout: Duration) -> io::Result<MockStream> {
+        dial_from(&self.net, self.dest, &self.shared, peer, timeout)
     }
 }
 
