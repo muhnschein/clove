@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use clove_core::bitfield::Bitfield;
 use clove_core::json::Value;
+use clove_core::magnet::{self, Magnet};
 use clove_core::metainfo::{self, MetaInfo};
 use clove_core::picker::Mode;
 use clove_core::resume::Resume;
@@ -46,7 +47,27 @@ where
     state_dir: PathBuf,
     downloads_dir: PathBuf,
     torrents: BTreeMap<[u8; 20], Hosted>,
+    /// Magnet adds still fetching their metadata (BEP 9). Promoted into
+    /// `torrents` by [`complete_magnet`](Registry::complete_magnet).
+    pending: BTreeMap<[u8; 20], PendingMagnet>,
     network: Option<Network<D>>,
+}
+
+/// A magnet awaiting metadata; its fetch loop runs on a daemon thread.
+struct PendingMagnet {
+    magnet: Magnet,
+    /// Set once a fetch thread owns this entry, so it is spawned once.
+    claimed: bool,
+}
+
+/// What a metadata-fetch round has to work with.
+pub(crate) struct FetchContext<D> {
+    /// The magnet's I2P tracker URLs.
+    pub(crate) trackers: Vec<String>,
+    pub(crate) dialer: D,
+    pub(crate) naming: NamingCache<D>,
+    pub(crate) peer_id: [u8; 20],
+    pub(crate) dest_b64: String,
 }
 
 /// The attached network backend: everything needed to bring a torrent live.
@@ -126,6 +147,8 @@ impl fmt::Display for ActionError {
 pub(crate) enum AddError {
     /// The `.torrent` did not parse (400).
     Parse(metainfo::Error),
+    /// The magnet URI did not parse (400).
+    Magnet(magnet::Error),
     /// A torrent with this info-hash is already hosted (409).
     Duplicate,
     /// A filesystem error (500).
@@ -136,6 +159,7 @@ impl fmt::Display for AddError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AddError::Parse(e) => write!(f, "{e}"),
+            AddError::Magnet(e) => write!(f, "{e}"),
             AddError::Duplicate => write!(f, "torrent already added"),
             AddError::Io(e) => write!(f, "{e}"),
         }
@@ -180,6 +204,7 @@ where
             state_dir,
             downloads_dir,
             torrents: BTreeMap::new(),
+            pending: BTreeMap::new(),
             network: None,
         };
         registry.load_all();
@@ -416,6 +441,87 @@ where
         Ok(info_hash)
     }
 
+    /// Add a magnet link: parse it, persist the URI, and queue it for
+    /// metadata fetching (the caller spawns the fetch thread). Returns the
+    /// info-hash.
+    ///
+    /// # Errors
+    ///
+    /// [`AddError`] on an unparseable magnet, a duplicate, or a filesystem
+    /// error persisting the URI.
+    pub(crate) fn add_magnet(&mut self, uri: &str) -> Result<[u8; 20], AddError> {
+        let magnet = Magnet::parse(uri).map_err(AddError::Magnet)?;
+        let info_hash = magnet.info_hash;
+        if self.torrents.contains_key(&info_hash) || self.pending.contains_key(&info_hash) {
+            return Err(AddError::Duplicate);
+        }
+        atomic_write(
+            &self.state_dir.join(format!("{}.magnet", hex(&info_hash))),
+            uri.as_bytes(),
+        )
+        .map_err(AddError::Io)?;
+        self.pending.insert(
+            info_hash,
+            PendingMagnet {
+                magnet,
+                claimed: false,
+            },
+        );
+        Ok(info_hash)
+    }
+
+    /// Claim a pending magnet for fetching. `true` exactly once per entry, so
+    /// callers spawn at most one fetch thread each.
+    pub(crate) fn claim_fetch(&mut self, info_hash: &[u8; 20]) -> bool {
+        match self.pending.get_mut(info_hash) {
+            Some(pending) if !pending.claimed => {
+                pending.claimed = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Every pending magnet's info-hash (for spawning fetchers at startup).
+    pub(crate) fn pending_hashes(&self) -> Vec<[u8; 20]> {
+        self.pending.keys().copied().collect()
+    }
+
+    /// The context a fetch round needs, or `None` when the magnet is gone
+    /// (fetch thread should exit) wrapped as the outer Option, and the inner
+    /// `None` when there is simply no network yet (sleep and retry).
+    #[allow(
+        clippy::option_option,
+        reason = "the two Nones mean different things: gone vs. not-yet"
+    )]
+    pub(crate) fn fetch_context(&self, info_hash: &[u8; 20]) -> Option<Option<FetchContext<D>>> {
+        let pending = self.pending.get(info_hash)?;
+        Some(self.network.as_ref().map(|network| FetchContext {
+            trackers: pending.magnet.trackers.clone(),
+            dialer: network.dialer.clone(),
+            naming: network.naming.clone(),
+            peer_id: network.peer_id,
+            dest_b64: network.dest_b64.clone(),
+        }))
+    }
+
+    /// Promote a fetched magnet: drop the pending entry and its URI file,
+    /// then add the synthesized `.torrent` bytes through the normal path
+    /// (persist, go live).
+    ///
+    /// # Errors
+    ///
+    /// [`AddError`] from the underlying [`add_torrent`](Registry::add_torrent).
+    pub(crate) fn complete_magnet(
+        &mut self,
+        info_hash: &[u8; 20],
+        torrent_bytes: &[u8],
+    ) -> Result<(), AddError> {
+        self.pending.remove(info_hash);
+        let _ = fs::remove_file(self.state_dir.join(format!("{}.magnet", hex(info_hash))));
+        self.add_torrent(torrent_bytes).map(|_| ())
+    }
+
     /// Pause or resume a torrent, persisting the change.
     ///
     /// # Errors
@@ -522,6 +628,11 @@ where
         info_hash: &[u8; 20],
         delete_data: bool,
     ) -> Result<(), RemoveError> {
+        if self.pending.remove(info_hash).is_some() {
+            // A magnet still fetching: drop its URI file; the fetch thread
+            // notices the entry is gone and exits.
+            return remove_file_ok(&self.state_dir.join(format!("{}.magnet", hex(info_hash))));
+        }
         if !self.torrents.contains_key(info_hash) {
             return Err(RemoveError::NotFound);
         }
@@ -554,7 +665,21 @@ where
     /// Live progress is refreshed first.
     pub(crate) fn list(&mut self) -> Value {
         self.refresh();
-        Value::Array(self.torrents.values().map(Hosted::to_json).collect())
+        let mut items: Vec<Value> = self.torrents.values().map(Hosted::to_json).collect();
+        for (info_hash, pending) in &self.pending {
+            let name = pending
+                .magnet
+                .display_name
+                .clone()
+                .unwrap_or_else(|| hex(info_hash));
+            items.push(Value::Object(vec![
+                ("info_hash".to_owned(), Value::from(hex(info_hash))),
+                ("name".to_owned(), Value::from(name)),
+                ("state".to_owned(), Value::from("fetching-metadata")),
+                ("progress".to_owned(), Value::Float(0.0)),
+            ]));
+        }
+        Value::Array(items)
     }
 
     /// Load every previously added torrent from the state directory. A file
@@ -565,13 +690,33 @@ where
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("torrent") {
-                continue;
-            }
-            if let Err(e) = self.load_one(&path) {
-                eprintln!("cloved: skipping {}: {e}", path.display());
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("torrent") => {
+                    if let Err(e) = self.load_one(&path) {
+                        eprintln!("cloved: skipping {}: {e}", path.display());
+                    }
+                }
+                Some("magnet") => {
+                    if let Err(e) = self.load_magnet(&path) {
+                        eprintln!("cloved: skipping {}: {e}", path.display());
+                    }
+                }
+                _ => {}
             }
         }
+    }
+
+    fn load_magnet(&mut self, path: &Path) -> Result<(), String> {
+        let uri = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let magnet = Magnet::parse(uri.trim()).map_err(|e| e.to_string())?;
+        self.pending.insert(
+            magnet.info_hash,
+            PendingMagnet {
+                magnet,
+                claimed: false,
+            },
+        );
+        Ok(())
     }
 
     fn load_one(&mut self, torrent_path: &Path) -> Result<(), String> {
@@ -761,9 +906,11 @@ mod tests {
     use super::*;
     use clove_core::bencode::{self, Value as Ben};
     use clove_core::wire::BLOCK_LEN;
+    use i2pnet::I2pListener;
     use i2pnet::mock::{MockDialer, MockNet};
     use sha1::{Digest, Sha1};
     use std::collections::BTreeMap as Map;
+    use std::io::Read as _;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
@@ -932,6 +1079,79 @@ mod tests {
             .and_then(|item| item.get("state").and_then(|s| s.as_str().map(String::from)));
         assert_eq!(state.as_deref(), Some("waiting-for-router"));
         assert!(registry.add_peer(&info_hash, DestHash([0xEE; 32])).is_err());
+    }
+
+    #[test]
+    fn magnet_fetches_metadata_and_becomes_a_live_torrent() {
+        let net = MockNet::new();
+        let (content, bytes) = fixture("magnet-demo");
+        let meta = MetaInfo::parse(&bytes).unwrap();
+        let info_hash = meta.info_hash.0;
+        let (seed_dest, _seed_dir) = spawn_seeder(&net, &content, &bytes);
+
+        // A mock tracker that always returns the seeder.
+        let tracker_ep = net.endpoint();
+        net.register_name("tracker.i2p", tracker_ep.dest());
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _from)) = tracker_ep.accept() {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).map(|n| n == 0).unwrap_or(true) {
+                        break;
+                    }
+                    head.push(byte[0]);
+                }
+                let mut body = b"d8:intervali60e5:peers32:".to_vec();
+                body.extend_from_slice(&seed_dest.0);
+                body.push(b'e');
+                let response = clove_core::http::Response::new(200, "text/plain", body);
+                let _ = std::io::Write::write_all(&mut stream, &response.encode());
+            }
+        });
+
+        let data = TempDir::new("magnet-data");
+        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let ep = net.endpoint();
+        registry.attach_network(
+            ep.dialer(),
+            InboundDemux::new(8),
+            *b"-CV0001-magnetmagnet",
+            quick_swarm(),
+            "magnet-b64".to_owned(),
+        );
+
+        let uri = format!(
+            "magnet:?xt=urn:btih:{}&dn=magnet-demo&tr=http%3A%2F%2Ftracker.i2p%2Fannounce",
+            hex(&info_hash)
+        );
+        assert_eq!(registry.add_magnet(&uri).unwrap(), info_hash);
+        assert!(registry.claim_fetch(&info_hash));
+        assert!(!registry.claim_fetch(&info_hash), "claim is once-only");
+
+        // Drive the fetch loop by hand (the daemon thread does the same).
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(Instant::now() < deadline, "metadata fetch did not finish");
+            let ctx = registry.fetch_context(&info_hash).unwrap().unwrap();
+            if let Some(bytes) = crate::try_fetch_round(&ctx, info_hash, true) {
+                registry.complete_magnet(&info_hash, &bytes).unwrap();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Promoted: pending gone, fetch_context reports it.
+        assert!(registry.fetch_context(&info_hash).is_none());
+
+        // And the promoted torrent downloads to completion.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while first_progress(&mut registry) < 1.0 {
+            assert!(
+                Instant::now() < deadline,
+                "promoted torrent did not download"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]

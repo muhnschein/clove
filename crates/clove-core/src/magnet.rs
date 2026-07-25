@@ -10,6 +10,7 @@
 //! `docs/PROTOCOL.i2p-bt` until confirmed against real examples — we do not
 //! guess at a grammar we cannot verify.
 
+use crate::bencode::{self, Value};
 use crate::http;
 use crate::metainfo::is_i2p_tracker;
 
@@ -175,5 +176,59 @@ mod tests {
             Magnet::parse("magnet:?xt=urn:btih:zzzz456789abcdef0123456789abcdef01234567"),
             Err(Error::BadInfoHash)
         );
+    }
+}
+
+/// Build `.torrent` bytes from a fetched raw info dictionary plus the
+/// magnet's tracker URLs, so a magnet add persists and reloads exactly like
+/// a file add. The info bytes are embedded verbatim (the info-hash covers
+/// them), with an `announce-list` of one tier per URL.
+#[must_use]
+pub fn torrent_bytes(raw_info: &[u8], trackers: &[String]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw_info.len() + 128);
+    out.push(b'd');
+    if !trackers.is_empty() {
+        out.extend_from_slice(b"13:announce-list");
+        let tiers = Value::List(
+            trackers
+                .iter()
+                .map(|url| Value::List(vec![Value::Bytes(url.clone().into_bytes())]))
+                .collect(),
+        );
+        out.extend_from_slice(&bencode::encode(&tiers));
+    }
+    out.extend_from_slice(b"4:info");
+    out.extend_from_slice(raw_info);
+    out.push(b'e');
+    out
+}
+
+#[cfg(test)]
+mod torrent_bytes_tests {
+    use super::*;
+    use crate::metainfo::MetaInfo;
+
+    #[test]
+    fn synthesized_torrent_parses_with_same_hash_and_trackers() {
+        // A minimal real info dict via the bencode encoder.
+        use std::collections::BTreeMap;
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), Value::Int(16384));
+        info.insert(b"name".to_vec(), Value::Bytes(b"demo".to_vec()));
+        info.insert(b"piece length".to_vec(), Value::Int(16384));
+        info.insert(b"pieces".to_vec(), Value::Bytes(vec![0u8; 20]));
+        let raw_info = bencode::encode(&Value::Dict(info));
+
+        let trackers = vec!["http://tracker.i2p/announce".to_owned()];
+        let bytes = torrent_bytes(&raw_info, &trackers);
+        let meta = MetaInfo::parse(&bytes).unwrap();
+        assert_eq!(meta.raw_info, raw_info);
+        assert_eq!(meta.trackers, vec![trackers.clone()]);
+
+        // Trackerless magnets synthesize too.
+        let bare = torrent_bytes(&raw_info, &[]);
+        let meta2 = MetaInfo::parse(&bare).unwrap();
+        assert_eq!(meta2.info_hash, meta.info_hash);
+        assert!(meta2.trackers.is_empty());
     }
 }
