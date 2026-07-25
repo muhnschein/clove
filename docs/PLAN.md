@@ -98,7 +98,9 @@ Exit (M4 demo): daily-drivable daemon+CLI against a local router.
 ## Phase G — Hardening & packaging
 
 - Layer 2: Landlock + seccomp post-init self-restriction, ABI-probed,
-  graceful single-log-line fallback; "pledge-shaped" phase hooks.
+  graceful single-log-line fallback; "pledge-shaped" phase hooks. *Landed:*
+  `crates/cloved/src/sandbox.rs`, one `enter_post_init` hook called after the
+  control socket binds and before the first thread starts.
 - Man pages: `cloved(8)`, `clove(1)`, `clove.conf(5)`, `clove-api(7)` — each
   with real EXAMPLES. `PROTOCOL.i2p-bt` consolidated. `SECURITY.md`.
 - systemd unit (Layer 3) + network-namespace recipe; chaos suite in CI
@@ -116,6 +118,6 @@ Exit: 0.1 release criteria per SCOPE §9 (signed tag, green interop matrix).
 | D | `yosemite` (features = `sync`, allowlisted in `ci/check-net-deps.sh`) + `sha2` (dest-hash) |
 | E | none |
 | F | `getrandom` (API token randomness) |
-| G | `landlock`, `seccompiler` |
+| G | `landlock`, `seccompiler`, `libc` (constants for the seccomp filter) |
 
-Total: 6 of the ≤15 budget (`DEPENDENCIES.md` is authoritative).
+Total: 7 of the ≤15 budget (`DEPENDENCIES.md` is authoritative).

@@ -32,6 +32,25 @@ commit. Closure sizes are recorded when the dependency is actually added.
   the one library that speaks SAM, and it is wrapped so the engine never
   sees it. Reviewed for socket capability: none of the closure beyond
   `yosemite` itself opens sockets.
+- **`landlock` 0.4** (`cloved`, Linux only) — entered Phase G. Layer-2
+  filesystem (and, on ABI 4+, outbound-TCP) self-restriction; see
+  `crates/cloved/src/sandbox.rs`. The raw `landlock_*` syscalls are unsafe and
+  the ABI negotiation is fiddly enough to get subtly wrong, which is the whole
+  failure mode this layer exists to avoid — and the workspace forbids
+  `unsafe_code`, so a hand-rolled binding is not on the table. Maintained by
+  the Landlock authors. Not socket-capable: it takes rights away. Closure:
+  `enumflags2` (+ its derive), `thiserror` 2, `libc`.
+- **`seccompiler` 0.5** (`cloved`, Linux only) — entered Phase G. Builds and
+  installs the post-init seccomp-BPF deny filter. Firecracker lineage, small,
+  the `json` feature (and its serde dependency) left off, so what we compile is
+  the BPF backend and nothing else. Closure: `libc`.
+- **`libc` 0.2** (`cloved`, Linux only) — entered Phase G. The seccomp filter
+  names syscalls and address families; these are the C ABI constants for them,
+  and getting them from the maintained table beats a hand-written per-
+  architecture list that is wrong on the one machine nobody tested. Already in
+  the tree under `getrandom`, `landlock` and `seccompiler`, so this is a direct
+  edge to an existing node, not a new crate. Not socket-capable in our use: we
+  reference constants, and `unsafe_code = "forbid"` means we cannot call it.
 - **`getrandom` 0.2** (`cloved`) — entered Phase F. The API token and the
   peer-ID suffix are bytes straight from the OS RNG; `getrandom` is the
   maintained thin wrapper over `getrandom(2)`/`/dev/urandom`, exactly the
@@ -45,18 +64,24 @@ commit. Closure sizes are recorded when the dependency is actually added.
 
 Checked against crates.io on 2026-07-25. `yosemite` 0.7.0 is current;
 `sha1`/`sha2` were moved 0.10 → 0.11 together; `getrandom` is held at 0.2 on
-purpose (above). Total transitive closure: **39 crates**, the bulk of it
+purpose (above). Total transitive closure: **46 crates**, the bulk of it
 yosemite's (`rand`, `thiserror`, `nom`, `tracing` and the proc-macro trio).
+
 `cargo tree -d` should report no duplicates; if it does, that is a review
-topic, not a shrug.
+topic, not a shrug. It currently reports one, arriving with Phase G:
+`thiserror` (and so `thiserror-impl` and `syn`) exists twice, because
+`yosemite` is on `thiserror` 1 and `landlock` is on `thiserror` 2. Three
+duplicated crates, all build-time-only in the second copy. The two ways out
+are both worse than the duplicate: pinning `landlock` back to a 0.4.x on
+`thiserror` 1 downgrades the crate whose correctness is the entire point of
+Layer 2, and dropping `landlock` means hand-written `landlock_*` syscalls in a
+workspace that forbids `unsafe_code`. The real fix is upstream — recheck when
+`yosemite` moves to `thiserror` 2.
 
 ## Approved, enters at the scheduled phase (docs/PLAN.md)
 
-- **`landlock`** — Phase G. Landlock ABI probing and ruleset application for
-  Layer-2 filesystem self-restriction; the raw syscall interface is unsafe
-  and fiddly, and this crate is the maintained reference binding.
-- **`seccompiler`** — Phase G. seccomp-BPF filter construction (Firecracker
-  lineage, small, no proc macros) for Layer-2 syscall dropping.
+Nothing outstanding: the last two scheduled entries, `landlock` and
+`seccompiler`, landed in Phase G and are listed above.
 
 Everything else in SCOPE §9's hand-roll list (bencode, config, arg parsing,
 HTTP/1.1 both ends) is written in-tree, deliberately.

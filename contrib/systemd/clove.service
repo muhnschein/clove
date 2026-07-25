@@ -81,6 +81,14 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @obsolete @mount @debug @swap
 SystemCallErrorNumber=EPERM
+# cloved also restricts itself after start-up (Layer 2, cloved(8) SECURITY).
+# That needs the seccomp and landlock_* syscalls, which live in systemd's
+# @sandbox group. Recent systemd folds @sandbox into @system-service; if the
+# daemon's startup line reports the sandbox as not applied under this unit,
+# add:
+#   SystemCallFilter=@sandbox
+# Layer 2 failing here costs Layer 2 only — the unit's own restrictions and
+# Layer 1 are unaffected.
 
 # --- Resources ---
 # clove is thread-per-peer; the default file limit is ample for I2P swarm

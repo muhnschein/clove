@@ -4,10 +4,11 @@
 //! of live torrents over the SAM backend), and serves the local `/v1/` HTTP
 //! API (hand-rolled HTTP/1.1 + JSON, Q6) over a unix socket with token auth.
 //! The SAM session comes up in the background on the supervisor's backoff;
-//! until then torrents wait in "waiting-for-router". Layer-2 self-restriction
-//! (Landlock/seccomp) is Phase G.
+//! until then torrents wait in "waiting-for-router". Once initialisation is
+//! done the daemon restricts itself (Landlock/seccomp, [`sandbox`]).
 
 mod registry;
+mod sandbox;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -125,6 +126,24 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("binding {}: {e}", config.api_socket.display()))?;
     eprintln!("cloved: listening on {}", config.api_socket.display());
 
+    // Initialisation is over: everything that needs a path outside the data
+    // directory, or a capability beyond talking to the router and its own
+    // files, has already happened. Drop the rest (SCOPE §5 Layer 2). This runs
+    // before any thread is spawned — a Landlock domain covers the calling
+    // thread and its descendants, not siblings that already exist.
+    let mut read_write: Vec<&Path> = vec![&config.data_dir];
+    if let Some(parent) = config.api_socket.parent() {
+        read_write.push(parent);
+    }
+    eprintln!(
+        "cloved: {}",
+        sandbox::enter_post_init(&sandbox::Limits {
+            read_write: &read_write,
+            read_only: &[Path::new("/dev/urandom")],
+            connect_tcp: sam_tcp_port(&config.sam_address),
+        })
+    );
+
     let daemon = Arc::new(Daemon {
         start: Instant::now(),
         sam_address: config.sam_address.clone(),
@@ -156,6 +175,15 @@ struct Daemon {
     router: Mutex<&'static str>,
 }
 
+/// The TCP port of a `host:port` SAM address, or `None` for a unix-socket
+/// path or anything unparseable. Used both to dial the bridge and to tell the
+/// sandbox which port is the only one worth connecting to.
+fn sam_tcp_port(sam_address: &str) -> Option<u16> {
+    sam_address
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+}
+
 /// How often the SAM session's health is probed once connected.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -166,10 +194,7 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
 fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str) {
     // yosemite speaks SAM on 127.0.0.1:<port> only; a unix-socket SAM path
     // cannot be used by this backend.
-    let Some(port) = sam_address
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse::<u16>().ok())
-    else {
+    let Some(port) = sam_tcp_port(sam_address) else {
         eprintln!("cloved: sam_address {sam_address:?} is not host:port; running without a router");
         *lock(&daemon.router) = "unsupported-sam-address";
         return;

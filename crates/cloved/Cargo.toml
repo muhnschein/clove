@@ -16,6 +16,15 @@ i2pnet = { path = "../i2pnet" }
 # moves to a rand that uses getrandom 0.3+.
 getrandom = "0.2"
 
+# Layer-2 self-restriction (SCOPE §5). Linux-only, applied after
+# initialisation; see crates/cloved/src/sandbox.rs. `libc` is here for the
+# syscall numbers and address-family constants the seccomp filter names — it
+# is already in the tree under both of the others, so this adds no crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+libc = "0.2"
+
 [dev-dependencies]
 # Tests build real .torrent fixtures, which need SHA-1 piece hashes. Already
 # in the tree via clove-core; dev-only, not part of the runtime budget.
