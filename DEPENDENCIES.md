@@ -8,18 +8,18 @@ commit. Closure sizes are recorded when the dependency is actually added.
 
 ## Current
 
-- **`sha1` 0.10** (RustCrypto, `clove-core`) — entered Phase A (info-hash
+- **`sha1` 0.11** (RustCrypto, `clove-core`) — entered Phase A (info-hash
   needs it at .torrent parse time, ahead of Phase C piece verification).
   SHA-1 is by protocol; rolling our own cryptographic hash is the one place
   hand-rolling is *worse* engineering. Small, `no_std`-capable, no proc
-  macros. Transitive closure: 7 crates (`digest`, `block-buffer`,
-  `crypto-common`, `generic-array`, `typenum`, `cpufeatures`, `cfg-if`),
-  all RustCrypto-adjacent, none socket-capable.
-- **`sha2` 0.10** (RustCrypto, `i2pnet`) — entered Phase D. A peer's
+  macros. Transitive closure: RustCrypto-adjacent only (`digest`,
+  `block-buffer`, `crypto-common`, `hybrid-array`, `typenum`, `cpufeatures`,
+  `cfg-if`), none socket-capable.
+- **`sha2` 0.11** (RustCrypto, `i2pnet`) — entered Phase D. A peer's
   32-byte destination hash is SHA-256 of its full I2P destination
-  (`i2pnet::addr`). Pinned to 0.10 (not 0.11) so it shares `sha1`'s
-  `digest` 0.10 tree instead of pulling a second copy. No new socket-
-  capable crates.
+  (`i2pnet::addr`). Kept on the same major as `sha1` so the two share one
+  `digest` tree instead of pulling a second copy; when one moves, both move.
+  No new socket-capable crates.
 - **`yosemite` 0.7** (features = `["sync"]`, `i2pnet`) — entered Phase D.
   The reason this project is buildable: SAMv3 sessions/streams/naming.
   MIT, responsive author (R1); consumed only inside `i2pnet` behind our
@@ -32,11 +32,23 @@ commit. Closure sizes are recorded when the dependency is actually added.
   the one library that speaks SAM, and it is wrapped so the engine never
   sees it. Reviewed for socket capability: none of the closure beyond
   `yosemite` itself opens sockets.
-- **`getrandom` 0.2** (`cloved`) — entered Phase F. The API token is 32 bytes
-  straight from the OS RNG; `getrandom` is the maintained thin wrapper over
-  `getrandom(2)`/`/dev/urandom`, exactly the syscall access we do not want to
-  hand-roll. (Peer-ID randomness is covered transitively by yosemite's `rand`.)
-  Tiny closure (`cfg-if`, `libc`); not socket-capable.
+- **`getrandom` 0.2** (`cloved`) — entered Phase F. The API token and the
+  peer-ID suffix are bytes straight from the OS RNG; `getrandom` is the
+  maintained thin wrapper over `getrandom(2)`/`/dev/urandom`, exactly the
+  syscall access we do not want to hand-roll. **Deliberately held at 0.2**
+  rather than 0.3+: yosemite's `rand` already pulls 0.2, so sharing it costs
+  one call-site API name and saves a duplicate crate in the tree. Revisit when
+  yosemite moves to a `rand` built on 0.3. Tiny closure (`cfg-if`, `libc`);
+  not socket-capable.
+
+## Currency
+
+Checked against crates.io on 2026-07-25. `yosemite` 0.7.0 is current;
+`sha1`/`sha2` were moved 0.10 → 0.11 together; `getrandom` is held at 0.2 on
+purpose (above). Total transitive closure: **39 crates**, the bulk of it
+yosemite's (`rand`, `thiserror`, `nom`, `tracing` and the proc-macro trio).
+`cargo tree -d` should report no duplicates; if it does, that is a review
+topic, not a shrug.
 
 ## Approved, enters at the scheduled phase (docs/PLAN.md)
 

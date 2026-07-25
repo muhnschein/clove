@@ -11,5 +11,5 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-sha2 = { version = "0.10", default-features = false }
+sha2 = { version = "0.11", default-features = false }
 yosemite = { version = "0.7.0", default-features = false, features = ["sync"] }
