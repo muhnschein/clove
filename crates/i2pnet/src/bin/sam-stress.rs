@@ -68,12 +68,12 @@ fn run() -> io::Result<()> {
     let listen = SamSession::connect(&SamConfig {
         samv3_tcp_port: port,
         nickname: "clove-stress-listen".to_owned(),
-        persistent_key: None,
+        ..Default::default()
     })?;
     let dial = Arc::new(SamSession::connect(&SamConfig {
         samv3_tcp_port: port,
         nickname: "clove-stress-dial".to_owned(),
-        persistent_key: None,
+        ..Default::default()
     })?);
 
     let listener = SamListener::forward(Arc::new(listen))?;

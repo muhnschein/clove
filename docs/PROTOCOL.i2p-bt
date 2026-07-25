@@ -26,6 +26,16 @@ Status legend:
     resolves the b32 to a full destination via its netDb.
     Implemented in i2pnet::addr, tested against RFC 4648 vectors.
 
+    1.2a [decided] The decode is strict about the final character's spare
+      bits. 52 base32 characters carry 260 bits and a destination hash is
+      256, so a lax decoder maps sixteen distinct labels onto one identity
+      ("…ljnj" and "…ljna" would name the same peer). Found by the mutation
+      sweep in i2pnet::addr, and refused: a decoder must not accept what its
+      own encoder cannot produce, the same rule as a resume bitfield's
+      trailing bits. No interop cost — every implementation derives the label
+      as base32(SHA-256(dest)), which always leaves those bits zero — so a
+      label with them set was not produced by any conforming client.
+
 1.3 [decided] Inbound / naming: SAM reports a peer's *full* base64
     destination (I2P's base64 alphabet is standard base64 with '+'->'-' and
     '/'->'~'). Its hash is SHA-256 of the decoded destination bytes. These
@@ -135,6 +145,30 @@ Status legend:
       it, as the real peer-acquisition path must. Distinct from a *cold router*
       (reseed incomplete → no peers → CantReachPeer indefinitely), which is an
       operator/setup problem (see LIVE-TESTING.md troubleshooting).
+
+2.7 [decided] yosemite 0.7.0 sets no read or write timeout on its SAM control
+    socket. Against a bridge that accepts the TCP connection and then says
+    nothing, `Session::new` blocks forever — it does not error, so nothing
+    upstream of it can back off, retry, or log. Measured in-tree against a
+    fake bridge: of six misbehaviours (close, silence, garbage, endless
+    bytes, refuse-hello, one-byte-dribble), four hung indefinitely and only
+    the two that closed or answered returned at all.
+
+    clove's answer is a pre-flight probe (i2pnet::sam::probe_bridge): before
+    yosemite is handed the port, clove opens its own socket with a connect
+    timeout, a per-read timeout, a whole-exchange deadline and a 512-byte cap,
+    speaks `HELLO VERSION` itself, and requires `HELLO REPLY RESULT=OK`. All
+    six cases now fail cleanly and quickly, with an error naming the address.
+    Budget is SamConfig::probe_timeout (default 10s).
+
+    Residual gap, deliberately not papered over: a bridge that answers HELLO
+    correctly and *then* stalls on SESSION CREATE still hangs inside
+    yosemite. The probe cannot see that far. Closing it needs either read
+    timeouts upstream in yosemite, or proxying yosemite's control connection
+    through a socket clove owns so it can be shut down — the latter is real
+    complexity for a failure mode much rarer than "the router is not up yet",
+    so it waits for evidence from live running. Tracked by the test
+    `a_bridge_that_passes_hello_and_then_stalls_is_a_known_gap`.
 
 
 3. Reconnect discipline (i2pnet::supervisor, M1)

@@ -1296,7 +1296,7 @@ mod tests {
             SamSession::connect(&SamConfig {
                 samv3_tcp_port: port,
                 nickname: "clove-it-seed".to_owned(),
-                persistent_key: None,
+                ..Default::default()
             })
             .expect("seeder SAM session (is the router up with tunnels built?)"),
         );
@@ -1306,7 +1306,7 @@ mod tests {
         let leech_session = SamSession::connect(&SamConfig {
             samv3_tcp_port: port,
             nickname: "clove-it-leech".to_owned(),
-            persistent_key: None,
+            ..Default::default()
         })
         .expect("leecher SAM session");
 

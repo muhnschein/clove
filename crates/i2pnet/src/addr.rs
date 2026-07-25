@@ -95,8 +95,18 @@ pub fn base32_encode(data: &[u8]) -> String {
 
 /// RFC 4648 base32 decode of lowercase, unpadded input.
 ///
+/// Strict about the leftover bits of the final character. 52 characters carry
+/// 260 bits but a destination hash is 256, and a lax decoder therefore maps
+/// sixteen different-looking labels onto one identity — `…ljnj` and `…ljna`
+/// would name the same peer. clove's encoder never emits those bits set, so
+/// input that has them set did not come from clove and is refused, on the
+/// same principle as a resume bitfield's trailing bits (`docs/STATE-FORMAT.md`)
+/// and an unknown config key: a decoder must not accept what its encoder
+/// cannot produce.
+///
 /// # Errors
-/// Returns `None` on any character outside the lowercase base32 alphabet.
+/// Returns `None` on any character outside the lowercase base32 alphabet, or
+/// on a final character whose spare bits are not zero.
 #[must_use]
 pub fn base32_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() * 5 / 8);
@@ -110,6 +120,9 @@ pub fn base32_decode(s: &str) -> Option<Vec<u8>> {
             bits -= 8;
             out.push(((buffer >> bits) & 0xff) as u8);
         }
+    }
+    if bits > 0 && (buffer & ((1 << bits) - 1)) != 0 {
+        return None;
     }
     Some(out)
 }
@@ -252,5 +265,194 @@ mod tests {
         );
 
         assert!(DestHash::from_b64_destination("").is_none());
+    }
+}
+
+#[cfg(test)]
+mod hostile_tests {
+    //! Adversarial coverage for the address parsers.
+    //!
+    //! These are attacker-reachable and were outside every existing sweep:
+    //! `clove-core/tests/hostile.rs` only reaches parsers in `clove-core`,
+    //! and these live here. A b32 label arrives from a magnet link, a PEX
+    //! message or `clove peer`; a full base64 destination arrives from a
+    //! non-compact tracker response and from the router on every inbound
+    //! stream. All of it is bytes someone else chose.
+    //!
+    //! The contract is the same one the rest of the project holds parsers
+    //! to: parse or return `None` — never panic, never loop, never accept
+    //! something the encoder would not have produced.
+
+    use super::*;
+
+    /// A deterministic xorshift, so a failure reproduces from its seed
+    /// rather than being a once-a-month CI flake.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            usize::try_from(self.next() % n as u64).unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn b32_labels_of_the_wrong_length_are_refused() {
+        let valid = DestHash([0x42; 32]).to_b32();
+        let label = valid.strip_suffix(".b32.i2p").expect("suffix");
+        assert_eq!(label.len(), 52, "32 bytes is 52 base32 characters");
+        assert!(DestHash::from_b32(&valid).is_some());
+        assert!(DestHash::from_b32(label).is_some());
+
+        // One character short or long decodes to the wrong byte count, which
+        // must be refused rather than silently truncated or zero-padded: a
+        // near-miss address that resolved to *some* peer would be worse than
+        // no address at all.
+        assert!(DestHash::from_b32(&label[..51]).is_none());
+        assert!(DestHash::from_b32(&format!("{label}a")).is_none());
+        assert!(DestHash::from_b32("").is_none());
+        assert!(DestHash::from_b32(".b32.i2p").is_none());
+    }
+
+    #[test]
+    fn b32_rejects_everything_outside_its_alphabet() {
+        let label: String = DestHash([7; 32])
+            .to_b32()
+            .strip_suffix(".b32.i2p")
+            .expect("suffix")
+            .to_owned();
+        // RFC 4648 base32 as I2P uses it is lowercase a-z and 2-7. Uppercase,
+        // digits 0/1/8/9, padding and punctuation are all outside it.
+        for bad in ['A', 'Z', '0', '1', '8', '9', '=', '.', '/', ' ', '\n'] {
+            let mut mutated = label.clone();
+            mutated.replace_range(10..11, &bad.to_string());
+            assert!(
+                DestHash::from_b32(&mutated).is_none(),
+                "{bad:?} was accepted in a b32 label"
+            );
+        }
+        // Non-ASCII must not panic on a byte-oriented decoder.
+        assert!(DestHash::from_b32("é".repeat(52).as_str()).is_none());
+    }
+
+    #[test]
+    fn the_b32_suffix_is_stripped_once_and_only_at_the_end() {
+        let hash = DestHash([0x99; 32]);
+        let label = hash.to_b32();
+        assert_eq!(DestHash::from_b32(&label), Some(hash));
+        // Surrounding whitespace is tolerated; a doubled suffix is not a
+        // valid address and must not be peeled twice.
+        assert_eq!(DestHash::from_b32(&format!("  {label}  ")), Some(hash));
+        assert!(DestHash::from_b32(&format!("{label}.b32.i2p")).is_none());
+    }
+
+    #[test]
+    fn base64_destinations_reject_the_standard_alphabet() {
+        // I2P base64 swaps '+' -> '-' and '/' -> '~'. A destination carrying
+        // the standard characters is not ours, and accepting it would hash a
+        // different byte string than the router did — a peer identity that
+        // silently disagrees with everyone else's.
+        let dest = i2p_base64_encode(&[0xFB; 48]);
+        assert!(DestHash::from_b64_destination(&dest).is_some());
+        assert!(i2p_base64_decode("+").is_none());
+        assert!(i2p_base64_decode("/").is_none());
+        assert!(i2p_base64_decode(&dest.replace('-', "+")).is_none() || !dest.contains('-'));
+    }
+
+    #[test]
+    fn an_empty_or_unparseable_destination_is_none_not_a_hash_of_nothing() {
+        // SHA-256 of the empty string is a perfectly good hash, and would be
+        // a catastrophic peer identity: every malformed destination would
+        // collide into one peer.
+        assert!(DestHash::from_b64_destination("").is_none());
+        assert!(DestHash::from_b64_destination("   ").is_none());
+        assert!(DestHash::from_b64_destination("====").is_none());
+        assert!(DestHash::from_b64_destination(".i2p").is_none());
+        assert!(DestHash::from_b64_destination("\n\n").is_none());
+    }
+
+    #[test]
+    fn destination_parsing_stops_at_the_first_foreign_character() {
+        // SAM may append a base32 label or params after the destination.
+        // Everything from the first character outside the alphabet is
+        // ignored, and the prefix alone decides the hash.
+        let dest = i2p_base64_encode(&[0x11; 45]);
+        let expected = DestHash::from_b64_destination(&dest).expect("plain destination");
+        for suffix in [
+            " FROM_PORT=0 TO_PORT=0",
+            ".b32.i2p",
+            "\r\n",
+            " garbage",
+            "\u{0}trailing",
+        ] {
+            assert_eq!(
+                DestHash::from_b64_destination(&format!("{dest}{suffix}")),
+                Some(expected),
+                "suffix {suffix:?} changed the identity"
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_a_real_address_never_panics_and_never_lies() {
+        // A sweep in the shape of clove-core's hostile.rs, over the two
+        // address parsers no other sweep reaches.
+        let mut rng = Rng(0x5EED_1234_ABCD_0001);
+        let hash = DestHash([0x5A; 32]);
+        let b32 = hash.to_b32();
+        let b64 = i2p_base64_encode(&[0x33; 387]);
+
+        for round in 0..20_000u32 {
+            let seed = &if round % 2 == 0 {
+                b32.clone()
+            } else {
+                b64.clone()
+            };
+            let mut bytes = seed.clone().into_bytes();
+            if bytes.is_empty() {
+                continue;
+            }
+            match rng.below(3) {
+                0 => {
+                    let at = rng.below(bytes.len());
+                    bytes[at] = u8::try_from(rng.below(256)).unwrap_or(0);
+                }
+                1 => {
+                    let at = rng.below(bytes.len());
+                    bytes.truncate(at);
+                }
+                _ => {
+                    let at = rng.below(bytes.len());
+                    bytes.insert(at, u8::try_from(rng.below(256)).unwrap_or(0));
+                }
+            }
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            // The claim is only that these terminate and do not panic...
+            let from32 = DestHash::from_b32(text);
+            let from64 = DestHash::from_b64_destination(text);
+            // ...and that anything they *do* accept round-trips: a b32 that
+            // parses must re-encode to the same label, or the decoder is
+            // accepting inputs its own encoder cannot produce.
+            if let Some(h) = from32 {
+                let canonical = h.to_b32();
+                let label = text.trim().strip_suffix(".b32.i2p").unwrap_or(text.trim());
+                assert_eq!(
+                    canonical.strip_suffix(".b32.i2p").expect("suffix"),
+                    label,
+                    "round {round}: {text:?} parsed but does not re-encode"
+                );
+            }
+            if let Some(h) = from64 {
+                assert_ne!(h.0, [0u8; 32], "round {round}: all-zero hash from {text:?}");
+            }
+        }
     }
 }
