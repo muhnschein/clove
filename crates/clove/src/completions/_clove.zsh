@@ -3,7 +3,7 @@
 # Install: clove completions zsh > "${fpath[1]}/_clove"
 _clove() {
     local -a cmds
-    cmds=(status list show add remove pause resume verify priorities completions)
+    cmds=(status list watch show add remove pause resume verify priorities peer completions)
     _arguments '1: :->command' '*:: :->args'
     case $state in
         command) _describe 'clove command' cmds ;;
