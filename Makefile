@@ -14,7 +14,7 @@ WAIT ?= 180
 
 QUADLET_DIR := $(HOME)/.config/containers/systemd
 
-.PHONY: test smoke test-live sam-stress router-up router-down router-wait \
+.PHONY: test smoke chaos test-live sam-stress router-up router-down router-wait \
         fmt lint man-lint fuzz install uninstall
 
 # Install layout. Override on the command line, e.g.
@@ -34,6 +34,13 @@ test:
 smoke:
 	cargo build --workspace
 	./ci/smoke.sh
+
+## Crash resilience: SIGKILL storms during state writes, torn temporaries, and
+## a state directory that stops being writable. No router needed. Runs the
+## unwritable-directory case only when unprivileged (root ignores permissions).
+chaos:
+	cargo build --workspace
+	./ci/chaos.sh
 
 ## Tier 2: the router-gated tests (#[ignore]d, keyed on CLOVE_SAM_PORT).
 ## Waits for SAM first so a cold router doesn't produce spurious failures.

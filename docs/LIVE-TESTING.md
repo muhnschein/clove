@@ -210,7 +210,9 @@ A once-run manual pass rots. Two commitments keep M1/M3 *closed*:
 
 1. **Runnable by anyone** (SCOPE §9 regress doctrine): `make test-live` against
    the quadlet is the whole setup. If a contributor with a local i2pd can run
-   tier-2, it stays honest.
+   tier-2, it stays honest. Tier 1 needs nothing at all: `make test` (units and
+   the hostile-input sweep), `make smoke` (the daemon end to end), and
+   `make chaos` (SIGKILL storms and failed state writes).
 2. **Nightly, later**: once the operator box is stable, a `systemd` timer (or a
    self-hosted runner on that box) runs `make test-live` + `sam-stress`
    nightly, so a regression surfaces in a day, not a release. Deferred but
