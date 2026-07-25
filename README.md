@@ -5,9 +5,11 @@ SAMv3 to an external I2P router (i2pd, Java I2P, or emissary). Leak-proof by
 construction: the engine has no IP vocabulary, and only the `i2pnet` crate
 may touch a socket — enforced by lint and CI, not convention.
 
-**Status: pre-alpha bootstrap.** The workspace skeleton, no-clearnet
-enforcement gates, and design documents are in place; the engine is being
-built per the phase plan.
+**Status: pre-alpha.** The client is feature-complete against its v1 scope and
+proven end to end over an in-memory network — daemon, CLI, engine, tracker,
+PEX, magnets, persistence. What it has *not* had is a live I2P router: that
+sign-off is the outstanding work before 0.1 (see
+[`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md)).
 
 ## Documents
 
@@ -31,9 +33,25 @@ the `IPAddressDeny=any` clearnet lock (Layer 3, `docs/SCOPE.md` §5).
 `contrib/netns/` documents the same lock for non-systemd hosts.
 `contrib/podman/` has the i2pd quadlet used for live testing.
 
-## Building
+## Building and testing
 
-Stable Rust. `cargo build`, `cargo test`, `make smoke` (end-to-end, no router
-needed), `make install` (honors `PREFIX`/`DESTDIR`). CI additionally runs rustfmt,
-`clippy::pedantic`, `cargo deny`, and `ci/check-net-deps.sh` (the
-no-clearnet dependency gate).
+Stable Rust, four runtime dependencies, no async runtime.
+
+```
+cargo build                 # or: make install PREFIX=/usr DESTDIR=pkg
+make test                   # units + the hostile-input parser sweep
+make smoke                  # the daemon end to end, no router needed
+make chaos                  # SIGKILL storms and failed state writes
+make man-lint               # the manuals still parse
+```
+
+Everything above runs from a clean checkout with no infrastructure. Two tiers
+need more: `make test-live` wants a local I2P router (see
+[`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md)), and `make fuzz` wants a
+nightly toolchain (see [`fuzz/README.md`](fuzz/README.md)).
+
+CI runs all of the above plus rustfmt, `clippy::pedantic` denied,
+`cargo deny`, and `ci/check-net-deps.sh` — the gate that fails the build if a
+socket-capable crate reaches the dependency tree without being allowlisted.
+Debug builds additionally carry invariant assertions over the piece
+accounting, the choke scheduler and the peer table; release builds do not.
