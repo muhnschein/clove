@@ -46,11 +46,12 @@ Three independent layers (`docs/SCOPE.md` §5), none assuming another is present
 
 ## Building and testing
 
-Stable Rust, four runtime dependencies, no async runtime.
+Stable Rust, seven direct dependencies (three of them Linux-only sandboxing),
+no async runtime.
 
 ```
 cargo build                 # or: make install PREFIX=/usr DESTDIR=pkg
-make test                   # units + the hostile-input parser sweep
+make test                   # units, the hostile-input parser sweep, the evil-peer suite
 make smoke                  # the daemon end to end, no router needed
 make chaos                  # SIGKILL storms and failed state writes
 make man-lint               # the manuals still parse
