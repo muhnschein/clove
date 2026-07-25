@@ -285,6 +285,13 @@ impl Torrent {
         lock(&self.shared.state).picker.have_field().clone()
     }
 
+    /// Switch piece-selection mode on a running torrent (SCOPE §3's
+    /// per-torrent sequential flag). Takes effect on the next pick; nothing
+    /// in flight is cancelled.
+    pub fn set_mode(&self, mode: Mode) {
+        lock(&self.shared.state).picker.set_mode(mode);
+    }
+
     /// Disconnect every attached peer: each is removed from the peer table
     /// (withdrawing its availability and releasing its in-flight blocks) and
     /// its outgoing queue is dropped, so its writer thread exits and no

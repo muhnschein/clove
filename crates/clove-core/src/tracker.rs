@@ -265,6 +265,17 @@ impl AnnounceState {
         now >= self.next_due
     }
 
+    /// Make an announce due immediately, bypassing both the tracker's
+    /// interval and any failure backoff.
+    ///
+    /// This exists for one caller: an operator asking for a re-announce
+    /// (`clove announce`). Nothing automatic may use it — the interval a
+    /// tracker hands back is an instruction, and the whole point of
+    /// [`on_success`](Self::on_success) is to obey it.
+    pub fn make_due(&mut self) {
+        self.next_due = 0;
+    }
+
     /// The event the next announce should carry, given whether the torrent
     /// is now complete.
     #[must_use]

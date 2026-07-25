@@ -127,6 +127,17 @@ impl Value {
         }
     }
 
+    /// The boolean, if this is a [`Bool`](Value::Bool). Strict: `1` and
+    /// `"true"` are not booleans, and a reader that accepts them hides the
+    /// encoder bug that produced them.
+    #[must_use]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
     /// The elements, if this is an [`Array`](Value::Array).
     #[must_use]
     pub fn as_array(&self) -> Option<&[Value]> {
