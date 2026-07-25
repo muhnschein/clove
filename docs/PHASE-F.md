@@ -180,7 +180,16 @@ budget-spending decision — not smuggled in with M4.
      from stop_live), and the **naming cache** (`i2pnet::naming::NamingCache`,
      R6 — positive results cached forever, negative results back off 30s
      doubling to 30min; shared per session, wired in front of the announcer).
-     Still deferred: BEP 9 **magnet add** (next increment).
-6. **`clove watch`**: the hand-rolled live view (§6).
+     - **5e. Magnet add — landed:** `POST /v1/torrents` with a `magnet:` body
+     parses and persists the URI (`state/<ih>.magnet`), then a daemon thread
+     runs fetch rounds — announce to the magnet's trackers for peers, then
+     BEP 9 `fetch_metadata` from each — until it resolves. On success the raw
+     info dict plus the magnet's trackers are synthesized into `.torrent`
+     bytes (`magnet::torrent_bytes`) and promoted through the normal add path,
+     so a magnet and a file add are indistinguishable once resolved. Pending
+     magnets list as `fetching-metadata`, survive restart (the fetch resumes),
+     and can be removed. Mock-proven end to end: magnet → tracker → peer →
+     metadata → live torrent → 100%.
+6. **`clove watch`**: the hand-rolled live view (§6) — the last Phase-F item.
 
 Layer-2 self-restriction (Landlock/seccomp) and man pages are Phase G, not here.

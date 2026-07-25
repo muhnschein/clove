@@ -118,6 +118,14 @@ fn run() -> Result<(), String> {
         router: Mutex::new("connecting"),
     });
 
+    // Resume metadata fetches for magnets loaded from disk. Collect first:
+    // a `for .. in lock(..)` holds the guard for the whole loop body, and
+    // spawn_metadata_fetch re-locks it (deadlock).
+    let pending = lock(&daemon.registry).pending_hashes();
+    for info_hash in pending {
+        spawn_metadata_fetch(&daemon, info_hash);
+    }
+
     spawn_sam_supervisor(&daemon, &config.sam_address);
     spawn_persist_loop(&daemon);
     serve(&listener, &daemon)
@@ -226,6 +234,105 @@ fn spawn_persist_loop(daemon: &Arc<Daemon>) {
     });
 }
 
+/// Pause between metadata-fetch rounds (announce + peer attempts).
+const FETCH_ROUND_WAIT: Duration = Duration::from_secs(30);
+
+/// Spawn the metadata-fetch thread for a pending magnet, at most once per
+/// entry. The thread runs rounds — announce to the magnet's trackers for
+/// peers, then try each peer for BEP 9 metadata — until the magnet resolves
+/// or is removed; without a network it just sleeps and retries.
+fn spawn_metadata_fetch(daemon: &Arc<Daemon>, info_hash: [u8; 20]) {
+    if !lock(&daemon.registry).claim_fetch(&info_hash) {
+        return;
+    }
+    let daemon = Arc::clone(daemon);
+    std::thread::spawn(move || {
+        let mut first_round = true;
+        loop {
+            // Outer None: the magnet resolved or was removed — stop.
+            let Some(context) = lock(&daemon.registry).fetch_context(&info_hash) else {
+                return;
+            };
+            if let Some(ctx) = context
+                && let Some(bytes) = try_fetch_round(&ctx, info_hash, first_round)
+            {
+                match lock(&daemon.registry).complete_magnet(&info_hash, &bytes) {
+                    Ok(()) => eprintln!(
+                        "cloved: magnet {} resolved; torrent added",
+                        registry::hex(&info_hash)
+                    ),
+                    Err(e) => eprintln!(
+                        "cloved: magnet {} fetched but add failed: {e}",
+                        registry::hex(&info_hash)
+                    ),
+                }
+                return;
+            }
+            first_round = false;
+            std::thread::sleep(FETCH_ROUND_WAIT);
+        }
+    });
+}
+
+/// One fetch round: announce to each tracker for peers, then ask each peer
+/// for the metadata. Returns synthesized `.torrent` bytes on success.
+/// Generic so the mock network proves it in tests.
+fn try_fetch_round<D>(
+    ctx: &registry::FetchContext<D>,
+    info_hash: [u8; 20],
+    first_round: bool,
+) -> Option<Vec<u8>>
+where
+    D: i2pnet::I2pDialer + i2pnet::I2pNamingLookup + Clone + Send + Sync + 'static,
+{
+    use clove_core::tracker;
+
+    let mut peers: Vec<DestHash> = Vec::new();
+    for url in &ctx.trackers {
+        let params = tracker::AnnounceParams {
+            info_hash,
+            peer_id: ctx.peer_id,
+            uploaded: 0,
+            downloaded: 0,
+            left: 1, // metadata unknown: report as leeching
+            event: if first_round {
+                tracker::Event::Started
+            } else {
+                tracker::Event::Periodic
+            },
+            numwant: 30,
+            our_dest_b64: &ctx.dest_b64,
+        };
+        let Ok((host, request)) = tracker::build_announce(url, &params) else {
+            continue;
+        };
+        let Ok(dest) = i2pnet::I2pNamingLookup::lookup(&ctx.naming, &host) else {
+            continue;
+        };
+        let Ok(mut stream) = i2pnet::I2pDialer::dial(&ctx.dialer, dest, Duration::from_secs(120))
+        else {
+            continue;
+        };
+        if let Ok(response) = tracker::announce_over(&mut stream, &request) {
+            peers.extend(response.peers);
+        }
+    }
+    peers.dedup();
+    for peer in peers {
+        let Ok(stream) = i2pnet::I2pDialer::dial(&ctx.dialer, peer, Duration::from_secs(120))
+        else {
+            continue;
+        };
+        if let Ok(meta) = clove_core::torrent::fetch_metadata(stream, info_hash, ctx.peer_id) {
+            return Some(clove_core::magnet::torrent_bytes(
+                &meta.raw_info,
+                &ctx.trackers,
+            ));
+        }
+    }
+    None
+}
+
 /// The daemon's wire identity: the Q7 `-CV0001-` prefix plus 12 random bytes.
 fn build_peer_id() -> [u8; 20] {
     let mut id = *b"-CV0001-............";
@@ -255,7 +362,7 @@ fn serve(listener: &ApiListener, daemon: &Arc<Daemon>) -> Result<(), String> {
 }
 
 /// Serve one request: parse, authenticate, route, respond.
-fn handle(mut stream: ApiStream, daemon: &Daemon) -> std::io::Result<()> {
+fn handle(mut stream: ApiStream, daemon: &Arc<Daemon>) -> std::io::Result<()> {
     let Ok(request) = http::read_request(&mut stream, MAX_REQUEST_BODY) else {
         return write_response(&mut stream, &error(400, "malformed request"));
     };
@@ -272,7 +379,7 @@ fn handle(mut stream: ApiStream, daemon: &Daemon) -> std::io::Result<()> {
     write_response(&mut stream, &response)
 }
 
-fn route(request: &http::ServerRequest, daemon: &Daemon) -> Response {
+fn route(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response {
     let method = request.method.as_str();
     let path = request.path();
     match (method, path) {
@@ -290,12 +397,30 @@ fn route(request: &http::ServerRequest, daemon: &Daemon) -> Response {
     }
 }
 
-fn add_torrent(request: &http::ServerRequest, daemon: &Daemon) -> Response {
+fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response {
     if request.body.starts_with(b"magnet:") {
-        return error(
-            501,
-            "magnet links need a running SAM session (a later slice)",
-        );
+        let uri = String::from_utf8_lossy(&request.body).into_owned();
+        // Bind first: a `match lock(..)` would hold the registry guard across
+        // the arms, and spawn_metadata_fetch re-locks it (deadlock).
+        let added = lock(&daemon.registry).add_magnet(uri.trim());
+        return match added {
+            Ok(info_hash) => {
+                spawn_metadata_fetch(daemon, info_hash);
+                let body = Value::Object(vec![
+                    (
+                        "info_hash".to_owned(),
+                        Value::from(registry::hex(&info_hash)),
+                    ),
+                    ("state".to_owned(), Value::from("fetching-metadata")),
+                ])
+                .encode()
+                .into_bytes();
+                Response::new(201, "application/json", body)
+            }
+            Err(AddError::Magnet(e)) => error(400, &e.to_string()),
+            Err(AddError::Duplicate) => error(409, "torrent already added"),
+            Err(e) => error(500, &format!("adding magnet: {e}")),
+        };
     }
     match lock(&daemon.registry).add_torrent(&request.body) {
         Ok(info_hash) => {
@@ -307,7 +432,7 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Daemon) -> Response {
             .into_bytes();
             Response::new(201, "application/json", body)
         }
-        Err(AddError::Parse(e)) => error(400, &e.to_string()),
+        Err(e @ (AddError::Parse(_) | AddError::Magnet(_))) => error(400, &e.to_string()),
         Err(AddError::Duplicate) => error(409, "torrent already added"),
         Err(AddError::Io(e)) => error(500, &format!("adding torrent: {e}")),
     }
