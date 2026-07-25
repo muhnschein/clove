@@ -1,0 +1,68 @@
+[package]
+name = "clove-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Not a workspace member (see the root Cargo.toml): libfuzzer-sys and a
+# nightly toolchain stay out of the shipped build entirely.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+clove-core = { path = "../crates/clove-core" }
+
+[[bin]]
+name = "bencode"
+path = "fuzz_targets/bencode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "metainfo"
+path = "fuzz_targets/metainfo.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "resume"
+path = "fuzz_targets/resume.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "json"
+path = "fuzz_targets/json.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "http"
+path = "fuzz_targets/http.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "tracker"
+path = "fuzz_targets/tracker.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "extensions"
+path = "fuzz_targets/extensions.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "magnet"
+path = "fuzz_targets/magnet.rs"
+test = false
+doc = false

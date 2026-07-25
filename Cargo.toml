@@ -6,6 +6,10 @@ members = [
     "crates/cloved",
     "crates/clove",
 ]
+# cargo-fuzz targets need a nightly toolchain and pull in libfuzzer; they are
+# a separate crate with its own lockfile so neither the dependency budget nor
+# the stable build is affected. See fuzz/README.md.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.0.1"

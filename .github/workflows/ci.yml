@@ -3,6 +3,10 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    # Nightly deep fuzzing; everything else runs on push.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -28,6 +32,28 @@ jobs:
       # passed all of them).
       - run: cargo build --workspace
       - run: ./ci/smoke.sh
+
+  # Coverage-guided fuzzing needs nightly, so it runs on a schedule rather
+  # than blocking every push; the deterministic sweep in
+  # crates/clove-core/tests/hostile.rs covers parsers on each commit.
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [bencode, metainfo, resume, json, http, wire, tracker, extensions, magnet]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
 
   man:
     runs-on: ubuntu-latest
