@@ -38,7 +38,7 @@ WAIT ?= 180
 
 QUADLET_DIR := $(HOME)/.config/containers/systemd
 
-.PHONY: test smoke chaos test-live sam-stress matrix routers report \
+.PHONY: test smoke chaos test-live sam-stress matrix routers report router-ready \
         router-up router-down router-wait router-build router-sam-enable \
         fmt lint man-lint fuzz install uninstall
 
@@ -121,6 +121,17 @@ router-line:
 	@printf '%-10s %-18s 127.0.0.1:%s\n' '$(ROUTER)' '$(UNIT)' '$(SAM_PORT)'
 .PHONY: router-line
 
+## Can this router do the one thing the live tests need — carry a stream from
+## one of its own destinations to another? Two sessions, one dial, bounded.
+##
+## Worth 90 seconds before spending 500 on a test that fails the same way. A
+## fresh router says "unfinished": its netDb is too thin to resolve a leaseSet
+## yet, and the answer is to wait, not to debug clove.
+READY_DEADLINE ?= 90
+router-ready: check-router router-wait
+	@echo "== $(ROUTER): one stream between two of its own destinations =="
+	CLOVE_SAM_PORT=$(SAM_PORT) CLOVE_STRESS_DEADLINE=$(READY_DEADLINE) 		cargo run --release -p i2pnet --bin sam-stress -- 1
+
 ## R2 stress harness: N concurrent streams on one session (docs/PROTOCOL §2.6).
 sam-stress:
 	CLOVE_SAM_PORT=$(SAM_PORT) cargo run --release -p i2pnet --bin sam-stress -- $(N)
@@ -187,7 +198,11 @@ fuzz:
 ## Check the manuals parse and follow mdoc conventions. Unresolved cross-page
 ## references are expected until the pages are installed, so they are filtered.
 man-lint:
-	@fail=0; for page in man/*; do \
+	@if ! command -v mandoc >/dev/null 2>&1; then \
+		echo "man-lint: SKIP (mandoc is not installed; apt install mandoc)"; \
+		exit 0; \
+	fi; \
+	fail=0; for page in man/*; do \
 		out=$$(mandoc -T lint -W warning "$$page" 2>&1 \
 			| grep -v 'referenced manual not found'); \
 		if [ -n "$$out" ]; then echo "$$out"; fail=1; fi; \
