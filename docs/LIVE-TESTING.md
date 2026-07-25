@@ -191,6 +191,15 @@ bugs on both sides, coordinate upstream) → Java I2P (P1, reference).
       **completes** without a restart of clove. Confirms `supervisor` §3.1/§3.2
       against a real router.
 - [ ] The above pass on emissary; deltas from i2pd noted. Java I2P sanity pass.
+- [ ] Layer 2 is actually on: `cloved`'s startup line reads
+      `sandbox: landlock enforced; seccomp filter installed`, and everything
+      above still passes with it enforced. This one belongs here rather than in
+      Bucket 1 because container CI does not expose Landlock — the unit test in
+      `crates/cloved/src/sandbox.rs` reports it as unenforced and exercises only
+      seccomp there, so a bad path set would not surface until an operator with
+      a real kernel runs the daemon. `contrib/systemd`'s `ReadWritePaths` and
+      the sandbox's read-write set must agree; a mismatch shows up as an I/O
+      error on a torrent that worked before.
 
 ### 6.2 M3 exit checklist
 

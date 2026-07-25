@@ -26,11 +26,22 @@ Man pages are the primary user documentation and live in [`man/`](man):
 installing with `mandoc man/clove.1`, or after with `man clove`. This README
 stays short on purpose.
 
-## Packaging
+## Confinement
 
-`contrib/systemd/` has a system unit and a per-user unit; the system one carries
-the `IPAddressDeny=any` clearnet lock (Layer 3, `docs/SCOPE.md` §5).
-`contrib/netns/` documents the same lock for non-systemd hosts.
+Three independent layers (`docs/SCOPE.md` §5), none assuming another is present:
+
+1. **By construction** — the engine has no IP vocabulary and cannot open a
+   socket; only `i2pnet` can, and only to a loopback SAM bridge. Enforced by
+   `clippy.toml` and `ci/check-net-deps.sh`.
+2. **Self-restriction** — after initialisation `cloved` confines itself with
+   Landlock (filesystem down to the data directory; on ABI 4+, outbound TCP
+   down to the SAM port) and a seccomp filter refusing exec, ptrace, module and
+   BPF loading, mount, and unfamiliar address families. Best-effort: a kernel
+   without them gets one log line, not a failed start.
+3. **OS sandbox** — `contrib/systemd/` has a system unit and a per-user unit;
+   the system one carries the `IPAddressDeny=any` clearnet lock.
+   `contrib/netns/` documents the same lock for non-systemd hosts.
+
 `contrib/podman/` has the i2pd quadlet used for live testing.
 
 ## Building and testing

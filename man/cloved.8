@@ -90,6 +90,43 @@ They are never contacted, and never logged beyond a count.
 .Pp
 The API token is required on every request, including over the unix socket.
 Keep the data directory readable only by the daemon's user.
+.Ss Self-restriction
+Once initialisation is finished \(em configuration read, data directory
+created, token loaded, torrents loaded, control socket bound \(em
+.Nm
+drops the capabilities it no longer needs, before it starts any thread.
+On Linux this is
+.Xr landlock 7 ,
+confining the filesystem to the data directory and the control socket's
+directory, and, on kernels with Landlock ABI 4 or later, confining outbound
+TCP to the single SAM port; plus a
+.Xr seccomp 2
+filter refusing
+.Xr execve 2 ,
+.Xr ptrace 2 ,
+module and BPF loading, mount and namespace calls, kernel replacement, the
+kernel keyring, and
+.Xr socket 2
+for any address family other than
+.Dv AF_UNIX ,
+.Dv AF_INET
+and
+.Dv AF_INET6 .
+.Pp
+Neither mechanism is allowed to fail startup.
+What was actually applied is reported in one line on standard error, for
+example
+.Bd -literal -offset indent
+cloved: sandbox: landlock enforced; seccomp filter installed
+.Ed
+.Pp
+On a kernel without Landlock the same line says so, and the daemon continues:
+this is one of three independent layers, and no layer assumes another is
+present.
+The others are the by-construction restrictions above and the OS sandbox in
+.Pa contrib/systemd
+and
+.Pa contrib/netns .
 .Sh FILES
 .Bl -tag -width Ds -compact
 .It Pa ~/.config/clove/clove.conf

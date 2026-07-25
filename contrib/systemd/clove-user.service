@@ -59,6 +59,9 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @obsolete @mount @debug @swap
 SystemCallErrorNumber=EPERM
+# See the system unit: if cloved's startup line reports its own Layer-2
+# sandbox as not applied, this filter is missing systemd's @sandbox group
+# (the seccomp and landlock_* syscalls) — add SystemCallFilter=@sandbox.
 
 LimitNOFILE=8192
 TasksMax=1024
