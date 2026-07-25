@@ -38,7 +38,7 @@ WAIT ?= 180
 
 QUADLET_DIR := $(HOME)/.config/containers/systemd
 
-.PHONY: test smoke chaos test-live sam-stress matrix routers \
+.PHONY: test smoke chaos test-live sam-stress matrix routers report \
         router-up router-down router-wait router-build router-sam-enable \
         fmt lint man-lint fuzz install uninstall
 
@@ -101,6 +101,15 @@ matrix:
 	echo "passed:$${pass:- none}"; \
 	echo "failed:$${fail:- none}"; \
 	[ -z "$$fail" ]
+
+## Everything that applies on this machine, into one report file to hand over.
+## Adds router versions, netDb counts and container logs, so a failure arrives
+## already distinguishable from a cold router.
+##   make report              # test whatever routers are already up
+##   make report ARGS=--up    # bring them up first
+ARGS ?=
+report:
+	./ci/live-report.sh $(ARGS)
 
 ## What each router is called and where its SAM lands.
 routers:

@@ -64,6 +64,11 @@ I2P router (see
 [`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md)), and `make fuzz` wants a
 nightly toolchain (see [`fuzz/README.md`](fuzz/README.md)).
 
+`make report` runs every tier that applies on the machine — including each
+router in turn — and writes one file with the verdicts, the router versions and
+the container logs, so a live session produces something reviewable rather than
+a scrollback.
+
 CI runs all of the above plus rustfmt, `clippy::pedantic` denied,
 `cargo deny`, and `ci/check-net-deps.sh` — the gate that fails the build if a
 socket-capable crate reaches the dependency tree without being allowlisted.

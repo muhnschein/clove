@@ -1,1 +1,5 @@
 /target
+
+# Reports from ci/live-report.sh — machine-specific, not project state.
+/live-report-*.txt
+/live-report-*.txt.short

@@ -20,6 +20,8 @@ make router-up ROUTER=i2pd         # start one (rootless podman quadlet)
 make sam-stress N=64               # R2 harness: 64 concurrent streams, one session
 make test-live                     # the router-gated loopback download
 make matrix                        # …or all three routers in turn
+
+make report ARGS=--up              # …or all of the above, into one file (§5.3)
 ```
 
 All three routers in `SCOPE.md` §6 — i2pd, Java I2P and emissary — have a
@@ -208,7 +210,41 @@ destination; they reach each other dest-to-dest through that router's tunnels �
 exactly the "two instances over one local router" of `SCOPE.md` §6, tier 2. One
 quadlet covers M1's loopback criterion.
 
-### 5.3 `make test-live`
+### 5.3 One command, one file: `make report`
+
+Running the tiers one at a time and pasting each result somewhere is how a
+live session turns into an afternoon. `ci/live-report.sh` runs everything that
+applies on the machine and writes a single report:
+
+```
+make report              # test whatever routers are already answering
+make report ARGS=--up    # bring the routers up first, then test
+./ci/live-report.sh --help
+```
+
+It runs tier 1 (build, unit tests, smoke, chaos, the no-clearnet gate, man
+pages) once, then for each router: context, the live tier, and `sam-stress` at
+16/32/64/128. Nothing aborts on failure — a router that is down, a test that
+fails, a stress level that collapses are all recorded and stepped past, because
+a run that stops at the first problem wastes the other twenty minutes.
+
+Two files come out:
+
+- `live-report-<timestamp>.txt` — everything.
+- `…​.txt.short` — environment, the verdict table, and only the sections that
+  did **not** pass. Usually a few hundred lines; this is the one to send first.
+
+What it collects beyond raw output is the part that saves a round trip: router
+version and image, container restart count, whether SAM and the console answer,
+i2pd's netDb/tunnel counts, and the container log for any router that failed.
+Those are what separate "clove cannot dial" from "this router knows nobody to
+dial through" — a distinction that cost us a debugging session once already.
+
+API tokens are redacted. I2P destinations are not, since they are what makes a
+dial traceable and the ones in a test run are transient; `--redact-dests`
+removes them if you would rather.
+
+### 5.4 `make test-live`
 
 ```
 make test-live                    # waits for SAM, runs cargo test -- --ignored
@@ -221,6 +257,9 @@ make matrix                       # the live tier against all three, in turn
 Readiness is a TCP probe of `127.0.0.1:$CLOVE_SAM_PORT` plus a trial transient
 session (SAM answering ≠ tunnels built); the target polls with a timeout and
 fails loudly rather than running tests against a half-up router.
+
+These are the individual targets; `make report` (§5.3) drives all of them and
+is the better starting point for a session whose results you intend to share.
 
 ## 6. Bucket 2 — the live sign-off (operator machine)
 
