@@ -15,7 +15,7 @@ WAIT ?= 180
 QUADLET_DIR := $(HOME)/.config/containers/systemd
 
 .PHONY: test smoke test-live sam-stress router-up router-down router-wait \
-        fmt lint man-lint install uninstall
+        fmt lint man-lint fuzz install uninstall
 
 # Install layout. Override on the command line, e.g.
 #   make install PREFIX=/usr DESTDIR=$(CURDIR)/pkg
@@ -70,6 +70,14 @@ router-wait:
 		fi; sleep 1; \
 	done; \
 	echo "SAM did not come up on 127.0.0.1:$(SAM_PORT) within $(WAIT)s" >&2; exit 1
+
+## Deep, coverage-guided fuzzing (nightly toolchain + cargo-fuzz). The
+## every-push parser coverage is `make test`; see fuzz/README.md.
+##   make fuzz TARGET=metainfo SECS=600
+TARGET ?= bencode
+SECS ?= 60
+fuzz:
+	cargo +nightly fuzz run $(TARGET) -- -max_total_time=$(SECS)
 
 ## Check the manuals parse and follow mdoc conventions. Unresolved cross-page
 ## references are expected until the pages are installed, so they are filtered.

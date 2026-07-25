@@ -56,7 +56,13 @@ impl Value {
             }
             Value::Float(f) => {
                 if f.is_finite() {
-                    let _ = write!(out, "{f}");
+                    // A whole float would print as "1", which re-parses as an
+                    // integer; keep the fraction so encode/parse round-trips.
+                    if f.fract() == 0.0 && f.abs() < 1e15 {
+                        let _ = write!(out, "{f:.1}");
+                    } else {
+                        let _ = write!(out, "{f}");
+                    }
                 } else {
                     out.push_str("null");
                 }
@@ -130,10 +136,10 @@ impl Value {
         }
     }
 
-    /// This value as `u64` if it is a non-negative integer. Note that a whole
-    /// number encodes and re-parses as an integer even if it began as a float
-    /// (e.g. `1.0` → `1`), so numeric fields should be read through this or
-    /// [`as_f64`](Value::as_f64), not matched on a specific variant.
+    /// This value as `u64` if it is a non-negative integer. Numeric fields
+    /// should be read through this or [`as_f64`](Value::as_f64) rather than
+    /// matched on a specific variant: which one a number arrives as depends on
+    /// how it was written, and JSON itself draws no such distinction.
     #[must_use]
     pub fn as_u64(&self) -> Option<u64> {
         match self {
@@ -516,6 +522,14 @@ mod tests {
         assert_eq!(Value::Int(-42).encode(), "-42");
         assert_eq!(Value::UInt(42).encode(), "42");
         assert_eq!(Value::Str("hi".to_owned()).encode(), "\"hi\"");
+    }
+
+    #[test]
+    fn whole_floats_keep_their_fraction() {
+        // Otherwise `1` comes back as Int and the round trip is lossy.
+        assert_eq!(Value::Float(1.0).encode(), "1.0");
+        assert_eq!(Value::Float(-15e9).encode(), "-15000000000.0");
+        assert_eq!(parse("1.0").unwrap(), Value::Float(1.0));
     }
 
     #[test]
