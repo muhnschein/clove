@@ -2,9 +2,10 @@
 //!
 //! A thin client: hand-rolled arg parsing, one request per invocation over the
 //! local API (unix socket), rendering the daemon's JSON (`--json` passes it
-//! through). Commands: `status`, `list`, `show`, `add`, `remove`, `pause`,
-//! `resume`, `verify`, `priorities`, `completions`. The live `clove watch` view
-//! is a later Phase-F slice (`docs/PHASE-F.md`).
+//! through). Commands: `status`, `list`, `watch`, `show`, `add`, `remove`,
+//! `pause`, `resume`, `verify`, `peer`, `priorities`, `completions`.
+//! `watch` is the live view — a repaint loop over the same renderers, not a
+//! TUI framework (`docs/PHASE-F.md` §6).
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -77,6 +78,7 @@ fn run() -> Result<(), Fail> {
     match command.as_deref() {
         Some("status") => cmd_status(socket, json),
         Some("list") => cmd_list(socket, json),
+        Some("watch") => cmd_watch(socket, &operands),
         Some("add") => cmd_add(socket, &operands),
         Some("remove") => cmd_remove(socket, &operands),
         Some("show") => cmd_show(socket, json, &operands),
@@ -98,6 +100,7 @@ fn print_help() {
     println!("commands:");
     println!("  status [--json]                daemon and router status");
     println!("  list [--json]                  hosted torrents");
+    println!("  watch [--interval <secs>]      live view, repainted (Ctrl-C to quit)");
     println!("  show <info-hash> [--json]      one torrent in detail");
     println!("  add <file.torrent|magnet:…>    add a torrent");
     println!("  remove <info-hash> [--data]    remove a torrent (--data also deletes files)");
@@ -138,6 +141,93 @@ fn cmd_list(socket: Option<PathBuf>, json: bool) -> Result<(), Fail> {
     }
     print!("{}", render_torrents(&parse_body(&body)?));
     Ok(())
+}
+
+/// Default repaint interval for `clove watch`.
+const WATCH_DEFAULT_SECS: u64 = 2;
+
+/// Slowest repaint we accept, so a typo cannot wedge the view for an hour.
+const WATCH_MAX_SECS: u64 = 3600;
+
+/// The live view (`docs/PHASE-F.md` §6): re-fetch status + torrents on an
+/// interval and repaint the same tables the one-shot commands print.
+///
+/// Deliberately *not* a TUI: no raw mode, no alternate screen, no framework —
+/// two ANSI escapes (erase display, cursor home) and the existing renderers.
+/// The terminal stays in its normal mode throughout, so Ctrl-C at any moment
+/// leaves a sane terminal with nothing to restore.
+fn cmd_watch(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
+    let mut interval = WATCH_DEFAULT_SECS;
+    let mut args = operands.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--interval" => {
+                let value = args.next().ok_or_else(|| {
+                    Fail::Usage("--interval needs a number of seconds".to_owned())
+                })?;
+                interval = value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|secs| (1..=WATCH_MAX_SECS).contains(secs))
+                    .ok_or_else(|| {
+                        Fail::Usage(format!("--interval must be 1..={WATCH_MAX_SECS} seconds"))
+                    })?;
+            }
+            other => return Err(Fail::Usage(format!("unexpected argument {other:?}"))),
+        }
+    }
+
+    let (socket, token) = resolve(socket)?;
+    loop {
+        let frame = watch_frame(&socket, &token, interval)?;
+        // Erase the display and park the cursor at the top-left, then draw.
+        // One write keeps the repaint from tearing on a slow terminal.
+        print!("\x1b[2J\x1b[H{frame}");
+        std::io::stdout()
+            .flush()
+            .map_err(|e| Fail::Failed(format!("writing to the terminal: {e}")))?;
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+    }
+}
+
+/// One repaint's worth of text: the daemon summary line, then the torrents.
+fn watch_frame(socket: &Path, token: &str, interval: u64) -> Result<String, Fail> {
+    let status = parse_body(&request(socket, token, "GET", "/v1/status", &[])?)?;
+    let torrents = parse_body(&request(socket, token, "GET", "/v1/torrents", &[])?)?;
+
+    let router = status.get("router").and_then(Value::as_str).unwrap_or("-");
+    let version = status.get("version").and_then(Value::as_str).unwrap_or("-");
+    let count = status.get("torrents").and_then(Value::as_u64).unwrap_or(0);
+    let uptime = status
+        .get("uptime_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "clove {version}  router: {router}  torrents: {count}  up: {}  (every {interval}s, Ctrl-C to quit)",
+        human_duration(uptime)
+    );
+    out.push('\n');
+    out.push_str(&render_torrents(&torrents));
+    Ok(out)
+}
+
+/// Compact uptime: `9s`, `5m`, `3h12m`, `2d4h`.
+fn human_duration(secs: u64) -> String {
+    let (days, rest) = (secs / 86_400, secs % 86_400);
+    let (hours, rest) = (rest / 3_600, rest % 3_600);
+    let (minutes, seconds) = (rest / 60, rest % 60);
+    if days > 0 {
+        format!("{days}d{hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn cmd_add(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {

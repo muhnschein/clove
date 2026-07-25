@@ -1,6 +1,6 @@
 # Phase F — Operable (`cloved`, `clove`)
 
-**Status:** In progress. This pins the API surface, the daemon/CLI shape, the
+**Status:** Complete (build order §7 all landed). This pins the API surface, the daemon/CLI shape, the
 persistence plan, and the TUI decision before the daemon wiring is written, so
 the architecture is agreed up front. Maps to `PLAN.md` Phase F and milestone M4
 (daily-drivable daemon + CLI). Nothing here relaxes `SCOPE.md` §9 — in
@@ -190,6 +190,19 @@ budget-spending decision — not smuggled in with M4.
      magnets list as `fetching-metadata`, survive restart (the fetch resumes),
      and can be removed. Mock-proven end to end: magnet → tracker → peer →
      metadata → live torrent → 100%.
-6. **`clove watch`**: the hand-rolled live view (§6) — the last Phase-F item.
+6. **`clove watch` — landed:** the hand-rolled live view (§6). Re-fetches
+   `/v1/status` + `/v1/torrents` on an interval (`--interval`, 1..=3600s,
+   default 2) and repaints via the *same* renderers the one-shot commands use,
+   using two ANSI escapes (erase display, cursor home) and one write per
+   frame. No raw mode, no alternate screen, no framework, zero new
+   dependencies — so Ctrl-C leaves a sane terminal with nothing to restore.
+   Header line carries version, router state, torrent count, uptime.
+
+**Phase F is complete.** M4's deliverable — a daily-drivable daemon + CLI —
+stands: config + `-C`, token-authed `/v1/` API over a unix socket, the full
+command surface, persistence with a written format spec, engine hosting over
+SAM with supervision, tracker/PEX/magnet peer acquisition, and the live view.
+What remains for the milestone is out-of-CI: the live-router sign-off in
+`LIVE-TESTING.md`. Man pages, sandboxing and packaging are Phase G.
 
 Layer-2 self-restriction (Landlock/seccomp) and man pages are Phase G, not here.
