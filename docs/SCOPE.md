@@ -28,6 +28,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 - Web UI. Deferred to v2. The HTTP API is designed so a web UI can be added without engine changes.
 - BitTorrent v2 (BEP 52), uTP, Local Peer Discovery, IP-based anything.
 - Embedded router. We require an external router exposing SAMv3 (i2pd, Java I2P, or emissary).
+- `clove fetch`, the daemon-less one-shot download mode. Entered §3 as an explicit stretch goal and is **cut** rather than carried: it needs a second lifecycle (session setup, download, teardown, all in one process) whose failure modes are not the daemon's, and every hour spent on it is an hour not spent on the live-router sign-off that actually gates 0.1. Nothing about the design forecloses it — the engine already runs headless in tests — so it is a v2 candidate, not a rejection.
 
 ## 3. v1 Feature Cut
 
@@ -65,7 +66,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 - Daemon `cloved` + control CLI `clove`, speaking to the local HTTP API over a unix socket (default) or localhost TCP (opt-in).
 - Commands: add (file/magnet), remove (with/without data), list, status (per torrent: peers, tunnels, speeds, availability), pause/resume, verify, set file priorities, tracker re-announce, client-level stats.
 - Human-friendly default output (aligned tables, progress, rates); `--json` on every read command for scripting.
-- Sensible exit codes, shell completion generation, no daemon required for `clove fetch`-style one-shot download mode (stretch goal, may cut).
+- Sensible exit codes, shell completion generation. The `clove fetch`-style one-shot download mode (no daemon) was the one stretch goal here and is **cut from v1** — see §2.
 - Peer identity on the wire: Azureus-style peer-ID prefix and client name string chosen per Q7 and kept stable thereafter; checked against the informal BEP 20 registry to avoid collisions.
 
 ### HTTP API

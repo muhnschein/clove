@@ -6,17 +6,17 @@ project has. This file says how to report one and what to expect back. It is
 published before the first release, deliberately, so it is never retrofitted
 after the first report.
 
-> **Maintainer: fill in before tagging 0.1.**
-> The contact address and signing-key fingerprint below are placeholders. A
-> security policy that points nowhere is worse than none, so 0.1 must not ship
-> until they are real. Everything else on this page is accurate today.
-
 ## Reporting a vulnerability
 
-Report privately, not in a public issue:
+**Use GitHub's private vulnerability reporting on this repository** — the
+*Security* tab, *Report a vulnerability*. That is the only reporting channel,
+deliberately: one channel that is authenticated, private by construction, and
+cannot be misdelivered beats a published address nobody watches and a PGP key
+nobody can verify. Do not open a public issue for a suspected vulnerability.
 
-- **Email:** `SECURITY-CONTACT-TBD` (PGP key `KEY-FINGERPRINT-TBD`)
-- Or use GitHub's private vulnerability reporting on the repository.
+If you cannot use GitHub at all, open a public issue containing **no details** —
+just that you have something to report — and you will be given somewhere private
+to send it.
 
 Please include the clove version or commit, the router and version
 (i2pd / Java I2P / emissary), what you observed, and a reproduction if you have
@@ -25,8 +25,8 @@ chase a hunch than miss a leak.
 
 ## What to expect
 
-- **Acknowledgement within 7 days.** If you do not hear back, assume the mail
-  went astray and try the other channel.
+- **Acknowledgement within 7 days.** GitHub notifies the maintainer directly, so
+  silence past that means something went wrong — nudge the advisory thread.
 - An assessment — whether we agree it is a vulnerability, and its severity —
   within 14 days.
 - We aim to fix and release within 90 days of the report. Leak-class bugs
@@ -92,8 +92,9 @@ definition, even without a demonstrated exploit.
 
 ## Releases
 
-Release tags are signed. Verify with the maintainer key above before building
-anything you intend to run.
+Release tags are signed. The signing key's fingerprint is published with the
+first signed release and does not change without an announcement; verify the tag
+before building anything you intend to run.
 
 Security fixes ship as a normal release with the issue described plainly in
 the release notes. We do not quietly slip fixes into unrelated commits.
