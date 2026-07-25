@@ -170,6 +170,49 @@ Status legend:
     so it waits for evidence from live running. Tracked by the test
     `a_bridge_that_passes_hello_and_then_stalls_is_a_known_gap`.
 
+2.8 [open] emissary 0.4.0, first live run (2026-07-25): every dial between two
+    destinations on the *same* emissary router failed. The router's own log is
+    unambiguous about why:
+
+      WARN emissary::sam::session: unable to open stream, lease set not found
+           session_id="clove-stress-dial" destination_id=uLFobsL8 error=Timeout
+
+    Not CANT_REACH_PEER from a failed tunnel build: the dialing session cannot
+    resolve the *leaseSet* of a destination hosted by the very router it is
+    talking to. The target session's tunnels were up at the time — the same log
+    shows "inbound tunnel built name=clove-stress-listen" — so this is a netDb
+    lookup that goes to the network and times out, rather than being answered
+    locally. 19 such timeouts across the run; zero dials succeeded.
+
+    Also seen, immediately after each of that session's inbound tunnel builds:
+
+      WARN emissary::tunnel::pool: unhandled message name=clove-stress-listen
+           message_type=DeliveryStatus
+
+    DeliveryStatus is how a netDb store is acknowledged, so an unhandled one is
+    consistent with the leaseSet never being recorded as published.
+
+    Two candidate explanations, not yet separated:
+      (a) emissary does not short-circuit leaseSet lookups for destinations it
+          hosts itself, so a same-router dial needs a full floodfill round trip
+          — which a young router with a thin netDb cannot complete. Java I2P
+          and i2pd both answer locally, which is why the loopback topology
+          (LIVE-TESTING §5.2) was assumed cheap.
+      (b) the router was simply too young (~30 min, first boot) and would
+          succeed given hours.
+
+    Distinguishing them is one run: leave the router up for several hours and
+    repeat `make router-ready ROUTER=emissary`. Still failing ⇒ (a), and an
+    upstream report with this log. Succeeding ⇒ (b), and LIVE-TESTING gains a
+    minimum-router-age note.
+
+    Nothing here implicates clove: the dial is an ordinary SAM STREAM CONNECT
+    to a b32, and the router refuses it before any of our code is involved. It
+    is recorded because SCOPE §6 predicted exactly this ("young router, young
+    SAM impl — expect to find bugs on both sides; coordinate upstream"), and
+    because the same *symptom* (CantReachPeer) appeared earlier against i2pd
+    without a log detailed enough to say whether the cause was the same.
+
 
 3. Reconnect discipline (i2pnet::supervisor, M1)
 ------------------------------------------------

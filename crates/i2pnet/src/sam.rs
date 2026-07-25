@@ -393,6 +393,23 @@ pub struct ForwardedStream {
     inner: TcpStream,
 }
 
+impl ForwardedStream {
+    /// Bound how long reads and writes on this stream may block.
+    ///
+    /// The socket is a loopback TCP connection from the router, so this is a
+    /// real timeout and not a polite request. Worth setting on anything that
+    /// serves peers: a stream that connects and then goes quiet otherwise
+    /// parks a thread for the life of the process.
+    ///
+    /// # Errors
+    ///
+    /// The underlying `setsockopt` failed.
+    pub fn set_timeouts(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.set_read_timeout(timeout)?;
+        self.inner.set_write_timeout(timeout)
+    }
+}
+
 impl Read for ForwardedStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)

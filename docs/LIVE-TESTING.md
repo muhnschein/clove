@@ -359,6 +359,27 @@ A once-run manual pass rots. Two commitments keep M1/M3 *closed*:
    designed for — nothing in Bucket 1 blocks adding it, since the harness and
    tests are already env-driven and non-interactive.
 
+### 6.4 Before spending 500 seconds: `make router-ready`
+
+```
+make router-ready ROUTER=emissary
+```
+
+Two sessions on the router, one dial between them, bounded at 90 seconds. It
+is the smallest thing that exercises what every live test needs, and its
+verdicts are the ones worth acting on:
+
+- **succeeded 1/1** — the router can carry a stream between its own
+  destinations. Run the real tier.
+- **unfinished 1** — the router accepted the sessions but never completed the
+  dial. Almost always a netDb too thin to resolve a leaseSet: wait, do not
+  debug clove. Check again in an hour; a first-boot router can need several.
+- **failed 1** with an error — that error is the finding. Record it.
+
+Run this after any router restart and before a matrix sweep. A live tier that
+fails after eight minutes of retries tells you nothing this does not tell you
+in ninety seconds.
+
 ## 7a. Troubleshooting (live-run findings)
 
 **`CantReachPeer` on every dial, immediately after `router-up`.** Two causes,

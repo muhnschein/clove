@@ -40,7 +40,12 @@ Volume=clove-i2p-java-config:/i2p/.i2p
 Environment=IP_ADDR=0.0.0.0
 # Java I2P wants more headroom than i2pd; the JVM plus a full netDb is not a
 # 256 MiB proposition. Raise if the router logs OOM during reseed.
-Memory=1g
+#
+# Passed through as a podman argument rather than a quadlet `Memory=` key:
+# quadlet skips generating the unit entirely for a key it does not recognise,
+# and the symptom is "Unit i2p-java.service not found" with the real complaint
+# buried in the user journal. PodmanArgs= has been there since quadlet shipped.
+PodmanArgs=--memory=1g
 
 [Service]
 # A cold Java router reseeds, unpacks webapps and builds tunnels; that is

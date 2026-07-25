@@ -9,17 +9,25 @@
 //! N times at once.
 //!
 //! Needs a live router — this is a manual tool, not a CI test. It prints a
-//! clear message and exits non-zero when SAM is unreachable, and never hangs
-//! silently. See `docs/LIVE-TESTING.md` §6.1 for how its output feeds M1.
+//! clear message and exits non-zero when SAM is unreachable.
+//!
+//! **Everything here is on a deadline.** A stress harness whose failure mode is
+//! "sits there" is worse than useless: it burns the operator's session and
+//! tells them nothing. Streams that do not finish are counted as unfinished and
+//! reported as such, rather than parked on forever — which is what an
+//! unbounded `join` on a wedged dial amounts to. Raise the budget with
+//! `CLOVE_STRESS_DEADLINE` when testing a slow router.
 //!
 //! Usage:
-//!   sam-stress [N]            # N concurrent streams (default 32)
-//!   `CLOVE_SAM_PORT=7656` ... # SAM control port (default 7656)
+//!   sam-stress [N]                  # N concurrent streams (default 32)
+//!   `CLOVE_SAM_PORT=7656` ...       # SAM control port (default 7656)
+//!   `CLOVE_STRESS_DEADLINE=360` ... # seconds for the whole run (default 360)
 
 use std::env;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,19 +49,40 @@ const WARMUP_DEADLINE: Duration = Duration::from_secs(240);
 /// Pause between dial retries during warmup.
 const RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Default budget for the whole run, from "sessions up" to the report.
+///
+/// Comfortably longer than [`WARMUP_DEADLINE`] so a legitimately slow warmup
+/// still finishes, and short enough that a wedged router costs minutes rather
+/// than an afternoon. Override with `CLOVE_STRESS_DEADLINE` (seconds).
+const RUN_DEADLINE: Duration = Duration::from_secs(360);
+
+/// How long an echo handler waits on its half of an exchange. Handlers hold a
+/// loopback socket, so unlike the dial side this is enforceable.
+const ECHO_TIMEOUT: Duration = Duration::from_secs(120);
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("sam-stress: {e}");
-            eprintln!(
-                "sam-stress: is a router running with SAM enabled on \
-                 127.0.0.1:{}? (set CLOVE_SAM_PORT to change)",
-                sam_port()
-            );
             ExitCode::FAILURE
         }
     }
+}
+
+/// Attach the "is a router even there?" hint to a session-setup failure.
+///
+/// Only to setup failures: once the sessions are up the router is plainly
+/// running, and repeating the question there sends the reader to check
+/// something they have already proved.
+fn setup_hint<T>(result: io::Result<T>) -> io::Result<T> {
+    result.inspect_err(|_| {
+        eprintln!(
+            "sam-stress: could not bring up a SAM session on 127.0.0.1:{}. \
+             Is a router running with SAM enabled there? (CLOVE_SAM_PORT changes the port)",
+            sam_port()
+        );
+    })
 }
 
 fn run() -> io::Result<()> {
@@ -65,57 +94,123 @@ fn run() -> io::Result<()> {
     let port = sam_port();
 
     eprintln!("sam-stress: connecting to SAM on 127.0.0.1:{port} (two sessions)…");
-    let listen = SamSession::connect(&SamConfig {
+    let listen = setup_hint(SamSession::connect(&SamConfig {
         samv3_tcp_port: port,
         nickname: "clove-stress-listen".to_owned(),
         ..Default::default()
-    })?;
-    let dial = Arc::new(SamSession::connect(&SamConfig {
+    }))?;
+    let dial = Arc::new(setup_hint(SamSession::connect(&SamConfig {
         samv3_tcp_port: port,
         nickname: "clove-stress-dial".to_owned(),
         ..Default::default()
-    })?);
+    }))?);
 
-    let listener = SamListener::forward(Arc::new(listen))?;
+    let listener = setup_hint(SamListener::forward(Arc::new(listen)))?;
     let target = listener.local_dest();
-    eprintln!("sam-stress: sessions up; driving {n} concurrent streams…");
+    let listen_port = listener.local_port();
+    let deadline_budget = run_deadline();
+    eprintln!(
+        "sam-stress: sessions up; driving {n} concurrent streams (deadline {}s)…",
+        deadline_budget.as_secs()
+    );
 
-    // Listener side: accept N streams, echo PAYLOAD_LEN bytes on each.
-    let acceptor = thread::spawn(move || echo_server(&listener, n));
+    // Listener side: accept up to N streams and echo on each, until told to
+    // stop. It is told to stop rather than counting to N, because when a dial
+    // fails there is no Nth stream to accept and counting would wait for it
+    // forever — the original bug this harness had.
+    let stop = Arc::new(AtomicBool::new(false));
+    let acceptor_stop = Arc::clone(&stop);
+    let acceptor = thread::spawn(move || echo_server(&listener, n, &acceptor_stop));
 
-    // Dialer side: N threads, each dials the listener's destination once.
+    // Dialer side: N threads, each dials the listener's destination once and
+    // reports through the channel. Results are collected by deadline, not by
+    // joining: a thread stuck in a read on a yosemite stream cannot be
+    // interrupted (no socket to time out), so it must not be waited on.
     let start = Instant::now();
-    let mut dialers = Vec::with_capacity(n);
+    let deadline = start + deadline_budget;
+    // Bounded at n: every dialer sends exactly once, so this never blocks a
+    // sender, and SCOPE §4 has no unbounded channels.
+    let (tx, rx) = mpsc::sync_channel(n);
     for _ in 0..n {
         let dial = Arc::clone(&dial);
-        dialers.push(thread::spawn(move || dial_once(&dial, target)));
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(dial_once(&dial, target));
+        });
     }
+    drop(tx);
 
     let mut connects = Vec::with_capacity(n);
     let mut rtts = Vec::with_capacity(n);
     let mut failures = Vec::new();
     let mut attempts = 0u32;
-    for handle in dialers {
-        match handle.join() {
+    let mut finished = 0usize;
+    while finished < n {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
             Ok(Ok(sample)) => {
                 connects.push(sample.connect);
                 rtts.push(sample.rtt);
                 attempts += sample.attempts;
+                finished += 1;
             }
-            Ok(Err(e)) => failures.push(e.to_string()),
-            Err(_) => failures.push("dialer thread panicked".to_owned()),
+            Ok(Err(e)) => {
+                failures.push(e.to_string());
+                finished += 1;
+            }
+            // Out of time, or every sender is gone and nothing further can
+            // arrive. Either way there is nothing left to wait for.
+            Err(_) => break,
         }
     }
     let wall = start.elapsed();
+    let unfinished = n - finished;
+
+    // Unblock the acceptor: raise the flag, then poke its loopback port so a
+    // blocking accept() returns and sees it.
+    stop.store(true, Ordering::Relaxed);
+    let _ = i2pnet::sam::poke_listener(listen_port);
     let _ = acceptor.join();
 
-    report(n, wall, attempts, &mut connects, &mut rtts, &failures);
+    report(
+        n,
+        wall,
+        attempts,
+        unfinished,
+        &mut connects,
+        &mut rtts,
+        &failures,
+    );
+    // Unfinished first: it is the more specific diagnosis. "Everything failed"
+    // when nothing actually returned an error would send the reader looking
+    // for error text that does not exist.
+    if unfinished > 0 {
+        return Err(io::Error::other(format!(
+            "{unfinished} of {n} streams had not finished after {}s. The router \
+             accepted the session but is not completing dials — check it has \
+             peers and built tunnels. Raise CLOVE_STRESS_DEADLINE if it is \
+             merely slow.",
+            deadline_budget.as_secs()
+        )));
+    }
     if connects.is_empty() {
         return Err(io::Error::other(
             "every stream failed — see the failures above",
         ));
     }
     Ok(())
+}
+
+/// The whole-run budget from `CLOVE_STRESS_DEADLINE` (seconds), or
+/// [`RUN_DEADLINE`].
+fn run_deadline() -> Duration {
+    env::var("CLOVE_STRESS_DEADLINE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map_or(RUN_DEADLINE, Duration::from_secs)
 }
 
 /// The SAM control port from `CLOVE_SAM_PORT`, or the `SAMv3` default.
@@ -164,14 +259,28 @@ fn dial_once(dialer: &SamSession, target: DestHash) -> io::Result<Sample> {
     })
 }
 
-/// Accept `n` inbound streams and echo `PAYLOAD_LEN` bytes on each, one
-/// handler thread per stream.
-fn echo_server(listener: &SamListener, n: usize) {
+/// Accept up to `n` inbound streams and echo `PAYLOAD_LEN` bytes on each, one
+/// handler thread per stream, until `stop` is raised.
+///
+/// Stops on the flag rather than on a count: if a dial fails there is no
+/// corresponding inbound stream, and an accept loop counting to `n` waits for
+/// one that is never coming.
+fn echo_server(listener: &SamListener, n: usize, stop: &AtomicBool) {
     let mut handlers = Vec::with_capacity(n);
-    for _ in 0..n {
+    let mut accepted = 0usize;
+    while accepted < n && !stop.load(Ordering::Relaxed) {
         match listener.accept() {
-            Ok((mut stream, _from)) => {
+            Ok((stream, _from)) => {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                accepted += 1;
+                // A handler holds a loopback socket, so its waits are
+                // genuinely boundable — do it, or a peer that connects and
+                // says nothing parks this thread for the run.
+                let _ = stream.set_timeouts(Some(ECHO_TIMEOUT));
                 handlers.push(thread::spawn(move || {
+                    let mut stream = stream;
                     let mut buf = vec![0u8; PAYLOAD_LEN];
                     if stream.read_exact(&mut buf).is_ok() {
                         let _ = stream.write_all(&buf);
@@ -179,7 +288,9 @@ fn echo_server(listener: &SamListener, n: usize) {
                 }));
             }
             Err(e) => {
-                eprintln!("sam-stress: accept failed ({e}); listener stopping");
+                if !stop.load(Ordering::Relaxed) {
+                    eprintln!("sam-stress: accept failed ({e}); listener stopping");
+                }
                 break;
             }
         }
@@ -190,10 +301,17 @@ fn echo_server(listener: &SamListener, n: usize) {
 }
 
 /// Print the run summary: successes, failures, and connect/RTT percentiles.
+///
+/// `unfinished` is reported separately from `failures` on purpose. A stream
+/// that errored told us something; a stream still sitting in a read when the
+/// deadline arrived told us nothing except that it was sitting there, and
+/// folding the two together would hide exactly the symptom worth chasing.
+#[allow(clippy::too_many_arguments, reason = "a report of eight numbers")]
 fn report(
     n: usize,
     wall: Duration,
     attempts: u32,
+    unfinished: usize,
     connects: &mut [Duration],
     rtts: &mut [Duration],
     failures: &[String],
@@ -205,6 +323,7 @@ fn report(
     println!("── sam-stress: {n} concurrent streams ──");
     println!("  succeeded : {ok}/{n}");
     println!("  failed    : {}", failures.len());
+    println!("  unfinished: {unfinished} (still running when the deadline hit)");
     println!("  dial tries: {attempts} (> succeeded ⇒ leaseSet-warmup retries)");
     println!("  wall clock: {:.2}s", wall.as_secs_f64());
     if !connects.is_empty() {
