@@ -42,7 +42,8 @@ Three independent layers (`docs/SCOPE.md` §5), none assuming another is present
    the system one carries the `IPAddressDeny=any` clearnet lock.
    `contrib/netns/` documents the same lock for non-systemd hosts.
 
-`contrib/podman/` has the i2pd quadlet used for live testing.
+`contrib/podman/` has quadlets for all three I2P routers clove targets — i2pd,
+Java I2P and emissary — which run side by side for the interop matrix.
 
 ## Building and testing
 
@@ -58,7 +59,8 @@ make man-lint               # the manuals still parse
 ```
 
 Everything above runs from a clean checkout with no infrastructure. Two tiers
-need more: `make test-live` wants a local I2P router (see
+need more: `make test-live` (or `make matrix`, for every router) wants a local
+I2P router (see
 [`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md)), and `make fuzz` wants a
 nightly toolchain (see [`fuzz/README.md`](fuzz/README.md)).
 

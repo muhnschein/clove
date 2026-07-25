@@ -14,11 +14,17 @@ the exit criteria for M1 and M3 in `SCOPE.md` §8.
 and the environment (`contrib/podman/i2pd.container` + `Makefile`). Run it:
 
 ```
-make router-up        # start a local i2pd (rootless podman quadlet)
-                      # …give a cold router a few minutes to build tunnels…
-make sam-stress N=64  # R2 harness: 64 concurrent streams on one session
-make test-live        # the router-gated loopback download + waits for SAM
+make routers                       # the three routers and where their SAM lands
+make router-up ROUTER=i2pd         # start one (rootless podman quadlet)
+                                   # …give a cold router a few minutes for tunnels…
+make sam-stress N=64               # R2 harness: 64 concurrent streams, one session
+make test-live                     # the router-gated loopback download
+make matrix                        # …or all three routers in turn
 ```
+
+All three routers in `SCOPE.md` §6 — i2pd, Java I2P and emissary — have a
+quadlet and run side by side on different SAM ports (§5.1); 0.1 needs the
+sign-off on all of them, and §6.3 is the table to record it in.
 
 ## 1. The debt, stated plainly
 
@@ -111,43 +117,88 @@ Target: a Debian-stable operator box running **rootless podman with quadlet**
 support (podman ≥ 4.4; Debian 13/trixie ships 5.x). No docker, no compose. The
 router is a container managed by a systemd user unit generated from a quadlet.
 
-### 5.1 i2pd quadlet
+### 5.1 Three routers, three quadlets, one command each
 
-`contrib/podman/i2pd.container` (a `.container` quadlet dropped in
-`~/.config/containers/systemd/` for rootless, or `/etc/containers/systemd/` for
-system-wide):
+The interop matrix (`SCOPE.md` §6) names three routers, and all three are
+first-class here rather than "i2pd plus a TODO". They publish SAM on different
+host ports, so **all three can run at once** and the matrix is a loop, not a
+teardown dance:
 
-```ini
-[Unit]
-Description=i2pd router for clove live tests
+| ROUTER | Implementation | Image | SAM (host) | Console |
+|---|---|---|---|---|
+| `i2pd` | C++ (deployment target, P0) | `docker.io/purplei2p/i2pd` | 127.0.0.1:**7656** | 127.0.0.1:7070 |
+| `java` | Java I2P (the reference, P1) | `docker.io/geti2p/i2p` | 127.0.0.1:**7666** | 127.0.0.1:7657 |
+| `emissary` | Rust (young SAM, P0) | built here, no registry image | 127.0.0.1:**7676** | none; read the log |
 
-[Container]
-Image=docker.io/purplei2p/i2pd:latest
-# SAM on loopback only — matches Layer 1's loopback rule.
-PublishPort=127.0.0.1:7656:7656
-Volume=clove-i2pd-data:/home/i2pd/data:Z
-# Enable the SAM bridge (off by default in the stock image).
-Exec=--sam.enabled=true --sam.address=0.0.0.0 --sam.port=7656
+Inside every container SAM is on 7656; only the published host port differs, so
+nothing but `CLOVE_SAM_PORT` changes between routers — which is exactly what
+the harness was designed for.
 
-[Install]
-WantedBy=default.target
+```
+make routers                          # what each is called and where SAM lands
+make router-build ROUTER=emissary     # only emissary needs building
+make router-up    ROUTER=i2pd
+make router-sam-enable ROUTER=java    # not needed for i2pd; see below
+make test-live    ROUTER=java
+make matrix                           # the live tier against all three in turn
 ```
 
-Notes:
-- `sam.address=0.0.0.0` binds SAM *inside the container*; `PublishPort` pins the
-  host side to `127.0.0.1`, so the router is never reachable off-box. yosemite
-  connects to `127.0.0.1:7656` (it hardcodes the host — `PROTOCOL.i2p-bt` §2.1),
-  which this satisfies.
-- The named volume persists netDb and the router's own keys, so a **restart**
-  (the chaos test) resurrects a warm router instead of a cold reseed — the test
-  measures our supervisor, not I2P bootstrap time.
-- First bring-up needs a few minutes to reseed and build tunnels before SAM
-  sessions will succeed. `make test-live` waits for readiness (§5.3) rather than
-  assuming it.
+`make matrix` keeps going after a failure and prints which routers passed —
+one router being down must not hide the results of the two that are up.
 
-A second quadlet (`i2pd-emissary.container`, `emissary` image on a different
-published port) is added when the matrix reaches emissary; the harness and tests
-take the port as input, so only `CLOVE_SAM_PORT` changes between routers.
+#### Why two of them need `router-sam-enable`
+
+Not laziness on their part; SAM is an optional bridge and each hides it
+differently. The step exists because **the setting lives in a file the router
+writes on its first boot**, so there is nothing for a quadlet to configure
+until it has booted once.
+
+- **i2pd** — nothing to do. `--sam.enabled=true` on the command line, in the
+  quadlet, and it is done.
+- **Java I2P** — ships the SAM bridge as a client app with
+  `startOnLoad=false`. The image's entrypoint fixes SAM's *bind address* but
+  leaves it switched off, so a stock container answers on 7657 and refuses
+  7656. `router-sam-enable` flips `startOnLoad` in the persisted
+  `clients.config.d` entry and restarts. (Equivalent: tick "SAM application
+  bridge" under `/configclients` in the console.)
+- **emissary** — writes `router.toml` on first boot with `[sam]` bound to
+  loopback *inside* the container, which `PublishPort` cannot forward to.
+  `router-sam-enable` sets `host = "0.0.0.0"` under `[sam]` only and restarts.
+
+Both edits are idempotent, so re-run after any config reset, or when unsure.
+
+#### Notes per router
+
+- **i2pd** runs as container-root (`User=0`). Under rootless podman that maps
+  to *your* user — the owner of the named volume — so i2pd can write its
+  reseed certificates. Left as the image's non-root user it hits
+  `certificates: Permission denied`, reseed fails, the router gets no peers,
+  and every dial is `CantReachPeer`. That symptom is indistinguishable from a
+  clove bug from the outside, which is why the quadlet pins it.
+- **Java I2P** needs `IP_ADDR=0.0.0.0` so the entrypoint binds local services
+  to all interfaces inside the container; without it the entrypoint derives
+  the container's private IP, which `PublishPort` cannot reach either. It also
+  wants ~1 GiB — a JVM plus a full netDb is not a 256 MiB proposition — and a
+  long `TimeoutStartSec`, since a cold Java router reseeds, unpacks webapps
+  and builds tunnels before it is any use.
+- **emissary** has no published image, so `contrib/podman/Containerfile.emissary`
+  builds one with `cargo install emissary-cli`, upstream's own install path.
+  It drops the `ui` feature, which would pull dioxus/desktop and with it GTK
+  and WebKit — a headless test router has no use for a desktop window. CA
+  certificates *are* installed: reseeding is an HTTPS fetch, and without them
+  the router starts, finds no peers, and every dial fails with `CantReachPeer`
+  — the same misleading symptom as the i2pd volume problem above.
+
+Every named volume persists netDb and the router's own keys, so a **restart**
+(the M1 chaos criterion) resurrects a warm router instead of a cold reseed:
+the test measures our supervisor, not I2P bootstrap time.
+
+> **Status of this section:** the image names, config file locations, defaults
+> and entrypoint behaviour are read from each project's own sources, and the
+> config edits are unit-tested against sample files. What has *not* happened is
+> a boot of all three on a real machine — that is the operator's first pass,
+> and §6.3 is where its results go. Expect to fix a detail or two here on the
+> first run; correct them in place rather than working around them.
 
 ### 5.2 Why one router is enough for the loopback download
 
@@ -160,9 +211,11 @@ quadlet covers M1's loopback criterion.
 ### 5.3 `make test-live`
 
 ```
-make test-live          # brings the quadlet up if needed, waits for SAM,
-                        # runs cargo test -- --ignored, prints the harness summary
-make sam-stress N=128   # runs the R2 harness at a given concurrency
+make test-live                    # waits for SAM, runs cargo test -- --ignored
+make test-live ROUTER=java        # …against a different router
+make sam-stress N=128             # the R2 harness at a given concurrency
+make sam-stress N=128 ROUTER=emissary
+make matrix                       # the live tier against all three, in turn
 ```
 
 Readiness is a TCP probe of `127.0.0.1:$CLOVE_SAM_PORT` plus a trial transient
@@ -177,6 +230,16 @@ findings straight into `PROTOCOL.i2p-bt`, flipping [assumed]/[open] entries to
 
 **Router order:** i2pd (P0, deployment target) → emissary (P0, young SAM, expect
 bugs on both sides, coordinate upstream) → Java I2P (P1, reference).
+
+The order is about where to spend attention, not what to skip: **the checklists
+below are per-router and 0.1 needs all three.** A finding on one router is not
+a finding until you know whether the other two agree — that is the whole value
+of having a reference implementation (Java I2P) in the matrix. When they
+disagree, Java I2P is presumed right and the deviation goes in
+`PROTOCOL.i2p-bt` naming the router.
+
+Run `make matrix` to sweep all three; the per-router detail below is for when
+something fails and you need to know what it was supposed to prove.
 
 ### 6.1 M1 exit checklist
 
@@ -212,6 +275,35 @@ bugs on both sides, coordinate upstream) → Java I2P (P1, reference).
       starvation under peer load (revisit Q1 only if it appears).
 - [ ] Wire identity `-CV0001-` re-checked against observed swarm peer IDs before
       the first announce (Q7 checkpoint — the wire-permanent moment).
+
+### 6.3 Results matrix
+
+Fill this in as runs happen — one row per router, dated. An empty cell is
+"not yet run", which is different from a failure and should not be blurred
+into one. `—` means not applicable.
+
+| Check | i2pd | Java I2P | emissary |
+|---|---|---|---|
+| Router boots, SAM answers | | | |
+| `sam-stress` 16/32/64 | | | |
+| `sam-stress` 128/200 | | | |
+| Inbound dest-hash reconciles (§2.5) | | | |
+| Two-instance loopback download, both directions | | | |
+| Survives router restart mid-transfer | | | |
+| Public i2psnark swarm: full download | | | |
+| PEX acquisition observed | | | |
+| Announce quirks confirmed (§5.1, §5.4) | | | |
+| Multi-hour seed soak | | | |
+
+Alongside each result, note the router **version** — "i2pd 2.58" not "i2pd" —
+because a behaviour that changes between releases is exactly the kind of thing
+this table exists to catch, and an undated "works" is worth very little a year
+from now.
+
+M1 closes when the first six rows are green on all three. M3 closes when the
+rest are. A row that fails on one router and passes on the other two is a
+finding to file, not a reason to stop: record it, open the issue, and carry on
+with the other checks.
 
 ## 7. Keeping them closed (anti-decay)
 

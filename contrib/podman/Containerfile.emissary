@@ -1,0 +1,39 @@
+# emissary — the Rust I2P router (https://github.com/eepnet/emissary), by the
+# author of yosemite, the SAM library clove depends on. There is no published
+# image, so we build one; `cargo install emissary-cli` is upstream's own
+# recommended install path.
+#
+# Build:  make router-build ROUTER=emissary
+# Run:    make router-up    ROUTER=emissary
+#
+# --no-default-features drops the `ui` feature, which pulls dioxus/desktop and
+# with it GTK and WebKit. A headless test router has no use for a desktop
+# window, and dragging that toolchain into the image would triple its size for
+# nothing. Diagnostics come from the log instead (see EMISSARY_LOG below).
+
+FROM docker.io/library/rust:1-bookworm AS build
+ARG EMISSARY_VERSION=0.4.0
+RUN cargo install emissary-cli \
+        --version "${EMISSARY_VERSION}" \
+        --no-default-features \
+        --locked \
+        --root /out
+
+FROM docker.io/library/debian:bookworm-slim
+# Reseeding is an HTTPS fetch; without CA certificates the router starts, finds
+# no peers, and every dial fails with CantReachPeer — the same symptom as a
+# misconfigured volume, and just as annoying to diagnose. Install them.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/bin/emissary-cli /usr/local/bin/emissary-cli
+
+# Everything the router owns lives here, so one volume persists netDb, keys and
+# router.toml across restarts — the restart-mid-transfer test wants a warm
+# router, not a fresh reseed.
+ENV EMISSARY_BASE=/var/lib/emissary
+ENV EMISSARY_LOG=emissary=info
+VOLUME ["/var/lib/emissary"]
+EXPOSE 7656
+
+ENTRYPOINT ["/bin/sh", "-c", "exec emissary-cli --base-path \"$EMISSARY_BASE\" --log \"$EMISSARY_LOG\""]
