@@ -1,0 +1,156 @@
+.Dd July 25, 2026
+.Dt CLOVED 8
+.Os
+.Sh NAME
+.Nm cloved
+.Nd I2P-only BitTorrent daemon
+.Sh SYNOPSIS
+.Nm
+.Op Fl C
+.Op Fl c Ar file
+.Sh DESCRIPTION
+.Nm
+is a BitTorrent daemon that speaks only I2P.
+It hosts the torrent engine, keeps state on disk, and serves a local HTTP API
+for
+.Xr clove 1 .
+Peers are I2P destinations; there is no IP or port vocabulary anywhere in the
+engine, and only the network layer may open a socket at all
+.Pq see Sx SECURITY .
+.Pp
+.Nm
+requires an external I2P router exposing SAMv3
+.Pq i2pd, Java I2P, or emissary .
+It connects to that router in the background and retries on an exponential
+backoff, so it may be started before the router is ready: torrents simply sit
+in the
+.Sy waiting-for-router
+state until a session is established.
+If the session is later lost, the whole session tree is torn down and rebuilt
+on the same backoff, and torrents return to
+.Sy waiting-for-router
+in the meantime rather than failing.
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl C , Fl -check
+Parse and validate the configuration, print the resolved paths, and exit
+without starting the daemon.
+Use this before restarting a running daemon.
+.It Fl c , Fl -config Ar file
+Read configuration from
+.Ar file
+instead of the default path.
+A file named here must exist; the default path may be absent, in which case
+the built-in defaults are the entire configuration.
+.It Fl h , Fl -help
+Print a usage summary and exit.
+.El
+.Sh RUNTIME
+On start
+.Nm
+creates its data directory, generates an API token
+.Pq 32 random bytes, hex, mode 0600
+if none exists, loads previously added torrents from disk, and binds the
+control socket.
+Torrents that were not paused are brought online as soon as a router session
+exists; paused ones stay offline until
+.Cm clove resume .
+.Pp
+Progress is snapshotted to each torrent's resume file every 30 seconds and
+around every lifecycle change.
+State files are written with a temporary file, an
+.Xr fsync 2 ,
+and a rename, so a crash at any point leaves the previous state intact; the
+worst outcome is re-verification.
+.Pp
+.Nm
+runs in the foreground and logs to standard error.
+Under a service manager, run it as an ordinary unprivileged user: it needs no
+elevated rights, only its own data directory and the router's SAM port.
+.Sh SECURITY
+clove is I2P-only by construction, not by configuration:
+.Bl -bullet -compact
+.It
+Only the
+.Sy i2pnet
+crate may open a socket; the engine cannot, and this is enforced by lint and
+by a dependency gate in CI rather than by convention.
+.It
+The only outbound IP socket is the connection to the SAM bridge, which must be
+a loopback address unless the explicit, documented-as-dangerous override is
+set.
+.It
+There is no name resolution outside I2P: hostnames are resolved by SAM naming
+only, never by DNS.
+.It
+Announce URLs in a torrent that are not I2P URLs are dropped at parse time.
+They are never contacted, and never logged beyond a count.
+.El
+.Pp
+The API token is required on every request, including over the unix socket.
+Keep the data directory readable only by the daemon's user.
+.Sh FILES
+.Bl -tag -width Ds -compact
+.It Pa ~/.config/clove/clove.conf
+Default configuration file; see
+.Xr clove.conf 5 .
+.It Pa ~/.local/share/clove/
+Data directory.
+.It Pa ~/.local/share/clove/token
+API token, mode 0600.
+.It Pa ~/.local/share/clove/state/
+Per-torrent state: the original
+.Pa .torrent ,
+resume data, and pending magnet URIs.
+.It Pa ~/.local/share/clove/downloads/
+Downloaded files.
+.It Pa $XDG_RUNTIME_DIR/clove.sock
+Default control socket.
+.El
+.Sh EXAMPLES
+Check the configuration, then run:
+.Bd -literal -offset indent
+$ cloved -C
+cloved: configuration OK
+  config     /home/u/.config/clove/clove.conf (absent; using defaults)
+  data_dir   /home/u/.local/share/clove
+  api_socket /run/user/1000/clove.sock
+  sam_address 127.0.0.1:7656
+$ cloved
+cloved: 3 torrent(s) loaded
+cloved: listening on /run/user/1000/clove.sock
+cloved: router connected; we are asubu6d7wsbj7x7b7agamhimpmnlr3ezb7qu5zh2jllyalblxdpq.b32.i2p
+.Ed
+.Pp
+Run under a user service manager:
+.Bd -literal -offset indent
+$ systemctl --user start clove
+$ journalctl --user -u clove -f
+.Ed
+.Pp
+Start before the router is up.
+The daemon waits rather than exiting:
+.Bd -literal -offset indent
+$ cloved
+cloved: waiting for router (SAM at 127.0.0.1:7656): Connection refused
+$ clove status
+version      0.1.0
+router       waiting-for-router
+.Ed
+.Sh SEE ALSO
+.Xr clove 1 ,
+.Xr clove.conf 5 ,
+.Xr clove-api 7
+.Sh STANDARDS
+BEP 3 (peer protocol), BEP 6 (fast extension), BEP 9 (metadata exchange),
+BEP 10 (extension protocol), BEP 12 (multiple trackers), BEP 20 (peer id),
+and the I2P BitTorrent dialect: 32-byte destination hashes in compact tracker
+responses and
+.Sy i2p_pex .
+clove's reading of the underspecified corners is recorded in the
+.Pa PROTOCOL.i2p-bt
+file shipped with the source.
+.Sh CAVEATS
+i2p_dht, UDP tracker announces, and BitTorrent v2 are not implemented.
+Peer discovery is by tracker announce and peer exchange.

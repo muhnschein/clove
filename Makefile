@@ -14,7 +14,15 @@ WAIT ?= 180
 
 QUADLET_DIR := $(HOME)/.config/containers/systemd
 
-.PHONY: test smoke test-live sam-stress router-up router-down router-wait fmt lint
+.PHONY: test smoke test-live sam-stress router-up router-down router-wait \
+        fmt lint man-lint install uninstall
+
+# Install layout. Override on the command line, e.g.
+#   make install PREFIX=/usr DESTDIR=$(CURDIR)/pkg
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
+MANDIR ?= $(PREFIX)/share/man
+DESTDIR ?=
 
 ## Tier 1: unit + engine tests over the mock network. No router needed.
 test:
@@ -62,6 +70,37 @@ router-wait:
 		fi; sleep 1; \
 	done; \
 	echo "SAM did not come up on 127.0.0.1:$(SAM_PORT) within $(WAIT)s" >&2; exit 1
+
+## Check the manuals parse and follow mdoc conventions. Unresolved cross-page
+## references are expected until the pages are installed, so they are filtered.
+man-lint:
+	@fail=0; for page in man/*; do \
+		out=$$(mandoc -T lint -W warning "$$page" 2>&1 \
+			| grep -v 'referenced manual not found'); \
+		if [ -n "$$out" ]; then echo "$$out"; fail=1; fi; \
+	done; \
+	[ $$fail -eq 0 ] && echo "man-lint: ok"
+
+## Install the binaries and manuals. Release build; strip nothing, so a
+## crash report from a user still carries symbols.
+install:
+	cargo build --workspace --release
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 target/release/cloved $(DESTDIR)$(BINDIR)/cloved
+	install -m 0755 target/release/clove $(DESTDIR)$(BINDIR)/clove
+	install -d $(DESTDIR)$(MANDIR)/man1 $(DESTDIR)$(MANDIR)/man5 \
+		$(DESTDIR)$(MANDIR)/man7 $(DESTDIR)$(MANDIR)/man8
+	install -m 0644 man/clove.1 $(DESTDIR)$(MANDIR)/man1/clove.1
+	install -m 0644 man/clove.conf.5 $(DESTDIR)$(MANDIR)/man5/clove.conf.5
+	install -m 0644 man/clove-api.7 $(DESTDIR)$(MANDIR)/man7/clove-api.7
+	install -m 0644 man/cloved.8 $(DESTDIR)$(MANDIR)/man8/cloved.8
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/cloved $(DESTDIR)$(BINDIR)/clove
+	rm -f $(DESTDIR)$(MANDIR)/man1/clove.1 \
+		$(DESTDIR)$(MANDIR)/man5/clove.conf.5 \
+		$(DESTDIR)$(MANDIR)/man7/clove-api.7 \
+		$(DESTDIR)$(MANDIR)/man8/cloved.8
 
 ## CI-parity convenience.
 fmt:

@@ -1,0 +1,204 @@
+.Dd July 25, 2026
+.Dt CLOVE-API 7
+.Os
+.Sh NAME
+.Nm clove-api
+.Nd local HTTP API served by cloved
+.Sh DESCRIPTION
+.Xr cloved 8
+serves a small HTTP/1.1 API on a local unix socket
+.Pq see Xr clove.conf 5 .
+.Xr clove 1
+is its only client today; this page documents the interface so that other
+tools, and a future web interface, can use it directly.
+.Pp
+The API is local-only.
+It is not, and will not be, compatible with the Transmission or qBittorrent
+APIs.
+.Ss Conventions
+Every path is versioned under
+.Pa /v1/ .
+Replies are JSON with
+.Sy Content-Type: application/json .
+One request and one reply per connection: there is no keep-alive and no
+chunked transfer encoding.
+.Pp
+Every request must carry the API token in an
+.Sy X-Clove-Token
+header, including over the unix socket.
+The token is the contents of
+.Pa <data_dir>/token ,
+which the daemon writes mode 0600 on first start.
+A missing or wrong token is answered with
+.Sy 401 ,
+compared in constant time.
+.Pp
+An error reply is a JSON object with a single
+.Sy error
+key and a status that says what went wrong:
+.Bl -tag -width "409" -compact -offset indent
+.It Sy 400
+Malformed request, bad info-hash, or invalid body.
+.It Sy 401
+Missing or invalid token.
+.It Sy 404
+No such resource or torrent.
+.It Sy 405
+Method not allowed for that path.
+.It Sy 409
+The torrent is already added.
+.It Sy 500
+The daemon failed the operation; the message says how.
+.El
+.Ss Endpoints
+.Bl -tag -width Ds
+.It Sy GET Pa /v1/status
+Daemon and router state:
+.Sy version ,
+.Sy uptime_secs ,
+.Sy sam_address ,
+.Sy torrents ,
+and
+.Sy router
+.Pq Sy connecting , Sy waiting-for-router , Sy connected , Sy unsupported-sam-address .
+.It Sy GET Pa /v1/torrents
+An array of torrent summaries:
+.Sy info_hash ,
+.Sy name ,
+.Sy size ,
+.Sy pieces ,
+.Sy have ,
+.Sy progress
+.Pq 0.0 to 1.0 ,
+.Sy uploaded ,
+.Sy downloaded ,
+.Sy priorities ,
+and
+.Sy state .
+.Pp
+.Sy state
+is one of
+.Sy downloading ,
+.Sy seeding ,
+.Sy complete
+.Pq complete but offline ,
+.Sy paused ,
+.Sy waiting-for-router ,
+or
+.Sy fetching-metadata
+.Pq a magnet whose info dictionary has not arrived yet .
+.It Sy POST Pa /v1/torrents
+Add a torrent.
+The body is either the raw bytes of a
+.Pa .torrent
+file or a
+.Ar magnet:\&
+URI.
+Answers
+.Sy 201
+with the
+.Sy info_hash ;
+a magnet also reports
+.Sy state: fetching-metadata .
+.It Sy GET Pa /v1/torrents/ Ns Ar info-hash
+One torrent in detail: the summary fields plus
+.Sy private ,
+a
+.Sy files
+array
+.Pq Sy path , Sy length , Sy priority ,
+and
+.Sy trackers .
+.It Sy DELETE Pa /v1/torrents/ Ns Ar info-hash Ns Op ?data=1
+Remove a torrent.
+With
+.Sy data=1
+its downloaded files are deleted too.
+.It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /pause
+.It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /resume
+Take the torrent offline or bring it back.
+Pausing disconnects its peers and persists across restarts.
+.It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /verify
+Re-check every piece against the metainfo hashes and answer with the
+.Sy verified
+count.
+The torrent must be paused first;
+.Sy 400
+otherwise.
+.It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /peers
+Hand a running torrent a peer to dial.
+The body is a b32 address, with or without the
+.Pa .b32.i2p
+suffix.
+.It Sy PUT Pa /v1/torrents/ Ns Ar info-hash Ns Pa /priorities
+Set per-file priorities.
+The body is a comma-separated list, one value per file in the torrent's own
+order:
+.Sy 0
+skip,
+.Sy 1
+normal,
+.Sy 2
+high.
+The count must equal the file count.
+.El
+.Sh EXAMPLES
+Query status with
+.Xr curl 1 :
+.Bd -literal -offset indent
+$ tok=$(cat ~/.local/share/clove/token)
+$ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
+    -H "X-Clove-Token: $tok" http://clove/v1/status
+{"version":"0.1.0","uptime_secs":842,"sam_address":"127.0.0.1:7656",
+ "torrents":3,"router":"connected"}
+.Ed
+.Pp
+Add a torrent file:
+.Bd -literal -offset indent
+$ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
+    -H "X-Clove-Token: $tok" --data-binary @release.torrent \e
+    http://clove/v1/torrents
+{"info_hash":"58e2fc46a8dc57c78191f079648750b0644d03a2"}
+.Ed
+.Pp
+Add a magnet:
+.Bd -literal -offset indent
+$ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
+    -H "X-Clove-Token: $tok" \e
+    --data-binary 'magnet:?xt=urn:btih:58e2fc46a8dc57c78191f079648750b0644d03a2' \e
+    http://clove/v1/torrents
+{"info_hash":"58e2fc46a8dc57c78191f079648750b0644d03a2",
+ "state":"fetching-metadata"}
+.Ed
+.Pp
+Skip the first file of a three-file torrent:
+.Bd -literal -offset indent
+$ curl -s -X PUT --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
+    -H "X-Clove-Token: $tok" --data-binary '0,1,1' \e
+    http://clove/v1/torrents/58e2fc46a8dc57c78191f079648750b0644d03a2/priorities
+{"ok":true}
+.Ed
+.Pp
+Remove a torrent and its data:
+.Bd -literal -offset indent
+$ curl -s -X DELETE --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
+    -H "X-Clove-Token: $tok" \e
+    'http://clove/v1/torrents/58e2fc46a8dc57c78191f079648750b0644d03a2?data=1'
+{"ok":true}
+.Ed
+.Pp
+A missing token is refused:
+.Bd -literal -offset indent
+$ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock http://clove/v1/status
+{"error":"missing or invalid API token"}
+.Ed
+.Sh SEE ALSO
+.Xr clove 1 ,
+.Xr clove.conf 5 ,
+.Xr cloved 8
+.Sh CAVEATS
+The API is versioned under
+.Pa /v1/
+and will stay compatible within that prefix, but it is young: expect fields
+to be added.
+Clients should ignore unknown fields rather than reject them.

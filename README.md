@@ -18,11 +18,14 @@ built per the phase plan.
 - [`docs/PHASE-F.md`](docs/PHASE-F.md) — daemon/CLI/API design, and the TUI decision
 - [`DEPENDENCIES.md`](DEPENDENCIES.md) — the dependency allowlist
 
-Man pages (`cloved(8)`, `clove(1)`, `clove.conf(5)`) become the primary user
-documentation from M4; this README stays short on purpose.
+Man pages are the primary user documentation and live in [`man/`](man):
+`clove(1)`, `clove.conf(5)`, `clove-api(7)`, `cloved(8)`. Read them before
+installing with `mandoc man/clove.1`, or after with `man clove`. This README
+stays short on purpose.
 
 ## Building
 
-Stable Rust. `cargo build`, `cargo test`. CI additionally runs rustfmt,
+Stable Rust. `cargo build`, `cargo test`, `make smoke` (end-to-end, no router
+needed), `make install` (honors `PREFIX`/`DESTDIR`). CI additionally runs rustfmt,
 `clippy::pedantic`, `cargo deny`, and `ci/check-net-deps.sh` (the
 no-clearnet dependency gate).
