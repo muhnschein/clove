@@ -39,6 +39,12 @@ key and a status that says what went wrong:
 .Bl -tag -width "409" -compact -offset indent
 .It Sy 400
 Malformed request, bad info-hash, or invalid body.
+A
+.Sy Content-Length
+above 2 MiB is refused here, on the header, before the body is read.
+Because those bytes are never drained, a client that sends the oversized body
+anyway sees the connection reset rather than this reply \(em check the length
+before sending.
 .It Sy 401
 Missing or invalid token.
 .It Sy 404

@@ -21,6 +21,7 @@ use i2pnet::api;
 const MAX_RESPONSE_BODY: usize = 8 * 1024 * 1024;
 
 /// How a command failed, mapped to an exit code.
+#[derive(Debug)]
 enum Fail {
     /// Bad invocation (exit 2).
     Usage(String),
@@ -430,6 +431,7 @@ fn render_detail(value: &Value) -> String {
         "have",
         "progress",
         "state",
+        "sequential",
         "private",
     ] {
         let Some(field) = value.get(key) else {
@@ -594,6 +596,13 @@ fn human_size(bytes: u64) -> String {
         size /= 1024.0;
         unit += 1;
     }
+    // Rounding to one decimal can push a value back over the boundary the
+    // loop just cleared: 1048575 bytes is 1023.999 KiB, which prints as
+    // "1024.0 KiB". Step up instead of showing a size in units of itself.
+    if (size * 10.0).round() >= 10_240.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
     format!("{size:.1} {}", UNITS[unit])
 }
 
@@ -660,4 +669,199 @@ fn request(
         )));
     }
     Ok(response.body)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the parts of the CLI that are pure: argument shapes, the
+    //! exit-code contract, and the rendering of a daemon response into the
+    //! table a human reads.
+    //!
+    //! `ci/smoke.sh` proves the commands work against a live daemon. What it
+    //! cannot see is *formatting* — a column that stops aligning, a size that
+    //! renders as `1024.0 KiB`, a missing field that prints `null` instead of
+    //! `-`. Those regress silently and are exactly what a scripted end-to-end
+    //! test looks straight past.
+
+    use super::*;
+
+    fn obj(fields: &[(&str, Value)]) -> Value {
+        Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn sizes_read_the_way_a_human_expects() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1), "1 B");
+        // The boundary either side of the first unit change.
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(1536), "1.5 KiB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(human_size(1024u64.pow(4)), "1.0 TiB");
+        assert_eq!(human_size(1024u64.pow(5)), "1.0 PiB");
+        // The unit table runs out at PiB; the value must keep growing rather
+        // than wrap or index past the end.
+        assert!(human_size(u64::MAX).ends_with(" PiB"));
+        // Nothing may render as "1024.0" of a smaller unit.
+        for n in [1023u64, 1024, 1025, 1024 * 1023, 1024 * 1024 - 1] {
+            assert!(
+                !human_size(n).starts_with("1024."),
+                "{n} rendered as {}",
+                human_size(n)
+            );
+        }
+    }
+
+    #[test]
+    fn durations_pick_the_two_largest_units() {
+        assert_eq!(human_duration(0), "0s");
+        assert_eq!(human_duration(59), "59s");
+        assert_eq!(human_duration(60), "1m");
+        assert_eq!(human_duration(3_599), "59m");
+        assert_eq!(human_duration(3_600), "1h0m");
+        assert_eq!(human_duration(3_661), "1h1m");
+        assert_eq!(human_duration(86_399), "23h59m");
+        assert_eq!(human_duration(86_400), "1d0h");
+        assert_eq!(human_duration(90_000), "1d1h");
+        assert_eq!(human_duration(u64::MAX), "213503982334601d7h");
+    }
+
+    #[test]
+    fn columns_align_to_the_widest_cell() {
+        let out = align(
+            &["A", "LONGHEADER"],
+            &[
+                vec!["x".to_owned(), "1".to_owned()],
+                vec!["wide-cell".to_owned(), "2".to_owned()],
+            ],
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "header plus two rows");
+        // Every second column starts at the same offset — the whole contract
+        // of this function. The widest first-column cell is 9 characters, so
+        // that offset is 11 on every line including the header.
+        let second_col: Vec<usize> = lines
+            .iter()
+            .map(|l| l.rfind("  ").expect("a column separator") + 2)
+            .collect();
+        assert_eq!(second_col, vec![11, 11, 11], "{out}");
+        // The last column is not padded: no trailing spaces anywhere.
+        for line in &lines {
+            assert_eq!(*line, line.trim_end(), "trailing padding in {line:?}");
+        }
+        // A row shorter than the header must not panic or misalign the rest.
+        let ragged = align(&["A", "B", "C"], &[vec!["only".to_owned()]]);
+        assert_eq!(ragged.lines().count(), 2);
+    }
+
+    #[test]
+    fn an_empty_list_says_so_rather_than_printing_a_bare_header() {
+        assert_eq!(render_torrents(&Value::Array(Vec::new())), "no torrents\n");
+    }
+
+    #[test]
+    fn the_listing_shortens_hashes_and_fills_missing_fields() {
+        let full = "58e2fc46a8dc57c78191f079648750b0644d03a2";
+        let out = render_torrents(&Value::Array(vec![
+            obj(&[
+                ("info_hash", Value::from(full.to_owned())),
+                ("name", Value::from("release.iso".to_owned())),
+                ("size", Value::UInt(1_500_000_000)),
+                ("progress", Value::Float(0.423)),
+                ("state", Value::from("downloading".to_owned())),
+            ]),
+            // A torrent whose metadata has not arrived yet: every optional
+            // field is absent and must render as a dash, not as "null".
+            obj(&[("info_hash", Value::from("ab".repeat(20)))]),
+        ]));
+        assert!(out.contains("58e2fc46a8dc"), "{out}");
+        assert!(
+            !out.contains(full),
+            "the full hash belongs in show, not list: {out}"
+        );
+        assert!(out.contains("42%"), "{out}");
+        assert!(out.contains("1.4 GiB"), "{out}");
+        assert!(!out.contains("null"), "{out}");
+        assert!(out.lines().any(|l| l.contains(" -  ")), "{out}");
+    }
+
+    #[test]
+    fn a_non_array_listing_does_not_pretend_to_be_a_table() {
+        // If the daemon ever answered with something unexpected, the CLI
+        // prints it rather than rendering an empty table over it.
+        let out = render_torrents(&Value::from("unexpected".to_owned()));
+        assert!(out.contains("unexpected"), "{out}");
+    }
+
+    #[test]
+    fn detail_shows_the_per_torrent_switches() {
+        let out = render_detail(&obj(&[
+            ("name", Value::from("film.mkv".to_owned())),
+            ("size", Value::UInt(2048)),
+            ("progress", Value::Float(0.5)),
+            ("state", Value::from("downloading".to_owned())),
+            ("sequential", Value::Bool(true)),
+            ("private", Value::Bool(false)),
+        ]));
+        assert!(out.contains("2.0 KiB"), "{out}");
+        assert!(out.contains("50%"), "{out}");
+        // Sequential mode is a per-torrent setting an operator turned on; it
+        // has to be visible in the view they turn to for confirmation.
+        assert!(out.contains("sequential"), "{out}");
+        assert!(out.contains("true"), "{out}");
+    }
+
+    #[test]
+    fn priority_names() {
+        assert_eq!(priority_name(0), "skip");
+        assert_eq!(priority_name(1), "normal");
+        assert_eq!(priority_name(2), "high");
+        // A value the daemon should never send is shown, not swallowed.
+        assert_eq!(priority_name(9), "9");
+    }
+
+    #[test]
+    fn one_operand_commands_reject_zero_and_many() {
+        let ok = vec!["abc".to_owned()];
+        assert_eq!(one_info_hash(&ok).expect("one operand"), "abc");
+        assert!(matches!(one_info_hash(&[]), Err(Fail::Usage(_))));
+        assert!(matches!(
+            one_info_hash(&["a".to_owned(), "b".to_owned()]),
+            Err(Fail::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn a_broken_response_body_is_a_failure_not_a_panic() {
+        assert!(parse_body(b"{\"ok\":true}").is_ok());
+        // Not JSON at all.
+        assert!(matches!(parse_body(b"<html>"), Err(Fail::Failed(_))));
+        // Truncated mid-object.
+        assert!(matches!(parse_body(b"{\"ok\":"), Err(Fail::Failed(_))));
+        // Not UTF-8.
+        assert!(matches!(parse_body(&[0xFF, 0xFE]), Err(Fail::Failed(_))));
+        assert!(matches!(parse_body(b""), Err(Fail::Failed(_))));
+    }
+
+    #[test]
+    fn exit_codes_are_distinct_and_documented() {
+        // clove(1) promises 0 ok, 1 failed, 2 usage, 3 unreachable. A script
+        // that distinguishes "daemon is down" from "you asked for something
+        // that does not exist" depends on these not drifting.
+        let code = |f: &Fail| match f {
+            Fail::Failed(_) => 1u8,
+            Fail::Usage(_) => 2,
+            Fail::Unreachable(_) => 3,
+        };
+        assert_eq!(code(&Fail::Failed(String::new())), 1);
+        assert_eq!(code(&Fail::Usage(String::new())), 2);
+        assert_eq!(code(&Fail::Unreachable(String::new())), 3);
+    }
 }
