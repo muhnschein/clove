@@ -24,6 +24,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use clove_core::bitfield::Bitfield;
 use clove_core::json::Value;
@@ -36,6 +37,7 @@ use clove_core::swarm::{
     AnnounceTarget, Announcer, AnnouncerConfig, InboundDemux, Swarm, SwarmConfig,
 };
 use clove_core::torrent::Torrent;
+use clove_core::tracker::MIN_ANNOUNCE_INTERVAL;
 use i2pnet::naming::NamingCache;
 use i2pnet::{DestHash, I2pDialer, I2pNamingLookup};
 
@@ -90,6 +92,8 @@ struct Hosted {
     uploaded: u64,
     downloaded: u64,
     paused: bool,
+    /// Pick pieces in order rather than rarest-first (SCOPE §3).
+    sequential: bool,
     live: Option<Live>,
 }
 
@@ -101,6 +105,9 @@ struct Live {
     /// Lifetime (uploaded, downloaded) at engine start; the torrent's own
     /// counters are per-run deltas on top of these.
     stats_base: (u64, u64),
+    /// When the operator last forced an announce, so a script cannot turn
+    /// `clove announce` into a tracker flood.
+    last_forced_announce: Option<Instant>,
 }
 
 impl Hosted {
@@ -117,6 +124,7 @@ impl Hosted {
             downloaded: self.downloaded,
             trackers: self.meta.trackers.clone(),
             paused: self.paused,
+            sequential: self.sequential,
         }
     }
 }
@@ -269,7 +277,7 @@ where
             &hosted.meta,
             storage,
             &hosted.have,
-            Mode::RarestFirst,
+            hosted.mode(),
             network.peer_id,
         );
         network.demux.register(&torrent);
@@ -302,6 +310,7 @@ where
             swarm,
             announcer,
             stats_base: (hosted.uploaded, hosted.downloaded),
+            last_forced_announce: None,
         });
         Ok(())
     }
@@ -428,6 +437,7 @@ where
             uploaded: 0,
             downloaded: 0,
             paused: false,
+            sequential: false,
             live: None,
         };
         let hex = hex(&info_hash);
@@ -578,6 +588,73 @@ where
         let resume = hosted.resume(*info_hash);
         write_resume_file(&self.state_dir, info_hash, &resume).map_err(ActionError::Io)?;
         Ok(count)
+    }
+
+    /// Switch a torrent between rarest-first and sequential piece selection
+    /// (SCOPE §3), persisting the choice. A live torrent picks up the change
+    /// immediately; nothing in flight is cancelled.
+    ///
+    /// # Errors
+    ///
+    /// [`ActionError::NotFound`], or a filesystem error writing the resume
+    /// file.
+    pub(crate) fn set_sequential(
+        &mut self,
+        info_hash: &[u8; 20],
+        sequential: bool,
+    ) -> Result<(), ActionError> {
+        let hosted = self
+            .torrents
+            .get_mut(info_hash)
+            .ok_or(ActionError::NotFound)?;
+        hosted.sequential = sequential;
+        if let Some(live) = &hosted.live {
+            live.torrent.set_mode(hosted.mode());
+        }
+        let resume = hosted.resume(*info_hash);
+        write_resume_file(&self.state_dir, info_hash, &resume).map_err(ActionError::Io)
+    }
+
+    /// Force an immediate announce to every tracker (SCOPE §3's operator
+    /// re-announce), bypassing the intervals trackers gave us.
+    ///
+    /// Rate-limited to one forced announce per
+    /// [`MIN_ANNOUNCE_INTERVAL`](clove_core::tracker::MIN_ANNOUNCE_INTERVAL):
+    /// the command exists for an operator who suspects a stale peer set, not
+    /// as something to put in a loop.
+    ///
+    /// # Errors
+    ///
+    /// [`ActionError::NotFound`], or [`ActionError::BadInput`] when the
+    /// torrent has no running announcer or was asked too recently.
+    pub(crate) fn announce_now(&mut self, info_hash: &[u8; 20]) -> Result<(), ActionError> {
+        let hosted = self
+            .torrents
+            .get_mut(info_hash)
+            .ok_or(ActionError::NotFound)?;
+        if hosted.paused {
+            return Err(ActionError::BadInput("torrent is paused"));
+        }
+        let Some(live) = &mut hosted.live else {
+            return Err(ActionError::BadInput(
+                "torrent is not running yet (waiting for the router)",
+            ));
+        };
+        let Some(announcer) = &live.announcer else {
+            return Err(ActionError::BadInput(
+                "torrent has no I2P trackers to announce to",
+            ));
+        };
+        if let Some(last) = live.last_forced_announce
+            && last.elapsed() < MIN_ANNOUNCE_INTERVAL
+        {
+            return Err(ActionError::BadInput(
+                "an announce was already forced in the last minute",
+            ));
+        }
+        announcer.announce_now();
+        live.last_forced_announce = Some(Instant::now());
+        Ok(())
     }
 
     /// Re-verify a torrent's data against the piece hashes on disk, updating
@@ -740,6 +817,7 @@ where
                 uploaded: resume.uploaded,
                 downloaded: resume.downloaded,
                 paused: resume.paused,
+                sequential: resume.sequential,
                 meta,
                 live: None,
             },
@@ -749,6 +827,15 @@ where
 }
 
 impl Hosted {
+    /// The picker mode this torrent's engine should run with.
+    fn mode(&self) -> Mode {
+        if self.sequential {
+            Mode::Sequential
+        } else {
+            Mode::RarestFirst
+        }
+    }
+
     /// The state string shown in listings.
     fn state(&self) -> &'static str {
         let complete = self.have.count() == self.have.len();
@@ -830,6 +917,7 @@ impl Hosted {
             ("have".to_owned(), Value::UInt(u64::from(self.have.count()))),
             ("progress".to_owned(), Value::Float(self.progress())),
             ("state".to_owned(), Value::from(self.state())),
+            ("sequential".to_owned(), Value::Bool(self.sequential)),
             ("private".to_owned(), Value::Bool(self.meta.private)),
             ("files".to_owned(), Value::Array(files)),
             ("trackers".to_owned(), Value::Array(trackers)),
@@ -1079,6 +1167,57 @@ mod tests {
             .and_then(|item| item.get("state").and_then(|s| s.as_str().map(String::from)));
         assert_eq!(state.as_deref(), Some("waiting-for-router"));
         assert!(registry.add_peer(&info_hash, DestHash([0xEE; 32])).is_err());
+    }
+
+    #[test]
+    fn sequential_mode_persists_across_a_restart() {
+        let (_content, bytes) = fixture("sequential-demo");
+        let data = TempDir::new("data");
+        let info_hash = {
+            let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+            let info_hash = registry.add_torrent(&bytes).unwrap();
+            // Rarest-first is the default; nothing is claimed until asked.
+            assert_eq!(sequential_flag(&mut registry, &info_hash), Some(false));
+            registry.set_sequential(&info_hash, true).unwrap();
+            assert_eq!(sequential_flag(&mut registry, &info_hash), Some(true));
+            info_hash
+        };
+        // A fresh registry over the same data dir reads the flag back out of
+        // the resume file — the point of putting it in the format at all.
+        let mut reopened = Registry::<MockDialer>::open(&data.0).unwrap();
+        assert_eq!(sequential_flag(&mut reopened, &info_hash), Some(true));
+        reopened.set_sequential(&info_hash, false).unwrap();
+        assert_eq!(sequential_flag(&mut reopened, &info_hash), Some(false));
+    }
+
+    #[test]
+    fn announce_now_refuses_a_torrent_that_is_not_running() {
+        let (_content, bytes) = fixture("announce-demo");
+        let data = TempDir::new("data");
+        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let info_hash = registry.add_torrent(&bytes).unwrap();
+        // No router yet: the error names that, rather than pretending to
+        // announce into a void.
+        assert!(matches!(
+            registry.announce_now(&info_hash),
+            Err(ActionError::BadInput(_))
+        ));
+        registry.set_paused(&info_hash, true).unwrap();
+        assert!(matches!(
+            registry.announce_now(&info_hash),
+            Err(ActionError::BadInput(_))
+        ));
+        assert!(matches!(
+            registry.announce_now(&[0xAB; 20]),
+            Err(ActionError::NotFound)
+        ));
+    }
+
+    fn sequential_flag(registry: &mut Registry<MockDialer>, info_hash: &[u8; 20]) -> Option<bool> {
+        registry
+            .detail(info_hash)?
+            .get("sequential")
+            .and_then(Value::as_bool)
     }
 
     #[test]

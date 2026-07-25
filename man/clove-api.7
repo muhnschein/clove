@@ -141,6 +141,24 @@ normal,
 .Sy 2
 high.
 The count must equal the file count.
+.It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /announce
+Announce to every tracker now, ignoring the intervals they gave us.
+Refused with
+.Sy 400
+if the torrent is paused, has no running engine, has no I2P trackers, or was
+already forced within the last minute.
+.It Sy PUT Pa /v1/torrents/ Ns Ar info-hash Ns Pa /sequential
+Switch piece selection between file order and rarest-first.
+The body is exactly
+.Sy true
+or
+.Sy false ;
+anything else is a
+.Sy 400 .
+The setting is persisted and reported as
+.Sy sequential
+by
+.Sy GET Pa /v1/torrents/ Ns Ar info-hash .
 .El
 .Sh EXAMPLES
 Query status with

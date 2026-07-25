@@ -108,6 +108,20 @@ skip,
 normal,
 .Sy 2
 high.
+.It Cm announce Ar info-hash
+Announce to every one of the torrent's trackers immediately, ignoring the
+intervals they last asked for.
+For an operator who suspects a stale peer set; it is not something to put in
+a loop, and the daemon refuses a second forced announce within a minute.
+The torrent must be running and have at least one I2P tracker.
+.It Cm sequential Ar info-hash Cm on | Cm off
+Pick pieces in file order rather than rarest-first.
+Useful for media you want to start watching before the download finishes; it
+is worse for the swarm and slightly worse for you, because the rare pieces
+you would otherwise have fetched early may leave before you ask for them.
+The change takes effect immediately and survives a restart.
+Blocks already requested are left alone, so the switch costs nothing already
+in flight.
 .It Cm completions Ar bash | Ar zsh | Ar fish
 Print a shell completion script on standard output.
 .El
@@ -151,6 +165,15 @@ $ clove show 58e2fc46a8dc57c78191f079648750b0644d03a2
 Download only the second of three files:
 .Bd -literal -offset indent
 $ clove priorities 58e2fc46a8dc57c78191f079648750b0644d03a2 0,1,0
+.Ed
+.Pp
+Start watching a film before it has finished downloading, then ask the
+trackers for more peers:
+.Bd -literal -offset indent
+$ clove sequential 58e2fc46a8dc57c78191f079648750b0644d03a2 on
+58e2fc46a8dc57c78191f079648750b0644d03a2 now picks pieces in order
+$ clove announce 58e2fc46a8dc57c78191f079648750b0644d03a2
+announcing 58e2fc46a8dc57c78191f079648750b0644d03a2
 .Ed
 .Pp
 Re-check a torrent's data on disk:

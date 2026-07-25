@@ -208,6 +208,14 @@ impl Announcer {
         self.stop.raise();
     }
 
+    /// Announce to every tracker now, ignoring the intervals they gave us and
+    /// any failure backoff — the operator's `clove announce`, and nothing
+    /// else. Returns as soon as the loop is woken; the announces themselves
+    /// happen on the announcer's own thread.
+    pub fn announce_now(&self) {
+        self.stop.nudge();
+    }
+
     /// Signal the loop to stop and wait for it to finish.
     pub fn shutdown(mut self) {
         self.stop.raise();
@@ -294,8 +302,16 @@ fn announce_loop<D, N>(
                 Err(_) => state.on_failure(unix_now()),
             }
         }
-        if stop.wait(config.poll_interval) {
-            return;
+        match stop.wait_for(config.poll_interval) {
+            Wake::Stopped => return,
+            // An operator asked for a re-announce: make every tracker due,
+            // then fall through to the top of the loop.
+            Wake::Nudged => {
+                for state in &mut states {
+                    state.make_due();
+                }
+            }
+            Wake::Elapsed => {}
         }
     }
 }
@@ -522,28 +538,73 @@ fn lock_map<K, V>(m: &Mutex<HashMap<K, V>>) -> std::sync::MutexGuard<'_, HashMap
 /// pause immediately instead of sleeping it out.
 #[derive(Default)]
 struct StopFlag {
-    raised: Mutex<bool>,
+    state: Mutex<Flags>,
     cv: Condvar,
+}
+
+/// The two things a sleeping loop can be woken for.
+#[derive(Default)]
+struct Flags {
+    /// Shut down and return.
+    stopped: bool,
+    /// Stop waiting and do a round now. Consumed by the waiter.
+    nudged: bool,
+}
+
+/// Why a nudgeable wait returned.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    /// The flag was raised; the loop must return.
+    Stopped,
+    /// Someone asked for a round now.
+    Nudged,
+    /// The timeout expired, which is the ordinary case.
+    Elapsed,
 }
 
 impl StopFlag {
     fn raise(&self) {
-        *self.raised.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.lock().stopped = true;
         self.cv.notify_all();
     }
 
     fn is_raised(&self) -> bool {
-        *self.raised.lock().unwrap_or_else(PoisonError::into_inner)
+        self.lock().stopped
+    }
+
+    /// Ask a waiter to wake and run a round immediately. The flag stays set
+    /// until a waiter consumes it, so a nudge that arrives mid-round is not
+    /// lost.
+    fn nudge(&self) {
+        self.lock().nudged = true;
+        self.cv.notify_all();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Flags> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Wait up to `timeout`; returns whether the flag is raised.
     fn wait(&self, timeout: Duration) -> bool {
-        let guard = self.raised.lock().unwrap_or_else(PoisonError::into_inner);
-        let (guard, _) = self
+        self.wait_for(timeout) == Wake::Stopped
+    }
+
+    /// Wait up to `timeout`, returning what woke it. A nudge is consumed on
+    /// the way out so the next wait sleeps again.
+    fn wait_for(&self, timeout: Duration) -> Wake {
+        let guard = self.lock();
+        let (mut guard, result) = self
             .cv
-            .wait_timeout_while(guard, timeout, |raised| !*raised)
+            .wait_timeout_while(guard, timeout, |f| !f.stopped && !f.nudged)
             .unwrap_or_else(PoisonError::into_inner);
-        *guard
+        if guard.stopped {
+            return Wake::Stopped;
+        }
+        if std::mem::take(&mut guard.nudged) {
+            return Wake::Nudged;
+        }
+        debug_assert!(result.timed_out());
+        Wake::Elapsed
     }
 }
 

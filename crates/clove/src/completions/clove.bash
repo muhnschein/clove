@@ -3,7 +3,7 @@
 _clove() {
     local cur cmds
     cur="${COMP_WORDS[COMP_CWORD]}"
-    cmds="status list watch show add remove pause resume verify priorities peer completions"
+    cmds="status list watch show add remove pause resume verify priorities announce sequential peer completions"
     if [ "${COMP_CWORD}" -eq 1 ]; then
         COMPREPLY=( $(compgen -W "${cmds}" -- "${cur}") )
         return 0
@@ -11,6 +11,7 @@ _clove() {
     case "${COMP_WORDS[1]}" in
         add) COMPREPLY=( $(compgen -f -- "${cur}") ) ;;
         completions) COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") ) ;;
+        sequential) [ "${COMP_CWORD}" -eq 3 ] && COMPREPLY=( $(compgen -W "on off" -- "${cur}") ) ;;
     esac
     return 0
 }

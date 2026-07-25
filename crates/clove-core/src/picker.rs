@@ -162,6 +162,23 @@ impl Picker {
         }
     }
 
+    /// The piece-selection mode in force.
+    #[must_use]
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Switch piece-selection mode.
+    ///
+    /// Only the *next* pick is affected: blocks already requested stay
+    /// requested, so a torrent switched to sequential mid-download finishes
+    /// its outstanding pieces before walking forward in order. That is the
+    /// intended behaviour — cancelling in-flight work to obey a preference
+    /// wastes exactly the bandwidth the preference is trying to spend well.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+    }
+
     /// Override the endgame threshold (blocks remaining). Zero disables
     /// endgame entirely.
     pub fn set_endgame_blocks(&mut self, blocks: u32) {
@@ -447,6 +464,24 @@ mod tests {
         let picks = p.pick(&field(4, &[0, 1, 2, 3]), 4);
         let order: Vec<u32> = picks.iter().map(|b| b.index).collect();
         assert_eq!(order, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn switching_mode_changes_the_next_pick_only() {
+        let mut p = Picker::new(4, BLOCK_LEN, 4 * u64::from(BLOCK_LEN), Mode::RarestFirst);
+        // Endgame would hand the same block out twice and obscure the point.
+        p.set_endgame_blocks(0);
+        let peer = field(4, &[0, 1, 2, 3]);
+        p.add_bitfield(&peer);
+        p.add_bitfield(&field(4, &[0, 1, 2])); // piece 3 is now rarest
+        assert_eq!(p.pick(&peer, 1)[0].index, 3);
+        assert_eq!(p.mode(), Mode::RarestFirst);
+
+        p.set_mode(Mode::Sequential);
+        assert_eq!(p.mode(), Mode::Sequential);
+        // Piece 3 stays in flight — the switch does not cancel work — and the
+        // next pick walks from the front regardless of rarity.
+        assert_eq!(p.pick(&peer, 1)[0].index, 0);
     }
 
     #[test]

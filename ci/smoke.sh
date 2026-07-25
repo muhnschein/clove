@@ -140,6 +140,28 @@ echo "smoke: priorities"
 run priorities "$info_hash" 2 >/dev/null || fail "priorities failed"
 expect_contains "$(run show "$info_hash")" "high" "priority in show"
 
+echo "smoke: sequential mode persists across a restart"
+run sequential "$info_hash" on >/dev/null || fail "sequential on failed"
+expect_contains "$(run show "$info_hash" --json)" '"sequential":true' "sequential in show"
+stop_daemon
+start_daemon
+expect_contains "$(run show "$info_hash" --json)" '"sequential":true' "sequential after restart"
+run sequential "$info_hash" off >/dev/null || fail "sequential off failed"
+expect_contains "$(run show "$info_hash" --json)" '"sequential":false' "sequential back off"
+
+set +e
+run sequential "$info_hash" maybe >/dev/null 2>&1
+code=$?
+set -e
+expect_status "$code" 2 "sequential with a bad setting"
+
+echo "smoke: announce refuses a torrent with no router"
+set +e
+run announce "$info_hash" >/dev/null 2>&1
+code=$?
+set -e
+expect_status "$code" 1 "announce without a running engine"
+
 echo "smoke: resume, then remove both torrents"
 run resume "$info_hash" >/dev/null || fail "resume failed"
 run remove "$info_hash" --data >/dev/null || fail "remove failed"

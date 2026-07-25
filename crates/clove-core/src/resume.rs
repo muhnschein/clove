@@ -17,8 +17,9 @@ use crate::bencode::{self, Value};
 /// Current resume-format version. Bump on any semantic change.
 ///
 /// History: v1 initial; v2 added the optional `paused` flag (a v1 file reads
-/// as not paused).
-pub const VERSION: i64 = 2;
+/// as not paused); v3 added the optional `sequential` flag (an earlier file
+/// reads as rarest-first).
+pub const VERSION: i64 = 3;
 
 /// Everything clove needs to pick a torrent back up after a restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +46,10 @@ pub struct Resume {
     /// Whether the torrent is paused. Optional on disk (added in v2); a v1
     /// file, or any file omitting it, reads as `false`.
     pub paused: bool,
+    /// Whether pieces are picked in order rather than rarest-first (SCOPE §3's
+    /// per-torrent sequential flag). Optional on disk (added in v3); an
+    /// earlier file, or any file omitting it, reads as `false`.
+    pub sequential: bool,
 }
 
 /// Why a resume file was refused. Refusal never writes anything.
@@ -85,7 +90,7 @@ pub fn bitfield_len(num_pieces: u32) -> usize {
     num_pieces.div_ceil(8) as usize
 }
 
-const KEYS: [&[u8]; 10] = [
+const KEYS: [&[u8]; 11] = [
     b"version",
     b"info_hash",
     b"num_pieces",
@@ -96,6 +101,7 @@ const KEYS: [&[u8]; 10] = [
     b"downloaded",
     b"trackers",
     b"paused",
+    b"sequential",
 ];
 
 impl Resume {
@@ -135,6 +141,7 @@ impl Resume {
             .collect();
         put(b"trackers", Value::List(tiers));
         put(b"paused", Value::Int(i64::from(self.paused)));
+        put(b"sequential", Value::Int(i64::from(self.sequential)));
         bencode::encode(&Value::Dict(map))
     }
 
@@ -223,6 +230,13 @@ impl Resume {
             .and_then(Value::as_int)
             .is_some_and(|n| n != 0);
 
+        // Optional since v3; an older file reads as rarest-first, which is
+        // what it was downloading with.
+        let sequential = root
+            .get(b"sequential")
+            .and_then(Value::as_int)
+            .is_some_and(|n| n != 0);
+
         Ok(Resume {
             info_hash,
             num_pieces,
@@ -233,6 +247,7 @@ impl Resume {
             downloaded,
             trackers,
             paused,
+            sequential,
         })
     }
 }
@@ -277,6 +292,7 @@ mod tests {
             downloaded: 67890,
             trackers: vec![vec!["http://t.i2p/a".into()], vec!["http://u.i2p/a".into()]],
             paused: true,
+            sequential: true,
         }
     }
 
@@ -312,15 +328,31 @@ mod tests {
     }
 
     #[test]
+    fn a_file_without_sequential_reads_as_rarest_first() {
+        // Strip the `sequential` entry to simulate a v2 file.
+        let mut r = sample();
+        r.sequential = false;
+        let encoded = r.encode();
+        let needle = b"10:sequentiali0e";
+        let pos = encoded
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .unwrap();
+        let mut stripped = encoded[..pos].to_vec();
+        stripped.extend_from_slice(&encoded[pos + needle.len()..]);
+        assert!(!Resume::decode(&stripped).unwrap().sequential);
+    }
+
+    #[test]
     fn refuses_the_future_cleanly() {
         let mut r = sample().encode();
-        // Bump the version int in place past the current VERSION (2 -> 3).
+        // Bump the version int in place past the current VERSION (3 -> 4).
         let pos = r.windows(9).position(|w| w == b"7:version").map(|p| p + 10);
         let pos = pos.unwrap();
-        assert_eq!(r[pos], b'2');
-        r[pos] = b'3';
+        assert_eq!(r[pos], b'3');
+        r[pos] = b'4';
         match Resume::decode(&r) {
-            Err(Error::FutureVersion(3)) => {}
+            Err(Error::FutureVersion(4)) => {}
             other => panic!("expected FutureVersion, got {other:?}"),
         }
     }

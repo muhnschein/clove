@@ -87,6 +87,8 @@ fn run() -> Result<(), Fail> {
         Some("verify") => cmd_verify(socket, &operands),
         Some("peer") => cmd_peer(socket, &operands),
         Some("priorities") => cmd_priorities(socket, &operands),
+        Some("announce") => cmd_action(socket, &operands, "announce", "announcing"),
+        Some("sequential") => cmd_sequential(socket, &operands),
         Some("completions") => cmd_completions(&operands),
         Some(other) => Err(Fail::Usage(format!(
             "unknown command {other:?} (try --help)"
@@ -109,6 +111,8 @@ fn print_help() {
     println!("  verify <info-hash>             re-check data on disk");
     println!("  peer <info-hash> <b32-addr>    hand a running torrent a peer to dial");
     println!("  priorities <info-hash> <spec>  set per-file priorities (e.g. 1,0,2)");
+    println!("  announce <info-hash>           re-announce to every tracker now");
+    println!("  sequential <info-hash> on|off  pick pieces in order instead of rarest-first");
     println!("  completions <bash|zsh|fish>    print a shell completion script");
 }
 
@@ -360,6 +364,38 @@ fn cmd_priorities(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fa
         spec.as_bytes(),
     )?;
     println!("set priorities for {info_hash}");
+    Ok(())
+}
+
+fn cmd_sequential(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
+    let [info_hash, setting] = operands else {
+        return Err(Fail::Usage(
+            "sequential needs <info-hash> and on or off".to_owned(),
+        ));
+    };
+    let on = match setting.as_str() {
+        "on" | "yes" | "true" => true,
+        "off" | "no" | "false" => false,
+        other => {
+            return Err(Fail::Usage(format!("expected on or off, got {other:?}")));
+        }
+    };
+    let (socket, token) = resolve(socket)?;
+    request(
+        &socket,
+        &token,
+        "PUT",
+        &format!("/v1/torrents/{info_hash}/sequential"),
+        if on {
+            b"true".as_slice()
+        } else {
+            b"false".as_slice()
+        },
+    )?;
+    println!(
+        "{info_hash} now picks pieces {}",
+        if on { "in order" } else { "rarest-first" }
+    );
     Ok(())
 }
 

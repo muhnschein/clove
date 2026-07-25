@@ -57,6 +57,7 @@ listener, honored on the unix socket too). Read commands take `?json` implicitly
 | `DELETE /v1/torrents/{ih}` | remove; `?data=1` also deletes downloaded data |
 | `POST /v1/torrents/{ih}/pause` · `/resume` · `/verify` · `/announce` | lifecycle actions |
 | `PUT /v1/torrents/{ih}/priorities` | set per-file priorities |
+| `PUT /v1/torrents/{ih}/sequential` | pick pieces in file order instead of rarest-first |
 
 Errors are a JSON `{ "error": "…" }` body with an accurate status (400 bad
 input, 401 bad/missing token, 404 unknown info-hash, 409 duplicate add).
@@ -65,7 +66,7 @@ input, 401 bad/missing token, 404 unknown info-hash, 409 duplicate add).
 
 Subcommands map onto the endpoints: `add` (file/magnet), `remove [--data]`,
 `list`, `status <ih>`, `pause`/`resume`, `verify`, `priorities`, `announce`,
-`stats`. Rules (SCOPE §3):
+`sequential`, `stats`. Rules (SCOPE §3):
 
 - Aligned-table human output by default; **`--json` on every read command**
   (the raw API body) for scripting.

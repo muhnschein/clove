@@ -523,6 +523,13 @@ fn torrent_action(
             };
             action_result(lock(&daemon.registry).add_peer(&info_hash, peer))
         }
+        ("POST", Some("announce")) => {
+            action_result(lock(&daemon.registry).announce_now(&info_hash))
+        }
+        ("PUT", Some("sequential")) => match parse_bool_body(&request.body) {
+            Some(on) => action_result(lock(&daemon.registry).set_sequential(&info_hash, on)),
+            None => error(400, "body must be \"true\" or \"false\""),
+        },
         ("POST", Some("verify")) => match lock(&daemon.registry).verify(&info_hash) {
             Ok(verified) => {
                 let body = Value::Object(vec![(
@@ -581,6 +588,17 @@ fn parse_priorities(body: &[u8]) -> Option<Vec<u8>> {
         out.push(value);
     }
     Some(out)
+}
+
+/// Parse a boolean request body. Deliberately strict — only `true` and
+/// `false`, since a flag that silently reads a typo as "off" is worse than
+/// one that refuses it.
+fn parse_bool_body(body: &[u8]) -> Option<bool> {
+    match std::str::from_utf8(body).ok()?.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 /// Whether a query string carries a truthy `data` flag (`data`, `data=1`,

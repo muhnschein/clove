@@ -3,7 +3,7 @@
 clove's on-disk state is an **API**, not an implementation detail (the SQLite
 doctrine, `SCOPE.md` §3). This file specifies it. The rules:
 
-- Every resume file carries an integer `version` (currently **2**).
+- Every resume file carries an integer `version` (currently **3**).
 - **Newer clove reads older state.** Older clove **refuses newer state
   cleanly** — a clear error, no write, no corruption (worst case: you downgrade
   and re-add the torrent).
@@ -38,7 +38,7 @@ key means version discipline failed somewhere:
 
 | Key | Type | Meaning |
 |---|---|---|
-| `version` | int | Format version. `> 1` is refused by this clove. |
+| `version` | int | Format version. A version above the one this clove knows is refused. |
 | `info_hash` | 20 bytes | The torrent identity; must match the sibling `.torrent`. |
 | `num_pieces` | int ≥ 1 | Piece count, so the bitfields are unambiguous. |
 | `have` | bytes | MSB-first piece bitfield (BEP 3); trailing spare bits must be 0. |
@@ -48,8 +48,10 @@ key means version discipline failed somewhere:
 | `downloaded` | int | Lifetime bytes downloaded. |
 | `trackers` | list of list of byte-strings | Announce tiers (BEP 12) in current order. |
 | `paused` | int (optional, v2+) | `1` if paused. Absent (a v1 file) reads as `0`. |
+| `sequential` | int (optional, v3+) | `1` to pick pieces in file order instead of rarest-first. Absent (a v1 or v2 file) reads as `0`. |
 
-Version history: **v1** initial; **v2** added the optional `paused` flag.
+Version history: **v1** initial; **v2** added the optional `paused` flag; **v3**
+added the optional `sequential` flag.
 
 `have` and `verified` are stored separately on purpose: a crash between writing
 a piece and verifying it costs a re-verification, never false trust.
