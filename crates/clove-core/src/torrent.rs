@@ -61,6 +61,52 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Cross-check the torrent's own bookkeeping against the picker's, in debug
+/// builds only (SCOPE §9). The picker validates itself; what it cannot see is
+/// whether the peer table agrees with it, and a mismatch there is exactly how
+/// a download stalls: blocks counted as in flight that no peer will ever
+/// deliver, because the peer that owed them went away without releasing them.
+#[cfg(debug_assertions)]
+fn debug_check_state(state: &State) {
+    state.picker.check_invariants();
+
+    // The picker must never believe more blocks are owed than peers actually
+    // owe: a count held for a block no peer will deliver is never handed out
+    // again, which is how a download stalls one block short.
+    //
+    // The reverse is legitimate and common. When a piece completes, set_have
+    // drops its block accounting entirely, while peers keep their entries for
+    // that piece until the outstanding responses arrive or they disconnect —
+    // so peers can hold entries the picker has already forgotten.
+    let peer_in_flight: u64 = state.peers.iter().map(|p| p.in_flight.len() as u64).sum();
+    let picker_in_flight = state.picker.in_flight_total();
+    assert!(
+        picker_in_flight <= peer_in_flight,
+        "picker believes {picker_in_flight} blocks are in flight but peers owe only \
+         {peer_in_flight}: a request was leaked and will never be re-offered"
+    );
+
+    // Peer ids are handed out from a counter and must stay unique: two peers
+    // sharing an id would make every lookup ambiguous.
+    for (i, peer) in state.peers.iter().enumerate() {
+        assert!(
+            peer.id < state.next_id,
+            "peer id {} was never issued",
+            peer.id
+        );
+        assert!(
+            !state.peers[i + 1..].iter().any(|other| other.id == peer.id),
+            "duplicate peer id {}",
+            peer.id
+        );
+    }
+}
+
+/// No-op outside debug builds: release stays lean.
+#[cfg(not(debug_assertions))]
+#[inline]
+fn debug_check_state(_state: &State) {}
+
 /// A running torrent: owns the shared state and the peer threads.
 pub struct Torrent {
     shared: Arc<Shared>,
@@ -461,6 +507,7 @@ impl Shared {
                 st.picker.block_failed(piece, block);
             }
         }
+        debug_check_state(&st);
     }
 
     /// Handle one message: mutate state under the lock, collect outgoing
@@ -470,6 +517,9 @@ impl Shared {
         {
             let mut st = lock(&self.state);
             self.handle(&mut st, id, msg, &mut out);
+            // Every peer message can move piece accounting; check the whole
+            // picture while the lock is still held and the state is settled.
+            debug_check_state(&st);
         }
         for (tx, msg) in out {
             let _ = tx.send(msg);
@@ -753,10 +803,24 @@ fn fill_requests(st: &mut State, idx: usize, out: &mut Vec<Outgoing>) {
     }
     let has = st.peers[idx].has.clone();
     let requests = st.picker.pick(&has, space);
+
+    // In endgame the picker deliberately hands the same block to more than
+    // one peer. It has no per-peer view, though, so it can also hand a block
+    // back to the peer that already owes it — a wasted request, and a count
+    // the picker would never see settled, since the peer answers once. Drop
+    // those and give the count straight back.
+    let mut duplicates = Vec::new();
     let peer = &mut st.peers[idx];
     for req in requests {
-        peer.in_flight.insert((req.index, req.begin / BLOCK_LEN));
-        out.push((peer.out.clone(), Message::Request(req)));
+        let block = req.begin / BLOCK_LEN;
+        if peer.in_flight.insert((req.index, block)) {
+            out.push((peer.out.clone(), Message::Request(req)));
+        } else {
+            duplicates.push((req.index, block));
+        }
+    }
+    for (index, block) in duplicates {
+        st.picker.block_failed(index, block);
     }
 }
 
