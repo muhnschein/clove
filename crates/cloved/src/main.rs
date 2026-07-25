@@ -54,9 +54,17 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+/// The argument parser proper, over any iterator so tests can drive it.
+/// `--help` still exits the process: it is a terminal action either way, and
+/// pretending otherwise would mean a success path that prints usage and then
+/// carries on.
+fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Args, String> {
     let mut check = false;
     let mut config_path = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = args;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-C" | "--check" => check = true,
@@ -683,4 +691,426 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    //! Adversarial tests for the control API — the daemon's only externally
+    //! reachable surface, and the one place a bug is a security bug rather
+    //! than a correctness one.
+    //!
+    //! `ci/smoke.sh` drives this API through the real CLI, which by
+    //! construction always sends a well-formed request with the right token.
+    //! Everything an attacker would actually send — no token, a wrong token,
+    //! a lying `Content-Length`, a traversal in the path — is only reachable
+    //! from here.
+    //!
+    //! [`handle`] is exercised over a real socketpair rather than by calling
+    //! [`route`] directly, so request parsing, authentication, routing and
+    //! response writing are all in the path, in that order. A test that
+    //! bypassed authentication to reach the router would not notice if the
+    //! two were ever swapped.
+
+    use super::*;
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static C: AtomicU32 = AtomicU32::new(0);
+            let n = C.fetch_add(1, Ordering::Relaxed);
+            let p =
+                std::env::temp_dir().join(format!("clove-api-{tag}-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&p).expect("temp dir");
+            TempDir(p)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn daemon(dir: &TempDir) -> Arc<Daemon> {
+        Arc::new(Daemon {
+            start: Instant::now(),
+            sam_address: "127.0.0.1:7656".to_owned(),
+            token: TOKEN.to_owned(),
+            registry: Mutex::new(Registry::open(&dir.0).expect("registry")),
+            router: Mutex::new("connecting"),
+        })
+    }
+
+    /// Send `raw` to the daemon over a socketpair and return what it wrote
+    /// back. Half-closing the write side matters: a request whose declared
+    /// body never arrives must terminate on EOF rather than block a
+    /// connection thread forever.
+    fn speak(daemon: &Arc<Daemon>, raw: &[u8]) -> String {
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        let mut client_w = client.try_clone().expect("clone");
+        // The write runs on its own thread: a request larger than the socket
+        // buffer would otherwise block here, before the daemon has been given
+        // a chance to read a byte of it. That is exactly the shape of the
+        // oversized-body case below.
+        let body = raw.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = client_w.write_all(&body);
+            let _ = client_w.shutdown(std::net::Shutdown::Write);
+        });
+        handle(ApiStream::Unix(server), daemon).expect("handle");
+        let mut reply = Vec::new();
+        let mut client_r = client;
+        client_r.read_to_end(&mut reply).expect("read response");
+        let _ = writer.join();
+        String::from_utf8_lossy(&reply).into_owned()
+    }
+
+    fn status_of(reply: &str) -> u16 {
+        reply
+            .split(' ')
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status line in {reply:?}"))
+    }
+
+    fn get(path: &str, token: Option<&str>) -> Vec<u8> {
+        let mut req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n");
+        if let Some(t) = token {
+            let _ = write!(req, "x-clove-token: {t}\r\n");
+        }
+        req.push_str("\r\n");
+        req.into_bytes()
+    }
+
+    // ------------------------------------------------------------- auth
+
+    #[test]
+    fn every_request_needs_the_token() {
+        let dir = TempDir::new("auth");
+        let d = daemon(&dir);
+
+        // No token at all.
+        assert_eq!(status_of(&speak(&d, &get("/v1/status", None))), 401);
+        // Wrong token of the same length — the case constant_time_eq exists
+        // for.
+        let same_len = "f".repeat(TOKEN.len());
+        assert_eq!(
+            status_of(&speak(&d, &get("/v1/status", Some(&same_len)))),
+            401
+        );
+        // Wrong token of a different length.
+        assert_eq!(status_of(&speak(&d, &get("/v1/status", Some("x")))), 401);
+        // A prefix of the real token must not pass.
+        assert_eq!(
+            status_of(&speak(&d, &get("/v1/status", Some(&TOKEN[..16])))),
+            401
+        );
+        // The real one does.
+        assert_eq!(status_of(&speak(&d, &get("/v1/status", Some(TOKEN)))), 200);
+    }
+
+    #[test]
+    fn authentication_precedes_routing() {
+        let dir = TempDir::new("order");
+        let d = daemon(&dir);
+        // An unauthenticated request to a path that does not exist must be
+        // refused for the token, not answered with a 404: otherwise the API
+        // tells an unauthenticated caller which paths are real.
+        assert_eq!(status_of(&speak(&d, &get("/v1/nope", None))), 401);
+        assert_eq!(status_of(&speak(&d, &get("/v1/status", None))), 401);
+    }
+
+    // ---------------------------------------------------------- routing
+
+    #[test]
+    fn unknown_paths_and_methods_are_refused_cleanly() {
+        let dir = TempDir::new("routes");
+        let d = daemon(&dir);
+        assert_eq!(status_of(&speak(&d, &get("/", Some(TOKEN)))), 404);
+        assert_eq!(status_of(&speak(&d, &get("/v2/status", Some(TOKEN)))), 404);
+        assert_eq!(
+            status_of(&speak(
+                &d,
+                b"DELETE /v1/status HTTP/1.1\r\nx-clove-token: 0123456789abcdef0123456789abcdef\r\n\r\n"
+            )),
+            405
+        );
+    }
+
+    #[test]
+    fn a_traversal_in_the_info_hash_is_not_a_path() {
+        let dir = TempDir::new("traversal");
+        let d = daemon(&dir);
+        // The info-hash segment is parsed as 40 hex characters, never joined
+        // onto the state directory. These must all be "no such torrent", and
+        // must leave the data directory untouched.
+        for evil in [
+            "/v1/torrents/../../../etc/passwd",
+            "/v1/torrents/..%2f..%2fetc%2fpasswd",
+            "/v1/torrents/....//....//etc/passwd",
+            "/v1/torrents/%00",
+            "/v1/torrents/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/../../verify",
+        ] {
+            let code = status_of(&speak(&d, &get(evil, Some(TOKEN))));
+            assert!(
+                code == 404 || code == 400 || code == 405,
+                "{evil} answered {code}"
+            );
+        }
+        let leaked: Vec<_> = std::fs::read_dir(dir.0.join("state"))
+            .expect("state dir")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(leaked.is_empty(), "a traversal created state files");
+    }
+
+    #[test]
+    fn a_non_hex_info_hash_is_rejected_not_guessed() {
+        let dir = TempDir::new("hex");
+        let d = daemon(&dir);
+        // Malformed is 400 and absent is 404; the two are different answers
+        // on purpose, so a typo in a script reads as a typo.
+        for bad in [
+            "/v1/torrents/zzzz",
+            "/v1/torrents/0123456789abcdef0123456789abcdef012345", // 38 chars
+            "/v1/torrents/0123456789abcdef0123456789abcdef0123456789", // 42 chars
+            "/v1/torrents/0123456789ABCDEF0123456789ABCDEF01234567", // uppercase
+            "/v1/torrents/0123456789abcdef0123456789abcdef0123456 ", // trailing space
+        ] {
+            assert_eq!(status_of(&speak(&d, &get(bad, Some(TOKEN)))), 400, "{bad}");
+        }
+        let absent = "/v1/torrents/0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(status_of(&speak(&d, &get(absent, Some(TOKEN)))), 404);
+    }
+
+    // ----------------------------------------------------- hostile HTTP
+
+    #[test]
+    fn malformed_requests_get_400_not_a_panic() {
+        let dir = TempDir::new("malformed");
+        let d = daemon(&dir);
+        let cases: Vec<Vec<u8>> = vec![
+            b"\r\n\r\n".to_vec(),
+            b"GET\r\n\r\n".to_vec(),
+            b"GET /v1/status\r\n\r\n".to_vec(),
+            b"GET /v1/status HTTP/9.9\r\n\r\n".to_vec(),
+            b"GET /v1/status FTP/1.1\r\n\r\n".to_vec(),
+            b"\x00\x01\x02\x03\r\n\r\n".to_vec(),
+            // A header line with no colon.
+            b"GET /v1/status HTTP/1.1\r\nnonsense\r\n\r\n".to_vec(),
+            // Non-UTF-8 in the head.
+            b"GET /v1/\xff\xfe HTTP/1.1\r\n\r\n".to_vec(),
+            // No terminator at all, then EOF.
+            b"GET /v1/status HTTP/1.1\r\n".to_vec(),
+        ];
+        for raw in cases {
+            let code = status_of(&speak(&d, &raw));
+            assert!(
+                code == 400 || code == 401,
+                "{:?} answered {code}",
+                String::from_utf8_lossy(&raw)
+            );
+        }
+    }
+
+    #[test]
+    fn an_oversized_body_is_refused_on_the_declared_length() {
+        let dir = TempDir::new("oversize");
+        let d = daemon(&dir);
+        // Declares a gigabyte and sends none of it. The refusal comes from
+        // the Content-Length header alone — if the daemon buffered first this
+        // would allocate a gigabyte and then block waiting for bytes that
+        // never come.
+        //
+        // Sending the body too is not tested here, and cannot be: refusing
+        // without reading means the unread bytes sit in the socket, and
+        // closing on top of them resets the connection before the client can
+        // read the 400. That is the correct trade — draining an attacker's
+        // body is the denial of service the limit exists to prevent — but it
+        // does mean an oversized *send* is answered with a reset rather than
+        // a message. Clients should check the length before sending.
+        let raw = format!(
+            "POST /v1/torrents HTTP/1.1\r\nx-clove-token: {TOKEN}\r\nContent-Length: 1073741824\r\n\r\n"
+        );
+        assert_eq!(status_of(&speak(&d, raw.as_bytes())), 400);
+    }
+
+    #[test]
+    fn a_body_at_exactly_the_limit_is_read_and_judged_on_its_merits() {
+        let dir = TempDir::new("limit");
+        let d = daemon(&dir);
+        // The boundary is inclusive: MAX_REQUEST_BODY bytes are accepted by
+        // the transport and then rejected by the torrent parser. Both answers
+        // are 400, so the distinction that matters is the message — a size
+        // refusal here would mean the largest legal .torrent cannot be added.
+        let mut raw = format!(
+            "POST /v1/torrents HTTP/1.1\r\nx-clove-token: {TOKEN}\r\nContent-Length: {MAX_REQUEST_BODY}\r\n\r\n"
+        )
+        .into_bytes();
+        raw.extend(std::iter::repeat_n(b'a', MAX_REQUEST_BODY));
+        let reply = speak(&d, &raw);
+        assert_eq!(status_of(&reply), 400);
+        assert!(
+            !reply.contains("exceeds the allowed size"),
+            "a body at the limit was refused for its size: {reply}"
+        );
+    }
+
+    #[test]
+    fn a_body_shorter_than_declared_ends_at_eof() {
+        let dir = TempDir::new("short-body");
+        let d = daemon(&dir);
+        // Promises 4 KiB, sends 3 bytes, then closes. This must terminate.
+        let raw = format!(
+            "POST /v1/torrents HTTP/1.1\r\nx-clove-token: {TOKEN}\r\nContent-Length: 4096\r\n\r\nabc"
+        );
+        let code = status_of(&speak(&d, raw.as_bytes()));
+        assert!(code == 400, "truncated body answered {code}");
+    }
+
+    #[test]
+    fn garbage_bodies_do_not_become_torrents() {
+        let dir = TempDir::new("garbage-add");
+        let d = daemon(&dir);
+        for body in [
+            b"not a torrent".as_slice(),
+            b"d".as_slice(),
+            b"magnet:?xt=urn:btih:nothex".as_slice(),
+            b"magnet:".as_slice(),
+            &[0xFF; 64],
+        ] {
+            let mut raw = format!(
+                "POST /v1/torrents HTTP/1.1\r\nx-clove-token: {TOKEN}\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            raw.extend_from_slice(body);
+            assert_eq!(status_of(&speak(&d, &raw)), 400);
+        }
+        assert_eq!(lock(&d.registry).count(), 0, "garbage was accepted");
+    }
+
+    // ------------------------------------------------------- pure parts
+
+    #[test]
+    fn constant_time_eq_is_an_equality() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abc", b""));
+        // Differing in the first byte and in the last must both fail: an
+        // early return would make the first case faster and leak.
+        assert!(!constant_time_eq(b"xbc", b"abc"));
+        assert!(!constant_time_eq(b"abx", b"abc"));
+    }
+
+    #[test]
+    fn argument_parsing() {
+        let args = |v: &[&str]| parse_args_from(v.iter().map(|s| (*s).to_owned()));
+        assert!(args(&[]).expect("empty").config_path.is_none());
+        assert!(args(&["-C"]).expect("-C").check);
+        assert!(args(&["--check"]).expect("--check").check);
+        assert_eq!(
+            args(&["-c", "/etc/clove.conf"])
+                .expect("-c")
+                .config_path
+                .as_deref(),
+            Some(Path::new("/etc/clove.conf"))
+        );
+        // A flag that eats the next argument must complain when there is none.
+        assert!(args(&["-c"]).is_err());
+        assert!(args(&["--config"]).is_err());
+        // Unknown arguments are fatal, never ignored (the config file's rule).
+        assert!(args(&["--nope"]).is_err());
+        assert!(args(&["-C", "--nope"]).is_err());
+        // A path that looks like a flag is still a path: the parser takes the
+        // next argument verbatim.
+        assert_eq!(
+            args(&["-c", "-C"]).expect("-c -C").config_path.as_deref(),
+            Some(Path::new("-C"))
+        );
+    }
+
+    #[test]
+    fn priority_bodies() {
+        assert_eq!(parse_priorities(b"1,0,2"), Some(vec![1, 0, 2]));
+        assert_eq!(parse_priorities(b" 1 , 0 "), Some(vec![1, 0]));
+        assert_eq!(parse_priorities(b"1"), Some(vec![1]));
+        assert_eq!(parse_priorities(b"3"), None);
+        assert_eq!(parse_priorities(b"-1"), None);
+        assert_eq!(parse_priorities(b"1,,2"), None);
+        assert_eq!(parse_priorities(b""), None);
+        assert_eq!(parse_priorities(b"1,2,x"), None);
+        assert_eq!(parse_priorities(&[0xFF, 0xFE]), None);
+        // 256 wraps to 0 in a u8 parse only if the parser is careless.
+        assert_eq!(parse_priorities(b"256"), None);
+    }
+
+    #[test]
+    fn boolean_bodies_are_strict() {
+        assert_eq!(parse_bool_body(b"true"), Some(true));
+        assert_eq!(parse_bool_body(b"false"), Some(false));
+        assert_eq!(parse_bool_body(b" true\n"), Some(true));
+        // A typo must be an error, not silently "off".
+        assert_eq!(parse_bool_body(b"True"), None);
+        assert_eq!(parse_bool_body(b"1"), None);
+        assert_eq!(parse_bool_body(b"yes"), None);
+        assert_eq!(parse_bool_body(b""), None);
+        assert_eq!(parse_bool_body(&[0xFF]), None);
+    }
+
+    #[test]
+    fn data_query_flag() {
+        assert!(query_has_data("data=1"));
+        assert!(query_has_data("data"));
+        assert!(query_has_data("data=true"));
+        assert!(query_has_data("foo=1&data=yes"));
+        assert!(!query_has_data(""));
+        assert!(!query_has_data("data=0"));
+        assert!(!query_has_data("data=maybe"));
+        // Substring matches must not count.
+        assert!(!query_has_data("metadata=1"));
+        assert!(!query_has_data("data_files=1"));
+    }
+
+    #[test]
+    fn sam_port_extraction() {
+        assert_eq!(sam_tcp_port("127.0.0.1:7656"), Some(7656));
+        assert_eq!(sam_tcp_port("localhost:7656"), Some(7656));
+        assert_eq!(sam_tcp_port("[::1]:7656"), Some(7656));
+        // A unix path has no port, and must not be guessed at: the sandbox
+        // leaves outbound TCP alone rather than pinning the wrong port.
+        assert_eq!(sam_tcp_port("/run/i2pd/sam.sock"), None);
+        assert_eq!(sam_tcp_port("127.0.0.1"), None);
+        assert_eq!(sam_tcp_port("127.0.0.1:notaport"), None);
+        assert_eq!(sam_tcp_port("127.0.0.1:99999"), None);
+    }
+
+    #[test]
+    fn the_token_file_is_created_once_and_kept_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("token");
+        let first = load_or_create_token(&dir.0).expect("create");
+        assert_eq!(first.len(), 64, "32 random bytes, hex");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let mode = std::fs::metadata(dir.0.join("token"))
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "token readable by another local user");
+
+        // A second call reads the existing token rather than rotating it —
+        // rotating would invalidate every running CLI on restart.
+        assert_eq!(load_or_create_token(&dir.0).expect("reuse"), first);
+    }
 }
