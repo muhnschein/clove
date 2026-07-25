@@ -92,6 +92,9 @@ Live sign-off checklist in `LIVE-TESTING.md` §6.2.
   verify/priorities/re-announce/stats; aligned-table output, `--json` on
   every read command; sensible exit codes; shell completions.
 - `STATE-FORMAT.md` written alongside the resume writer's final form.
+- `clove sequential` and `clove announce` close the last two §3 CLI
+  commitments. `clove fetch` (daemon-less one-shot) is **cut from v1**, 2026-07;
+  see SCOPE §2 for the reasoning. It is a v2 candidate, not a rejection.
 
 Exit (M4 demo): daily-drivable daemon+CLI against a local router.
 
