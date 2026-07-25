@@ -78,16 +78,31 @@ fn parse_args() -> Result<Args, String> {
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     let defaults = Defaults::from_env().map_err(|e| e.to_string())?;
+    // An explicit -c must exist; the default path may simply be absent, in
+    // which case the built-in defaults are the whole configuration.
     let text = match &args.config_path {
         Some(path) => {
             std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?
         }
-        None => String::new(),
+        None => std::fs::read_to_string(defaults.config_path()).unwrap_or_default(),
     };
     let config = Config::parse(&text, &defaults).map_err(|e| e.to_string())?;
 
     if args.check {
+        let from = args
+            .config_path
+            .clone()
+            .unwrap_or_else(|| defaults.config_path());
         println!("cloved: configuration OK");
+        println!(
+            "  config     {} {}",
+            from.display(),
+            if from.exists() {
+                ""
+            } else {
+                "(absent; using defaults)"
+            }
+        );
         println!("  data_dir   {}", config.data_dir.display());
         println!("  api_socket {}", config.api_socket.display());
         println!("  sam_address {}", config.sam_address);

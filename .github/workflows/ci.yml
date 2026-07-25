@@ -29,6 +29,16 @@ jobs:
       - run: cargo build --workspace
       - run: ./ci/smoke.sh
 
+  man:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y mandoc
+      # The manuals are the primary user documentation (SCOPE §9); keep them
+      # parsing and conventional so they cannot rot unnoticed.
+      - run: make man-lint
+
   deny:
     runs-on: ubuntu-latest
     steps:

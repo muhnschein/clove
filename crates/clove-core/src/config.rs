@@ -25,6 +25,9 @@ pub struct Defaults {
     pub data_home: PathBuf,
     /// `$XDG_RUNTIME_DIR` when set; preferred home of the control socket.
     pub runtime_dir: Option<PathBuf>,
+    /// XDG config home (`$XDG_CONFIG_HOME` or `~/.config`); the default
+    /// config file is `<config_home>/clove/clove.conf`.
+    pub config_home: PathBuf,
 }
 
 impl Defaults {
@@ -43,10 +46,25 @@ impl Defaults {
             },
         };
         let runtime_dir = nonempty_env("XDG_RUNTIME_DIR").map(PathBuf::from);
+        let config_home = match nonempty_env("XDG_CONFIG_HOME") {
+            Some(dir) => PathBuf::from(dir),
+            None => match nonempty_env("HOME") {
+                Some(home) => PathBuf::from(home).join(".config"),
+                None => return Err(Error::NoHome),
+            },
+        };
         Ok(Defaults {
             data_home,
             runtime_dir,
+            config_home,
         })
+    }
+
+    /// Where `cloved` looks for its config file when `-c` is not given.
+    /// Absent is not an error: an empty config is the working default.
+    #[must_use]
+    pub fn config_path(&self) -> PathBuf {
+        self.config_home.join("clove/clove.conf")
     }
 }
 
@@ -288,6 +306,7 @@ mod tests {
         Defaults {
             data_home: PathBuf::from("/home/u/.local/share"),
             runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            config_home: PathBuf::from("/home/u/.config"),
         }
     }
 
@@ -299,6 +318,14 @@ mod tests {
         assert!(!c.ephemeral);
         assert_eq!(c.data_dir, PathBuf::from("/home/u/.local/share/clove"));
         assert_eq!(c.api_socket, PathBuf::from("/run/user/1000/clove.sock"));
+    }
+
+    #[test]
+    fn default_config_path_is_xdg() {
+        assert_eq!(
+            defaults().config_path(),
+            PathBuf::from("/home/u/.config/clove/clove.conf")
+        );
     }
 
     #[test]

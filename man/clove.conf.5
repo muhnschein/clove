@@ -1,0 +1,123 @@
+.Dd July 25, 2026
+.Dt CLOVE.CONF 5
+.Os
+.Sh NAME
+.Nm clove.conf
+.Nd configuration file for cloved
+.Sh DESCRIPTION
+.Nm
+configures
+.Xr cloved 8 .
+It is read from
+.Pa $XDG_CONFIG_HOME/clove/clove.conf
+.Pq or Pa ~/.config/clove/clove.conf
+unless
+.Fl c
+names another file.
+.Pp
+An absent or empty file is the correct, working configuration.
+Every key exists to
+.Em deviate
+from a sane default, never to enable basic function: a fresh install against a
+default-configured local router downloads a torrent with no configuration
+written at all.
+.Pp
+The format is one
+.Ar key value
+pair per line.
+Keys and values are separated by whitespace.
+Blank lines are ignored, and a
+.Sq #
+begins a comment that runs to the end of the line.
+There is no nesting, no quoting, and no include mechanism.
+.Pp
+An unknown key is a fatal error, as is a key given twice or a key with no
+value.
+A typo must fail startup loudly rather than be silently ignored; use
+.Ic cloved -C
+to check a file before restarting a running daemon.
+.Sh KEYWORDS
+.Bl -tag -width Ds
+.It Ic sam_address Ar host:port | Ar path
+Address of the router's SAMv3 bridge.
+Default:
+.Pa 127.0.0.1:7656 .
+.Pp
+The address must be loopback
+.Pq Pa 127.0.0.1 , Pa localhost , Pa [::1]
+or an absolute unix socket path, unless
+.Ic i_know_sam_is_remote
+is set.
+.Pa localhost
+is the only hostname clove accepts anywhere: there is no DNS resolution.
+Exotic loopback spellings such as
+.Pa 127.0.0.2
+are refused rather than given the benefit of the doubt.
+.It Ic i_know_sam_is_remote Ar yes | Ar no
+Permit a non-loopback
+.Ic sam_address .
+Default:
+.Ar no .
+.Pp
+This is dangerous and deliberately ugly to type.
+Traffic between clove and a remote SAM bridge is unprotected: anyone who can
+see that link sees which destinations you talk to, defeating the point of
+running over I2P.
+Do not set this unless the link is a trusted, otherwise-protected one.
+.It Ic data_dir Ar path
+Absolute path of the state directory: destination keys, per-torrent resume
+data, the API token, and downloaded files.
+Default:
+.Pa $XDG_DATA_HOME/clove ,
+that is
+.Pa ~/.local/share/clove .
+.It Ic api_socket Ar path
+Absolute path of the unix socket serving the local HTTP API.
+Default:
+.Pa $XDG_RUNTIME_DIR/clove.sock ,
+falling back to
+.Pa <data_dir>/clove.sock
+when
+.Ev XDG_RUNTIME_DIR
+is unset.
+.It Ic ephemeral Ar yes | Ar no
+Use a transient I2P destination instead of persisting the client's keys, so
+the identity differs on every start.
+Default:
+.Ar no .
+.Pp
+A transient identity is unlinkable across restarts, at the cost of losing
+your standing in swarms and having to re-announce as a new peer each time.
+.El
+.Sh EXAMPLES
+The recommended configuration is no file at all.
+.Pp
+A router on a non-standard SAM port, with downloads on a larger disk:
+.Bd -literal -offset indent
+# clove.conf
+sam_address 127.0.0.1:7000
+data_dir /srv/clove
+.Ed
+.Pp
+A throwaway identity for a one-off download:
+.Bd -literal -offset indent
+ephemeral yes
+.Ed
+.Pp
+A system-wide instance with a fixed socket path, so a service manager and its
+users agree on where to find it:
+.Bd -literal -offset indent
+data_dir /var/lib/clove
+api_socket /run/clove/clove.sock
+.Ed
+.Pp
+Check a file before restarting the daemon.
+A typo is fatal, and says where:
+.Bd -literal -offset indent
+$ cloved -C -c /etc/clove/clove.conf
+config: line 3: unknown key "sam_adress"
+.Ed
+.Sh SEE ALSO
+.Xr clove 1 ,
+.Xr clove-api 7 ,
+.Xr cloved 8

@@ -1,0 +1,190 @@
+.Dd July 25, 2026
+.Dt CLOVE 1
+.Os
+.Sh NAME
+.Nm clove
+.Nd control an I2P-only BitTorrent daemon
+.Sh SYNOPSIS
+.Nm
+.Op Fl -socket Ar path
+.Ar command
+.Op Ar arguments
+.Sh DESCRIPTION
+.Nm
+is the control program for
+.Xr cloved 8 ,
+an I2P-only BitTorrent daemon.
+It sends one request per invocation over the daemon's local HTTP API
+.Pq a unix socket by default
+and prints the reply as an aligned table, or verbatim JSON with
+.Fl -json .
+.Pp
+The socket path and the API token are read from the same configuration the
+daemon uses, so
+.Nm
+normally needs no arguments beyond a command.
+The token is read from
+.Pa <data_dir>/token ,
+which the daemon creates mode 0600 on first start; running
+.Nm
+therefore requires the same user as the daemon, or read access to that file.
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl -socket Ar path
+Talk to the daemon listening on
+.Ar path
+instead of the configured socket.
+.It Fl -json
+Print the API's JSON reply unchanged.
+Accepted by every read-only command
+.Pq Cm status , Cm list , Cm show .
+.It Fl h , Fl -help
+Print a command summary and exit.
+.El
+.Sh COMMANDS
+.Bl -tag -width Ds
+.It Cm status Op Fl -json
+Daemon and router state: version, uptime, SAM address, torrent count, and
+the router connection state
+.Pq Sy connecting , Sy waiting-for-router , Sy connected .
+.It Cm list Op Fl -json
+One line per torrent: progress, state, size, name, and the leading bytes of
+the info-hash.
+.It Cm watch Op Fl -interval Ar seconds
+Repaint
+.Cm status
+and
+.Cm list
+every
+.Ar seconds
+.Pq 1 to 3600, default 2
+until interrupted.
+This is a plain redraw loop, not a full-screen program: the terminal is
+never put into raw mode, so
+.Ic Ctrl-C
+leaves it exactly as it was.
+.It Cm show Ar info-hash Op Fl -json
+One torrent in detail: sizes, progress, state, the file table with per-file
+priorities, and the announce URLs.
+.It Cm add Ar file | Ar magnet
+Add a torrent from a
+.Pa .torrent
+file or a
+.Ar magnet:\&
+URI.
+A magnet is stored immediately and listed as
+.Sy fetching-metadata
+while the daemon fetches its info dictionary from peers; it becomes an
+ordinary torrent once that succeeds.
+.It Cm remove Ar info-hash Op Fl -data
+Remove a torrent.
+With
+.Fl -data
+its downloaded files are deleted as well.
+.It Cm pause Ar info-hash
+Stop peer acquisition and disconnect this torrent's peers.
+The paused state persists across daemon restarts.
+.It Cm resume Ar info-hash
+Bring a paused torrent back online.
+.It Cm verify Ar info-hash
+Re-read the torrent's data from disk and re-check every piece against the
+metainfo hashes.
+The torrent must be paused first, since a running one is writing to the same
+files.
+.It Cm peer Ar info-hash Ar b32-address
+Hand a running torrent a peer to dial, as a
+.Ar 52-character
+b32 address with or without the
+.Pa .b32.i2p
+suffix.
+Useful for private swarms and for lab testing between two known instances.
+.It Cm priorities Ar info-hash Ar spec
+Set per-file priorities from a comma-separated list, one value per file in
+the torrent's own order:
+.Sy 0
+skip,
+.Sy 1
+normal,
+.Sy 2
+high.
+.It Cm completions Ar bash | Ar zsh | Ar fish
+Print a shell completion script on standard output.
+.El
+.Sh FILES
+.Bl -tag -width Ds -compact
+.It Pa ~/.config/clove/clove.conf
+Configuration read by both programs; see
+.Xr clove.conf 5 .
+.It Pa ~/.local/share/clove/token
+API token, mode 0600.
+.It Pa $XDG_RUNTIME_DIR/clove.sock
+Default control socket.
+.El
+.Sh EXIT STATUS
+.Bl -tag -width Ds -compact
+.It 0
+The command succeeded.
+.It 1
+The daemon was reached but refused or failed the operation.
+.It 2
+The command line was wrong.
+.It 3
+The daemon could not be reached.
+.El
+.Sh EXAMPLES
+Add a torrent and watch it:
+.Bd -literal -offset indent
+$ clove add ~/Downloads/release.torrent
+added 58e2fc46a8dc57c78191f079648750b0644d03a2
+$ clove watch
+.Ed
+.Pp
+List torrents, then look at one in detail:
+.Bd -literal -offset indent
+$ clove list
+PROGRESS  STATE        SIZE     NAME          INFO-HASH
+ 42%      downloading  1.4 GiB  release.iso   58e2fc46a8dc
+$ clove show 58e2fc46a8dc57c78191f079648750b0644d03a2
+.Ed
+.Pp
+Download only the second of three files:
+.Bd -literal -offset indent
+$ clove priorities 58e2fc46a8dc57c78191f079648750b0644d03a2 0,1,0
+.Ed
+.Pp
+Re-check a torrent's data on disk:
+.Bd -literal -offset indent
+$ clove pause 58e2fc46a8dc57c78191f079648750b0644d03a2
+$ clove verify 58e2fc46a8dc57c78191f079648750b0644d03a2
+verified 5721 piece(s) for 58e2fc46a8dc57c78191f079648750b0644d03a2
+$ clove resume 58e2fc46a8dc57c78191f079648750b0644d03a2
+.Ed
+.Pp
+Connect two instances directly, without a tracker.
+On the first host read its destination from
+.Cm status ,
+then on the second:
+.Bd -literal -offset indent
+$ clove peer 58e2fc46a8dc57c78191f079648750b0644d03a2 \e
+    asubu6d7wsbj7x7b7agamhimpmnlr3ezb7qu5zh2jllyalblxdpq.b32.i2p
+.Ed
+.Pp
+Script against the API by asking for JSON:
+.Bd -literal -offset indent
+$ clove list --json | jq -r '.[] | select(.state=="seeding") | .name'
+.Ed
+.Pp
+Install shell completion:
+.Bd -literal -offset indent
+$ clove completions bash > ~/.local/share/bash-completion/completions/clove
+.Ed
+.Sh SEE ALSO
+.Xr clove.conf 5 ,
+.Xr clove-api 7 ,
+.Xr cloved 8
+.Sh CAVEATS
+.Nm
+speaks only to a local daemon.
+It never touches the network itself, and it has no clearnet code path at all:
+every byte clove moves goes through I2P.
