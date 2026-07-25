@@ -33,6 +33,13 @@ Description=emissary router for clove live tests (SAMv3 on loopback:7676)
 # exists upstream. `make router-build ROUTER=emissary` produces this tag.
 Image=localhost/clove-emissary:latest
 PublishPort=127.0.0.1:7676:7656
+# The router's own transport port (NTCP2/SSU2), from router.toml's [ntcp2]
+# port (emissary defaults to 8888). Not loopback-bound: this is how other
+# routers reach us. Without it emissary logs "router is firewalled,
+# publishing U" and participates as a second-class peer. Forward it on your
+# NAT if there is one.
+PublishPort=8888:8888/tcp
+PublishPort=8888:8888/udp
 Volume=clove-emissary-data:/var/lib/emissary
 Environment=EMISSARY_LOG=emissary=info
 

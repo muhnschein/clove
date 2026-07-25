@@ -144,6 +144,32 @@ fn probe_bridge(port: u16, timeout: Duration) -> io::Result<String> {
         .to_owned())
 }
 
+/// A SAM session id unlikely to collide with one already registered.
+///
+/// SAM session ids are per-router, not per-connection, and a router does not
+/// necessarily free one the instant our control socket closes — emissary
+/// 0.4.0 holds it long enough that a second run seconds later is refused with
+/// `DuplicateId`. Observed as three consecutive `sam-stress` runs failing at
+/// session setup after the first one exited normally
+/// (`docs/PROTOCOL.i2p-bt` §2.9).
+///
+/// This matters well beyond the harness: the SCOPE §4 reconnect discipline
+/// has the daemon rebuild its session tree after losing the router. If it
+/// reuses a fixed id, the rebuild can be refused by the stale session it is
+/// replacing — the supervisor would then back off and retry into the same
+/// refusal, which is the failure it exists to prevent.
+///
+/// The id is not the identity: that is the destination key (Q4). This can
+/// therefore vary freely per process, and stays readable so an operator can
+/// still find the session in a router console.
+#[must_use]
+pub fn unique_nickname(base: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    format!("{base}-{}-{now:05x}", std::process::id())
+}
+
 /// How to bring up the SAM session.
 #[derive(Clone, Debug)]
 pub struct SamConfig {
@@ -527,6 +553,20 @@ mod tests {
     use super::*;
     use crate::addr::i2p_base64_encode;
     use std::io::Cursor;
+
+    #[test]
+    fn nicknames_are_unique_and_still_readable() {
+        let a = unique_nickname("clove");
+        let b = unique_nickname("clove");
+        assert_ne!(a, b, "two ids in the same process collided");
+        // Readable enough to find in a router console, and a valid SAM id:
+        // no spaces, no quotes, nothing needing escaping.
+        assert!(a.starts_with("clove-"), "{a}");
+        assert!(
+            a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "{a} would need quoting in a SAM command"
+        );
+    }
 
     #[test]
     fn forwarded_stream_splits_and_carries_both_directions() {

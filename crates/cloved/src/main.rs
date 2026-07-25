@@ -262,7 +262,10 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str) {
 fn connect_session(port: u16) -> std::io::Result<(Arc<SamSession>, SamListener)> {
     let session = Arc::new(SamSession::connect(&SamConfig {
         samv3_tcp_port: port,
-        nickname: "clove".to_owned(),
+        // Unique per attempt: a router that has not yet released the previous
+        // session would refuse a fixed id with DuplicateId, and the
+        // supervisor would back off into the same refusal forever.
+        nickname: i2pnet::sam::unique_nickname("clove"),
         // Q4 persistent identity lands once key export is confirmed against
         // a live router; until then every run is transient.
         persistent_key: None,

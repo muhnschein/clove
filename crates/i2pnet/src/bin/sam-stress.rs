@@ -31,7 +31,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use i2pnet::sam::{DEFAULT_SAM_PORT, SamConfig, SamListener, SamSession};
+use i2pnet::sam::{DEFAULT_SAM_PORT, SamConfig, SamListener, SamSession, unique_nickname};
 use i2pnet::{DestHash, I2pDialer, I2pListener};
 
 /// Bytes each stream sends and expects echoed back — enough to exercise a
@@ -96,12 +96,12 @@ fn run() -> io::Result<()> {
     eprintln!("sam-stress: connecting to SAM on 127.0.0.1:{port} (two sessions)…");
     let listen = setup_hint(SamSession::connect(&SamConfig {
         samv3_tcp_port: port,
-        nickname: "clove-stress-listen".to_owned(),
+        nickname: unique_nickname("clove-stress-listen"),
         ..Default::default()
     }))?;
     let dial = Arc::new(setup_hint(SamSession::connect(&SamConfig {
         samv3_tcp_port: port,
-        nickname: "clove-stress-dial".to_owned(),
+        nickname: unique_nickname("clove-stress-dial"),
         ..Default::default()
     }))?);
 
