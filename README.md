@@ -17,11 +17,19 @@ built per the phase plan.
 - [`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) — closing M1/M3 against a real router (podman/quadlet)
 - [`docs/PHASE-F.md`](docs/PHASE-F.md) — daemon/CLI/API design, and the TUI decision
 - [`DEPENDENCIES.md`](DEPENDENCIES.md) — the dependency allowlist
+- [`SECURITY.md`](SECURITY.md) — how to report a vulnerability, and what counts as one
 
 Man pages are the primary user documentation and live in [`man/`](man):
 `clove(1)`, `clove.conf(5)`, `clove-api(7)`, `cloved(8)`. Read them before
 installing with `mandoc man/clove.1`, or after with `man clove`. This README
 stays short on purpose.
+
+## Packaging
+
+`contrib/systemd/` has a system unit and a per-user unit; the system one carries
+the `IPAddressDeny=any` clearnet lock (Layer 3, `docs/SCOPE.md` §5).
+`contrib/netns/` documents the same lock for non-systemd hosts.
+`contrib/podman/` has the i2pd quadlet used for live testing.
 
 ## Building
 
