@@ -70,6 +70,83 @@ pub struct Picker {
 }
 
 impl Picker {
+    /// Check every invariant this structure is supposed to maintain.
+    ///
+    /// Release builds stay lean; debug builds are dense with these checks
+    /// (SCOPE §9's paranoid-debug-builds rule), so a bug in the piece
+    /// accounting is caught the moment it is introduced rather than surfacing
+    /// later as a stalled or corrupt download. Called after every mutating
+    /// operation via [`debug_check`](Picker::debug_check).
+    ///
+    /// # Panics
+    ///
+    /// If any invariant is violated. That is the point: an inconsistent
+    /// picker is a bug, and a bug should not be allowed to survive contact
+    /// with a debug build.
+    pub fn check_invariants(&self) {
+        assert_eq!(
+            self.availability.len(),
+            self.num_pieces as usize,
+            "availability table does not span the torrent"
+        );
+        assert_eq!(self.have.len(), self.num_pieces, "have field is missized");
+        assert_eq!(
+            self.progress.len(),
+            self.num_pieces as usize,
+            "progress table does not span the torrent"
+        );
+
+        for index in 0..self.num_pieces {
+            let Some(progress) = &self.progress[index as usize] else {
+                continue;
+            };
+            let blocks = self.blocks_in_piece(index) as usize;
+            assert_eq!(
+                progress.received.len(),
+                blocks,
+                "piece {index}: received vector disagrees with its block count"
+            );
+            assert_eq!(
+                progress.in_flight.len(),
+                blocks,
+                "piece {index}: in-flight vector disagrees with its block count"
+            );
+            // A piece we already have must not still be accumulating blocks:
+            // set_have clears its progress, so anything left here means a
+            // completed piece was re-entered without being reset.
+            assert!(
+                !self.have.has(index),
+                "piece {index}: held complete yet still has block progress"
+            );
+        }
+
+        assert_eq!(
+            self.is_complete(),
+            self.have.count() == self.num_pieces,
+            "completion flag disagrees with the have field"
+        );
+    }
+
+    /// Total in-flight block requests the picker believes are outstanding.
+    /// Cross-checked against the peer table in debug builds — the two must
+    /// agree, or blocks have leaked (never re-offered) or been double-counted.
+    #[must_use]
+    pub fn in_flight_total(&self) -> u64 {
+        self.progress
+            .iter()
+            .flatten()
+            .flat_map(|p| p.in_flight.iter())
+            .map(|&n| u64::from(n))
+            .sum()
+    }
+
+    /// Run [`check_invariants`](Picker::check_invariants) in debug builds only.
+    #[inline]
+    fn debug_check(&self) {
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+    }
+
     /// A picker for a torrent of `num_pieces` pieces.
     #[must_use]
     pub fn new(num_pieces: u32, piece_length: u32, total_length: u64, mode: Mode) -> Self {
@@ -144,6 +221,7 @@ impl Picker {
                 self.availability[index as usize] += 1;
             }
         }
+        self.debug_check();
     }
 
     /// Undo [`add_bitfield`] when a peer disconnects.
@@ -154,6 +232,7 @@ impl Picker {
                 *a = a.saturating_sub(1);
             }
         }
+        self.debug_check();
     }
 
     /// Record a single new piece a peer announced via `have`.
@@ -161,6 +240,7 @@ impl Picker {
         if index < self.num_pieces {
             self.availability[index as usize] += 1;
         }
+        self.debug_check();
     }
 
     /// Availability of piece `index` (how many peers hold it).
@@ -175,6 +255,7 @@ impl Picker {
             self.have.set(index);
             self.progress[index as usize] = None;
         }
+        self.debug_check();
     }
 
     /// Discard a piece's downloaded blocks after a failed verification, so
@@ -183,6 +264,7 @@ impl Picker {
         if index < self.num_pieces {
             self.progress[index as usize] = None;
         }
+        self.debug_check();
     }
 
     /// Record that block `block` of piece `index` arrived. Returns `true`
@@ -196,12 +278,17 @@ impl Picker {
         let Some(slot) = prog.received.get_mut(block as usize) else {
             return false;
         };
-        if !*slot {
-            *slot = true;
-            let inflight = &mut prog.in_flight[block as usize];
-            *inflight = inflight.saturating_sub(1);
-        }
-        prog.received_count() == blocks
+        // The caller only reports blocks it had in flight, so the request is
+        // settled either way. Decrementing only on the first arrival would
+        // leak a phantom in-flight count for every duplicate endgame
+        // delivery, leaving the picker believing a block is owed that nobody
+        // will send.
+        let inflight = &mut prog.in_flight[block as usize];
+        *inflight = inflight.saturating_sub(1);
+        *slot = true;
+        let complete = prog.received_count() == blocks;
+        self.debug_check();
+        complete
     }
 
     /// Release an in-flight block that will not arrive (timeout, reject, or
@@ -212,6 +299,7 @@ impl Picker {
         {
             *inflight = inflight.saturating_sub(1);
         }
+        self.debug_check();
     }
 
     /// Choose up to `want` blocks for a peer whose piece set is `peer_has`,
@@ -252,6 +340,7 @@ impl Picker {
                 });
             }
         }
+        self.debug_check();
         out
     }
 

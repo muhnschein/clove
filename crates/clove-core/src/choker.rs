@@ -60,6 +60,41 @@ impl Default for Choker {
 }
 
 impl Choker {
+    /// Check that a plan is internally consistent (SCOPE §9's paranoid
+    /// debug builds): no peer is told to choke and unchoke in the same round,
+    /// every named peer exists, and the resulting unchoked set does not
+    /// exceed the slot count.
+    #[cfg(debug_assertions)]
+    fn check_decision(decision: &Decision, peers: &[PeerSnapshot], max_unchoked: usize) {
+        for id in &decision.unchoke {
+            assert!(
+                !decision.choke.contains(id),
+                "peer {id} was told to choke and unchoke in one round"
+            );
+            assert!(
+                peers.iter().any(|p| p.id == *id),
+                "plan names peer {id}, which is not connected"
+            );
+        }
+        for id in &decision.choke {
+            assert!(
+                peers.iter().any(|p| p.id == *id),
+                "plan names peer {id}, which is not connected"
+            );
+        }
+        // What the peer set looks like once this plan is applied.
+        let after = peers
+            .iter()
+            .filter(|p| {
+                decision.unchoke.contains(&p.id) || (p.unchoked && !decision.choke.contains(&p.id))
+            })
+            .count();
+        assert!(
+            after <= max_unchoked,
+            "plan leaves {after} peers unchoked, over the {max_unchoked} slots"
+        );
+    }
+
     /// A choker that unchokes `max_unchoked` peers at a time.
     #[must_use]
     pub fn new(max_unchoked: usize) -> Self {
@@ -112,6 +147,8 @@ impl Choker {
                 decision.choke.push(peer.id);
             }
         }
+        #[cfg(debug_assertions)]
+        Self::check_decision(&decision, peers, self.max_unchoked);
         decision
     }
 }
