@@ -14,11 +14,18 @@ WAIT ?= 180
 
 QUADLET_DIR := $(HOME)/.config/containers/systemd
 
-.PHONY: test test-live sam-stress router-up router-down router-wait fmt lint
+.PHONY: test smoke test-live sam-stress router-up router-down router-wait fmt lint
 
 ## Tier 1: unit + engine tests over the mock network. No router needed.
 test:
 	cargo test --workspace
+
+## Tier 1, end to end: drive the real binaries as an operator does. Catches
+## whole-process faults (deadlocks, startup regressions) that unit tests
+## cannot see. No router needed.
+smoke:
+	cargo build --workspace
+	./ci/smoke.sh
 
 ## Tier 2: the router-gated tests (#[ignore]d, keyed on CLOVE_SAM_PORT).
 ## Waits for SAM first so a cold router doesn't produce spurious failures.

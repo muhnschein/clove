@@ -10,6 +10,9 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A deadlock must fail the job in minutes, not burn the platform's
+    # six-hour ceiling. Tier-1 runs in well under a minute today.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       # The pinned toolchain comes from rust-toolchain.toml; rustup installs
@@ -20,6 +23,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: ./ci/check-net-deps.sh
+      # End-to-end: drive the real binaries as an operator does. Unit tests
+      # cannot see whole-process faults (the Phase-F registry deadlocks
+      # passed all of them).
+      - run: cargo build --workspace
+      - run: ./ci/smoke.sh
 
   deny:
     runs-on: ubuntu-latest
