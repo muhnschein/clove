@@ -266,6 +266,7 @@ fn connect_session(port: u16) -> std::io::Result<(Arc<SamSession>, SamListener)>
         // Q4 persistent identity lands once key export is confirmed against
         // a live router; until then every run is transient.
         persistent_key: None,
+        ..Default::default()
     })?);
     let listener = SamListener::forward(Arc::clone(&session))?;
     Ok((session, listener))

@@ -39,6 +39,111 @@ use crate::{DestHash, I2pDialer, I2pListener, I2pNamingLookup, I2pStream};
 /// Standard `SAMv3` control port.
 pub const DEFAULT_SAM_PORT: u16 = 7656;
 
+/// Default for [`SamConfig::probe_timeout`].
+///
+/// Generous: a loopback router under load can be slow, and a false negative
+/// here costs a full backoff cycle. It only has to be shorter than "forever".
+pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on the probe's `HELLO REPLY` line. A bridge that streams bytes without
+/// a newline is refused rather than buffered — the reason this is a byte cap
+/// and not just a timeout.
+const MAX_HELLO_LINE: usize = 512;
+
+/// Ask the bridge on `port` to prove it is a SAM bridge, within `timeout`.
+///
+/// Returns the version it reports, for the operator's log.
+///
+/// This exists because `yosemite` sets no read or write timeout on its
+/// control socket (checked in 0.7.0). Against a bridge that accepts the
+/// connection and then goes quiet — a router still starting up, a wedged
+/// one, or some other service squatting on 7656 — `Session::new` blocks
+/// forever. It never returns an error, so the supervisor above never backs
+/// off, never retries and never logs: the daemon simply sits in "connecting"
+/// until someone restarts it. That is precisely the failure mode SCOPE §4
+/// exists to prevent, so it is worth one extra connection to rule out.
+///
+/// The probe speaks the SAM handshake itself, with timeouts and a length cap,
+/// on a socket it owns and closes. What it cannot cover is a bridge that
+/// answers `HELLO` correctly and *then* stalls on `SESSION CREATE`:
+/// `Session::new` still hangs there. Closing that gap needs read timeouts
+/// inside yosemite (upstream) or proxying its control connection through one
+/// of ours; see `docs/PROTOCOL.i2p-bt` §2.7.
+fn probe_bridge(port: u16, timeout: Duration) -> io::Result<String> {
+    let addr = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(b"HELLO VERSION MIN=3.1 MAX=3.3\n")?;
+
+    // The read timeout is per-call, so a bridge dribbling one byte just
+    // inside it could hold the probe open indefinitely. Bound the whole
+    // exchange as well.
+    let deadline = std::time::Instant::now() + timeout;
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("SAM bridge on 127.0.0.1:{port} did not finish its HELLO reply in time"),
+            ));
+        }
+        // A read timeout surfaces as WouldBlock/TimedOut, whose stock text
+        // ("Resource temporarily unavailable") tells an operator nothing.
+        let got = stream.read(&mut byte).map_err(|e| {
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "127.0.0.1:{port} accepted the connection but did not answer HELLO within \
+                         {}s; is the router still starting, or is something else on that port?",
+                        timeout.as_secs()
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
+        if got == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("SAM bridge on 127.0.0.1:{port} closed the connection during HELLO"),
+            ));
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if line.len() >= MAX_HELLO_LINE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "127.0.0.1:{port} answered HELLO with {MAX_HELLO_LINE}+ bytes and no newline; \
+                     this does not look like a SAM bridge"
+                ),
+            ));
+        }
+        line.push(byte[0]);
+    }
+
+    let reply = String::from_utf8_lossy(&line);
+    let reply = reply.trim_end_matches('\r');
+    if !reply.starts_with("HELLO REPLY") || !reply.contains("RESULT=OK") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SAM bridge on 127.0.0.1:{port} refused HELLO: {reply}"),
+        ));
+    }
+    Ok(reply
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("VERSION="))
+        .unwrap_or("unknown")
+        .to_owned())
+}
+
 /// How to bring up the SAM session.
 #[derive(Clone, Debug)]
 pub struct SamConfig {
@@ -49,6 +154,12 @@ pub struct SamConfig {
     /// Base64 private key for a stable identity (Q4). `None` requests a
     /// transient destination.
     pub persistent_key: Option<String>,
+    /// How long the pre-flight handshake probe waits for the bridge to
+    /// answer `HELLO` before giving up on this attempt (see
+    /// [`probe_bridge`]). Raise it for a router that is slow to come up; the
+    /// cost of a low value is a wasted backoff cycle, the cost of no value
+    /// at all is a daemon that hangs.
+    pub probe_timeout: Duration,
 }
 
 impl Default for SamConfig {
@@ -57,6 +168,7 @@ impl Default for SamConfig {
             samv3_tcp_port: DEFAULT_SAM_PORT,
             nickname: "clove".to_owned(),
             persistent_key: None,
+            probe_timeout: DEFAULT_PROBE_TIMEOUT,
         }
     }
 }
@@ -78,6 +190,13 @@ impl SamSession {
     /// The router is unreachable, refused the session, or returned a
     /// destination we cannot parse.
     pub fn connect(config: &SamConfig) -> io::Result<SamSession> {
+        // Prove the bridge is alive and speaks SAM before yosemite is given
+        // the port. See [`probe_bridge`]: without this, a router that accepts
+        // the connection and then says nothing blocks here forever, and the
+        // supervisor above never gets to back off, retry, or log a word.
+        let version = probe_bridge(config.samv3_tcp_port, config.probe_timeout)?;
+        debug_assert!(!version.is_empty());
+
         let destination = match &config.persistent_key {
             Some(key) => DestinationKind::Persistent {
                 private_key: key.clone(),
@@ -371,11 +490,22 @@ fn map_err(e: yosemite::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    //! Router-free coverage: the SAM session itself needs a live router
-    //! (exercised via `docs/LIVE-TESTING.md`), but the inbound path's two
-    //! bits of pure logic — splitting the forwarded socket and parsing the
-    //! `SILENT=false` destination header — are tested here over loopback TCP
-    //! and in-memory readers.
+    //! Router-free coverage. A *working* SAM session needs a live router
+    //! (`docs/LIVE-TESTING.md`), but everything about a router that is
+    //! **not** working can be tested here, and that is the half that decides
+    //! whether the daemon degrades or wedges.
+    //!
+    //! Three groups:
+    //!
+    //! - The inbound path's pure logic: splitting the forwarded socket and
+    //!   parsing the `SILENT=false` destination header.
+    //! - [`probe_bridge`] against a fake bridge that lies, stalls, floods or
+    //!   dies — SCOPE §9's "SAM bridge lying or dying mid-operation".
+    //! - [`SamSession::connect`] as a whole against the same fakes, which is
+    //!   the claim that actually matters: **every one of them must fail, and
+    //!   fail in bounded time.** Before the probe existed, four of six hung
+    //!   forever, and a hang here is worse than an error — the supervisor
+    //!   above never backs off, never retries and never logs.
 
     use super::*;
     use crate::addr::i2p_base64_encode;
@@ -438,5 +568,209 @@ mod tests {
         let mut cursor = Cursor::new(b"partial-no-newline".to_vec());
         let err = read_dest_line(&mut cursor, MAX_DEST_LINE).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+}
+
+#[cfg(test)]
+mod hostile_bridge_tests {
+    //! A fake SAM bridge, misbehaving in every way a real one can.
+    //!
+    //! Each case asserts two things: the call **fails** (never succeeds
+    //! against a bridge that is not one) and it **returns**. The second is
+    //! the one with teeth — see the module docs above.
+
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    /// Anything a bridge can do wrong before a session exists.
+    #[derive(Clone, Copy, Debug)]
+    enum Misbehaviour {
+        /// Accept, then close without a word.
+        CloseImmediately,
+        /// Accept and never say anything, holding the connection open.
+        Silence,
+        /// Bytes that are not SAM, with no line terminator.
+        Garbage,
+        /// An endless stream with no newline — the case a byte cap catches
+        /// and a timeout alone does not.
+        Flood,
+        /// A well-formed refusal.
+        RefuseHello,
+        /// A single byte every so often: inside any per-read timeout, but
+        /// never finishing. Only a whole-exchange deadline stops this.
+        Dribble,
+        /// Valid SAM, then a stall. The residual case the probe cannot
+        /// cover; asserted as a known limitation rather than a passing test.
+        HelloThenStall,
+    }
+
+    /// Start a fake bridge on an ephemeral loopback port.
+    ///
+    /// The listener thread is detached and the process ends the test binary;
+    /// nothing here outlives the run.
+    fn fake_bridge(how: Misbehaviour) -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                std::thread::spawn(move || {
+                    // Let the client get its HELLO out first.
+                    let mut buf = [0u8; 256];
+                    let _ = sock.read(&mut buf);
+                    match how {
+                        Misbehaviour::CloseImmediately => return,
+                        Misbehaviour::Garbage => {
+                            let _ = sock.write_all(&[0xFF; 64]);
+                        }
+                        Misbehaviour::Flood => {
+                            while sock.write_all(&[b'A'; 4096]).is_ok() {}
+                            return;
+                        }
+                        Misbehaviour::RefuseHello => {
+                            let _ = sock.write_all(b"HELLO REPLY RESULT=NOVERSION\n");
+                        }
+                        Misbehaviour::Dribble => loop {
+                            if sock.write_all(b"X").is_err() {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(200));
+                        },
+                        Misbehaviour::HelloThenStall => {
+                            let _ = sock.write_all(b"HELLO REPLY RESULT=OK VERSION=3.3\n");
+                        }
+                        Misbehaviour::Silence => {}
+                    }
+                    // Hold the connection open; the test's own deadline ends
+                    // the wait either way.
+                    std::thread::sleep(Duration::from_secs(120));
+                });
+            }
+        });
+        port
+    }
+
+    /// Run `f` on a thread and give it `limit`. `None` means it never
+    /// returned — a hang, which is the failure this suite exists to catch.
+    fn within<T: Send + 'static>(
+        limit: Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<(T, Duration)> {
+        let (tx, rx) = mpsc::channel();
+        let start = Instant::now();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(limit).ok().map(|v| (v, start.elapsed()))
+    }
+
+    /// Short enough that a test which regressed into a hang fails quickly,
+    /// long enough to clear the probe's own 10s budget.
+    const LIMIT: Duration = Duration::from_secs(25);
+
+    /// The probe budget under test. Short on purpose: these cases stall by
+    /// design, and `make test` should not spend half a minute proving it.
+    const PROBE: Duration = Duration::from_millis(600);
+
+    #[test]
+    fn the_probe_refuses_every_bridge_that_is_not_one() {
+        for how in [
+            Misbehaviour::CloseImmediately,
+            Misbehaviour::Silence,
+            Misbehaviour::Garbage,
+            Misbehaviour::Flood,
+            Misbehaviour::RefuseHello,
+            Misbehaviour::Dribble,
+        ] {
+            let port = fake_bridge(how);
+            let Some((result, elapsed)) = within(LIMIT, move || probe_bridge(port, PROBE)) else {
+                panic!("{how:?}: probe_bridge never returned");
+            };
+            let err = result.expect_err(&format!("{how:?} was accepted as a SAM bridge"));
+            assert!(elapsed < LIMIT, "{how:?}: probe took {elapsed:?}");
+            // The operator has to be able to act on this at 2 a.m., so the
+            // message names the address it could not talk to.
+            assert!(
+                err.to_string().contains("127.0.0.1:"),
+                "{how:?}: unhelpful error {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_fails_in_bounded_time_against_a_broken_bridge() {
+        // The regression this locks down: before the pre-flight probe,
+        // Silence, Garbage, Flood and Dribble all blocked in
+        // yosemite's Session::new forever, and cloved sat in "connecting"
+        // with nothing in its log until someone restarted it.
+        for how in [
+            Misbehaviour::CloseImmediately,
+            Misbehaviour::Silence,
+            Misbehaviour::Garbage,
+            Misbehaviour::Flood,
+            Misbehaviour::RefuseHello,
+            Misbehaviour::Dribble,
+        ] {
+            let port = fake_bridge(how);
+            let config = SamConfig {
+                samv3_tcp_port: port,
+                probe_timeout: PROBE,
+                ..Default::default()
+            };
+            let Some((result, elapsed)) = within(LIMIT, move || SamSession::connect(&config))
+            else {
+                panic!("{how:?}: SamSession::connect never returned — the hang is back");
+            };
+            assert!(
+                result.is_err(),
+                "{how:?}: connect claimed a session against a bridge that is not one"
+            );
+            assert!(elapsed < LIMIT, "{how:?}: connect took {elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_listening_is_a_fast_clean_error() {
+        // Bind and drop, so the port is almost certainly free: the ordinary
+        // "router is not running" case, which must be cheap because the
+        // supervisor retries it on every backoff tick.
+        let port = {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let config = SamConfig {
+            samv3_tcp_port: port,
+            probe_timeout: PROBE,
+            ..Default::default()
+        };
+        let (result, elapsed) =
+            within(LIMIT, move || SamSession::connect(&config)).expect("connect returned");
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    /// The gap the probe does not close, recorded as a test so it cannot be
+    /// forgotten: a bridge that answers `HELLO` and then stalls still hangs
+    /// inside yosemite, which sets no read timeout on its control socket.
+    ///
+    /// Written as an assertion about the *probe* — which correctly passes
+    /// such a bridge — rather than about `connect`, because asserting the
+    /// hang would mean a test that waits for one.
+    #[test]
+    fn a_bridge_that_passes_hello_and_then_stalls_is_a_known_gap() {
+        let port = fake_bridge(Misbehaviour::HelloThenStall);
+        let (result, _) = within(LIMIT, move || probe_bridge(port, PROBE)).expect("probe returned");
+        assert_eq!(
+            result.expect("a valid HELLO REPLY must pass the probe"),
+            "3.3"
+        );
+        // If yosemite ever grows read timeouts, connect() against this bridge
+        // starts failing cleanly and PROTOCOL.i2p-bt §2.7 can be closed.
+    }
+
+    #[test]
+    fn a_healthy_hello_is_accepted_and_its_version_reported() {
+        let port = fake_bridge(Misbehaviour::HelloThenStall);
+        assert_eq!(probe_bridge(port, PROBE).expect("hello accepted"), "3.3");
     }
 }
