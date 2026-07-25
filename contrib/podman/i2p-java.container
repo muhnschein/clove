@@ -1,0 +1,51 @@
+# Quadlet unit for a Java I2P router ("the OG") exposing SAMv3 to clove's
+# live tests. The reference implementation: when clove and a router disagree,
+# this one is presumed right (docs/SCOPE.md §6).
+#
+# Rootless install:
+#   make router-up ROUTER=java
+# or by hand:
+#   cp contrib/podman/i2p-java.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload && systemctl --user start i2p-java
+#
+# SAM lands on host 127.0.0.1:7666 (7656 inside the container), so this can run
+# alongside i2pd and emissary without a port fight — the whole point, since the
+# interop matrix wants all three answering at once. The router console is on
+# 127.0.0.1:7657.
+#
+# ONE EXTRA STEP, unlike i2pd: Java I2P ships the SAM bridge **disabled**
+# (`clientApp.1.startOnLoad=false` in clients.config upstream). The image's
+# entrypoint fixes SAM's bind address but not its startOnLoad, so a stock
+# container answers on 7657 and refuses 7656. After the first boot:
+#
+#   make router-sam-enable ROUTER=java
+#
+# which flips startOnLoad in the persisted clients.config.d entry and restarts.
+# It is idempotent; run it again after any config reset. Alternatively tick
+# "SAM application bridge" under /configclients in the console.
+#
+# IP_ADDR=0.0.0.0 tells the entrypoint to bind local services (console, SAM,
+# I2CP) to all interfaces *inside* the container; PublishPort pins the host
+# side to loopback, so nothing is reachable off-box. Without it the entrypoint
+# derives the container's private IP, which PublishPort cannot reach either.
+
+[Unit]
+Description=Java I2P router for clove live tests (SAMv3 on loopback:7666)
+
+[Container]
+Image=docker.io/geti2p/i2p:latest
+PublishPort=127.0.0.1:7666:7656
+PublishPort=127.0.0.1:7657:7657
+Volume=clove-i2p-java-config:/i2p/.i2p
+Environment=IP_ADDR=0.0.0.0
+# Java I2P wants more headroom than i2pd; the JVM plus a full netDb is not a
+# 256 MiB proposition. Raise if the router logs OOM during reseed.
+Memory=1g
+
+[Service]
+# A cold Java router reseeds, unpacks webapps and builds tunnels; that is
+# minutes, not seconds, and systemd should not call it failed in the meantime.
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

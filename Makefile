@@ -5,8 +5,32 @@
 # local I2P router exposing SAMv3 — bring one up with `make router-up`
 # (rootless podman quadlet). See docs/LIVE-TESTING.md.
 
-# SAM control port; override to point at an existing router.
-SAM_PORT ?= 7656
+# Which router the live targets talk to: i2pd, java, or emissary.
+# All three can run at once — they publish SAM on different host ports — so
+# the interop matrix is a loop over this variable, not a teardown dance.
+#   make test-live ROUTER=java
+ROUTER ?= i2pd
+# Every router in the SCOPE §6 matrix, in priority order.
+ROUTERS := i2pd java emissary
+
+# Per-router host SAM port and quadlet unit. Inside every container SAM is on
+# 7656; only the published host port differs.
+SAM_PORT_i2pd     := 7656
+SAM_PORT_java     := 7666
+SAM_PORT_emissary := 7676
+QUADLET_i2pd      := i2pd.container
+QUADLET_java      := i2p-java.container
+QUADLET_emissary  := emissary.container
+UNIT_i2pd         := i2pd
+UNIT_java         := i2p-java
+UNIT_emissary     := emissary
+
+# SAM control port. Derived from ROUTER; override to point at a router you
+# brought up some other way (a distro package, a remote-forwarded port).
+SAM_PORT ?= $(SAM_PORT_$(ROUTER))
+QUADLET := $(QUADLET_$(ROUTER))
+UNIT := $(UNIT_$(ROUTER))
+
 # Concurrency for the R2 stress harness: make sam-stress N=128
 N ?= 32
 # Seconds router-wait polls for the SAM port before giving up.
@@ -14,8 +38,18 @@ WAIT ?= 180
 
 QUADLET_DIR := $(HOME)/.config/containers/systemd
 
-.PHONY: test smoke chaos test-live sam-stress router-up router-down router-wait \
+.PHONY: test smoke chaos test-live sam-stress matrix routers \
+        router-up router-down router-wait router-build router-sam-enable \
         fmt lint man-lint fuzz install uninstall
+
+# Fail early and clearly on a typo'd ROUTER, rather than in the middle of a
+# systemctl invocation with an empty unit name.
+check-router:
+	@case " $(ROUTERS) " in \
+		*" $(ROUTER) "*) ;; \
+		*) echo "unknown ROUTER=$(ROUTER); one of: $(ROUTERS)" >&2; exit 2 ;; \
+	esac
+.PHONY: check-router
 
 # Install layout. Override on the command line, e.g.
 #   make install PREFIX=/usr DESTDIR=$(CURDIR)/pkg
@@ -44,39 +78,94 @@ chaos:
 
 ## Tier 2: the router-gated tests (#[ignore]d, keyed on CLOVE_SAM_PORT).
 ## Waits for SAM first so a cold router doesn't produce spurious failures.
+##   make test-live ROUTER=java
 test-live: router-wait
+	@echo "== live tests against $(ROUTER) (SAM 127.0.0.1:$(SAM_PORT)) =="
 	CLOVE_SAM_PORT=$(SAM_PORT) cargo test --workspace -- --ignored --nocapture
+
+## The interop matrix (SCOPE §6): the live tier against every router in turn.
+## Keeps going after a failure and reports which routers passed at the end —
+## a router that is down should not hide the results of the two that are up.
+## Record the outcome in docs/LIVE-TESTING.md §6.3.
+matrix:
+	@fail=""; pass=""; \
+	for r in $(ROUTERS); do \
+		echo; echo "################ $$r ################"; \
+		if $(MAKE) --no-print-directory test-live ROUTER=$$r; then \
+			pass="$$pass $$r"; \
+		else \
+			fail="$$fail $$r"; \
+		fi; \
+	done; \
+	echo; echo "== matrix summary =="; \
+	echo "passed:$${pass:- none}"; \
+	echo "failed:$${fail:- none}"; \
+	[ -z "$$fail" ]
+
+## What each router is called and where its SAM lands.
+routers:
+	@printf '%-10s %-18s %s\n' ROUTER UNIT "SAM (host)"; \
+	for r in $(ROUTERS); do \
+		$(MAKE) --no-print-directory router-line ROUTER=$$r; \
+	done
+router-line:
+	@printf '%-10s %-18s 127.0.0.1:%s\n' '$(ROUTER)' '$(UNIT)' '$(SAM_PORT)'
+.PHONY: router-line
 
 ## R2 stress harness: N concurrent streams on one session (docs/PROTOCOL §2.6).
 sam-stress:
 	CLOVE_SAM_PORT=$(SAM_PORT) cargo run --release -p i2pnet --bin sam-stress -- $(N)
 
-## Install and start the i2pd quadlet (rootless). Give it a few minutes on a
-## cold start to reseed and build tunnels before running the live targets.
-router-up:
-	mkdir -p $(QUADLET_DIR)
-	cp contrib/podman/i2pd.container $(QUADLET_DIR)/
-	systemctl --user daemon-reload
-	systemctl --user start i2pd
-	@echo "i2pd starting; a cold router needs a few minutes for tunnels."
+## Build the router image, for routers that have no published one. Only
+## emissary needs this; it is a no-op for the others.
+router-build: check-router
+	@if [ "$(ROUTER)" = emissary ]; then \
+		podman build -t localhost/clove-emissary:latest \
+			-f contrib/podman/Containerfile.emissary contrib/podman; \
+	else \
+		echo "$(ROUTER) uses a published image; nothing to build."; \
+	fi
 
-## Stop the router and remove the quadlet unit (the data volume is kept;
+## Install and start a router quadlet (rootless). Give it a few minutes on a
+## cold start to reseed and build tunnels before running the live targets.
+##   make router-up ROUTER=emissary
+router-up: check-router
+	mkdir -p $(QUADLET_DIR)
+	cp contrib/podman/$(QUADLET) $(QUADLET_DIR)/
+	systemctl --user daemon-reload
+	systemctl --user start $(UNIT)
+	@echo "$(ROUTER) starting; a cold router needs a few minutes for tunnels."
+	@if [ "$(ROUTER)" != i2pd ]; then \
+		echo "$(ROUTER) does not expose SAM until you run:"; \
+		echo "    make router-sam-enable ROUTER=$(ROUTER)"; \
+	fi
+
+## Switch on the SAM bridge for routers that do not ship it reachable (Java
+## I2P has it disabled; emissary binds it inside the container). Run once the
+## router has booted; idempotent. i2pd needs nothing.
+router-sam-enable: check-router
+	./contrib/podman/enable-sam.sh $(ROUTER)
+
+## Stop the router and remove its quadlet unit (the data volume is kept; e.g.
 ## `podman volume rm clove-i2pd-data` to wipe netDb and keys).
-router-down:
-	-systemctl --user stop i2pd
-	-rm -f $(QUADLET_DIR)/i2pd.container
+router-down: check-router
+	-systemctl --user stop $(UNIT)
+	-rm -f $(QUADLET_DIR)/$(QUADLET)
 	systemctl --user daemon-reload
 
 ## Block until the SAM port answers (or WAIT seconds elapse). Port-open does
 ## not prove tunnels are built — the live tests tolerate early connect churn.
-router-wait:
-	@echo "waiting up to $(WAIT)s for SAM on 127.0.0.1:$(SAM_PORT)…"
+router-wait: check-router
+	@echo "waiting up to $(WAIT)s for $(ROUTER) SAM on 127.0.0.1:$(SAM_PORT)…"
 	@for i in $$(seq 1 $(WAIT)); do \
 		if timeout 1 bash -c '</dev/tcp/127.0.0.1/$(SAM_PORT)' 2>/dev/null; then \
 			echo "SAM is answering."; exit 0; \
 		fi; sleep 1; \
 	done; \
-	echo "SAM did not come up on 127.0.0.1:$(SAM_PORT) within $(WAIT)s" >&2; exit 1
+	echo "$(ROUTER) SAM did not come up on 127.0.0.1:$(SAM_PORT) within $(WAIT)s" >&2; \
+	if [ "$(ROUTER)" != i2pd ]; then \
+		echo "  (did you run: make router-sam-enable ROUTER=$(ROUTER) ?)" >&2; \
+	fi; exit 1
 
 ## Deep, coverage-guided fuzzing (nightly toolchain + cargo-fuzz). The
 ## every-push parser coverage is `make test`; see fuzz/README.md.

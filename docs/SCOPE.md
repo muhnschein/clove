@@ -128,7 +128,13 @@ No layer assumes another is present.
 |---|---|---|
 | i2pd | P0 | Your deployment target; SAM quirks differ from Java |
 | emissary | P0 | Young router, young SAM impl — expect to find bugs on both sides; coordinate upstream |
-| Java I2P | P1 | Sanity/reference; also what most *remote* peers run behind |
+| Java I2P | P1 | Sanity/reference; also what most *remote* peers run behind. When routers disagree, this one is presumed right |
+
+Priority is where to spend attention first, not what to skip: **0.1 requires
+the live sign-off on all three.** All three have a podman quadlet in
+`contrib/podman/` and publish SAM on different loopback ports, so they run side
+by side and `make matrix` sweeps them in one command; results go in
+`docs/LIVE-TESTING.md` §6.3.
 
 **Peer clients (swarm side):**
 
@@ -140,7 +146,7 @@ No layer assumes another is present.
 
 **Test tiers:**
 1. Unit + engine tests against mocked `i2pnet` (no router needed; runs in CI).
-2. Loopback integration: two client instances over one local router (i2pd in CI container), private torrent, full download both directions, kill-router-mid-transfer chaos tests.
+2. Loopback integration: two client instances over one local router (operator machine, not CI — see `docs/LIVE-TESTING.md` §2), private torrent, full download both directions, kill-router-mid-transfer chaos tests. Repeated against each router in the table above.
 3. Live-network smoke tests (manual/nightly): join a well-seeded public I2P swarm, verify download + PEX peer acquisition + sustained seeding against i2psnark peers.
 
 ## 7. Risks & Open Questions

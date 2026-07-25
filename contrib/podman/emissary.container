@@ -1,0 +1,43 @@
+# Quadlet unit for an emissary router exposing SAMv3 to clove's live tests.
+#
+# emissary is the youngest of the three and shares an author with yosemite,
+# clove's SAM library. That makes it the most likely place to find a bug on
+# *both* sides of the wire, and the most likely place to get one fixed
+# (docs/SCOPE.md §6) — which is why it is in the matrix rather than an
+# afterthought.
+#
+# Rootless install:
+#   make router-build ROUTER=emissary   # no published image; we build one
+#   make router-up    ROUTER=emissary
+#
+# SAM lands on host 127.0.0.1:7676 (7656 inside the container), clear of i2pd
+# on 7656 and Java I2P on 7666.
+#
+# ONE EXTRA STEP, as with Java I2P: emissary writes a default router.toml on
+# first boot that binds SAM to loopback *inside the container*, which
+# PublishPort cannot reach. After the first boot:
+#
+#   make router-sam-enable ROUTER=emissary
+#
+# which sets `host = "0.0.0.0"` under [sam] and restarts. Idempotent.
+#
+# There is no web console here; `podman logs systemd-emissary` is the
+# diagnostic. Raise detail by editing EMISSARY_LOG below (the syntax is
+# emissary's own, e.g. emissary::sam=debug,emissary::tunnel=debug).
+
+[Unit]
+Description=emissary router for clove live tests (SAMv3 on loopback:7676)
+
+[Container]
+# Built locally from contrib/podman/Containerfile.emissary — no registry image
+# exists upstream. `make router-build ROUTER=emissary` produces this tag.
+Image=localhost/clove-emissary:latest
+PublishPort=127.0.0.1:7676:7656
+Volume=clove-emissary-data:/var/lib/emissary
+Environment=EMISSARY_LOG=emissary=info
+
+[Service]
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target
