@@ -170,7 +170,7 @@ Status legend:
     so it waits for evidence from live running. Tracked by the test
     `a_bridge_that_passes_hello_and_then_stalls_is_a_known_gap`.
 
-2.8 [open] emissary 0.4.0, first live run (2026-07-25): every dial between two
+2.8 [decided] emissary 0.4.0, first live run (2026-07-25): every dial between two
     destinations on the *same* emissary router failed. The router's own log is
     unambiguous about why:
 
@@ -201,10 +201,22 @@ Status legend:
       (b) the router was simply too young (~30 min, first boot) and would
           succeed given hours.
 
-    Distinguishing them is one run: leave the router up for several hours and
-    repeat `make router-ready ROUTER=emissary`. Still failing ⇒ (a), and an
-    upstream report with this log. Succeeding ⇒ (b), and LIVE-TESTING gains a
-    minimum-router-age note.
+    RESOLVED in favour of (a) by the second run (2026-07-25, router up ~1h):
+    same failure, and the router was demonstrably healthy at the time —
+
+      INFO emissary::router: taking backup of profile storage num_routers=327
+      INFO emissary::netdb: publish router info router_id=vfjZfWJx
+           floodfills=["JsQjTcor", "JpP9fT5x", "JRKwxnGk"]
+
+    327 known routers, three floodfills, client tunnel pools building inbound
+    and outbound throughout. Not a cold router. Every lookup for a leaseSet
+    belonging to a destination *on this same router* still timed out. Age is
+    not the variable; the local lookup is.
+
+    Worth reporting upstream with this log. The workaround, if one is needed
+    before then, is for the loopback test to use two routers rather than two
+    destinations on one — which costs the M1 criterion its simplicity, so it
+    waits until upstream has had a chance to look.
 
     Nothing here implicates clove: the dial is an ordinary SAM STREAM CONNECT
     to a b32, and the router refuses it before any of our code is involved. It
@@ -212,6 +224,44 @@ Status legend:
     SAM impl — expect to find bugs on both sides; coordinate upstream"), and
     because the same *symptom* (CantReachPeer) appeared earlier against i2pd
     without a log detailed enough to say whether the cause was the same.
+
+2.9 [decided] SAM session ids are per-router and are not necessarily released
+    when the control socket closes. emissary 0.4.0 holds one long enough that
+    a process starting seconds after a clean exit is refused:
+
+      WARN emissary::sam: duplicate session id session_id=clove-stress-listen
+
+    Observed as three consecutive sam-stress runs (N=32, 64, 128) failing at
+    session setup with `DuplicateId`, immediately after the N=16 run had
+    exited normally. The runs were seconds apart, which is exactly the shape
+    of an automated matrix sweep.
+
+    clove now derives every session id from a base name plus its pid and a
+    sub-second component (`i2pnet::sam::unique_nickname`). The id is not the
+    identity — that is the destination key (Q4) — so it can vary per process
+    freely, and it stays readable enough to find in a router console.
+
+    This is not only a harness concern. The SCOPE §4 reconnect discipline has
+    cloved rebuild its session tree after losing the router; with a fixed id,
+    that rebuild can be refused by the stale session it is replacing, and the
+    supervisor backs off and retries into the same refusal indefinitely — the
+    precise failure it exists to prevent. cloved uses a unique id per attempt
+    for that reason.
+
+2.10 [open] A SAM bridge answering `HELLO` does not mean the router can carry
+    a stream. Java I2P 2.12.0 accepted the TCP connection and completed the
+    pre-flight handshake (§2.7) ~25s after container start, then reset the
+    connection on `SESSION CREATE`:
+
+      seeder SAM session: Os { code: 104, kind: ConnectionReset }
+
+    The bridge binds early in the router's startup; the router behind it was
+    still coming up. Port-open and HELLO-OK are both necessary and neither is
+    sufficient, so `make router-ready` (two sessions, one dial, bounded) is
+    the gate worth trusting before a live tier, and the report now runs it
+    first rather than spending five minutes per stress level to learn the
+    same thing. How long Java I2P actually needs before SESSION CREATE
+    succeeds is still unmeasured.
 
 
 3. Reconnect discipline (i2pnet::supervisor, M1)

@@ -38,6 +38,15 @@ PublishPort=127.0.0.1:7666:7656
 PublishPort=127.0.0.1:7657:7657
 Volume=clove-i2p-java-config:/i2p/.i2p
 Environment=IP_ADDR=0.0.0.0
+# The router's own transport port (NTCP2/SSU2), published so peers can reach
+# us. Without it the entrypoint warns "I2P router will resolve to a Firewalled
+# state": the router still works, but as a second-class participant — fewer
+# usable peers, slower tunnel builds, worse netDb reachability. That is a
+# lousy baseline to judge clove against, so publish it and forward
+# 12345/tcp+udp on your NAT if there is one.
+PublishPort=12345:12345/tcp
+PublishPort=12345:12345/udp
+Environment=EXT_PORT=12345
 # Java I2P wants more headroom than i2pd; the JVM plus a full netDb is not a
 # 256 MiB proposition. Raise if the router logs OOM during reseed.
 #

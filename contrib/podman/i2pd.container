@@ -26,6 +26,13 @@ Description=i2pd router for clove live tests (SAMv3 on loopback)
 Image=docker.io/purplei2p/i2pd:latest
 PublishPort=127.0.0.1:7656:7656
 PublishPort=127.0.0.1:7070:7070
+# The router's own transport port (NTCP2/SSU2). Unlike SAM this is *not*
+# loopback-bound: it is how other I2P routers reach us. Without it the router
+# is firewalled — it still works, but with fewer usable peers and slower
+# tunnel builds, which is a poor baseline to measure clove against. Forward
+# 12346 on your NAT if there is one.
+PublishPort=12346:12346/tcp
+PublishPort=12346:12346/udp
 Volume=clove-i2pd-data:/home/i2pd/data
 # Run as container-root. Under rootless podman that maps to *your* user — the
 # owner of the named volume — so i2pd can write its reseed certificates. Left
@@ -36,7 +43,8 @@ Group=0
 # Enable the SAM bridge (off by default) and the web console. Bind them to
 # 0.0.0.0 *inside* the container; PublishPort pins the host sides to loopback.
 Exec=--sam.enabled=true --sam.address=0.0.0.0 --sam.port=7656 \
-     --http.enabled=true --http.address=0.0.0.0 --http.port=7070
+     --http.enabled=true --http.address=0.0.0.0 --http.port=7070 \
+     --port=12346
 
 [Install]
 WantedBy=default.target

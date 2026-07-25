@@ -296,7 +296,7 @@ for r in $ROUTERS; do
     say ""
     say "=== $r: router context"
     {
-        echo "unit state:   $(systemctl --user is-active "$(basename "$container" | sed 's/^systemd-//')" 2>/dev/null || echo unknown)"
+        echo "unit state:   $(systemctl --user is-active "$(unit_of "$r")" 2>/dev/null | head -1 || true)"
         if podman container exists "$container" 2>/dev/null; then
             echo "container:    present"
             echo "image:        $(podman inspect -f '{{.ImageName}}' "$container" 2>/dev/null || echo unknown)"
@@ -336,11 +336,14 @@ for r in $ROUTERS; do
 
     if ! port_answers "$port"; then
         skip "$r: live tests" "SAM not answering on 127.0.0.1:$port"
+        say ""
+        say "=== $r: why it is not answering"
+        router_diagnosis "$r" 2>&1 | sanitise >> "$OUT"
         if podman container exists "$container" 2>/dev/null; then
             say ""
             say "=== $r: container log (SAM down — this is usually why)"
             podman logs --tail 80 "$container" 2>&1 | sanitise >> "$OUT"
-        elif [ "$BRING_UP" = no ]; then
+        else
             note ""
             note "To bring it up:  make router-up ROUTER=$r"
             if [ "$r" = emissary ]; then
@@ -349,6 +352,22 @@ for r in $ROUTERS; do
             if [ "$r" != i2pd ]; then
                 note "                 then: make router-sam-enable ROUTER=$r"
             fi
+        fi
+        continue
+    fi
+
+    # One dial before many. A router that cannot carry a single stream will
+    # not carry sixteen, and finding that out costs 90 seconds here versus
+    # five minutes per stress level below.
+    if ! step "$r: readiness (one stream)" 180 make router-ready ROUTER="$r"; then
+        skip "$r: live tests" "failed readiness — see above"
+        for n in $STRESS; do
+            skip "$r: sam-stress N=$n" "router not ready"
+        done
+        if podman container exists "$container" 2>/dev/null; then
+            say ""
+            say "=== $r: container log (readiness failed)"
+            podman logs --tail 120 "$container" 2>&1 | sanitise >> "$OUT"
         fi
         continue
     fi

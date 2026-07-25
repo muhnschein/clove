@@ -380,6 +380,46 @@ Run this after any router restart and before a matrix sweep. A live tier that
 fails after eight minutes of retries tells you nothing this does not tell you
 in ninety seconds.
 
+### 6.5 Router readiness has three gates, not one
+
+Learned the expensive way (`PROTOCOL.i2p-bt` §2.10). Each of these is
+necessary and none of the earlier ones implies the later:
+
+1. **The SAM port answers.** `make router-wait`. Proves a process is
+   listening. Java I2P's bridge binds early in startup, so this passes while
+   the router behind it is still coming up.
+2. **It speaks SAM.** clove's pre-flight probe (§2.7) does a real `HELLO`
+   exchange before yosemite touches the port. Proves it is a SAM bridge and
+   not something else on that port. Still says nothing about tunnels.
+3. **It can carry a stream.** `make router-ready`. Two sessions, one dial,
+   bounded at 90 seconds. This is the only one that proves what the live
+   tests need, and it is the gate the report runs before the expensive tier.
+
+A router that passes 1 and 2 and fails 3 is *not* broken clove. It is a
+router that is still warming up, firewalled, or — as with emissary 0.4.0 —
+unable to resolve leaseSets for its own destinations (§2.8).
+
+### 6.6 Do not test a firewalled router if you can avoid it
+
+Both routers in the first three-router run reported themselves firewalled:
+
+```
+emissary: router is firewalled, publishing U  ipv4_status=Firewalled
+java:     *** EXT_PORT is unset.
+          *** I2P router will resolve to a "Firewalled" state
+```
+
+A firewalled router still works — it builds tunnels and clients function —
+but it participates as a second-class peer: fewer usable peers, slower tunnel
+builds, worse netDb reachability. That is a poor baseline to judge clove
+against, and it muddies every result with "was that us or the router?".
+
+The quadlets now publish each router's transport port (i2pd 12346, Java
+12345, emissary 8888 — NTCP2/SSU2, deliberately *not* loopback-bound, unlike
+SAM). If the machine is behind NAT, forward those ports too. If you cannot,
+note it in the §6.3 results table: a firewalled run is still worth recording,
+it just is not a clean sign-off.
+
 ## 7a. Troubleshooting (live-run findings)
 
 **`CantReachPeer` on every dial, immediately after `router-up`.** Two causes,

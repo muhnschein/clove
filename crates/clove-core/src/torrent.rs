@@ -1295,7 +1295,7 @@ mod tests {
         let seed_session = Arc::new(
             SamSession::connect(&SamConfig {
                 samv3_tcp_port: port,
-                nickname: "clove-it-seed".to_owned(),
+                nickname: i2pnet::sam::unique_nickname("clove-it-seed"),
                 ..Default::default()
             })
             .expect("seeder SAM session (is the router up with tunnels built?)"),
@@ -1305,7 +1305,7 @@ mod tests {
         let seed_dest = seed_listener.local_dest();
         let leech_session = SamSession::connect(&SamConfig {
             samv3_tcp_port: port,
-            nickname: "clove-it-leech".to_owned(),
+            nickname: i2pnet::sam::unique_nickname("clove-it-leech"),
             ..Default::default()
         })
         .expect("leecher SAM session");
