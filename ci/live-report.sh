@@ -343,15 +343,17 @@ for r in $ROUTERS; do
         quadlet_src="contrib/podman/$(quadlet_of "$r")"
         quadlet_dst="$HOME/.config/containers/systemd/$(quadlet_of "$r")"
         if ! podman container exists "$container" 2>/dev/null; then
-            # SAM answers but no container: this router is a host service or was
-            # started some other way, so the quadlet on disk is not what is being
-            # tested and diffing it only misleads. Say what is actually true —
-            # the repo's transport-port settings are not in play, and firewalled
-            # status has to be checked on the router itself.
-            echo "quadlet:      not in use — no container, so this router runs"
-            echo "              outside the quadlet (host service?). The repo's"
-            echo "              settings do not apply; check the router's own"
-            echo "              config for its transport port."
+            # SAM answers but no container: a host-installed router. Often the
+            # *better* subject — a daemon that has been up for weeks has a warm
+            # netDb and real peer profiles, which no freshly reseeded container
+            # can match. Nothing to warn about; the only thing worth saying is
+            # that the repo's quadlet settings are not in play, so its transport
+            # port and firewall status live in that router's own config.
+            echo "quadlet:      n/a — host-installed router, not a container."
+            echo "              (Often the better subject: a long-running router"
+            echo "              has a warmer netDb than a fresh container. The"
+            echo "              repo's transport-port settings do not apply — see"
+            echo "              this router's own config.)"
         elif [ ! -f "$quadlet_dst" ]; then
             echo "quadlet:      NOT INSTALLED at $quadlet_dst"
         elif cmp -s "$quadlet_src" "$quadlet_dst"; then
