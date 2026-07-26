@@ -807,6 +807,17 @@ where
         if resume.info_hash != info_hash {
             return Err("resume file does not match the .torrent".to_owned());
         }
+        // The piece count has to agree too, or every bitfield in the resume
+        // file is measured against a different torrent than the one on disk:
+        // progress, completeness and the have-set handed to the engine all
+        // come out wrong, and quietly.
+        if usize::try_from(resume.num_pieces).unwrap_or(usize::MAX) != meta.pieces.len() {
+            return Err(format!(
+                "resume file says {} pieces, the .torrent has {}",
+                resume.num_pieces,
+                meta.pieces.len()
+            ));
+        }
         let have = Bitfield::from_bytes(&resume.have, resume.num_pieces)
             .map_err(|_| "resume have-bitfield is inconsistent".to_owned())?;
         self.torrents.insert(
@@ -986,7 +997,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    fs::rename(&tmp, path)
+    fs::rename(&tmp, path)?;
+    // The rename is atomic, but it only survives a power cut once the
+    // directory entry itself is on the disk. Best-effort: filesystems that
+    // refuse to fsync a directory leave us exactly where we were.
+    if let Some(dir) = path.parent() {
+        let _ = fs::File::open(dir).and_then(|handle| handle.sync_all());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -994,7 +1012,6 @@ mod tests {
     use super::*;
     use clove_core::bencode::{self, Value as Ben};
     use clove_core::wire::BLOCK_LEN;
-    use i2pnet::I2pListener;
     use i2pnet::mock::{MockDialer, MockNet};
     use sha1::{Digest, Sha1};
     use std::collections::BTreeMap as Map;
@@ -1291,6 +1308,40 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn a_resume_file_for_a_different_torrent_is_skipped() {
+        let (_content, bytes) = fixture("mismatch-demo");
+        let data = TempDir::new("mismatch");
+        let info_hash = {
+            let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+            registry.add_torrent(&bytes).unwrap()
+        };
+        let resume_path = data.0.join(format!("state/{}.resume", hex(&info_hash)));
+
+        // Reopening as-is finds it.
+        assert_eq!(Registry::<MockDialer>::open(&data.0).unwrap().count(), 1);
+
+        // Now claim a different piece count. Every bitfield in the file is
+        // sized against that number, so the entry has to be refused rather
+        // than loaded and measured against the wrong torrent.
+        let good = Resume::decode(&fs::read(&resume_path).unwrap()).unwrap();
+        let mut bad = good.clone();
+        bad.num_pieces = good.num_pieces + 1;
+        bad.have = vec![0u8; clove_core::resume::bitfield_len(bad.num_pieces)];
+        bad.verified = bad.have.clone();
+        fs::write(&resume_path, bad.encode()).unwrap();
+        assert_eq!(
+            Registry::<MockDialer>::open(&data.0).unwrap().count(),
+            0,
+            "a resume file describing a different torrent was loaded anyway"
+        );
+
+        // And the good one still loads, so the check is about the mismatch and
+        // not about rejecting resume files in general.
+        fs::write(&resume_path, good.encode()).unwrap();
+        assert_eq!(Registry::<MockDialer>::open(&data.0).unwrap().count(), 1);
     }
 
     #[test]

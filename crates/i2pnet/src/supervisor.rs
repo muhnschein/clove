@@ -1,34 +1,40 @@
-//! SAM session supervision and reconnection (SCOPE §4).
+//! SAM session reconnection policy (SCOPE §4).
 //!
-//! This is the state machine the scope calls Suspect #1 for XD-style
-//! flakiness: when the router restarts or the SAM control connection drops,
-//! the whole session tree must come back on its own, on an exponential
-//! backoff, without a thundering-herd reconnect and without the engine
-//! above ever seeing a torn-down session as anything but a visible
+//! This is the arithmetic behind the state machine the scope calls Suspect #1
+//! for XD-style flakiness: when the router restarts or the SAM control
+//! connection drops, the whole session tree must come back on its own, on an
+//! exponential backoff, without a thundering-herd reconnect and without the
+//! engine above ever seeing a torn-down session as anything but a visible
 //! "waiting for router" pause.
 //!
-//! The policy is kept pure and independent of `yosemite` so it is testable
-//! with no router (the SAM backend is Phase D's other half). A [`Supervisor`]
-//! owns a [`SessionFactory`] — the only thing that actually touches the
-//! network — and drives it through this cycle:
+//! The cycle itself lives in `cloved` — it owns the session, the forwarded
+//! listener, the inbound demux and the registry, and the order in which those
+//! are built and torn down is the daemon's business:
 //!
 //! ```text
 //!            build() Ok
 //!   Down ───────────────────► Up(session)
 //!    ▲  │                        │
-//!    │  │ build() Err            │ session lost (caller reports failure)
+//!    │  │ build() Err            │ session lost (health probe fails)
 //!    │  ▼                        │
 //!    └ Backoff(delay) ◄──────────┘
 //!        │  delay elapses, retry build()
 //!        └► Down (attempt again)
 //! ```
 //!
-//! Backoff doubles from [`ReconnectPolicy::initial`] to a
-//! [`ReconnectPolicy::max`] ceiling, with optional jitter to prevent a whole
-//! swarm of torrents re-announcing in lockstep (the thundering herd). The
-//! supervisor never sleeps internally: it reports *when* the next attempt is
-//! due and the caller schedules it, so this stays single-threaded and
-//! deterministic under test.
+//! What lives *here* is the part worth testing on its own and reusing
+//! unchanged: how long to wait before attempt *n*, and how much to shave off
+//! that wait so a host running several daemons does not retry in lockstep.
+//! Keeping it pure means the daemon's loop has no arithmetic of its own to get
+//! wrong, and this file needs no router to test.
+//!
+//! There used to be a `Supervisor` here that drove a `SessionFactory` through
+//! the cycle above. It was never used: the session tree is three objects with
+//! different owners (an `Arc` session, a listener moved into an accept loop, a
+//! registry to attach), and threading that through a generic factory cost more
+//! than it explained. The daemon's own loop is the one that runs, so the
+//! untested duplicate is gone (SCOPE §9, culture of deletion) and the policy it
+//! calls is what is tested below.
 
 use std::time::Duration;
 
@@ -83,160 +89,21 @@ impl ReconnectPolicy {
     #[must_use]
     pub fn jittered(&self, base: Duration, roll: f64) -> Duration {
         let jitter = self.jitter.clamp(0.0, 1.0);
-        let roll = roll.clamp(0.0, 1.0);
+        // `clamp` passes NaN through, and `Duration::mul_f64` panics on it, so
+        // a roll that is not a number becomes no jitter rather than a crash.
+        let roll = if roll.is_nan() {
+            0.0
+        } else {
+            roll.clamp(0.0, 1.0)
+        };
         let factor = 1.0 - jitter * roll;
         base.mul_f64(factor)
-    }
-}
-
-/// Builds SAM sessions. The one piece the supervisor delegates to the
-/// network; the real impl (Phase D SAM backend) connects to the router,
-/// the test impl fails or succeeds on command.
-pub trait SessionFactory {
-    /// The session handle produced on success.
-    type Session;
-    /// Why a build attempt failed.
-    type Error;
-
-    /// Attempt to establish a fresh session tree (control connection,
-    /// primary session, forwarded listener).
-    ///
-    /// # Errors
-    /// The router is unreachable or rejected the session.
-    fn build(&mut self) -> Result<Self::Session, Self::Error>;
-}
-
-/// Supervisor lifecycle, exposed so the engine can surface "waiting for
-/// router" to torrents and the CLI.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Phase {
-    /// No session; an attempt should be made now.
-    Down,
-    /// A session is established.
-    Up,
-    /// A recent attempt failed; waiting out the backoff before retrying.
-    WaitingForRouter,
-}
-
-/// Drives a [`SessionFactory`] through connect/backoff/reconnect. Holds no
-/// threads and never sleeps: [`poll`](Self::poll) does one unit of work and
-/// reports the next deadline for the caller to schedule.
-pub struct Supervisor<F: SessionFactory> {
-    factory: F,
-    policy: ReconnectPolicy,
-    session: Option<F::Session>,
-    /// Consecutive failures since the last success; drives backoff.
-    failures: u32,
-    phase: Phase,
-}
-
-/// What [`Supervisor::poll`] did and what the caller should do next.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Poll {
-    /// A session is up; nothing to do until it is reported lost.
-    Up,
-    /// An attempt just failed; do not retry until `retry_in` has elapsed,
-    /// then poll again.
-    Backoff {
-        /// Delay before the next [`poll`](Supervisor::poll) should run.
-        retry_in: Duration,
-        /// Which consecutive failure this was (1 = first).
-        failures: u32,
-    },
-}
-
-impl<F: SessionFactory> Supervisor<F> {
-    /// A supervisor that will build sessions with `factory` under `policy`,
-    /// starting [`Phase::Down`] (no session yet).
-    pub fn new(factory: F, policy: ReconnectPolicy) -> Self {
-        Supervisor {
-            factory,
-            policy,
-            session: None,
-            failures: 0,
-            phase: Phase::Down,
-        }
-    }
-
-    /// Current lifecycle phase.
-    #[must_use]
-    pub fn phase(&self) -> Phase {
-        self.phase
-    }
-
-    /// The live session, if [`Phase::Up`].
-    #[must_use]
-    pub fn session(&self) -> Option<&F::Session> {
-        self.session.as_ref()
-    }
-
-    /// Consecutive failures since the last successful build.
-    #[must_use]
-    pub fn failures(&self) -> u32 {
-        self.failures
-    }
-
-    /// Report that the live session was lost (control socket dropped, router
-    /// gone). Transitions back to [`Phase::Down`] so the next
-    /// [`poll`](Self::poll) attempts a rebuild. The dropped session's failure
-    /// is not itself counted — only failed *rebuilds* grow the backoff — so
-    /// a healthy session that dies once retries promptly.
-    pub fn report_lost(&mut self) {
-        self.session = None;
-        self.phase = Phase::Down;
-    }
-
-    /// Do one unit of work: if a session is up, report [`Poll::Up`];
-    /// otherwise attempt a rebuild, returning [`Poll::Up`] on success or
-    /// [`Poll::Backoff`] (with the deadline the caller should wait) on
-    /// failure. `roll` supplies jitter in `[0.0, 1.0)` — pass `0.0` for no
-    /// jitter, or a per-attempt random value in production.
-    pub fn poll(&mut self, roll: f64) -> Poll {
-        if self.session.is_some() {
-            self.phase = Phase::Up;
-            return Poll::Up;
-        }
-        if let Ok(session) = self.factory.build() {
-            self.session = Some(session);
-            self.failures = 0;
-            self.phase = Phase::Up;
-            Poll::Up
-        } else {
-            self.failures = self.failures.saturating_add(1);
-            self.phase = Phase::WaitingForRouter;
-            let base = self.policy.base_delay(self.failures);
-            Poll::Backoff {
-                retry_in: self.policy.jittered(base, roll),
-                failures: self.failures,
-            }
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A factory that fails its first `fail_first` builds, then succeeds,
-    /// counting total attempts.
-    struct FlakyFactory {
-        fail_first: u32,
-        attempts: u32,
-    }
-
-    impl SessionFactory for FlakyFactory {
-        type Session = u32; // a stand-in session id
-        type Error = ();
-
-        fn build(&mut self) -> Result<u32, ()> {
-            self.attempts += 1;
-            if self.attempts <= self.fail_first {
-                Err(())
-            } else {
-                Ok(self.attempts)
-            }
-        }
-    }
 
     fn policy() -> ReconnectPolicy {
         ReconnectPolicy {
@@ -255,6 +122,7 @@ mod tests {
         assert_eq!(p.base_delay(3), Duration::from_secs(4));
         assert_eq!(p.base_delay(7), Duration::from_secs(60)); // 64 -> capped
         assert_eq!(p.base_delay(1000), Duration::from_secs(60)); // no overflow
+        assert_eq!(p.base_delay(u32::MAX), Duration::from_secs(60));
     }
 
     #[test]
@@ -268,122 +136,37 @@ mod tests {
         assert_eq!(p.jittered(base, 1.0), Duration::from_secs(5)); // max shave
         let mid = p.jittered(base, 0.5);
         assert!(mid <= base && mid >= Duration::from_secs(5));
-    }
-
-    #[test]
-    fn connects_first_try() {
-        let mut sup = Supervisor::new(
-            FlakyFactory {
-                fail_first: 0,
-                attempts: 0,
-            },
-            policy(),
-        );
-        assert_eq!(sup.phase(), Phase::Down);
-        assert_eq!(sup.poll(0.0), Poll::Up);
-        assert_eq!(sup.phase(), Phase::Up);
-        assert!(sup.session().is_some());
-        assert_eq!(sup.failures(), 0);
-    }
-
-    #[test]
-    fn backs_off_then_recovers() {
-        // Router down for two attempts, then up.
-        let mut sup = Supervisor::new(
-            FlakyFactory {
-                fail_first: 2,
-                attempts: 0,
-            },
-            policy(),
-        );
-
-        assert_eq!(
-            sup.poll(0.0),
-            Poll::Backoff {
-                retry_in: Duration::from_secs(1),
-                failures: 1
-            }
-        );
-        assert_eq!(sup.phase(), Phase::WaitingForRouter);
-
-        assert_eq!(
-            sup.poll(0.0),
-            Poll::Backoff {
-                retry_in: Duration::from_secs(2),
-                failures: 2
-            }
-        );
-
-        // Third attempt succeeds; backoff resets.
-        assert_eq!(sup.poll(0.0), Poll::Up);
-        assert_eq!(sup.phase(), Phase::Up);
-        assert_eq!(sup.failures(), 0);
-    }
-
-    #[test]
-    fn a_healthy_session_that_dies_retries_promptly() {
-        let mut sup = Supervisor::new(
-            FlakyFactory {
-                fail_first: 0,
-                attempts: 0,
-            },
-            policy(),
-        );
-        assert_eq!(sup.poll(0.0), Poll::Up);
-
-        // Router restarts: session lost. We go Down, not straight to a long
-        // backoff — the next poll retries immediately (and here succeeds).
-        sup.report_lost();
-        assert_eq!(sup.phase(), Phase::Down);
-        assert!(sup.session().is_none());
-        assert_eq!(sup.poll(0.0), Poll::Up);
-        assert_eq!(sup.failures(), 0);
-    }
-
-    #[test]
-    fn poll_while_up_is_idempotent_and_does_not_rebuild() {
-        let mut sup = Supervisor::new(
-            FlakyFactory {
-                fail_first: 0,
-                attempts: 0,
-            },
-            policy(),
-        );
-        assert_eq!(sup.poll(0.0), Poll::Up);
-        let first = *sup.session().unwrap();
-        // Polling again must not build a new session.
-        assert_eq!(sup.poll(0.0), Poll::Up);
-        assert_eq!(*sup.session().unwrap(), first);
+        // A roll outside [0,1] — or not a number at all — must not stretch the
+        // delay or produce something Duration cannot hold.
+        assert_eq!(p.jittered(base, -1.0), base);
+        assert_eq!(p.jittered(base, 5.0), Duration::from_secs(5));
+        assert!(p.jittered(base, f64::NAN) <= base);
     }
 
     #[test]
     fn no_thundering_herd_with_jitter() {
-        // Two supervisors failing in lockstep get different retry deadlines
-        // once jitter is applied with different rolls.
+        // Two daemons failing in lockstep get different retry deadlines once
+        // jitter is applied with different rolls — the whole point of it.
         let p = ReconnectPolicy {
             jitter: 0.5,
             ..policy()
         };
-        let mut a = Supervisor::new(
-            FlakyFactory {
-                fail_first: 5,
-                attempts: 0,
-            },
-            p,
+        let base = p.base_delay(4);
+        assert_ne!(
+            p.jittered(base, 0.1),
+            p.jittered(base, 0.9),
+            "different rolls must de-sync retries"
         );
-        let mut b = Supervisor::new(
-            FlakyFactory {
-                fail_first: 5,
-                attempts: 0,
-            },
-            p,
+    }
+
+    #[test]
+    fn the_default_policy_is_sane() {
+        let p = ReconnectPolicy::default();
+        assert!(p.base_delay(1) >= Duration::from_millis(500));
+        assert!(p.base_delay(100) <= p.max);
+        assert!(
+            p.jitter > 0.0,
+            "the default must de-sync concurrent daemons"
         );
-        let Poll::Backoff { retry_in: da, .. } = a.poll(0.1) else {
-            panic!("expected backoff");
-        };
-        let Poll::Backoff { retry_in: db, .. } = b.poll(0.9) else {
-            panic!("expected backoff");
-        };
-        assert_ne!(da, db, "different jitter rolls must de-sync retries");
     }
 }

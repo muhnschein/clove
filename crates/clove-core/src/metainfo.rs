@@ -201,15 +201,20 @@ impl MetaInfo {
     }
 }
 
-/// True when `url` announces to an I2P destination: `http(s)://` with a
-/// host ending in `.i2p` (which covers `.b32.i2p`). Anything else — IPs,
-/// clearnet hosts, other schemes — is not ours to talk to.
+/// True when `url` announces to an I2P destination: `http://` with a host
+/// ending in `.i2p` (which covers `.b32.i2p`). Anything else — IPs, clearnet
+/// hosts, other schemes — is not ours to talk to.
+///
+/// `https://` is *not* accepted, deliberately. clove speaks plain HTTP over an
+/// I2P stream (the tunnel is the encryption) and has no TLS stack to speak
+/// anything else with; a URL kept here that the announcer cannot dial would
+/// fail forever with nothing to show the operator. Keeping the filter and
+/// [`crate::tracker::build_announce`] in exact agreement is the point — a
+/// tracker we cannot talk to is dropped at parse time and counted, like any
+/// other.
 #[must_use]
 pub fn is_i2p_tracker(url: &str) -> bool {
-    let Some(rest) = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-    else {
+    let Some(rest) = url.strip_prefix("http://") else {
         return false;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
@@ -278,6 +283,7 @@ fn parse_files(info: &Value, name: &str) -> Result<(Vec<FileEntry>, u64), Error>
             if total == 0 {
                 return Err(Error::Invalid("torrent of zero total bytes"));
             }
+            check_distinct_paths(&entries)?;
             Ok((entries, total))
         }
     }
@@ -326,6 +332,32 @@ fn parse_trackers(root: &Value) -> Result<(Vec<Vec<String>>, usize), Error> {
 
 fn as_size(v: &Value) -> Option<u64> {
     v.as_int().and_then(|n| u64::try_from(n).ok())
+}
+
+/// Reject a file list whose paths collide on disk.
+///
+/// Two entries with the same path alias the same file at different offsets in
+/// the torrent's byte space: their writes overwrite each other, the pieces over
+/// them can never verify, and the download retries forever against every peer
+/// it meets. A path that is a strict prefix of another is the same problem in
+/// the other direction — one entry wants a file where another wants a
+/// directory — and fails at file-creation time instead.
+///
+/// Sorting makes this a scan of neighbours: if one path is a prefix of another,
+/// everything sorting between them shares that prefix too, so a collision
+/// always shows up in an adjacent pair.
+fn check_distinct_paths(entries: &[FileEntry]) -> Result<(), Error> {
+    let mut paths: Vec<&[String]> = entries.iter().map(|e| e.path.as_slice()).collect();
+    paths.sort_unstable();
+    for pair in paths.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(Error::Invalid("two files share the same path"));
+        }
+        if pair[1].starts_with(pair[0]) {
+            return Err(Error::Invalid("a file path is also a directory path"));
+        }
+    }
+    Ok(())
 }
 
 /// A path component usable under the data directory: nonempty, no
@@ -442,8 +474,11 @@ mod tests {
             "http://mb5ir7klpc2tj6ha3xhmrs3mseqvanauciuoiamx24mmomvkhaua.b32.i2p/a"
         ));
         assert!(is_i2p_tracker("http://opentracker.dg2.i2p:80/announce"));
-        assert!(is_i2p_tracker("https://TRACKER.EXAMPLE.I2P/announce"));
+        assert!(is_i2p_tracker("http://TRACKER.EXAMPLE.I2P/announce"));
 
+        // https is not ours to speak: no TLS stack, and the announcer would
+        // reject the URL later anyway. Dropped at parse time instead.
+        assert!(!is_i2p_tracker("https://tracker.example.i2p/announce"));
         assert!(!is_i2p_tracker("http://tracker.example.org/announce"));
         assert!(!is_i2p_tracker("udp://tracker.example.i2p/announce"));
         assert!(!is_i2p_tracker("http://1.2.3.4:6969/announce"));
@@ -474,6 +509,73 @@ mod tests {
     fn tracker_less_torrent_is_fine() {
         let t = MetaInfo::parse(&single_file(vec![])).unwrap();
         assert!(t.trackers.is_empty());
+    }
+
+    #[test]
+    fn rejects_colliding_file_paths() {
+        let piece_len = i64::from(MIN_PIECE_LENGTH);
+        let file = |len: i64, parts: Vec<&str>| {
+            dict(vec![
+                ("length", Value::Int(len)),
+                (
+                    "path",
+                    Value::List(parts.into_iter().map(bval).collect::<Vec<_>>()),
+                ),
+            ])
+        };
+        let torrent = |files: Vec<Value>| {
+            let total: i64 = piece_len;
+            let _ = total;
+            encode(&dict(vec![(
+                "info",
+                dict(vec![
+                    ("name", bval("album")),
+                    ("piece length", Value::Int(piece_len)),
+                    ("pieces", Value::Bytes(vec![0u8; 20])),
+                    ("files", Value::List(files)),
+                ]),
+            )]))
+        };
+
+        // Two entries naming one file: their writes would alias, and the
+        // pieces over them could never verify.
+        let dup = torrent(vec![
+            file(piece_len - 10, vec!["same.bin"]),
+            file(10, vec!["same.bin"]),
+        ]);
+        assert!(
+            matches!(MetaInfo::parse(&dup), Err(Error::Invalid(_))),
+            "duplicate file paths were accepted"
+        );
+
+        // A file where another entry wants a directory.
+        let shadow = torrent(vec![
+            file(piece_len - 10, vec!["a"]),
+            file(10, vec!["a", "b"]),
+        ]);
+        assert!(
+            matches!(MetaInfo::parse(&shadow), Err(Error::Invalid(_))),
+            "a file path shadowing a directory was accepted"
+        );
+        // Order must not matter.
+        let shadow_rev = torrent(vec![
+            file(10, vec!["a", "b"]),
+            file(piece_len - 10, vec!["a"]),
+        ]);
+        assert!(matches!(
+            MetaInfo::parse(&shadow_rev),
+            Err(Error::Invalid(_))
+        ));
+
+        // Names that merely share a prefix are fine, and so are same-named
+        // files in different directories.
+        let ok = torrent(vec![
+            file(piece_len - 30, vec!["a"]),
+            file(10, vec!["ab"]),
+            file(10, vec!["d", "a"]),
+            file(10, vec!["e", "a"]),
+        ]);
+        MetaInfo::parse(&ok).expect("distinct paths that share prefixes are legal");
     }
 
     #[test]

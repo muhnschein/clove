@@ -9,6 +9,14 @@ fuzz_target!(|data: &[u8]| {
         assert!(meta.piece_length > 0);
         let sum: u64 = meta.files.iter().map(|f| f.length).sum();
         assert_eq!(sum, meta.total_length);
+        // Paths must be distinct and non-shadowing: two entries on one path
+        // alias the same bytes on disk and the pieces over them never verify.
+        let mut paths: Vec<&[String]> = meta.files.iter().map(|f| f.path.as_slice()).collect();
+        paths.sort_unstable();
+        for pair in paths.windows(2) {
+            assert_ne!(pair[0], pair[1], "two files share a path");
+            assert!(!pair[1].starts_with(pair[0]), "a file path is a directory");
+        }
         for file in &meta.files {
             assert!(!file.path.is_empty());
             for part in &file.path {
