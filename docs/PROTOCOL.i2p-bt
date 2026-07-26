@@ -165,6 +165,28 @@ Status legend:
       question; worth a cross-router control before concluding anything from a
       same-router failure.
 
+      Seen twice now (2026-07-26, both runs), with the listener's inbound
+      tunnels confirmed built in emissary's own log immediately before the
+      dialing session failed to find its leaseSet. The control now exists:
+      `CLOVE_SAM_PORT_DIAL` puts the dialer on a different router and `make
+      cross` sweeps every ordered pair. Until a cross-router pair has been
+      tried, a same-router failure implicates nothing.
+
+    2.6e [decided] SAM `NAMING LOOKUP` of a `.b32.i2p` label is **not** a test of
+      leaseSet publication. Asked to resolve a freshly created local destination,
+      the three routers disagreed three ways: i2pd `InvalidKey`, Java I2P
+      `KeyNotFound` after 3.6s, emissary `KeyNotFound` in 0.0s — and a lookup
+      that returns in no time did not consult the network. The SAM spec defines
+      NAMING LOOKUP over address-book names and `ME`; b32 support is
+      router-dependent and at least one router rejects the form outright.
+
+      sam-stress briefly drew the wrong conclusion from this ("the leaseSet is
+      not resolvable … chase publication"). It now reports the router's answer as
+      fact and looks up the *dialer's own* destination as a control: both
+      failing means the router does not answer b32 lookups for its own session
+      destinations and the result says nothing about the target; only divergence
+      between the two implicates publication.
+
     2.6d [decided] The harness's own budgets must derive from one another, not
       sit as independent constants. `make router-ready` set a 90s run budget
       while sam-stress kept a fixed 240s warmup-retry budget, so the probe killed
@@ -173,6 +195,13 @@ Status legend:
       there and the whole matrix skipped behind it. The retry window is now
       computed from the run budget (`warmup_deadline`), with a regression test;
       READY_DEADLINE is 240s.
+
+      That fix was then reintroduced one layer up: `ci/live-report.sh` wrapped
+      the probe in a bare `timeout 180` while READY_DEADLINE was 240, so all
+      three routers reported TIMEOUT instead of a result. Making a rule
+      unrepresentable in one language does nothing about the copy of the number
+      in another. Every nested deadline in the shell now derives from the one it
+      contains.
 
       Related: with dial setup serialized (2.6a), a *fixed* run budget is a
       silent ceiling on N — at N=128 even a 3s connect needs 384s, more than the
