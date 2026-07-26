@@ -63,6 +63,22 @@ pub trait I2pStream: Read + Write + Send + Sized {
     /// # Errors
     /// The underlying implementation cannot produce independent halves.
     fn split(self) -> io::Result<(Self::Reader, Self::Writer)>;
+
+    /// Bound how long reads and writes on this stream may block, where the
+    /// backend can do it. `None` restores blocking behaviour.
+    ///
+    /// Worth setting around anything that waits on a peer's *first* bytes: a
+    /// connection that arrives and then says nothing otherwise parks a thread
+    /// for the life of the process. The default does nothing, for backends with
+    /// no timeout of their own to set (a SAM virtual stream has none), so a
+    /// caller must treat this as best-effort rather than a guarantee.
+    ///
+    /// # Errors
+    /// The underlying socket refused the option.
+    fn set_timeouts(&self, timeout: Option<Duration>) -> io::Result<()> {
+        let _ = timeout;
+        Ok(())
+    }
 }
 
 /// Outbound I2P stream connections (SAM `STREAM CONNECT`).
@@ -88,12 +104,22 @@ pub trait I2pListener {
     /// in handshakes and tracker announces.
     fn local_dest(&self) -> DestHash;
 
-    /// Block until a peer connects; returns the stream and who dialed us.
+    /// Block until a peer connects.
+    ///
+    /// `Ok(Some(..))` is a usable connection and who dialed us. `Ok(None)` means
+    /// *that one connection* was not usable — a forwarded stream whose
+    /// destination header never arrived, a local process poking the forward
+    /// port — and the caller should go straight back to accepting. The two are
+    /// separate outcomes on purpose: an accept loop that treats a single bad
+    /// connection as the end of the listener stops serving inbound peers
+    /// entirely until the session is rebuilt, which is a denial of service
+    /// anything on the loopback port could trigger.
     ///
     /// # Errors
-    /// Session loss. The supervisor (Phase D) owns re-establishment;
-    /// callers treat an error as "listener gone, wait for resurrection".
-    fn accept(&self) -> io::Result<(Self::Stream, DestHash)>;
+    /// Session loss — the listener itself is finished. The supervisor (Phase D)
+    /// owns re-establishment; callers treat an error as "listener gone, wait for
+    /// resurrection".
+    fn accept(&self) -> io::Result<Option<(Self::Stream, DestHash)>>;
 }
 
 /// Sharing a dialer across threads: an `Arc`'d dialer dials. This is how the

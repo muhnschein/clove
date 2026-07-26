@@ -154,6 +154,22 @@ impl Endpoint {
         self.dest
     }
 
+    /// Block for the next inbound stream.
+    ///
+    /// The mock's own convenience shape — one outcome, no "this connection was
+    /// unusable" case, because nothing in an in-memory network can produce one.
+    /// [`I2pListener::accept`] wraps it. Inherent, so it takes precedence at a
+    /// call site: tests read straightforwardly, the engine still goes through
+    /// the trait.
+    ///
+    /// # Errors
+    /// The session was killed or the endpoint is gone.
+    pub fn accept(&self) -> io::Result<(MockStream, DestHash)> {
+        self.incoming
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "mock: session lost"))
+    }
+
     /// A handle for injecting faults from other threads.
     #[must_use]
     pub fn fault_handle(&self) -> FaultHandle {
@@ -295,10 +311,8 @@ impl I2pListener for Endpoint {
         self.dest
     }
 
-    fn accept(&self) -> io::Result<(MockStream, DestHash)> {
-        self.incoming
-            .recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "mock: session lost"))
+    fn accept(&self) -> io::Result<Option<(MockStream, DestHash)>> {
+        Endpoint::accept(self).map(Some)
     }
 }
 

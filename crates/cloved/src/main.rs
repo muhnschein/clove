@@ -156,6 +156,7 @@ fn run() -> Result<(), String> {
         start: Instant::now(),
         sam_address: config.sam_address.clone(),
         token,
+        peer_id: build_peer_id().map_err(|e| e.to_string())?,
         registry: Mutex::new(registry),
         router: Mutex::new("connecting"),
     });
@@ -178,6 +179,8 @@ struct Daemon {
     start: Instant,
     sam_address: String,
     token: String,
+    /// Our wire identity for this run, decided before anything can need it.
+    peer_id: [u8; 20],
     registry: Mutex<Registry<Arc<SamSession>>>,
     /// Router connection state shown in `/v1/status`.
     router: Mutex<&'static str>,
@@ -222,7 +225,11 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str) {
                         }
                         failures = failures.saturating_add(1);
                         *lock(&daemon.router) = "waiting-for-router";
-                        std::thread::sleep(policy.base_delay(failures));
+                        // Jittered, so several daemons on one host (or one
+                        // daemon and one router restart script) do not retry in
+                        // lockstep and hammer the bridge the moment it answers.
+                        let base = policy.base_delay(failures);
+                        std::thread::sleep(policy.jittered(base, random_roll()));
                     }
                 }
             };
@@ -234,7 +241,7 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str) {
             lock(&daemon.registry).attach_network(
                 Arc::clone(&session),
                 Arc::clone(&demux),
-                build_peer_id(),
+                daemon.peer_id,
                 SwarmConfig::default(),
                 session.local_dest_b64().to_owned(),
             );
@@ -369,8 +376,7 @@ where
             peers.extend(response.peers);
         }
     }
-    peers.dedup();
-    for peer in peers {
+    for peer in distinct(peers) {
         let Ok(stream) = i2pnet::I2pDialer::dial(&ctx.dialer, peer, Duration::from_secs(120))
         else {
             continue;
@@ -385,14 +391,48 @@ where
     None
 }
 
+/// A jitter roll in `[0, 1)` for [`ReconnectPolicy::jittered`].
+///
+/// Randomness is the whole point — a fixed roll de-synchronises nothing — but a
+/// system that will not give us any is not a reason to stop reconnecting, so the
+/// fallback is "no jitter" rather than an error.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "53 bits into an f64 mantissa is exact"
+)]
+fn random_roll() -> f64 {
+    let mut bytes = [0u8; 8];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        return 0.0;
+    }
+    let mantissa = u64::from_le_bytes(bytes) >> 11; // 53 bits
+    mantissa as f64 / (1u64 << 53) as f64
+}
+
+/// Distinct destinations, in no particular order.
+///
+/// `Vec::dedup` only removes *neighbouring* duplicates, so the same peer
+/// arriving from two trackers survives it and gets dialled twice.
+fn distinct(mut peers: Vec<DestHash>) -> Vec<DestHash> {
+    peers.sort_unstable_by_key(|d| d.0);
+    peers.dedup();
+    peers
+}
+
 /// The daemon's wire identity: the Q7 `-CV0001-` prefix plus 12 random bytes.
-fn build_peer_id() -> [u8; 20] {
+///
+/// # Errors
+///
+/// The system refused to give us randomness. Fatal on purpose: the fallback
+/// used to be a fixed string, which would have every instance that hit it
+/// announcing under one peer id.
+fn build_peer_id() -> std::io::Result<[u8; 20]> {
     let mut id = *b"-CV0001-............";
     let mut tail = [0u8; 12];
-    if getrandom::getrandom(&mut tail).is_ok() {
-        id[8..].copy_from_slice(&tail);
-    }
-    id
+    getrandom::getrandom(&mut tail)
+        .map_err(|e| std::io::Error::other(format!("getrandom for the peer id: {e}")))?;
+    id[8..].copy_from_slice(&tail);
+    Ok(id)
 }
 
 /// Accept loop: one thread per connection (Q5; API load is tiny). Only a fatal
@@ -796,6 +836,7 @@ mod tests {
             start: Instant::now(),
             sam_address: "127.0.0.1:7656".to_owned(),
             token: TOKEN.to_owned(),
+            peer_id: *b"-CV0001-testtesttes\0",
             registry: Mutex::new(Registry::open(&dir.0).expect("registry")),
             router: Mutex::new("connecting"),
         })
@@ -1104,6 +1145,60 @@ mod tests {
     }
 
     #[test]
+    fn peer_lists_are_deduplicated_however_they_arrive() {
+        let a = DestHash([1; 32]);
+        let b = DestHash([2; 32]);
+        let c = DestHash([3; 32]);
+        // Interleaved duplicates — two trackers returning overlapping sets —
+        // which a neighbour-only dedup leaves in place.
+        let got = distinct(vec![a, b, a, c, b, a]);
+        assert_eq!(got.len(), 3);
+        for want in [a, b, c] {
+            assert!(got.contains(&want));
+        }
+        assert!(distinct(Vec::new()).is_empty());
+        assert_eq!(distinct(vec![a, a, a]).len(), 1);
+    }
+
+    #[test]
+    fn the_jitter_roll_is_in_range_and_moves() {
+        let rolls: Vec<f64> = (0..64).map(|_| random_roll()).collect();
+        for roll in &rolls {
+            assert!(
+                (0.0..1.0).contains(roll),
+                "{roll} is outside the [0,1) a jitter roll must be in"
+            );
+        }
+        // Not a constant: a fixed roll de-synchronises nothing, which is the
+        // entire reason jitter exists. Bit-inequality is the claim here, not
+        // numeric closeness, so an epsilon comparison would be the wrong test.
+        assert!(
+            rolls
+                .windows(2)
+                .any(|pair| pair[0].to_bits() != pair[1].to_bits()),
+            "every roll was identical"
+        );
+        // And it must actually shorten a delay when applied.
+        let policy = ReconnectPolicy::default();
+        let base = policy.base_delay(5);
+        assert!(policy.jittered(base, 1.0) < base);
+    }
+
+    #[test]
+    fn the_peer_id_is_random_and_labelled() {
+        let a = build_peer_id().expect("peer id");
+        let b = build_peer_id().expect("peer id");
+        assert!(a.starts_with(b"-CV0001-"), "Q7 prefix missing");
+        assert_ne!(
+            a, b,
+            "two peer ids were identical: the random tail is not random"
+        );
+        // The old fallback shipped this when getrandom failed; every instance
+        // that hit it would announce under one identity.
+        assert_ne!(a, *b"-CV0001-............");
+    }
+
+    #[test]
     fn boolean_bodies_are_strict() {
         assert_eq!(parse_bool_body(b"true"), Some(true));
         assert_eq!(parse_bool_body(b"false"), Some(false));
@@ -1154,6 +1249,7 @@ mod tests {
             start: Instant::now(),
             sam_address: "127.0.0.1:7656".to_owned(),
             token: String::new(),
+            peer_id: *b"-CV0001-testtesttes\0",
             registry: Mutex::new(Registry::open(&dir.0).expect("registry")),
             router: Mutex::new("connecting"),
         });

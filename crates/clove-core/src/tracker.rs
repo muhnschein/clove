@@ -108,6 +108,13 @@ fn split_url(url: &str) -> Option<AnnounceUrl<'_>> {
 ///
 /// The URL is not a parseable `http://…i2p/…` announce URL.
 pub fn build_announce(url: &str, params: &AnnounceParams) -> Result<(String, Vec<u8>), Error> {
+    // Second line of defence behind `metainfo`'s filter, and the reason the two
+    // agree exactly: a URL that reaches here from anywhere else (a resume file
+    // written by an older clove, an operator's edit) is refused rather than
+    // handed to a naming lookup.
+    if !crate::metainfo::is_i2p_tracker(url) {
+        return Err(Error::BadUrl);
+    }
     let parsed = split_url(url).ok_or(Error::BadUrl)?;
     // Preserve any query already in the announce path (e.g. postman's
     // /announce.php?...), then append ours with the right separator.
@@ -235,6 +242,8 @@ pub struct AnnounceState {
     next_due: u64,
     /// Whether the initial `started` announce has been sent.
     started: bool,
+    /// Whether `completed` has already been reported to this tracker.
+    completed: bool,
     /// Consecutive failures, for backoff.
     failures: u32,
     /// Backoff ceiling (secs).
@@ -246,6 +255,7 @@ impl Default for AnnounceState {
         AnnounceState {
             next_due: 0,
             started: false,
+            completed: false,
             failures: 0,
             max_backoff: 30 * 60,
         }
@@ -278,21 +288,33 @@ impl AnnounceState {
 
     /// The event the next announce should carry, given whether the torrent
     /// is now complete.
+    ///
+    /// `completed` is reported once. It is an event, not a state: a tracker
+    /// counts a snatch every time it sees one, so repeating it on every
+    /// periodic announce while seeding inflates the tracker's numbers for as
+    /// long as the torrent is up.
     #[must_use]
     pub fn next_event(&self, complete: bool) -> Event {
         if !self.started {
             Event::Started
-        } else if complete {
+        } else if complete && !self.completed {
             Event::Completed
         } else {
             Event::Periodic
         }
     }
 
-    /// Record a successful announce: schedule the next at `now + interval`
-    /// (floored at [`MIN_ANNOUNCE_INTERVAL`]) and clear the backoff.
-    pub fn on_success(&mut self, now: u64, interval: u32) {
+    /// Record a successful announce of `sent`: schedule the next at
+    /// `now + interval` (floored at [`MIN_ANNOUNCE_INTERVAL`]) and clear the
+    /// backoff.
+    ///
+    /// The event is a parameter because the state machine has to know what
+    /// actually went out — that is how `completed` stops being sent again.
+    pub fn on_success(&mut self, now: u64, interval: u32, sent: Event) {
         self.started = true;
+        if sent == Event::Completed {
+            self.completed = true;
+        }
         self.failures = 0;
         let floor = MIN_ANNOUNCE_INTERVAL.as_secs();
         self.next_due = now.saturating_add(u64::from(interval).max(floor));
@@ -471,16 +493,71 @@ mod tests {
         assert_eq!(st.next_event(false), Event::Started);
 
         // Success at t=0 with a 1800s interval -> next due at 1800.
-        st.on_success(0, 1800);
+        st.on_success(0, 1800, Event::Started);
         assert!(!st.due(1799));
         assert!(st.due(1800));
         assert_eq!(st.next_event(false), Event::Periodic);
         assert_eq!(st.next_event(true), Event::Completed);
 
         // A tiny interval is floored to MIN_ANNOUNCE_INTERVAL.
-        st.on_success(2000, 5);
+        st.on_success(2000, 5, Event::Periodic);
         assert!(!st.due(2000 + 59));
         assert!(st.due(2000 + 60));
+    }
+
+    #[test]
+    fn completed_is_reported_once_and_only_once() {
+        // A tracker counts a snatch per `completed` event, so a seeding torrent
+        // that reports it on every periodic announce inflates the count for as
+        // long as it stays up.
+        let mut st = AnnounceState::new();
+        assert_eq!(st.next_event(false), Event::Started);
+        st.on_success(0, 60, Event::Started);
+
+        assert_eq!(st.next_event(true), Event::Completed);
+        st.on_success(60, 60, Event::Completed);
+        assert_eq!(
+            st.next_event(true),
+            Event::Periodic,
+            "completed was reported twice"
+        );
+        st.on_success(120, 60, Event::Periodic);
+        assert_eq!(st.next_event(true), Event::Periodic);
+
+        // A torrent that completes later still gets its one report.
+        let mut later = AnnounceState::new();
+        later.on_success(0, 60, Event::Started);
+        assert_eq!(later.next_event(false), Event::Periodic);
+        later.on_success(60, 60, Event::Periodic);
+        assert_eq!(later.next_event(true), Event::Completed);
+    }
+
+    #[test]
+    fn build_announce_refuses_what_the_filter_drops() {
+        // The property that keeps the two in step: anything metainfo keeps,
+        // the announcer can build; anything it drops, the announcer refuses.
+        for url in [
+            "http://tracker.postman.i2p/announce.php",
+            "http://opentracker.dg2.i2p:80/announce",
+            "http://x.b32.i2p/a?x=1",
+        ] {
+            assert!(crate::metainfo::is_i2p_tracker(url), "{url}");
+            build_announce(url, &params()).expect(url);
+        }
+        for url in [
+            "https://tracker.example.i2p/announce",
+            "http://tracker.example.org/announce",
+            "udp://tracker.example.i2p/announce",
+            "http://1.2.3.4:6969/announce",
+            "http://evil@host.i2p/announce",
+            "not a url",
+        ] {
+            assert!(!crate::metainfo::is_i2p_tracker(url), "{url}");
+            assert!(
+                matches!(build_announce(url, &params()), Err(Error::BadUrl)),
+                "{url} was built into an announce"
+            );
+        }
     }
 
     #[test]
