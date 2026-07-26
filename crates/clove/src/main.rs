@@ -51,6 +51,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Fail> {
     let mut socket: Option<PathBuf> = None;
+    let mut config_path: Option<PathBuf> = None;
     let mut json = false;
     let mut command: Option<String> = None;
     let mut operands: Vec<String> = Vec::new();
@@ -64,6 +65,12 @@ fn run() -> Result<(), Fail> {
                     .ok_or_else(|| Fail::Usage("--socket needs a path".to_owned()))?;
                 socket = Some(PathBuf::from(path));
             }
+            "-c" | "--config" => {
+                let path = args
+                    .next()
+                    .ok_or_else(|| Fail::Usage(format!("{arg} needs a path")))?;
+                config_path = Some(PathBuf::from(path));
+            }
             "--json" => json = true,
             "-h" | "--help" => {
                 print_help();
@@ -76,20 +83,24 @@ fn run() -> Result<(), Fail> {
         }
     }
 
+    let where_ = Where {
+        socket,
+        config: config_path,
+    };
     match command.as_deref() {
-        Some("status") => cmd_status(socket, json),
-        Some("list") => cmd_list(socket, json),
-        Some("watch") => cmd_watch(socket, &operands),
-        Some("add") => cmd_add(socket, &operands),
-        Some("remove") => cmd_remove(socket, &operands),
-        Some("show") => cmd_show(socket, json, &operands),
-        Some("pause") => cmd_action(socket, &operands, "pause", "paused"),
-        Some("resume") => cmd_action(socket, &operands, "resume", "resumed"),
-        Some("verify") => cmd_verify(socket, &operands),
-        Some("peer") => cmd_peer(socket, &operands),
-        Some("priorities") => cmd_priorities(socket, &operands),
-        Some("announce") => cmd_action(socket, &operands, "announce", "announcing"),
-        Some("sequential") => cmd_sequential(socket, &operands),
+        Some("status") => cmd_status(&where_, json),
+        Some("list") => cmd_list(&where_, json),
+        Some("watch") => cmd_watch(&where_, &operands),
+        Some("add") => cmd_add(&where_, &operands),
+        Some("remove") => cmd_remove(&where_, &operands),
+        Some("show") => cmd_show(&where_, json, &operands),
+        Some("pause") => cmd_action(&where_, &operands, "pause", "paused"),
+        Some("resume") => cmd_action(&where_, &operands, "resume", "resumed"),
+        Some("verify") => cmd_verify(&where_, &operands),
+        Some("peer") => cmd_peer(&where_, &operands),
+        Some("priorities") => cmd_priorities(&where_, &operands),
+        Some("announce") => cmd_action(&where_, &operands, "announce", "announcing"),
+        Some("sequential") => cmd_sequential(&where_, &operands),
         Some("completions") => cmd_completions(&operands),
         Some(other) => Err(Fail::Usage(format!(
             "unknown command {other:?} (try --help)"
@@ -98,8 +109,18 @@ fn run() -> Result<(), Fail> {
     }
 }
 
+/// Where to find the daemon: the overrides from the command line, before the
+/// configuration they fall back to has been read.
+struct Where {
+    /// `--socket`, if given.
+    socket: Option<PathBuf>,
+    /// `-c`/`--config`, if given.
+    config: Option<PathBuf>,
+}
+
 fn print_help() {
-    println!("usage: clove [--socket <path>] <command>");
+    println!("usage: clove [-c <config>] [--socket <path>] <command>");
+    println!("  -c, --config <path>            read this configuration instead of the default");
     println!("commands:");
     println!("  status [--json]                daemon and router status");
     println!("  list [--json]                  hosted torrents");
@@ -126,8 +147,8 @@ fn one_info_hash(operands: &[String]) -> Result<&str, Fail> {
     }
 }
 
-fn cmd_status(socket: Option<PathBuf>, json: bool) -> Result<(), Fail> {
-    let (socket, token) = resolve(socket)?;
+fn cmd_status(where_: &Where, json: bool) -> Result<(), Fail> {
+    let (socket, token) = resolve(where_)?;
     let body = request(&socket, &token, "GET", "/v1/status", &[])?;
     if json {
         println!("{}", String::from_utf8_lossy(&body).trim_end());
@@ -137,8 +158,8 @@ fn cmd_status(socket: Option<PathBuf>, json: bool) -> Result<(), Fail> {
     Ok(())
 }
 
-fn cmd_list(socket: Option<PathBuf>, json: bool) -> Result<(), Fail> {
-    let (socket, token) = resolve(socket)?;
+fn cmd_list(where_: &Where, json: bool) -> Result<(), Fail> {
+    let (socket, token) = resolve(where_)?;
     let body = request(&socket, &token, "GET", "/v1/torrents", &[])?;
     if json {
         println!("{}", String::from_utf8_lossy(&body).trim_end());
@@ -161,7 +182,7 @@ const WATCH_MAX_SECS: u64 = 3600;
 /// two ANSI escapes (erase display, cursor home) and the existing renderers.
 /// The terminal stays in its normal mode throughout, so Ctrl-C at any moment
 /// leaves a sane terminal with nothing to restore.
-fn cmd_watch(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
+fn cmd_watch(where_: &Where, operands: &[String]) -> Result<(), Fail> {
     let mut interval = WATCH_DEFAULT_SECS;
     let mut args = operands.iter();
     while let Some(arg) = args.next() {
@@ -182,7 +203,7 @@ fn cmd_watch(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
         }
     }
 
-    let (socket, token) = resolve(socket)?;
+    let (socket, token) = resolve(where_)?;
     loop {
         let frame = watch_frame(&socket, &token, interval)?;
         // Erase the display and park the cursor at the top-left, then draw.
@@ -235,11 +256,11 @@ fn human_duration(secs: u64) -> String {
     }
 }
 
-fn cmd_add(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
+fn cmd_add(where_: &Where, operands: &[String]) -> Result<(), Fail> {
     let target = operands
         .first()
         .ok_or_else(|| Fail::Usage("add needs a .torrent file or magnet link".to_owned()))?;
-    let (socket, token) = resolve(socket)?;
+    let (socket, token) = resolve(where_)?;
     let body = if target.starts_with("magnet:") {
         target.clone().into_bytes()
     } else {
@@ -254,7 +275,7 @@ fn cmd_add(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
     Ok(())
 }
 
-fn cmd_remove(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
+fn cmd_remove(where_: &Where, operands: &[String]) -> Result<(), Fail> {
     let mut info_hash: Option<&str> = None;
     let mut delete_data = false;
     for op in operands {
@@ -265,7 +286,7 @@ fn cmd_remove(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> 
         }
     }
     let info_hash = info_hash.ok_or_else(|| Fail::Usage("remove needs an info-hash".to_owned()))?;
-    let (socket, token) = resolve(socket)?;
+    let (socket, token) = resolve(where_)?;
     let target = if delete_data {
         format!("/v1/torrents/{info_hash}?data=1")
     } else {
@@ -276,9 +297,9 @@ fn cmd_remove(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> 
     Ok(())
 }
 
-fn cmd_show(socket: Option<PathBuf>, json: bool, operands: &[String]) -> Result<(), Fail> {
+fn cmd_show(where_: &Where, json: bool, operands: &[String]) -> Result<(), Fail> {
     let info_hash = one_info_hash(operands)?;
-    let (socket, token) = resolve(socket)?;
+    let (socket, token) = resolve(where_)?;
     let body = request(
         &socket,
         &token,
@@ -295,14 +316,9 @@ fn cmd_show(socket: Option<PathBuf>, json: bool, operands: &[String]) -> Result<
 }
 
 /// A `POST /v1/torrents/{ih}/{action}` with no body; prints `<done> <ih>`.
-fn cmd_action(
-    socket: Option<PathBuf>,
-    operands: &[String],
-    action: &str,
-    done: &str,
-) -> Result<(), Fail> {
+fn cmd_action(where_: &Where, operands: &[String], action: &str, done: &str) -> Result<(), Fail> {
     let info_hash = one_info_hash(operands)?;
-    let (socket, token) = resolve(socket)?;
+    let (socket, token) = resolve(where_)?;
     request(
         &socket,
         &token,
@@ -314,9 +330,9 @@ fn cmd_action(
     Ok(())
 }
 
-fn cmd_verify(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
+fn cmd_verify(where_: &Where, operands: &[String]) -> Result<(), Fail> {
     let info_hash = one_info_hash(operands)?;
-    let (socket, token) = resolve(socket)?;
+    let (socket, token) = resolve(where_)?;
     let reply = request(
         &socket,
         &token,
@@ -332,13 +348,13 @@ fn cmd_verify(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> 
     Ok(())
 }
 
-fn cmd_peer(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
+fn cmd_peer(where_: &Where, operands: &[String]) -> Result<(), Fail> {
     let [info_hash, addr] = operands else {
         return Err(Fail::Usage(
             "peer needs <info-hash> and a b32 address".to_owned(),
         ));
     };
-    let (socket, token) = resolve(socket)?;
+    let (socket, token) = resolve(where_)?;
     request(
         &socket,
         &token,
@@ -350,13 +366,13 @@ fn cmd_peer(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
     Ok(())
 }
 
-fn cmd_priorities(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
+fn cmd_priorities(where_: &Where, operands: &[String]) -> Result<(), Fail> {
     let [info_hash, spec] = operands else {
         return Err(Fail::Usage(
             "priorities needs <info-hash> and a spec like 1,0,2".to_owned(),
         ));
     };
-    let (socket, token) = resolve(socket)?;
+    let (socket, token) = resolve(where_)?;
     request(
         &socket,
         &token,
@@ -368,7 +384,7 @@ fn cmd_priorities(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fa
     Ok(())
 }
 
-fn cmd_sequential(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fail> {
+fn cmd_sequential(where_: &Where, operands: &[String]) -> Result<(), Fail> {
     let [info_hash, setting] = operands else {
         return Err(Fail::Usage(
             "sequential needs <info-hash> and on or off".to_owned(),
@@ -381,7 +397,7 @@ fn cmd_sequential(socket: Option<PathBuf>, operands: &[String]) -> Result<(), Fa
             return Err(Fail::Usage(format!("expected on or off, got {other:?}")));
         }
     };
-    let (socket, token) = resolve(socket)?;
+    let (socket, token) = resolve(where_)?;
     request(
         &socket,
         &token,
@@ -606,12 +622,26 @@ fn human_size(bytes: u64) -> String {
     format!("{size:.1} {}", UNITS[unit])
 }
 
-/// Resolve the API socket path and token: an explicit `--socket` wins,
-/// otherwise the config default. The token always comes from the data dir.
-fn resolve(socket: Option<PathBuf>) -> Result<(PathBuf, String), Fail> {
+/// Resolve the API socket path and token from the same configuration the daemon
+/// uses, which is what `clove(1)` promises: an explicit `--socket` wins,
+/// otherwise `api_socket`; the token comes from `data_dir`.
+///
+/// Reading the config file is the point. Parsing an empty one instead — as this
+/// used to — means a `data_dir` or `api_socket` set in `clove.conf` is invisible
+/// here, and every command fails looking for a token in a directory the daemon
+/// does not use.
+fn resolve(where_: &Where) -> Result<(PathBuf, String), Fail> {
     let defaults = Defaults::from_env().map_err(|e| Fail::Failed(e.to_string()))?;
-    let config = Config::parse("", &defaults).map_err(|e| Fail::Failed(e.to_string()))?;
-    let socket = socket.unwrap_or(config.api_socket);
+    // An explicit -c must exist; the default path may simply be absent, in
+    // which case the built-in defaults are the whole configuration. Same rule
+    // as cloved, so the two agree on what "no config" means.
+    let text = match &where_.config {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| Fail::Usage(format!("reading {}: {e}", path.display())))?,
+        None => std::fs::read_to_string(defaults.config_path()).unwrap_or_default(),
+    };
+    let config = Config::parse(&text, &defaults).map_err(|e| Fail::Failed(e.to_string()))?;
+    let socket = where_.socket.clone().unwrap_or(config.api_socket);
     let token_path = config.data_dir.join("token");
     let token = std::fs::read_to_string(&token_path)
         .map_err(|e| {
@@ -848,6 +878,59 @@ mod tests {
         // Not UTF-8.
         assert!(matches!(parse_body(&[0xFF, 0xFE]), Err(Fail::Failed(_))));
         assert!(matches!(parse_body(b""), Err(Fail::Failed(_))));
+    }
+
+    #[test]
+    fn configuration_decides_where_the_daemon_is() {
+        // The regression this pins: `resolve` used to parse an empty config, so
+        // a data_dir or api_socket in clove.conf was invisible to the CLI and
+        // every command went looking for a token in the wrong directory.
+        let dir = std::env::temp_dir().join(format!("clove-cli-conf-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let data = dir.join("state");
+        std::fs::create_dir_all(&data).expect("data dir");
+        std::fs::write(data.join("token"), "a".repeat(64)).expect("token");
+        let conf = dir.join("clove.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "data_dir {}\napi_socket {}\n",
+                data.display(),
+                dir.join("sock").display()
+            ),
+        )
+        .expect("conf");
+
+        let where_ = Where {
+            socket: None,
+            config: Some(conf.clone()),
+        };
+        let (socket, token) = resolve(&where_).expect("resolve from the config file");
+        assert_eq!(socket, dir.join("sock"), "api_socket was ignored");
+        assert_eq!(
+            token,
+            "a".repeat(64),
+            "the token came from the wrong data_dir"
+        );
+
+        // --socket still wins over the file, and only over the socket.
+        let override_ = Where {
+            socket: Some(PathBuf::from("/tmp/other.sock")),
+            config: Some(conf.clone()),
+        };
+        let (socket, token) = resolve(&override_).expect("resolve with an override");
+        assert_eq!(socket, PathBuf::from("/tmp/other.sock"));
+        assert_eq!(token, "a".repeat(64));
+
+        // A -c path that does not exist is a usage error, not a silent fallback
+        // to the defaults — the same rule cloved follows.
+        let missing = Where {
+            socket: None,
+            config: Some(dir.join("nope.conf")),
+        };
+        assert!(matches!(resolve(&missing), Err(Fail::Usage(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -270,7 +270,10 @@ fn echo_server(listener: &SamListener, n: usize, stop: &AtomicBool) {
     let mut accepted = 0usize;
     while accepted < n && !stop.load(Ordering::Relaxed) {
         match listener.accept() {
-            Ok((stream, _from)) => {
+            // A connection that never sent its destination header is not an
+            // inbound stream; keep waiting for one that is.
+            Ok(None) => {}
+            Ok(Some((stream, _from))) => {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }

@@ -11,10 +11,23 @@ were reproduced before anything was changed.
 Severity is about the consequence for a user running the daemon, not about how
 hard the bug was to find.
 
-**Status.** The three critical findings are fixed on this branch, each with the
-test that catches it — every one of those tests fails on the tree as reviewed
-and passes after the fix (checked both ways, in debug and release). Findings 4
-onwards are open; the notes below stand as written.
+**Status.** Everything here is fixed on this branch except two items, each with
+the test that catches it. Every one of those tests was checked both ways — it
+fails on the tree as reviewed and passes after the fix — in debug and in release.
+
+Left undone, deliberately:
+
+- **Finding 21** (whole-torrent hashing under the registry mutex). Fixing it
+  means verification moves off the request path, which needs progress
+  reporting, cancellation and a new torrent state. That is a feature with a
+  design to agree on, not a bug fix, and doing it badly would be worse than the
+  blocking `verify` it replaces.
+- **Half of finding 9** (a read timeout on established peer connections). The
+  handshake read is bounded now and the thread count is capped, but a blanket
+  read timeout on a peer stream would disconnect healthy peers: BitTorrent
+  peers legitimately sit quiet for minutes, and tolerating that needs the
+  keep-alive machinery R5 describes. A naive timeout here would trade a slow
+  leak for dropped connections.
 
 ---
 
@@ -192,11 +205,18 @@ build `availability[i] += 1` is an overflow panic waiting on a long-lived
 connection. The debug invariant net does not cover availability, which is why it
 stays silent here.
 
-**Fix sketch.** Only count when the bit actually changes (`if !peer.has.has(p)`);
-on a second bitfield/have-all, `remove_bitfield(&old)` first, or — per BEP 3 —
-reject a second piece-set message and drop the peer. Add the missing cross-check
-to `debug_check_state`: availability must equal the column sums of the peers'
-bitfields.
+**Fixed.** A `have` counts only when the bit actually changes, and every
+piece-set message (`bitfield`, `have-all`, `have-none`) now goes through one
+`replace_piece_set` that withdraws the old set before adding the new one.
+`have-none` also re-checks interest, which it never did. The missing cross-check
+is in `debug_check_state`: availability must equal, piece by piece, the number of
+connected peers holding it.
+
+Test: `evil_peer::re_announcing_a_piece_set_does_not_distort_availability` — every
+way to re-announce, then availability asserted while the peer is attached and
+again after it leaves. `Torrent::availability` is now public, which is what makes
+that assertion possible; the debug invariant fires inside the engine's reader
+thread, where no test can see it.
 
 ### 5. Duplicate file paths in a `.torrent` alias on disk, and the torrent can never complete
 
@@ -212,9 +232,14 @@ in that state re-downloads the piece forever against every peer it meets.
 The related collision — `["a"]` and `["a", "b"]` — fails loudly instead
 (`create_dir_all` over a regular file), which merely makes the add fail.
 
-**Fix sketch.** Reject duplicate paths, and reject a path that is a strict prefix
-of another, in `parse_files`. Both are cheap set checks on data that is already
-collected there.
+**Fixed.** `parse_files` sorts the paths and rejects both cases in one scan of
+neighbours (if one path is a prefix of another, everything sorting between them
+shares that prefix, so a collision always lands in an adjacent pair).
+
+Tests: `metainfo::rejects_colliding_file_paths` covers duplicates, shadowing in
+both orders, and the legal cases that merely share a prefix. The invariant is
+also asserted in the hostile sweep and the `metainfo` fuzz target, so no future
+parser change can reintroduce it quietly.
 
 ### 6. `fetch_metadata` has no bound on frames, pieces, or time
 
@@ -229,8 +254,14 @@ Because `try_fetch_round` walks candidate peers sequentially, one such peer in a
 tracker's reply pins a daemon thread and prevents that magnet from ever
 resolving.
 
-**Fix sketch.** Cap total frames and wall-clock time for the exchange, re-request
-only `asm.missing()` after a timeout, and fail the peer rather than the round.
+**Fixed.** The exchange carries a frame budget (a few per metadata piece plus
+slack) and a two-minute deadline; exceeding either fails the peer rather than the
+round. Re-requesting only the missing pieces would need a read timeout the SAM
+stream cannot provide, so the bound is what closes this.
+
+Test: `torrent::metadata_fetch_gives_up_on_a_peer_that_never_finishes` — a peer
+that advertises a three-piece metadata and then answers forever with a piece of
+the wrong length.
 
 ### 7. `known_peers` is unbounded, and our own PEX messages exceed our own PEX limit
 
@@ -246,10 +277,14 @@ Two halves of the same oversight:
   busy torrents where it matters — a decoder refusing what its own encoder
   produces, which is the discipline `docs/STATE-FORMAT.md` argues for elsewhere.
 
-**Fix sketch.** Bound `known_peers` (a capped set with eviction), and chunk or
-sample outgoing PEX so a message is always under the limit. A `PexMessage`
-round-trip property test would have caught the second half (see
-[testing](#testing-regime), item H).
+**Fixed.** `known_peers` is capped at `MAX_KNOWN_PEERS` (new destinations are
+refused past it, which keeps the peers we learned first — including everyone we
+are connected to), and `send_pex` takes at most `MAX_PEX_PEERS` destinations, so
+a message we send always parses under the parser we enforce on others.
+
+Test: `evil_peer::peer_exchange_stays_within_the_limit_it_enforces` seeds 4000
+peers, then requires the PEX message we emit to parse under our own
+`PexMessage::parse` and the known-peer set to stay bounded.
 
 ### 8. One bad forwarded connection kills the inbound accept loop
 
@@ -268,10 +303,14 @@ accepting inbound peers *at all* until the SAM session is rebuilt (up to the 30 
 health interval plus reconnect backoff). `poke_listener` demonstrates how little
 it takes: connect and close.
 
-**Fix sketch.** Distinguish fatal listener failure from a per-connection one —
-have `accept` return the connection error in a form the loop can `continue` past
-(or move the dest-line read into the per-connection thread, which is where it
-belongs anyway, and where `InboundDemux::route` already reads the BT handshake).
+**Fixed.** `I2pListener::accept` now returns `io::Result<Option<..>>`: `Ok(None)`
+is "that connection was not usable, keep accepting" and `Err` is "the listener is
+finished". Both accept loops act on the difference, and the demux checks its stop
+flag against whatever came back, so teardown's poke still breaks a blocked accept.
+
+Test: `swarm::one_unusable_connection_does_not_end_the_accept_loop` puts a
+listener that reports three duds in front of a real one and requires the download
+to complete anyway.
 
 ### 9. No timeouts on peer streams; a thread per inbound connection, unbounded
 
@@ -294,9 +333,17 @@ Related: `Torrent::threads` is push-only — two `JoinHandle`s per attach, never
 joined or reaped — so peer churn grows it without bound even after the threads
 exit.
 
-**Fix sketch.** Call `set_timeouts` on accepted streams; bound the number of
-in-flight `route` threads; land the R5 keep-alive/idle timeout; reap finished
-handles (or stop storing them and track liveness in the peer table).
+**Partly fixed.** `I2pStream` grew a best-effort `set_timeouts`, and
+`InboundDemux::route` bounds the wait for a peer's *first* bytes with it before
+restoring blocking behaviour for the connection proper. Connections waiting on a
+handshake are capped at `MAX_PENDING_HANDSHAKES`, released by a guard that
+survives a panic, and `Torrent::attach` reaps the handles of peers that have
+already finished.
+
+The idle timeout on an established peer connection is *not* done — see the status
+note at the top: it needs keep-alives (R5) to avoid dropping healthy peers.
+
+Test: `swarm::a_flood_of_silent_connections_does_not_wedge_the_demux`.
 
 ### 10. The CLI ignores `clove.conf`
 
@@ -317,8 +364,14 @@ all, and there is no flag to point it at one (`--socket` covers only half the
 problem). XDG environment variables still work, which is why `ci/smoke.sh` does
 not notice.
 
-**Fix sketch.** Read the same config path the daemon defaults to, and add
-`-c/--config` to the CLI.
+**Fixed.** `clove` reads the same configuration file `cloved` does, by the same
+rule (an explicit `-c` must exist; the default path may be absent), and grew
+`-c`/`--config` to say which one. `--socket` still overrides the socket alone.
+
+Tests: `clove::configuration_decides_where_the_daemon_is` for the resolution
+rules, and a new `ci/smoke.sh` section that starts a daemon on a configured
+`data_dir`/`api_socket` and drives the CLI at it — the coverage whose absence let
+this survive, since everything else in the smoke test runs on the XDG defaults.
 
 ---
 
@@ -330,6 +383,7 @@ not notice.
     reports `completed` on every periodic announce, inflating tracker snatch
     counters. Latch it in `on_success`.
 
+    → **Fixed**: `completed` is latched in `AnnounceState`, which now takes the event that was sent. Test: `tracker::completed_is_reported_once_and_only_once`.
 12. **`https://` trackers are kept at parse time and then always fail.**
     `metainfo::is_i2p_tracker` accepts `http://` and `https://`;
     `tracker::split_url` strips only `http://`. An https announce URL therefore
@@ -338,57 +392,68 @@ not notice.
     Also, `build_announce` does not re-check `.i2p`, so it is not a second line
     of defence for a URL that arrives from somewhere other than `metainfo`.
 
+    → **Fixed**: `is_i2p_tracker` no longer accepts `https://` (clove has no TLS stack to speak it with, so such a URL is dropped and counted like any other tracker we cannot talk to), and `build_announce` refuses anything the filter would have dropped. Test: `tracker::build_announce_refuses_what_the_filter_drops`, which asserts the two agree in both directions.
 13. **`left` is under-reported.** `announce_once` computes
     `have.count() * piece_length`, which over-counts a held short final piece and
     so under-reports `left` whenever the last piece is present and others are
     missing. Use the real byte count.
 
+    → **Fixed**: `bytes_present` sums the real length of each held piece. Test: `swarm::bytes_present_counts_a_short_last_piece_as_short`.
 14. **`serve_request` does not bound a request to its piece.** It checks
     `length > BLOCK_LEN` and `picker.has(req.index)` but not
     `begin + length <= piece_len(index)`, so a peer can read across into the next
     piece — bytes we have not verified, possibly not downloaded — labelled as
     part of a piece we hold. `read_block` only bounds against the whole torrent.
 
+    → **Fixed**: a request must lie inside the piece it names, and a zero-length one is refused. Test: `evil_peer::a_request_may_not_reach_past_its_piece`.
 15. **The choker never rotates.** `run_choker` is called only from the
     `Interested`/`NotInterested` arms; there is no periodic round. So
     `Choker::plan`'s round counter — and therefore the optimistic-unchoke slot
     the module is built around, and its tests exercise — effectively never
     advances in production.
 
+    → **Fixed**: a round runs when one is due, driven off message traffic rather than a new timer thread (with no traffic there is nothing to reconsider). `Torrent::set_choke_interval` makes the cadence tunable (R5) and testable. Test: `evil_peer::every_interested_peer_eventually_gets_a_turn`, with six interested peers and four slots.
 16. **`registry::load_one` does not cross-check the resume piece count.** It
     verifies `resume.info_hash == meta.info_hash` but not
     `resume.num_pieces == meta.pieces.len()`, so a stale resume file yields a
     `Hosted.have` of a different length than the torrent (wrong `progress`,
     wrong `state`) until the next refresh overwrites it.
 
+    → **Fixed**: the piece count is checked alongside the info-hash, and a mismatch skips the entry with a message naming both numbers. Test: `registry::a_resume_file_for_a_different_torrent_is_skipped`.
 17. **`try_fetch_round` calls `peers.dedup()` on an unsorted vector**, which
     removes only *consecutive* duplicates. Sort first or use a set.
 
+    → **Fixed**: a `distinct` helper sorts before deduplicating. Test: `cloved::peer_lists_are_deduplicated_however_they_arrive`.
 18. **`build_peer_id` fails silently.** If `getrandom` fails, the peer id is the
     literal `-CV0001-............` — identical across every instance that hits
     that path. Prefer failing loudly to shipping a shared identity.
 
+    → **Fixed**: the peer id is generated once at startup and a failure is fatal, so no instance can ship the placeholder. Test: `cloved::the_peer_id_is_random_and_labelled`.
 19. **`atomic_write` does not fsync the directory.** temp + fsync + rename makes
     the write atomic against a process crash, which is what `ci/chaos.sh` tests,
     but not durable against power loss — the rename can be lost, taking the file
     with it. The module doc's "a crash mid-write never corrupts them" is true
     only for the tested case.
 
+    → **Fixed**: the containing directory is fsynced after the rename, best-effort.
 20. **`i2p_base64_decode`'s doc contract is wrong.** It claims to return `None`
     "on a truncated final group"; it does not (`"A"` yields `Some(vec![])`).
     Callers happen to check for emptiness, so nothing is broken today, and the
     asymmetry with `base32_decode` — which *is* strict about spare bits, for
     good reasons spelled out in its doc — is worth closing.
 
+    → **Fixed**: a dangling final symbol and non-zero spare bits are both refused, matching `base32_decode`'s rule and its documented reasoning. Test: `addr::i2p_base64_refuses_what_it_cannot_have_encoded`.
 21. **Whole-torrent hashing runs under the single registry mutex.**
     `add_torrent` calls `verify_all`, and `POST /v1/torrents/<ih>/verify` does the
     same, both holding `daemon.registry`. On a large torrent with data present,
     every other API request and the persist loop block for the duration.
 
+    → **Not fixed**, deliberately: see the status note at the top.
 22. **`Storage::read_block` allocates before validating.** `vec![0u8; len as
     usize]` precedes the range check in `for_each_segment`. All current callers
     bound `len`, so this is defence-in-depth, not a live bug.
 
+    → **Fixed**: the range is checked before the buffer is allocated. Test: `storage::an_absurd_read_length_is_refused_before_it_is_allocated`.
 23. **`supervisor::Supervisor` is dead code.** The tested state machine — backoff,
     jitter, `Phase`, `report_lost` — is not what runs: `spawn_sam_supervisor`
     reimplements the loop by hand and never applies jitter at all, so the
@@ -396,6 +461,7 @@ not notice.
     or delete it (the culture-of-deletion rule in SCOPE §9 would say the latter,
     if the hand-rolled loop is the one that stays).
 
+    → **Fixed** by deletion, which is where SCOPE §9 pointed: `Supervisor`, `Phase`, `Poll` and `SessionFactory` are gone, `ReconnectPolicy` (tested, and the part the daemon actually calls) stays, and the daemon's loop now applies the jitter it was missing. `jittered` also survives a NaN roll rather than panicking inside `Duration::mul_f64`. Tests: the policy tests in `supervisor`, plus `cloved::the_jitter_roll_is_in_range_and_moves`.
 ---
 
 ## Testing regime
@@ -430,6 +496,31 @@ a torrent that serves and downloads at the same time, which is the state a real
 leecher is in and the one no test covered. What is still missing is the general
 case: N peers, scripted, with the hostile ones interleaved rather than staged.
 
+### A2. Three ways these tests passed for the wrong reason
+
+Worth recording, because each one cost a rewrite and each is a trap this suite
+invites:
+
+- **A debug assertion inside an engine thread is invisible.** The availability
+  invariant fires in the peer's reader thread; that thread dies, the peer is
+  never deregistered, and the test carries on none the wiser. The first version
+  of the availability test passed for exactly this reason. Assertions in engine
+  threads need something observable from outside to go with them — which is why
+  `Torrent::availability` is now public.
+- **A test can win the race against the engine.** Attacking a torrent and then
+  immediately reading its peer table can observe the state *before* the engine's
+  own thread registers the connection, so every subsequent assertion is
+  vacuous — and fast, which is the tell. Hold the connection open and wait for
+  the state you expect before asserting on it.
+- **A hostile peer that gives up at the deadline proves nothing.** The
+  stalled-peer test held its connection for exactly as long as the assertion
+  waited, so dropping it released the stall just in time and the test passed. A
+  hostile fixture has to outlast the thing it is supposed to break.
+
+A shared thread that fails the test when any engine thread panics would close
+the first of these for good. `std::panic::set_hook` plus a flag the fixtures
+assert on at teardown is the cheap version.
+
 ### B. Model-based testing for the pure state machines
 
 `Picker` and `Choker` are pure, deterministic and cheap to drive. A seeded
@@ -447,6 +538,10 @@ Add the invariants that are currently missing rather than wrong:
 - no piece has block progress *or* accepts a block while it is in `have`
   (finding 1 — half of this exists, but only as a panic, not as a guard);
 - the have-set never loses a piece and never gains one that failed verification.
+
+Of the invariants named below, availability-versus-the-peer-table is now in
+`debug_check_state`, and "no piece has progress while it is held" is enforced
+structurally rather than asserted. The random-operation harness is still missing.
 
 ### C. Fuzzing stops at `clove-core`'s parsers
 
@@ -471,6 +566,10 @@ Also worth adding to the fuzz matrix in CI: `pex` and `metadata` are covered by
 the `extensions` target, but neither the `MetadataAssembler` nor
 `magnet::torrent_bytes` → `MetaInfo::parse` round-trip is.
 
+Done so far: the `metainfo` target and the hostile sweep now assert that an
+accepted torrent's file paths are distinct and non-shadowing, which is finding 5
+turned into a property. The three targets above are still to write.
+
 ### D. The mock cannot express the two faults that matter here
 
 `MockNet` models a dead session, a black hole, a manual read stall, and bounded
@@ -484,6 +583,11 @@ buffers. It cannot express:
   optional read timeout and set it in the fixtures; the missing peer-idle timeout
   then shows up as a test failure rather than a design note.
 
+Done so far: nothing. Both of these remain the reason a peer with no read
+timeout (finding 9) and a peer that stops draining (finding 2) had to be
+reproduced by hand, with a small `MockNet::with_capacity` and a peer that
+declines to read, rather than expressed as a fault.
+
 ### E. Nothing tests the token file's failure modes
 
 `the_token_file_is_created_once_and_kept_private` covers the happy path only.
@@ -494,24 +598,35 @@ restarts and asserts an unauthenticated request is still a 401. `ci/chaos.sh`
 starts its kill storm only after the daemon has answered once, so the token
 always exists by then.
 
+Done: four cases over an empty, whitespace-only, truncated, non-hex and
+over-long token file, plus an auth-path test that an empty expected token
+authenticates nobody. The chaos case — SIGKILL during *first* start, before the
+token exists — is still to add; `ci/chaos.sh` starts its kill storm only once the
+daemon has answered, so the token always exists by then.
+
 ### F. Test the supervisor that actually runs
 
 Either `cloved` uses `supervisor::Supervisor` or the module goes (finding 23).
 Whichever way it lands, the reconnect path deserves the treatment
 `hostile_bridge_tests` already gives session *setup*: a fake bridge that accepts,
 serves a session, then dies mid-operation, asserting that the daemon detaches,
-backs off with jitter, re-attaches, and that torrents come back live. Today the
-tested backoff is not the running backoff.
+backs off with jitter, re-attaches, and that torrents come back live.
 
-### G. Nothing starts the daemon with a real config file
+Done: the module went, and the daemon's loop now calls the tested policy —
+including the jitter it never applied. The end-to-end reconnect test above is
+still missing, and it is the one that would cover the loop's own sequencing
+(connect → attach → health-probe → tear down → rebuild), which no unit test
+reaches.
 
-`Config::parse` is well covered as a function, but no test writes a `clove.conf`
-with a non-default `data_dir`/`api_socket`, starts `cloved -c` on it, and drives
-`clove` at it. That is why finding 10 survives: the smoke test uses XDG
-environment variables, which both binaries honour. One extra smoke section closes
-it.
+### G. Nothing starts the daemon with a real config file *(done)*
 
-### H. Cheap properties that would each have caught a finding here
+`Config::parse` was well covered as a function, but no test wrote a `clove.conf`
+with a non-default `data_dir`/`api_socket`, started `cloved -c` on it, and drove
+`clove` at it. That is why finding 10 survived: the smoke test uses XDG
+environment variables, which both binaries honour. `ci/smoke.sh` now has that
+section.
+
+### H. Cheap properties that would each have caught a finding here *(done)*
 
 - Every `PexMessage` we encode parses under our own `parse` (finding 7).
 - Every URL kept by `is_i2p_tracker` is accepted by `build_announce`
@@ -521,13 +636,18 @@ it.
 - `Resume` → registry → `Resume` preserves the piece count and agrees with the
   `.torrent` (finding 16).
 
+All four exist now, as unit tests rather than generated properties: turning them
+into generated ones (over arbitrary torrents, arbitrary URL lists) is the version
+that keeps finding things.
+
 ### I. Two mechanical gaps
 
 - **CI never runs the tests in release mode.** The invariant net is
   `cfg(debug_assertions)`, so the release behaviour of finding 1 — silent
   corruption instead of a panic — is never exercised anywhere. Add
   `cargo test --workspace --release` to the `test` job; it is a minute, and it is
-  the configuration users run.
+  the configuration users run. (Every fix on this branch was checked in release
+  by hand, which is not the same as a gate.)
 - **Assertions can rot into no-ops unnoticed.** Add a handful of negative tests
   that deliberately corrupt state and assert the invariant *fires*
   (`#[should_panic]` on a debug-only test), so a future refactor that silently
@@ -558,17 +678,14 @@ warrants today.
 
 ## Appendix A: repros
 
-Findings 1, 2 and 3 now have committed tests (named under each finding above);
-what follows is the original throwaway reproduction of each, kept because it is
-the shortest statement of the bug, plus the repros for the findings that are
-still open.
+Every finding has a committed test now (named under each finding above), except
+the two left undone. What follows is the original throwaway reproduction of the
+first few, kept because each is the shortest statement of its bug.
 
 Drop into `crates/clove-core/tests/` and run with `cargo test -p clove-core`.
 Each fails on the tree as reviewed.
 
 ### Findings 1 and 4 — endgame overwrite, availability leak
-
-The first is fixed; `have_spam_inflates_availability` (finding 4) still fails.
 
 ```rust
 // picker: a duplicate endgame delivery for a piece we already hold trips the
@@ -616,6 +733,9 @@ within 20 s. Actual: `honest download stalled at 5/8 pieces while a peer held it
 socket`.
 
 ### Finding 5 — duplicate file paths
+
+Now covered by `metainfo::rejects_colliding_file_paths`; the original was a
+storage-level demonstration of what the parser was letting through.
 
 ```rust
 // Two `files` entries with the same path, 16384 + 100 bytes, two pieces.

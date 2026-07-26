@@ -187,6 +187,34 @@ code=$?
 set -e
 expect_status "$code" 3 "unreachable daemon"
 
+# A configured data_dir/api_socket has to be honoured by *both* binaries. The
+# CLI used to parse an empty configuration, so a clove.conf that moved either
+# one left it looking for a token in a directory the daemon never used — and
+# nothing here noticed, because everything above runs on the XDG defaults.
+echo "smoke: a configured data_dir and socket are honoured end to end"
+conf_dir="$work/conf"
+mkdir -p "$conf_dir/data" "$conf_dir/run"
+cat >"$conf_dir/clove.conf" <<EOF
+data_dir $conf_dir/data
+api_socket $conf_dir/run/clove.sock
+EOF
+timeout 60 "$cloved" -c "$conf_dir/clove.conf" >"$work/daemon-conf.log" 2>&1 &
+conf_pid=$!
+i=0
+until timeout 5 "$clove" -c "$conf_dir/clove.conf" status >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -gt 200 ] && fail "configured daemon never answered (log: $(cat "$work/daemon-conf.log"))"
+    sleep 0.05
+done
+[ -S "$conf_dir/run/clove.sock" ] || fail "the configured api_socket was not created"
+[ -f "$conf_dir/data/token" ] || fail "the token was not created in the configured data_dir"
+expect_contains "$(timeout 5 "$clove" -c "$conf_dir/clove.conf" list)" \
+    "no torrents" "list against the configured daemon"
+# Without -c the CLI looks at the default socket, which is a different daemon.
+expect_contains "$(timeout 5 "$clove" status)" "waiting-for-router" "default socket still works"
+kill "$conf_pid" 2>/dev/null
+wait "$conf_pid" 2>/dev/null || true
+
 echo "smoke: token file is 0600"
 mode=$(stat -c '%a' "$XDG_DATA_HOME/clove/token")
 [ "$mode" = "600" ] || fail "token mode is $mode, expected 600"

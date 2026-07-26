@@ -122,6 +122,10 @@ impl Storage {
     /// shorter than the requested range — an unwritten region).
     pub fn read_block(&self, index: u32, begin: u32, len: u32) -> io::Result<Vec<u8>> {
         let start = u64::from(index) * self.piece_length + u64::from(begin);
+        // Check the range before allocating for it. `len` is a u32 from the
+        // wire, so an unbounded caller would otherwise reserve up to 4 GiB on
+        // its way to being told the range does not exist.
+        self.check_range(start, u64::from(len))?;
         let mut out = vec![0u8; len as usize];
         self.for_each_segment(start, out.len(), |file, file_off, seg| {
             let lo = usize::try_from(seg.start).unwrap_or(usize::MAX);
@@ -180,6 +184,20 @@ impl Storage {
         Ok(())
     }
 
+    /// The end of a range inside the torrent's byte space, or
+    /// [`io::ErrorKind::InvalidInput`] if it does not fit.
+    fn check_range(&self, global_start: u64, len: u64) -> io::Result<u64> {
+        global_start
+            .checked_add(len)
+            .filter(|&e| e <= self.total_length)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "storage: range outside torrent",
+                )
+            })
+    }
+
     /// Split a global range into per-file segments and apply `op` to each.
     /// `op` receives the file, the offset within that file, and the segment
     /// range within the caller's buffer.
@@ -190,15 +208,7 @@ impl Storage {
         mut op: impl FnMut(&File, u64, std::ops::Range<u64>) -> io::Result<()>,
     ) -> io::Result<()> {
         let len = len as u64;
-        let end = global_start
-            .checked_add(len)
-            .filter(|&e| e <= self.total_length)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "storage: range outside torrent",
-                )
-            })?;
+        let end = self.check_range(global_start, len)?;
         if len == 0 {
             return Ok(());
         }
@@ -377,6 +387,28 @@ mod tests {
         // Flip a byte: verification must now fail.
         st.write_block(0, 5, &[0]).unwrap();
         assert!(!st.verify_piece(0).unwrap());
+    }
+
+    #[test]
+    fn an_absurd_read_length_is_refused_before_it_is_allocated() {
+        let dir = TempDir::new();
+        let content: Vec<u8> = vec![0; 10];
+        let meta = meta_for(
+            vec![FileEntry {
+                path: vec!["a".into()],
+                length: 10,
+            }],
+            16,
+            &content,
+        );
+        let st = Storage::create(&meta, &dir.0, false).unwrap();
+        // A peer-supplied length is a u32; the range check has to come first,
+        // or this reserves four gigabytes on its way to an error.
+        let err = st.read_block(0, 0, u32::MAX).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // And a length that fits the torrent still works.
+        st.write_block(0, 0, &content).unwrap();
+        assert_eq!(st.read_block(0, 0, 10).unwrap().len(), 10);
     }
 
     #[test]

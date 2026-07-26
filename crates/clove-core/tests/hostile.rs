@@ -182,6 +182,17 @@ fn metainfo_survives_hostile_input() {
             assert!(meta.piece_length > 0, "accepted a zero piece length");
             let sum: u64 = meta.files.iter().map(|f| f.length).sum();
             assert_eq!(sum, meta.total_length, "file lengths disagree with total");
+            // No two files may land on the same path, and none may sit where
+            // another wants a directory: either aliases bytes on disk.
+            let mut paths: Vec<&[String]> = meta.files.iter().map(|f| f.path.as_slice()).collect();
+            paths.sort_unstable();
+            for pair in paths.windows(2) {
+                assert_ne!(pair[0], pair[1], "accepted two files with one path");
+                assert!(
+                    !pair[1].starts_with(pair[0]),
+                    "accepted a file path that is also a directory"
+                );
+            }
             for file in &meta.files {
                 assert!(!file.path.is_empty(), "accepted an empty file path");
                 for part in &file.path {
@@ -267,7 +278,7 @@ fn tracker_responses_survive_hostile_input() {
             // assert *that*, which is the invariant that actually matters.
             let mut state = tracker::AnnounceState::new();
             let now = 1_000_000u64;
-            state.on_success(now, response.interval);
+            state.on_success(now, response.interval, tracker::Event::Periodic);
             let floor = tracker::MIN_ANNOUNCE_INTERVAL.as_secs();
             assert!(
                 !state.due(now + floor - 1),
