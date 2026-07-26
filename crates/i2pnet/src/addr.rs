@@ -154,12 +154,24 @@ pub fn i2p_base64_encode(data: &[u8]) -> String {
 
 /// Decode I2P base64 (the `-`/`~` alphabet), tolerating `=` padding.
 ///
+/// Strict in the same two ways [`base32_decode`] is, and for the same reason: a
+/// decoder must not accept what its own encoder cannot produce. A single
+/// dangling symbol carries six bits and encodes no byte, and the spare bits of
+/// the final group are always zero in a real encoding — so a lax decoder maps
+/// several different-looking destinations onto one identity, which for a peer
+/// address means two names for the same peer, or worse, one name the router and
+/// clove disagree about.
+///
 /// # Errors
-/// Returns `None` on any character outside the alphabet (padding aside) or
-/// on a truncated final group.
+/// Returns `None` on any character outside the alphabet (padding aside), on a
+/// truncated final group (one leftover symbol), or when the final group's spare
+/// bits are not zero.
 #[must_use]
 pub fn i2p_base64_decode(s: &str) -> Option<Vec<u8>> {
     let symbols: Vec<u8> = s.bytes().filter(|&b| b != b'=').collect();
+    if symbols.len() % 4 == 1 {
+        return None; // six bits alone encode nothing
+    }
     let mut out = Vec::with_capacity(symbols.len() * 3 / 4);
     let mut buffer = 0u32;
     let mut bits = 0u32;
@@ -171,6 +183,9 @@ pub fn i2p_base64_decode(s: &str) -> Option<Vec<u8>> {
             bits -= 8;
             out.push(((buffer >> bits) & 0xff) as u8);
         }
+    }
+    if bits > 0 && (buffer & ((1 << bits) - 1)) != 0 {
+        return None;
     }
     Some(out)
 }
@@ -222,6 +237,45 @@ mod tests {
         assert_eq!(i2p_base64_decode(&encoded).unwrap(), data);
         // A standard-alphabet string with '+' must be rejected.
         assert!(i2p_base64_decode("ab+d").is_none());
+    }
+
+    #[test]
+    fn i2p_base64_refuses_what_it_cannot_have_encoded() {
+        // One dangling symbol carries six bits and encodes no byte at all;
+        // returning an empty vec for it (as a lax decoder does) makes every
+        // such string decode to "nothing" rather than to an error.
+        assert!(i2p_base64_decode("A").is_none());
+        assert!(i2p_base64_decode("A===").is_none());
+        assert_eq!(i2p_base64_decode("").unwrap(), Vec::<u8>::new());
+
+        // Spare bits of the final group are zero in any real encoding, so two
+        // spellings must never decode to one value.
+        let one = i2p_base64_encode(&[0xFF]); // "~w==" style: 2 symbols
+        assert_eq!(i2p_base64_decode(&one).unwrap(), vec![0xFF]);
+        let mut lax = one.clone().into_bytes();
+        // Bump the last symbol: same leading byte, spare bits now set.
+        let last = lax
+            .iter()
+            .rposition(|&b| b != b'=')
+            .expect("a symbol to bump");
+        let idx = I2P_B64_ALPHABET
+            .iter()
+            .position(|&a| a == lax[last])
+            .expect("in alphabet");
+        lax[last] = I2P_B64_ALPHABET[idx + 1];
+        let lax = String::from_utf8(lax).expect("ascii");
+        assert_ne!(lax, one);
+        assert!(
+            i2p_base64_decode(&lax).is_none(),
+            "{lax} decoded despite spare bits the encoder never sets"
+        );
+
+        // Valid lengths still work: 2, 3 and 4 symbols per group.
+        for len in [1usize, 2, 3, 4, 5, 48, 387] {
+            let data = vec![0x5A; len];
+            let text = i2p_base64_encode(&data);
+            assert_eq!(i2p_base64_decode(&text).unwrap(), data, "len {len}");
+        }
     }
 
     #[test]

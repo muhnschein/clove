@@ -298,7 +298,7 @@ fn announce_loop<D, N>(
                 continue;
             }
             match announce_once(torrent, url, state, target, dialer, naming, config) {
-                Ok(interval) => state.on_success(unix_now(), interval),
+                Ok((interval, sent)) => state.on_success(unix_now(), interval, sent),
                 Err(_) => state.on_failure(unix_now()),
             }
         }
@@ -316,7 +316,29 @@ fn announce_loop<D, N>(
     }
 }
 
+/// Bytes of the torrent we actually hold.
+///
+/// Not `pieces * piece_length`: the last piece is usually short, so counting it
+/// as a whole one over-reports what we have and under-reports `left` — by up to
+/// a piece, on every announce, for any torrent holding its tail but not its
+/// middle.
+fn bytes_present(have: &crate::bitfield::Bitfield, piece_length: u64, total_length: u64) -> u64 {
+    if piece_length == 0 {
+        return 0;
+    }
+    have.iter_present()
+        .map(|index| {
+            let start = u64::from(index).saturating_mul(piece_length);
+            let remaining = total_length.saturating_sub(start);
+            remaining.min(piece_length)
+        })
+        .sum()
+}
+
 /// One announce to one tracker: build, resolve, dial, exchange, feed peers.
+///
+/// Returns the interval the tracker asked for and the event that went out, so
+/// the state machine knows what it has already reported.
 fn announce_once<D, N>(
     torrent: &Arc<Torrent>,
     url: &str,
@@ -325,29 +347,28 @@ fn announce_once<D, N>(
     dialer: &D,
     naming: &N,
     config: &AnnouncerConfig,
-) -> Result<u32, tracker::Error>
+) -> Result<(u32, tracker::Event), tracker::Error>
 where
     D: I2pDialer,
     N: I2pNamingLookup,
 {
     let have = torrent.have();
     let complete = have.count() == have.len();
-    let done = u64::from(have.count()).saturating_mul(target.piece_length);
     let left = if complete {
         0
     } else {
-        target
-            .total_length
-            .saturating_sub(done.min(target.total_length))
+        let done = bytes_present(&have, target.piece_length, target.total_length);
+        target.total_length.saturating_sub(done)
     };
     let (uploaded, downloaded) = torrent.stats();
+    let event = state.next_event(complete);
     let params = tracker::AnnounceParams {
         info_hash: torrent.info_hash(),
         peer_id: torrent.peer_id(),
         uploaded,
         downloaded,
         left,
-        event: state.next_event(complete),
+        event,
         numwant: config.numwant,
         our_dest_b64: &target.our_dest_b64,
     };
@@ -358,7 +379,7 @@ where
         .map_err(tracker::Error::Io)?;
     let response = tracker::announce_over(&mut stream, &request)?;
     torrent.add_peers(&response.peers);
-    Ok(response.interval)
+    Ok((response.interval, event))
 }
 
 /// One dial sweep after another until stopped, with per-peer retry backoff.
@@ -422,7 +443,7 @@ where
 {
     loop {
         match listener.accept() {
-            Ok((stream, from)) => {
+            Ok(Some((stream, from))) => {
                 if torrent.connected_peers().len() >= max_peers {
                     drop(stream);
                     continue;
@@ -430,6 +451,8 @@ where
                 // A failed handshake just closes this peer; the loop lives on.
                 let _ = torrent.attach(stream, from);
             }
+            // One unusable connection, not the end of the listener.
+            Ok(None) => {}
             Err(_) => return,
         }
     }
@@ -451,6 +474,33 @@ pub struct InboundDemux {
     max_peers: usize,
     /// Raised on session teardown; the accept loop exits at its next accept.
     stopped: std::sync::atomic::AtomicBool,
+    /// Connections currently waiting for their handshake to be read.
+    pending: std::sync::atomic::AtomicUsize,
+}
+
+/// How long an accepted connection has to produce its BEP 3 handshake.
+///
+/// Generous — an I2P round trip is slow — but finite: the read is the first
+/// thing a peer does, and a connection that never gets there is a thread we
+/// hold for nothing.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How many connections may be waiting on their handshake at once.
+///
+/// One thread each, and a peer that connects without speaking holds its thread
+/// for as long as the timeout allows, so this is the bound on what an inbound
+/// flood costs us. Well above any real swarm's arrival rate.
+const MAX_PENDING_HANDSHAKES: usize = 64;
+
+/// Decrements the pending count when a routing thread ends, panic included.
+struct PendingGuard(Arc<InboundDemux>);
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.0
+            .pending
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl InboundDemux {
@@ -461,6 +511,7 @@ impl InboundDemux {
             torrents: Mutex::new(HashMap::new()),
             max_peers,
             stopped: std::sync::atomic::AtomicBool::new(false),
+            pending: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -494,16 +545,34 @@ impl InboundDemux {
         let demux = Arc::clone(self);
         std::thread::spawn(move || {
             loop {
-                match listener.accept() {
-                    Ok((stream, from)) => {
-                        if demux.stopped.load(std::sync::atomic::Ordering::Relaxed) {
-                            return;
+                let accepted = listener.accept();
+                // Checked whatever came back: teardown pokes the forward port
+                // to break a blocked accept, and that poke arrives as a
+                // connection with no destination header — an `Ok(None)`.
+                if demux.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                match accepted {
+                    Ok(Some((stream, from))) => {
+                        use std::sync::atomic::Ordering;
+                        // Bounded: each of these is a thread, and a peer that
+                        // connects without handshaking holds one until its
+                        // timeout. Past the cap the connection is dropped,
+                        // which the dialling side sees as a refusal.
+                        if demux.pending.load(Ordering::Relaxed) >= MAX_PENDING_HANDSHAKES {
+                            drop(stream);
+                            continue;
                         }
+                        demux.pending.fetch_add(1, Ordering::Relaxed);
                         let demux = Arc::clone(&demux);
                         // Per-connection thread: the handshake read must
                         // never stall the accept loop.
-                        std::thread::spawn(move || demux.route(stream, from));
+                        std::thread::spawn(move || {
+                            let _guard = PendingGuard(Arc::clone(&demux));
+                            demux.route(stream, from);
+                        });
                     }
+                    Ok(None) => {}
                     Err(_) => return,
                 }
             }
@@ -512,10 +581,18 @@ impl InboundDemux {
 
     /// Read one inbound peer's handshake and attach it to its torrent.
     fn route<S: I2pStream + 'static>(&self, mut stream: S, from: DestHash) {
+        // Bound the wait for the peer's first bytes; a connection that never
+        // speaks would otherwise hold this thread for the life of the process.
+        // Best-effort: backends without a timeout of their own ignore it.
+        let _ = stream.set_timeouts(Some(HANDSHAKE_TIMEOUT));
         let mut buf = [0u8; wire::HANDSHAKE_LEN];
         if stream.read_exact(&mut buf).is_err() {
             return;
         }
+        // Back to blocking for the peer connection proper: a peer legitimately
+        // sits quiet between messages, and cutting that off needs the
+        // keep-alive work (R5), not a timeout here.
+        let _ = stream.set_timeouts(None);
         let Ok(theirs) = Handshake::parse(&buf) else {
             return;
         };
@@ -647,7 +724,7 @@ impl I2pListener for NoListener {
         match *self {}
     }
 
-    fn accept(&self) -> io::Result<(NoStream, DestHash)> {
+    fn accept(&self) -> io::Result<Option<(NoStream, DestHash)>> {
         match *self {}
     }
 }
@@ -852,6 +929,118 @@ mod tests {
         swarm_b.shutdown();
     }
 
+    /// A listener that reports a run of unusable connections before a real one,
+    /// counting how many times it was asked. Stands in for the forwarded socket
+    /// a router hands us without its destination header — or anything else on
+    /// the loopback forward port.
+    struct FlakyListener {
+        inner: Mutex<Option<i2pnet::mock::Endpoint>>,
+        bad_left: std::sync::atomic::AtomicUsize,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl I2pListener for FlakyListener {
+        type Stream = i2pnet::mock::MockStream;
+
+        fn local_dest(&self) -> DestHash {
+            DestHash([0; 32])
+        }
+
+        fn accept(&self) -> io::Result<Option<(Self::Stream, DestHash)>> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.bad_left.load(Ordering::Relaxed) > 0 {
+                self.bad_left.fetch_sub(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+            let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            match guard.as_ref() {
+                Some(ep) => ep.accept().map(Some),
+                None => Err(io::Error::new(io::ErrorKind::NotConnected, "gone")),
+            }
+        }
+    }
+
+    /// The bug this pins down: `accept` returning an error for *one* unusable
+    /// connection used to end the accept loop, so the daemon stopped taking
+    /// inbound peers entirely until its session was rebuilt — and anything able
+    /// to connect to the loopback forward port could cause it.
+    #[test]
+    fn one_unusable_connection_does_not_end_the_accept_loop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let net = MockNet::new();
+        let (seeder, leecher, _sd, _ld) = seed_and_leech();
+
+        // The real endpoint behind the flaky wrapper.
+        let seed_ep = net.endpoint();
+        let seed_dest = seed_ep.dest();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = FlakyListener {
+            inner: Mutex::new(Some(seed_ep)),
+            bad_left: AtomicUsize::new(3),
+            calls: Arc::clone(&calls),
+        };
+
+        let demux = InboundDemux::new(8);
+        demux.register(&seeder);
+        let _accept = demux.run(listener);
+
+        // Three duds first, then the leecher's connection must still be served.
+        let ep = net.endpoint();
+        leecher.add_peers(&[seed_dest]);
+        let swarm = Swarm::dial_only(Arc::clone(&leecher), ep.dialer(), quick_config());
+        assert!(
+            leecher.wait_complete(Duration::from_secs(20)),
+            "the accept loop gave up after an unusable connection"
+        );
+        assert!(
+            calls.load(Ordering::Relaxed) > 3,
+            "the loop stopped accepting after the duds"
+        );
+        swarm.shutdown();
+    }
+
+    /// An inbound flood of connections that never handshake. Each one costs a
+    /// thread while its handshake is awaited, so the demux caps how many it
+    /// will wait on at once — and must keep serving real peers either way.
+    #[test]
+    fn a_flood_of_silent_connections_does_not_wedge_the_demux() {
+        let net = MockNet::new();
+        let (seeder, leecher, _sd, _ld) = seed_and_leech();
+
+        let seed_ep = net.endpoint();
+        let seed_dest = seed_ep.dest();
+        let demux = InboundDemux::new(8);
+        demux.register(&seeder);
+        let _accept = demux.run(seed_ep);
+
+        // Well past the cap: connect, say nothing, hold them all open.
+        let flood_ep = net.endpoint();
+        let mut silent = Vec::new();
+        for _ in 0..(MAX_PENDING_HANDSHAKES * 2) {
+            match flood_ep.dialer().dial(seed_dest, Duration::from_secs(5)) {
+                Ok(stream) => silent.push(stream),
+                // The mock's accept backlog refuses past its own limit, which
+                // is itself the behaviour we want: a refusal, not a queue.
+                Err(_) => break,
+            }
+        }
+        assert!(!silent.is_empty(), "no connection was accepted at all");
+
+        // Releasing them lets the waiting threads finish, and an honest peer
+        // must then be served as if none of it had happened.
+        drop(silent);
+        let ep = net.endpoint();
+        leecher.add_peers(&[seed_dest]);
+        let swarm = Swarm::dial_only(Arc::clone(&leecher), ep.dialer(), quick_config());
+        assert!(
+            leecher.wait_complete(Duration::from_secs(20)),
+            "the demux never recovered from the flood"
+        );
+        swarm.shutdown();
+    }
+
     #[test]
     fn demux_drops_unknown_info_hash() {
         let net = MockNet::new();
@@ -967,6 +1156,32 @@ mod tests {
             leecher.connected_peers().is_empty(),
             "peer table must be empty after disconnect_all"
         );
+    }
+
+    #[test]
+    fn bytes_present_counts_a_short_last_piece_as_short() {
+        use crate::bitfield::Bitfield;
+        // Four pieces of 16 KiB over a torrent whose last piece is 100 bytes.
+        let piece = u64::from(BLOCK_LEN);
+        let total = 3 * piece + 100;
+        let field = |present: &[u32]| {
+            let mut bf = Bitfield::empty(4);
+            for &p in present {
+                bf.set(p);
+            }
+            bf
+        };
+        assert_eq!(bytes_present(&field(&[]), piece, total), 0);
+        assert_eq!(bytes_present(&field(&[0]), piece, total), piece);
+        // The tail is 100 bytes, not a whole piece — the case that used to
+        // over-count and report `left` as smaller than it was.
+        assert_eq!(bytes_present(&field(&[3]), piece, total), 100);
+        assert_eq!(bytes_present(&field(&[0, 3]), piece, total), piece + 100);
+        assert_eq!(bytes_present(&field(&[0, 1, 2, 3]), piece, total), total);
+        // Holding the tail while missing a middle piece must leave that piece
+        // outstanding, not zero.
+        let done = bytes_present(&field(&[0, 1, 3]), piece, total);
+        assert_eq!(total - done, piece, "a missing whole piece went unreported");
     }
 
     #[test]

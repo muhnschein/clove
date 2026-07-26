@@ -364,14 +364,21 @@ impl I2pListener for SamListener {
         self.local
     }
 
-    fn accept(&self) -> io::Result<(ForwardedStream, DestHash)> {
+    fn accept(&self) -> io::Result<Option<(ForwardedStream, DestHash)>> {
         let (mut stream, _addr) = self.listener.accept()?;
         // Bound the header read so a silent/misbehaving router cannot wedge
         // the acceptor; then hand a blocking socket to the reader thread.
         stream.set_read_timeout(Some(DEST_LINE_TIMEOUT))?;
-        let dest = read_dest_line(&mut stream, MAX_DEST_LINE)?;
+        // A header that never arrives, arrives as garbage, or belongs to
+        // something that is not the router at all says nothing about the
+        // listener: drop that connection and let the caller accept the next.
+        // Anything on the loopback forward port can produce one, including our
+        // own `poke_listener`.
+        let Ok(dest) = read_dest_line(&mut stream, MAX_DEST_LINE) else {
+            return Ok(None);
+        };
         stream.set_read_timeout(None)?;
-        Ok((ForwardedStream { inner: stream }, dest))
+        Ok(Some((ForwardedStream { inner: stream }, dest)))
     }
 }
 
@@ -459,6 +466,11 @@ impl I2pStream for ForwardedStream {
     fn split(self) -> io::Result<(TcpStream, TcpStream)> {
         let reader = self.inner.try_clone()?;
         Ok((reader, self.inner))
+    }
+
+    /// Real timeouts: this is a loopback TCP socket from the router.
+    fn set_timeouts(&self, timeout: Option<Duration>) -> io::Result<()> {
+        ForwardedStream::set_timeouts(self, timeout)
     }
 }
 

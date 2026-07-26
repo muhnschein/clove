@@ -277,9 +277,15 @@ impl Picker {
 
     /// Discard a piece's downloaded blocks after a failed verification, so
     /// it is re-downloaded from scratch.
+    ///
+    /// The have bit goes too. Bytes that failed SHA-1 are not a piece we
+    /// hold, and leaving the bit set would leave us announcing — and
+    /// serving — a piece the disk cannot back, with nothing left to
+    /// re-download it.
     pub fn reset_piece(&mut self, index: u32) {
         if index < self.num_pieces {
             self.progress[index as usize] = None;
+            self.have.clear(index);
         }
         self.debug_check();
     }
@@ -287,6 +293,10 @@ impl Picker {
     /// Record that block `block` of piece `index` arrived. Returns `true`
     /// when that completes the piece (all blocks received) and the engine
     /// should verify it.
+    ///
+    /// A block for a piece we already hold is ignored (`false`): the endgame
+    /// hands one block to several peers, so a copy can arrive after another
+    /// peer's copy completed and verified the piece.
     pub fn block_received(&mut self, index: u32, block: u32) -> bool {
         let blocks = self.blocks_in_piece(index);
         let Some(prog) = self.progress_mut(index, blocks) else {
@@ -401,7 +411,16 @@ impl Picker {
         candidates
     }
 
+    /// Block accounting for piece `index`, created on first use.
+    ///
+    /// `None` for an out-of-range index, and for a piece we already hold:
+    /// giving a completed piece fresh accounting would resurrect it, break
+    /// the invariant that `have` and block progress are disjoint, and — for a
+    /// one-block piece — report the piece complete a second time.
     fn progress_mut(&mut self, index: u32, blocks: u32) -> Option<&mut Progress> {
+        if self.have.has(index) {
+            return None;
+        }
         let slot = self.progress.get_mut(index as usize)?;
         Some(slot.get_or_insert_with(|| Progress::new(blocks)))
     }
@@ -557,6 +576,51 @@ mod tests {
         let again = p.pick(&peer, 1);
         assert_eq!(again.len(), 1);
         assert_eq!(again[0], b[0]);
+    }
+
+    #[test]
+    fn a_late_endgame_block_does_not_reopen_a_held_piece() {
+        // The endgame hands one block to several peers on purpose, so a
+        // second copy arrives after the first completed the piece. Accounting
+        // it would resurrect a finished piece: fresh block progress for a
+        // piece in `have` (which check_invariants forbids), and a second
+        // "piece complete" for the engine to act on — which is how a verified
+        // piece ends up overwritten by whatever the late peer sent.
+        let mut p = one_block_pieces(1);
+        let peer = field(1, &[0]);
+        assert_eq!(p.pick(&peer, 1).len(), 1);
+        assert!(p.block_received(0, 0), "the first copy completes the piece");
+        p.set_have(0);
+
+        assert!(
+            !p.block_received(0, 0),
+            "a late duplicate must not report the piece complete again"
+        );
+        assert!(p.has(0), "and must not disturb the piece we hold");
+        assert_eq!(p.in_flight_total(), 0);
+        p.check_invariants();
+        // Nothing is offered for it either, held or not.
+        assert!(p.pick(&peer, 1).is_empty());
+    }
+
+    #[test]
+    fn resetting_a_held_piece_gives_up_the_have_bit() {
+        // Bytes that failed SHA-1 are not a piece we hold. If the have bit
+        // survived a reset we would announce and serve a piece the disk
+        // cannot back, and never re-download it.
+        let mut p = one_block_pieces(2);
+        let peer = field(2, &[0, 1]);
+        let _ = p.pick(&peer, 2);
+        assert!(p.block_received(0, 0));
+        p.set_have(0);
+        assert!(p.has(0));
+
+        p.reset_piece(0);
+        assert!(!p.has(0));
+        assert!(!p.is_complete());
+        p.check_invariants();
+        // And it is a candidate again.
+        assert!(p.pick(&peer, 2).iter().any(|b| b.index == 0));
     }
 
     #[test]
