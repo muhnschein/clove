@@ -7,6 +7,11 @@
 //! torrent state (picker, choker, the peer table) lives behind one mutex;
 //! handlers compute their outgoing messages while holding it, then release
 //! it *before* sending so a slow writer can never stall the whole torrent.
+//! Releasing the lock is only half of that: the send itself never blocks
+//! either, because the messages one peer's reader thread produces are often
+//! addressed to *other* peers, and waiting on a peer that has stopped reading
+//! would park the thread serving somebody honest. A queue that will not take a
+//! message means a dead connection, so the peer is dropped instead.
 //!
 //! Peer-connection lifecycle (the explicit state machine SCOPE §9 asks for):
 //!
@@ -55,6 +60,13 @@ const OUR_METADATA_ID: u8 = 2;
 
 /// Outgoing message queue depth per peer before the writer applies
 /// backpressure. Bounded — no unbounded channels in the engine (SCOPE §4).
+///
+/// Deep enough that no honest peer reaches it: we queue at most
+/// [`PIPELINE_DEPTH`] requests, one `have` per completed piece, and one block
+/// per request the peer made — and a peer's own pipeline is what bounds that
+/// last one. A queue this full means the peer has stopped reading, which
+/// [`Shared::on_message`] treats as a dead connection rather than something to
+/// wait on.
 const OUTGOING_QUEUE: usize = 256;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -172,8 +184,10 @@ struct Peer {
 }
 
 /// A message queued to a specific peer, collected under the lock and sent
-/// after it is released.
-type Outgoing = (SyncSender<Message>, Message);
+/// after it is released. The peer's id travels with it because the sender is
+/// often *another* peer's reader thread — a broadcast `have`, a choke round —
+/// and it needs to know whose connection to drop if the queue will not take it.
+type Outgoing = (u64, SyncSender<Message>, Message);
 
 impl Torrent {
     /// Start a torrent over `storage`, whose currently-verified pieces are
@@ -528,8 +542,18 @@ impl Shared {
             // picture while the lock is still held and the state is settled.
             debug_check_state(&st);
         }
-        for (tx, msg) in out {
-            let _ = tx.send(msg);
+        for (id, tx, msg) in out {
+            // try_send, never send: this thread belongs to whichever peer's
+            // message triggered the work, not to the peer being written to. A
+            // peer that stops reading fills its socket and then its queue, and
+            // a blocking send here would park *every* other peer's reader
+            // thread behind it — one silent peer stalling the whole torrent.
+            // A full queue means the peer is not reading (see OUTGOING_QUEUE);
+            // a closed one means its writer is already gone. Drop it either
+            // way, which also returns its in-flight blocks to the picker.
+            if tx.try_send(msg).is_err() {
+                self.remove_peer(id);
+            }
         }
         self.check_done();
     }
@@ -666,6 +690,7 @@ impl Shared {
             return;
         }
         out.push((
+            st.peers[idx].id,
             st.peers[idx].out.clone(),
             Message::Extended {
                 id: pex_id,
@@ -692,6 +717,7 @@ impl Shared {
             }
         };
         out.push((
+            st.peers[idx].id,
             st.peers[idx].out.clone(),
             Message::Extended {
                 id: metadata_id,
@@ -719,8 +745,14 @@ impl Shared {
             return;
         }
         let was_requested = st.peers[idx].in_flight.remove(&(index, block_no));
-        if !was_requested {
-            // Unsolicited or already-satisfied block; ignore the payload but
+        // A block for a piece we already hold is a duplicate the endgame asked
+        // for: another peer answered first and the piece verified. Writing it
+        // would put this peer's bytes over verified ones, and for a piece of
+        // more than one block nothing would re-verify afterwards — so a peer
+        // that answers late with rubbish would silently corrupt a finished
+        // piece we go on to announce and serve.
+        if !was_requested || st.picker.has(index) {
+            // Unsolicited, already satisfied, or late; ignore the payload but
             // still try to keep the pipeline full below.
         } else if self.storage.write_block(index, begin, block).is_ok() {
             self.downloaded
@@ -733,7 +765,7 @@ impl Shared {
                 Ok(true) => {
                     st.picker.set_have(index);
                     for peer in &st.peers {
-                        out.push((peer.out.clone(), Message::Have(index)));
+                        out.push((peer.id, peer.out.clone(), Message::Have(index)));
                     }
                 }
                 _ => st.picker.reset_piece(index),
@@ -759,6 +791,7 @@ impl Shared {
             let peer = &mut st.peers[idx];
             peer.uploaded += data.len() as u64;
             out.push((
+                peer.id,
                 peer.out.clone(),
                 Message::Piece {
                     index: req.index,
@@ -788,14 +821,22 @@ fn update_interest(st: &mut State, idx: usize, out: &mut Vec<Outgoing>) {
     let want = peer.has.iter_present().any(|p| !st.picker.has(p));
     if want && !peer.we_interested {
         st.peers[idx].we_interested = true;
-        out.push((st.peers[idx].out.clone(), Message::Interested));
+        out.push((
+            st.peers[idx].id,
+            st.peers[idx].out.clone(),
+            Message::Interested,
+        ));
         // If they are already unchoking us we can request right away.
         if !st.peers[idx].peer_choking {
             fill_requests(st, idx, out);
         }
     } else if !want && peer.we_interested {
         st.peers[idx].we_interested = false;
-        out.push((st.peers[idx].out.clone(), Message::NotInterested));
+        out.push((
+            st.peers[idx].id,
+            st.peers[idx].out.clone(),
+            Message::NotInterested,
+        ));
     }
 }
 
@@ -821,7 +862,7 @@ fn fill_requests(st: &mut State, idx: usize, out: &mut Vec<Outgoing>) {
     for req in requests {
         let block = req.begin / BLOCK_LEN;
         if peer.in_flight.insert((req.index, block)) {
-            out.push((peer.out.clone(), Message::Request(req)));
+            out.push((peer.id, peer.out.clone(), Message::Request(req)));
         } else {
             duplicates.push((req.index, block));
         }
@@ -847,13 +888,13 @@ fn run_choker(st: &mut State, out: &mut Vec<Outgoing>) {
     for id in decision.unchoke {
         if let Some(peer) = st.peers.iter_mut().find(|p| p.id == id) {
             peer.we_choke = false;
-            out.push((peer.out.clone(), Message::Unchoke));
+            out.push((peer.id, peer.out.clone(), Message::Unchoke));
         }
     }
     for id in decision.choke {
         if let Some(peer) = st.peers.iter_mut().find(|p| p.id == id) {
             peer.we_choke = true;
-            out.push((peer.out.clone(), Message::Choke));
+            out.push((peer.id, peer.out.clone(), Message::Choke));
         }
     }
 }

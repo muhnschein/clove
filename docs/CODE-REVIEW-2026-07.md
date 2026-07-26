@@ -4,13 +4,17 @@ A read of the whole tree (16.8 kLOC of Rust across `i2pnet`, `clove-core`,
 `cloved`, `clove`) looking for bugs, followed by what the testing regime would
 have to look like to have caught them.
 
-Baseline: `cargo test --workspace` is green (221 tests) at the commit reviewed,
+Baseline: `cargo test --workspace` was green (221 tests) at the commit reviewed,
 and every finding below is against that green tree. Findings 1, 2, 3, 4 and 5
-were reproduced; the repros are in [Appendix A](#appendix-a-repros) and each
-fails on the current code.
+were reproduced before anything was changed.
 
 Severity is about the consequence for a user running the daemon, not about how
 hard the bug was to find.
+
+**Status.** The three critical findings are fixed on this branch, each with the
+test that catches it — every one of those tests fails on the tree as reviewed
+and passes after the fix (checked both ways, in debug and release). Findings 4
+onwards are open; the notes below stand as written.
 
 ---
 
@@ -59,11 +63,20 @@ Note this needs no malice — two honest seeders and a small torrent get there �
 but a malicious peer can aim it: request-and-delay is enough to corrupt a
 finished download that the victim will then advertise as complete.
 
-**Fix sketch.** In `on_block`, before writing: if `st.picker.has(index)`, drop the
-`in_flight` entry, skip both the write and `block_received`, and fall through to
-`fill_requests`. Independently, make `reset_piece` clear the have bit (or assert
-it is unset) so a failed re-verification can never leave `have` asserting a piece
-that just failed its hash.
+**Fixed.** `on_block` now skips the write and the accounting when
+`st.picker.has(index)`, and still refills the pipeline. Two guards behind it:
+`Picker::progress_mut` refuses to create block progress for a piece in `have`
+(so `block_received` returns `false` instead of resurrecting a finished piece —
+the invariant is now structurally unreachable rather than merely asserted), and
+`reset_piece` gives up the have bit, so bytes that failed SHA-1 can never leave
+us announcing a piece the disk cannot back.
+
+Tests: `evil_peer::a_late_duplicate_block_cannot_corrupt_a_verified_piece` drives
+the whole path — two peers offered the same blocks (asserted, not assumed), the
+honest one completes the torrent, the late one answers with rubbish, and the
+bytes on disk must still be the file we asked for. Plus
+`picker::a_late_endgame_block_does_not_reopen_a_held_piece` and
+`picker::resetting_a_held_piece_gives_up_the_have_bit` at the unit level.
 
 ### 2. One peer that stops reading stalls every other peer on the torrent
 
@@ -97,11 +110,19 @@ This is precisely the property `tests/evil_peer.rs` claims to hold ("A
 misbehaving peer cannot deny service to an honest one"); the existing slow-loris
 case only covers a peer that *says nothing*, which never fills a queue.
 
-**Fix sketch.** Use `try_send` and treat a full queue as a dead peer: drop it
-(`remove_peer`) rather than waiting on it. `finish_attach` already uses `try_send`
-for the opening messages, so the pattern is in the file. If backpressure to a
-slow-but-honest peer matters, give the writer thread a bounded overflow policy
-(coalesce `Have`s, drop keep-alives) — but never block a foreign reader thread.
+**Fixed.** `on_message` now uses `try_send` and drops the peer whose queue will
+not take the message, which also returns its in-flight blocks to the picker. The
+peer's id travels with each queued message (`Outgoing`) so the sending thread
+knows whose connection to close. No honest peer reaches a full queue: we enqueue
+at most `PIPELINE_DEPTH` requests, one `have` per completed piece, and one block
+per request the peer itself made — 256 deep means it has stopped reading.
+
+Test: `evil_peer::a_peer_that_stops_reading_cannot_stall_an_honest_one` — a
+half-seeded torrent serving a peer that floods requests and never reads, with an
+honest seeder attached afterwards that must still deliver the rest. Note the
+hostile peer has to hold its connection open past the assertion deadline:
+dropping it closes the queue and releases the stall, which makes the test pass
+for the wrong reason (it did, on the first attempt).
 
 ### 3. An empty token file authenticates every local client
 
@@ -132,10 +153,21 @@ token behind, and every later start reads it as "the empty secret". `SECURITY.md
 names "Local API authentication bypass" as in scope, so this is the project's own
 definition of a vulnerability.
 
-**Fix sketch.** Write the token through the same `atomic_write` used for state,
-and on load refuse a token that is empty or shorter than the 64 hex characters
-the daemon generates — regenerate it (and log that) or refuse to start. Consider
-requiring the header to be exactly the expected length before comparing.
+**Fixed.** The token is written atomically now — a `0600` temp file, fsynced,
+renamed over the target, so it is never half-written and never briefly readable
+by anyone else. On load, a file that is not exactly 64 hex characters is replaced
+rather than trusted, with one line to the log; nothing can be holding the old
+value, because it was never a complete token. And the authentication path itself
+checks the shape of its own expected token before comparing, so an empty secret
+authenticates nobody even if it somehow got there another way.
+
+Tests: `an_empty_token_authenticates_nobody` (over a real socket, through
+`handle`, so parsing and auth are both in the path),
+`a_malformed_token_file_is_replaced_not_trusted` across five ways the file can be
+useless — checking the replacement is well formed, persisted, `0600`, and leaves
+no temp behind — `a_well_formed_token_file_is_left_alone`, and
+`token_shape_check`. The existing test fixture's token was 32 characters; it is
+now the 64 a real one has, which is what made the shape check bite.
 
 ---
 
@@ -387,10 +419,16 @@ highest-value fix in this document:
   hostile ones attached *concurrently*, driven to completion.
 - Restate the evil-peer contract to mean what it says: the honest peer must
   finish **while sharing the torrent instance with** the misbehaving one, not
-  after it has been disconnected. My finding-2 repro is that test.
+  after it has been disconnected.
 - A specific endgame case: two peers asked for the same block, the second
   answering after the piece verified (finding 1), asserting the piece still
   verifies afterwards.
+
+The two tests added with the critical fixes are the start of this: both attach
+two peers to one torrent, and `partly_seeded_torrent` is the missing fixture —
+a torrent that serves and downloads at the same time, which is the state a real
+leecher is in and the one no test covered. What is still missing is the general
+case: N peers, scripted, with the hostile ones interleaved rather than staged.
 
 ### B. Model-based testing for the pure state machines
 
@@ -520,11 +558,17 @@ warrants today.
 
 ## Appendix A: repros
 
+Findings 1, 2 and 3 now have committed tests (named under each finding above);
+what follows is the original throwaway reproduction of each, kept because it is
+the shortest statement of the bug, plus the repros for the findings that are
+still open.
+
 Drop into `crates/clove-core/tests/` and run with `cargo test -p clove-core`.
-All four fail on the reviewed commit. They are not committed as tests because
-they are red.
+Each fails on the tree as reviewed.
 
 ### Findings 1 and 4 — endgame overwrite, availability leak
+
+The first is fixed; `have_spam_inflates_availability` (finding 4) still fails.
 
 ```rust
 // picker: a duplicate endgame delivery for a piece we already hold trips the
@@ -564,10 +608,12 @@ reader thread.
 
 ### Finding 2 — a peer that stops reading stalls the download
 
-A leecher pre-loaded with the first half of an 8-piece torrent; a hostile peer
-sends `Interested` then 2000 `Request`s for piece 0 and never reads; two seconds
-later an honest seeder attaches. Assert the leecher reaches 8/8 within 20 s.
-Actual: `honest download stalled at 5/8 pieces while a peer held its socket`.
+Now `evil_peer::a_peer_that_stops_reading_cannot_stall_an_honest_one`. The
+original: a leecher pre-loaded with the first half of an 8-piece torrent; a
+hostile peer sends `Interested` then 2000 `Request`s for piece 0 and never reads;
+two seconds later an honest seeder attaches. Assert the leecher reaches 8/8
+within 20 s. Actual: `honest download stalled at 5/8 pieces while a peer held its
+socket`.
 
 ### Finding 5 — duplicate file paths
 
@@ -581,6 +627,10 @@ assert!(st.verify_all().unwrap().is_full());              // fails: 1/2 verified
 ```
 
 ### Finding 3 — empty token
+
+Now `an_empty_token_authenticates_nobody` and
+`a_malformed_token_file_is_replaced_not_trusted`. The original, against a
+daemon built from the reviewed tree:
 
 ```sh
 mkdir -p data/clove run && : > data/clove/token

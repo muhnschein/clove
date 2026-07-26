@@ -96,6 +96,16 @@ impl Bitfield {
         self.bits[byte] |= 1 << bit;
     }
 
+    /// Mark piece `index` absent. Out-of-range indices are ignored.
+    pub fn clear(&mut self, index: u32) {
+        if index >= self.len {
+            return;
+        }
+        let byte = (index / 8) as usize;
+        let bit = 7 - (index % 8);
+        self.bits[byte] &= !(1 << bit);
+    }
+
     /// How many pieces are present.
     #[must_use]
     pub fn count(&self) -> u32 {
@@ -161,6 +171,22 @@ mod tests {
         assert!(!bf.has(10)); // out of range
         assert_eq!(bf.count(), 3);
         assert_eq!(bf.iter_present().collect::<Vec<_>>(), vec![0, 7, 9]);
+    }
+
+    #[test]
+    fn clear_removes_one_bit_and_nothing_else() {
+        let mut bf = Bitfield::full(10);
+        bf.clear(7);
+        assert!(!bf.has(7));
+        assert!(bf.has(6) && bf.has(8));
+        assert_eq!(bf.count(), 9);
+        // Idempotent, and out-of-range is ignored rather than panicking.
+        bf.clear(7);
+        bf.clear(10);
+        bf.clear(u32::MAX);
+        assert_eq!(bf.count(), 9);
+        // Spare bits stay zero: clearing must not disturb the final byte.
+        assert_eq!(bf.as_bytes()[1] & 0x3F, 0);
     }
 
     #[test]
