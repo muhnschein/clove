@@ -11,23 +11,23 @@ were reproduced before anything was changed.
 Severity is about the consequence for a user running the daemon, not about how
 hard the bug was to find.
 
-**Status.** Everything here is fixed on this branch except two items, each with
-the test that catches it. Every one of those tests was checked both ways — it
-fails on the tree as reviewed and passes after the fix — in debug and in release.
+**Status.** Everything here is fixed, each with the test that catches it. Every
+one of those tests was checked both ways — it fails on the tree as reviewed and
+passes after the fix — in debug and in release.
 
-Left undone, deliberately:
+The two items the first pass deliberately left are done as well, and
+looking at the second turned up a finding the first pass had missed — **finding
+24**, below: clove never sent a keep-alive at all. That is worse than the
+resource leak filed as part of finding 9, because it makes well-behaved peers
+hang up on *us*.
 
-- **Finding 21** (whole-torrent hashing under the registry mutex). Fixing it
-  means verification moves off the request path, which needs progress
-  reporting, cancellation and a new torrent state. That is a feature with a
-  design to agree on, not a bug fix, and doing it badly would be worse than the
-  blocking `verify` it replaces.
-- **Half of finding 9** (a read timeout on established peer connections). The
-  handshake read is bounded now and the thread count is capped, but a blanket
-  read timeout on a peer stream would disconnect healthy peers: BitTorrent
-  peers legitimately sit quiet for minutes, and tolerating that needs the
-  keep-alive machinery R5 describes. A naive timeout here would trade a slow
-  leak for dropped connections.
+What remains open is one upstream dependency, recorded in `PROTOCOL.i2p-bt`
+§2.7a rather than here: yosemite's virtual streams expose no read timeout, so a
+*dialled* peer that goes silent parks its reader thread until the router tears
+the stream down. clove drops such a peer from its table on the idle timeout, so
+it stops occupying a slot and its blocks go back to the picker, but the thread
+itself cannot be reclaimed from inside clove. Inbound connections are loopback
+TCP sockets clove owns and are already bounded.
 
 ---
 
@@ -340,10 +340,16 @@ handshake are capped at `MAX_PENDING_HANDSHAKES`, released by a guard that
 survives a panic, and `Torrent::attach` reaps the handles of peers that have
 already finished.
 
-The idle timeout on an established peer connection is *not* done — see the status
-note at the top: it needs keep-alives (R5) to avoid dropping healthy peers.
-
 Test: `swarm::a_flood_of_silent_connections_does_not_wedge_the_demux`.
+
+**Then finished.** The idle timeout that needed keep-alives first now exists:
+`Torrent::spawn_maintenance` runs a tick that drops a peer we have not heard from
+in `DEFAULT_IDLE_TIMEOUT`, and the keep-alives that make that safe go out on the
+same tick (finding 24). What is left is the parked *thread* of a silent outbound
+peer, which needs a timeout yosemite does not offer — `PROTOCOL.i2p-bt` §2.7a.
+
+Tests: `evil_peer::a_peer_that_says_nothing_is_eventually_dropped` and
+`evil_peer::maintenance_does_not_disturb_a_live_download`.
 
 ### 10. The CLI ignores `clove.conf`
 
@@ -448,7 +454,18 @@ this survive, since everything else in the smoke test runs on the XDG defaults.
     same, both holding `daemon.registry`. On a large torrent with data present,
     every other API request and the persist loop block for the duration.
 
-    → **Not fixed**, deliberately: see the status note at the top.
+    → **Fixed**: the registry hands out a `ScanJob` under a short lock, the
+    hashing runs with nothing held, and a second short lock publishes the
+    result — so `verify` on a large torrent no longer stops `status`, `list`,
+    `pause` or the resume writer. The same split covers `add_torrent` and the
+    magnet promotion, which had the same problem on a re-add over existing data.
+    A torrent being scanned reports `verifying`, cannot be resumed until it
+    finishes, and refuses a second concurrent scan; `ScanJob` is `#[must_use]`
+    because a job that is never published leaves its torrent stuck in that
+    state. No background-verification API, no progress reporting, no
+    cancellation — none of that was needed to stop the daemon wedging. Test:
+    `cloved::the_api_answers_while_a_torrent_is_being_scanned`, which holds a
+    watcher thread on the registry across a real scan.
 22. **`Storage::read_block` allocates before validating.** `vec![0u8; len as
     usize]` precedes the range check in `for_each_segment`. All current callers
     bound `len`, so this is defence-in-depth, not a live bug.
@@ -462,6 +479,39 @@ this survive, since everything else in the smoke test runs on the XDG defaults.
     if the hand-rolled loop is the one that stays).
 
     → **Fixed** by deletion, which is where SCOPE §9 pointed: `Supervisor`, `Phase`, `Poll` and `SessionFactory` are gone, `ReconnectPolicy` (tested, and the part the daemon actually calls) stays, and the daemon's loop now applies the jitter it was missing. `jittered` also survives a NaN roll rather than panicking inside `Duration::mul_f64`. Tests: the policy tests in `supervisor`, plus `cloved::the_jitter_roll_is_in_range_and_moves`.
+---
+
+## Found later
+
+### 24. clove never sent a keep-alive
+
+Found while closing the residual half of finding 9, and worse than that finding
+was. `Message::KeepAlive` was in the codec and handled on receipt as a no-op; no
+code path ever *sent* one. BEP 3's convention is one every two minutes, and
+clients drop a connection that has been silent for a few — so a peer with an
+ordinary idle timeout eventually hung up on clove whenever there was nothing else
+to say: a leecher waiting on a rare piece, a seeder nobody was requesting from, a
+connection to a peer that had everything we did. On I2P that costs more than it
+would on clearnet, because redialling means building tunnels again.
+
+It also explains why the idle-peer half of finding 9 could not simply be a read
+timeout. Both sides of that need the same thing: a clock.
+
+**Fixed.** `Torrent::spawn_maintenance` runs one thread per torrent that sends a
+keep-alive to any peer we have not written to in `DEFAULT_KEEPALIVE_INTERVAL`,
+drops peers silent for `DEFAULT_IDLE_TIMEOUT`, and runs the choke round. That
+last part replaces the traffic-driven round from finding 15 as the primary path —
+a torrent with nothing moving is exactly when the slots need reconsidering, and
+that is exactly when there is no traffic to drive them. The traffic-driven check
+stays as a fallback for an embedder using `Torrent` without a tick.
+
+Tests: `evil_peer::a_quiet_connection_still_gets_keep_alives`,
+`choke_rounds_run_without_any_traffic_at_all`,
+`a_peer_that_says_nothing_is_eventually_dropped`,
+`maintenance_does_not_disturb_a_live_download`, and
+`the_maintenance_tick_outlives_neither_its_handle_nor_its_torrent` (the tick must
+not keep a torrent's files open, and must stop when its handle goes).
+
 ---
 
 ## Testing regime
@@ -583,10 +633,27 @@ buffers. It cannot express:
   optional read timeout and set it in the fixtures; the missing peer-idle timeout
   then shows up as a test failure rather than a design note.
 
-Done so far: nothing. Both of these remain the reason a peer with no read
-timeout (finding 9) and a peer that stops draining (finding 2) had to be
-reproduced by hand, with a small `MockNet::with_capacity` and a peer that
-declines to read, rather than expressed as a fault.
+**Done: the read timeout.** `MockStream::set_timeouts` bounds reads and writes
+the way `SO_RCVTIMEO` does, and `I2pStream::set_timeouts` exposes it, so the mock
+can now express the fault the real inbound backend has. It immediately paid for
+itself twice:
+
+- Three of the keep-alive and idle-timeout tests were *hangs* before it — a
+  message the engine failed to send left `read_frame` blocked for ever, so the
+  test never reached its deadline assertion. In CI that is a job that runs until
+  the platform timeout and tells you nothing. With a bound they fail in two
+  seconds naming the missing message.
+- The first version put the timeout in the shared pipe rather than on the
+  endpoint, so a *read* timeout on one side became a *write* timeout on its
+  peer. That made `a_peer_that_says_nothing_is_eventually_dropped` pass for the
+  wrong reason: the engine was dropping the peer because its own reads timed
+  out, not because the idle timeout worked. A socket option is local, and the
+  mock now models that (`a_bounded_read_gives_up_instead_of_blocking` asserts
+  it).
+
+Still missing: a fault for **a peer that stops draining**, which finding 2 had to
+reproduce by hand with a small `MockNet::with_capacity` and a peer that declines
+to read.
 
 ### E. Nothing tests the token file's failure modes
 

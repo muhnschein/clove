@@ -90,6 +90,8 @@ is one of
 .Pq complete but offline ,
 .Sy paused ,
 .Sy waiting-for-router ,
+.Sy verifying
+.Pq its data is being hashed ,
 or
 .Sy fetching-metadata
 .Pq a magnet whose info dictionary has not arrived yet .
@@ -131,6 +133,16 @@ count.
 The torrent must be paused first;
 .Sy 400
 otherwise.
+.Pp
+Hashing a large torrent takes as long as reading it does, and this request
+waits for it — but nothing else does: the torrent reports
+.Sy verifying
+to
+.Sy GET Pa /v1/torrents
+throughout, and every other request is answered as usual.
+A second verify for the same torrent while one is running is
+.Sy 400 ,
+and the torrent cannot be resumed until it finishes.
 .It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /peers
 Hand a running torrent a peer to dial.
 The body is a b32 address, with or without the

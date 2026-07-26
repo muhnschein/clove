@@ -159,6 +159,25 @@ Status legend:
     timeout, a per-read timeout, a whole-exchange deadline and a 512-byte cap,
     speaks `HELLO VERSION` itself, and requires `HELLO REPLY RESULT=OK`. All
     six cases now fail cleanly and quickly, with an error naming the address.
+
+2.7a [open] The same gap applies to yosemite's *virtual streams*, and there the
+    probe trick does not help: `yosemite::Stream` (and the ReadHalf a peer's
+    reader thread owns) exposes no read or write timeout, so a dialled peer that
+    completes its handshake and then goes silent parks that thread until the
+    router tears the stream down. clove drops such a peer from its table on the
+    idle timeout (clove_core::torrent, DEFAULT_IDLE_TIMEOUT) so it stops
+    counting against the peer cap and its blocks go back to the picker, but the
+    thread itself is not reclaimable from here.
+
+    Inbound is unaffected: a forwarded connection is a loopback TCP socket clove
+    owns (i2pnet::sam::ForwardedStream), and I2pStream::set_timeouts bounds it —
+    which is what the demux uses to stop a connection that never handshakes from
+    holding a thread for the life of the process.
+
+    Closing this needs a timeout on yosemite's stream types, the same upstream
+    change §2.7 wants for the control socket. Until then the cost is one parked
+    thread per silent outbound peer, bounded in practice by how many peers a
+    torrent dials.
     Budget is SamConfig::probe_timeout (default 10s).
 
     Residual gap, deliberately not papered over: a bridge that answers HELLO

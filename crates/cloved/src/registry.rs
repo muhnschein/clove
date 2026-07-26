@@ -36,7 +36,7 @@ use clove_core::storage::Storage;
 use clove_core::swarm::{
     AnnounceTarget, Announcer, AnnouncerConfig, InboundDemux, Swarm, SwarmConfig,
 };
-use clove_core::torrent::Torrent;
+use clove_core::torrent::{DEFAULT_MAINTENANCE_INTERVAL, Maintenance, Torrent};
 use clove_core::tracker::MIN_ANNOUNCE_INTERVAL;
 use i2pnet::naming::NamingCache;
 use i2pnet::{DestHash, I2pDialer, I2pNamingLookup};
@@ -84,6 +84,38 @@ struct Network<D> {
     naming: NamingCache<D>,
 }
 
+/// A pass over everything a torrent has on disk, to be run *outside* the
+/// registry lock.
+///
+/// `verify_all` reads and SHA-1s every byte present, which for a large torrent
+/// is minutes of work. The registry lives behind one mutex that every API
+/// request takes, so hashing while holding it stops the whole daemon: status,
+/// list, pause, remove and the periodic resume writer all queue behind it. The
+/// lock therefore hands out this job, the hashing happens with nothing held, and
+/// a second short lock publishes the result
+/// ([`finish_scan`](Registry::finish_scan)).
+#[must_use = "a scan that is never run and published leaves its torrent marked \
+              as verifying, and it will never start"]
+pub(crate) struct ScanJob {
+    info_hash: [u8; 20],
+    meta: MetaInfo,
+    downloads_dir: PathBuf,
+}
+
+impl ScanJob {
+    /// Lay the files out if they are not there yet, then hash what is.
+    ///
+    /// Takes as long as it takes; the caller must not be holding the registry.
+    ///
+    /// # Errors
+    ///
+    /// Any filesystem error opening or reading the torrent's files.
+    pub(crate) fn run(&self) -> io::Result<Bitfield> {
+        let storage = Storage::create(&self.meta, &self.downloads_dir, false)?;
+        storage.verify_all()
+    }
+}
+
 /// One hosted torrent's in-memory summary.
 struct Hosted {
     meta: MetaInfo,
@@ -94,6 +126,10 @@ struct Hosted {
     paused: bool,
     /// Pick pieces in order rather than rarest-first (SCOPE §3).
     sequential: bool,
+    /// A hash of everything on disk is running for this torrent, outside the
+    /// registry lock. Nothing may start its engine or publish a have-set until
+    /// that finishes.
+    scanning: bool,
     live: Option<Live>,
 }
 
@@ -102,6 +138,9 @@ struct Live {
     torrent: Arc<Torrent>,
     swarm: Swarm,
     announcer: Option<Announcer>,
+    /// Keep-alives, idle-peer drops and choke rounds. Held rather than used:
+    /// dropping it with the rest of `Live` is what stops the tick on pause.
+    _maintenance: Maintenance,
     /// Lifetime (uploaded, downloaded) at engine start; the torrent's own
     /// counters are per-run deltas on top of these.
     stats_base: (u64, u64),
@@ -269,7 +308,10 @@ where
         let Some(hosted) = self.torrents.get_mut(info_hash) else {
             return Ok(());
         };
-        if hosted.paused || hosted.live.is_some() {
+        // A scan in flight owns this torrent's have-set until it publishes.
+        // Starting the engine now would hand it an empty one and re-download
+        // data that is already on disk.
+        if hosted.paused || hosted.live.is_some() || hosted.scanning {
             return Ok(());
         }
         let storage = Arc::new(Storage::create(&hosted.meta, &self.downloads_dir, false)?);
@@ -305,10 +347,12 @@ where
                 AnnouncerConfig::default(),
             ))
         };
+        let maintenance = torrent.spawn_maintenance(DEFAULT_MAINTENANCE_INTERVAL);
         hosted.live = Some(Live {
             torrent,
             swarm,
             announcer,
+            _maintenance: maintenance,
             stats_base: (hosted.uploaded, hosted.downloaded),
             last_forced_announce: None,
         });
@@ -418,26 +462,28 @@ where
     ///
     /// [`AddError`] if the bytes do not parse, the torrent is already hosted,
     /// or persistence fails.
-    pub(crate) fn add_torrent(&mut self, bytes: &[u8]) -> Result<[u8; 20], AddError> {
+    pub(crate) fn add_torrent(&mut self, bytes: &[u8]) -> Result<([u8; 20], ScanJob), AddError> {
         let meta = MetaInfo::parse(bytes).map_err(AddError::Parse)?;
         let info_hash = meta.info_hash.0;
         if self.torrents.contains_key(&info_hash) {
             return Err(AddError::Duplicate);
         }
-
-        // Lay out the files and see what (if anything) is already on disk.
-        let storage = Storage::create(&meta, &self.downloads_dir, false).map_err(AddError::Io)?;
-        let have = storage.verify_all().map_err(AddError::Io)?;
+        let num_pieces = u32::try_from(meta.pieces.len()).unwrap_or(u32::MAX);
         let priorities = vec![1u8; meta.files.len()];
 
+        // Registered with nothing yet, and marked as scanning: the initial pass
+        // over whatever is already on disk is the caller's to run without the
+        // lock, and the engine waits for it. A torrent re-added over a finished
+        // download is exactly the case that used to hold the daemon still.
         let hosted = Hosted {
-            meta,
-            have,
+            meta: meta.clone(),
+            have: Bitfield::empty(num_pieces),
             priorities,
             uploaded: 0,
             downloaded: 0,
             paused: false,
             sequential: false,
+            scanning: true,
             live: None,
         };
         let hex = hex(&info_hash);
@@ -446,9 +492,14 @@ where
         self.write_resume(&info_hash, &hosted)
             .map_err(AddError::Io)?;
         self.torrents.insert(info_hash, hosted);
-        // With a network attached, the torrent goes live immediately.
-        self.start_live(&info_hash).map_err(AddError::Io)?;
-        Ok(info_hash)
+        Ok((
+            info_hash,
+            ScanJob {
+                info_hash,
+                meta,
+                downloads_dir: self.downloads_dir.clone(),
+            },
+        ))
     }
 
     /// Add a magnet link: parse it, persist the URI, and queue it for
@@ -526,10 +577,10 @@ where
         &mut self,
         info_hash: &[u8; 20],
         torrent_bytes: &[u8],
-    ) -> Result<(), AddError> {
+    ) -> Result<ScanJob, AddError> {
         self.pending.remove(info_hash);
         let _ = fs::remove_file(self.state_dir.join(format!("{}.magnet", hex(info_hash))));
-        self.add_torrent(torrent_bytes).map(|_| ())
+        self.add_torrent(torrent_bytes).map(|(_, job)| job)
     }
 
     /// Pause or resume a torrent, persisting the change.
@@ -547,6 +598,11 @@ where
                 .torrents
                 .get_mut(info_hash)
                 .ok_or(ActionError::NotFound)?;
+            if !paused && hosted.scanning {
+                return Err(ActionError::BadInput(
+                    "a verification is running for this torrent; it will start on its own when that finishes",
+                ));
+            }
             hosted.paused = paused;
         }
         if paused {
@@ -657,13 +713,19 @@ where
         Ok(())
     }
 
-    /// Re-verify a torrent's data against the piece hashes on disk, updating
-    /// and persisting its have set. Returns the verified piece count.
+    /// Claim a torrent for re-verification and hand back the pass to run.
+    ///
+    /// The caller runs [`ScanJob::run`] with the registry unlocked and then
+    /// reports back through [`finish_scan`](Registry::finish_scan) — which it
+    /// must do even on failure, or the torrent stays marked as scanning and
+    /// never starts again.
     ///
     /// # Errors
     ///
-    /// [`ActionError::NotFound`] or a filesystem error.
-    pub(crate) fn verify(&mut self, info_hash: &[u8; 20]) -> Result<u32, ActionError> {
+    /// [`ActionError::NotFound`], or [`ActionError::BadInput`] if the torrent is
+    /// running or already being scanned.
+    pub(crate) fn begin_verify(&mut self, info_hash: &[u8; 20]) -> Result<ScanJob, ActionError> {
+        let downloads_dir = self.downloads_dir.clone();
         let hosted = self
             .torrents
             .get_mut(info_hash)
@@ -673,12 +735,49 @@ where
                 "pause the torrent before verifying (it is actively writing)",
             ));
         }
-        let storage =
-            Storage::create(&hosted.meta, &self.downloads_dir, false).map_err(ActionError::Io)?;
-        hosted.have = storage.verify_all().map_err(ActionError::Io)?;
+        if hosted.scanning {
+            return Err(ActionError::BadInput(
+                "this torrent is already being verified",
+            ));
+        }
+        hosted.scanning = true;
+        Ok(ScanJob {
+            info_hash: *info_hash,
+            meta: hosted.meta.clone(),
+            downloads_dir,
+        })
+    }
+
+    /// Publish the result of a [`ScanJob`]: adopt the have-set, persist it, and
+    /// bring the torrent live if it should be. Returns the verified piece count.
+    ///
+    /// Re-validates on the way in, because the lock was released for the
+    /// duration: the torrent may have been removed, and a `scanned` error may be
+    /// exactly why (its files went with it).
+    ///
+    /// # Errors
+    ///
+    /// [`ActionError::NotFound`] if the torrent was removed while the pass ran,
+    /// or the pass's own filesystem error.
+    pub(crate) fn finish_scan(
+        &mut self,
+        job: &ScanJob,
+        scanned: io::Result<Bitfield>,
+    ) -> Result<u32, ActionError> {
+        let info_hash = job.info_hash;
+        let Some(hosted) = self.torrents.get_mut(&info_hash) else {
+            // Removed while we hashed: nothing to publish, nothing to clear.
+            return Err(ActionError::NotFound);
+        };
+        hosted.scanning = false;
+        let have = scanned.map_err(ActionError::Io)?;
+        hosted.have = have;
         let count = hosted.have.count();
-        let resume = hosted.resume(*info_hash);
-        write_resume_file(&self.state_dir, info_hash, &resume).map_err(ActionError::Io)?;
+        let resume = hosted.resume(info_hash);
+        write_resume_file(&self.state_dir, &info_hash, &resume).map_err(ActionError::Io)?;
+        // Nothing could start it while the scan was in flight, so this is where
+        // an added or freshly-verified torrent goes live.
+        self.start_live(&info_hash).map_err(ActionError::Io)?;
         Ok(count)
     }
 
@@ -829,6 +928,7 @@ where
                 downloaded: resume.downloaded,
                 paused: resume.paused,
                 sequential: resume.sequential,
+                scanning: false,
                 meta,
                 live: None,
             },
@@ -850,7 +950,9 @@ impl Hosted {
     /// The state string shown in listings.
     fn state(&self) -> &'static str {
         let complete = self.have.count() == self.have.len();
-        if self.paused {
+        if self.scanning {
+            "verifying"
+        } else if self.paused {
             "paused"
         } else if self.live.is_some() {
             if complete { "seeding" } else { "downloading" }
@@ -1096,6 +1198,21 @@ mod tests {
         (dest, dir)
     }
 
+    /// Add a torrent the way the daemon does: register it, run its initial scan
+    /// with the registry not held, publish the result.
+    ///
+    /// The two halves exist because that scan hashes whatever is already on disk
+    /// and must not happen under the lock; a test that only called the first
+    /// half would leave the torrent stuck in "verifying" and never started.
+    fn add_and_scan(registry: &mut Registry<MockDialer>, bytes: &[u8]) -> [u8; 20] {
+        let (info_hash, job) = registry.add_torrent(bytes).expect("add");
+        let scanned = job.run();
+        registry
+            .finish_scan(&job, scanned)
+            .expect("publish the scan");
+        info_hash
+    }
+
     fn first_progress(registry: &mut Registry<MockDialer>) -> f64 {
         registry
             .list()
@@ -1122,7 +1239,7 @@ mod tests {
             "leecher-b64".to_owned(),
         );
 
-        let info_hash = registry.add_torrent(&bytes).unwrap();
+        let info_hash = add_and_scan(&mut registry, &bytes);
         registry.add_peer(&info_hash, seed_dest).unwrap();
 
         // Poll the registry's own view until the download completes.
@@ -1156,7 +1273,7 @@ mod tests {
             quick_swarm(),
             "pause-b64".to_owned(),
         );
-        let info_hash = registry.add_torrent(&bytes).unwrap();
+        let info_hash = add_and_scan(&mut registry, &bytes);
 
         // Live: an operator peer is accepted.
         registry.add_peer(&info_hash, DestHash([0xEE; 32])).unwrap();
@@ -1176,7 +1293,7 @@ mod tests {
         let (_content, bytes) = fixture("waiting-demo");
         let data = TempDir::new("data");
         let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
-        let info_hash = registry.add_torrent(&bytes).unwrap();
+        let info_hash = add_and_scan(&mut registry, &bytes);
         let state = registry
             .list()
             .as_array()
@@ -1192,7 +1309,7 @@ mod tests {
         let data = TempDir::new("data");
         let info_hash = {
             let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
-            let info_hash = registry.add_torrent(&bytes).unwrap();
+            let info_hash = add_and_scan(&mut registry, &bytes);
             // Rarest-first is the default; nothing is claimed until asked.
             assert_eq!(sequential_flag(&mut registry, &info_hash), Some(false));
             registry.set_sequential(&info_hash, true).unwrap();
@@ -1212,7 +1329,7 @@ mod tests {
         let (_content, bytes) = fixture("announce-demo");
         let data = TempDir::new("data");
         let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
-        let info_hash = registry.add_torrent(&bytes).unwrap();
+        let info_hash = add_and_scan(&mut registry, &bytes);
         // No router yet: the error names that, rather than pretending to
         // announce into a void.
         assert!(matches!(
@@ -1291,7 +1408,12 @@ mod tests {
             assert!(Instant::now() < deadline, "metadata fetch did not finish");
             let ctx = registry.fetch_context(&info_hash).unwrap().unwrap();
             if let Some(bytes) = crate::try_fetch_round(&ctx, info_hash, true) {
-                registry.complete_magnet(&info_hash, &bytes).unwrap();
+                // Same two steps as the daemon's fetch thread: promote, then run
+                // and publish the initial scan. Skipping the second would leave
+                // the torrent marked as verifying and it would never start.
+                let job = registry.complete_magnet(&info_hash, &bytes).unwrap();
+                let scanned = job.run();
+                registry.finish_scan(&job, scanned).unwrap();
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -1316,7 +1438,7 @@ mod tests {
         let data = TempDir::new("mismatch");
         let info_hash = {
             let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
-            registry.add_torrent(&bytes).unwrap()
+            add_and_scan(&mut registry, &bytes)
         };
         let resume_path = data.0.join(format!("state/{}.resume", hex(&info_hash)));
 
