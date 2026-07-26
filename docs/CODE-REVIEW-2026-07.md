@@ -1,0 +1,590 @@
+# Code review — 2026-07
+
+A read of the whole tree (16.8 kLOC of Rust across `i2pnet`, `clove-core`,
+`cloved`, `clove`) looking for bugs, followed by what the testing regime would
+have to look like to have caught them.
+
+Baseline: `cargo test --workspace` is green (221 tests) at the commit reviewed,
+and every finding below is against that green tree. Findings 1, 2, 3, 4 and 5
+were reproduced; the repros are in [Appendix A](#appendix-a-repros) and each
+fails on the current code.
+
+Severity is about the consequence for a user running the daemon, not about how
+hard the bug was to find.
+
+---
+
+## Critical
+
+### 1. A late duplicate block overwrites a verified piece — silent corruption, or a debug panic
+
+`Shared::on_block` (`crates/clove-core/src/torrent.rs:705`) writes any block a
+peer owed us straight to disk:
+
+```rust
+let was_requested = st.peers[idx].in_flight.remove(&(index, block_no));
+if !was_requested {
+    // ignore
+} else if self.storage.write_block(index, begin, block).is_ok() {
+```
+
+Nothing checks whether we already hold `index`. The picker deliberately creates
+exactly this situation: in endgame it hands one block to several peers
+(`picker.rs:348`, "duplicate requests … are the accepted cure for the
+last-block stall"). Endgame is on for the last 32 blocks of *every* torrent, and
+from the start for anything ≤ 512 KiB. So:
+
+1. Peers A and B are both asked for block *b* of piece *p*.
+2. A answers; the piece completes, verifies, `set_have(p)`, `Have` broadcast.
+3. B answers later. `was_requested` is still true for B, so B's bytes are
+   written over the verified piece.
+
+Consequences, both confirmed:
+
+- **Release build:** the on-disk piece is now whatever B sent, while `have` still
+  claims it and `is_complete()` is still true. For a multi-block piece
+  `block_received` returns `false`, so nothing re-verifies and *the corruption is
+  never noticed* — the client reports a finished download, serves the corrupt
+  piece to the swarm, and only a manual `clove verify` finds it. For a one-block
+  piece it does re-verify, fails, and calls `reset_piece`, which clears the block
+  progress but **not** the have bit — so the outcome is the same, plus a piece
+  the picker will never re-download.
+- **Debug build:** `block_received` → `progress_mut` creates block progress for a
+  piece in `have`, and `Picker::check_invariants` panics with `piece 0: held
+  complete yet still has block progress`, killing that peer's reader thread.
+
+The repro prints `after B: complete=true piece_verifies=false`.
+
+Note this needs no malice — two honest seeders and a small torrent get there —
+but a malicious peer can aim it: request-and-delay is enough to corrupt a
+finished download that the victim will then advertise as complete.
+
+**Fix sketch.** In `on_block`, before writing: if `st.picker.has(index)`, drop the
+`in_flight` entry, skip both the write and `block_received`, and fall through to
+`fill_requests`. Independently, make `reset_piece` clear the have bit (or assert
+it is unset) so a failed re-verification can never leave `have` asserting a piece
+that just failed its hash.
+
+### 2. One peer that stops reading stalls every other peer on the torrent
+
+`on_message` collects outgoing messages under the lock and then sends them with
+the *blocking* `SyncSender::send` (`torrent.rs:531`):
+
+```rust
+for (tx, msg) in out {
+    let _ = tx.send(msg);
+}
+```
+
+`out` routinely holds messages for peers *other* than the one whose reader thread
+is running: the `Have` broadcast on piece completion (`on_block`), every
+choke/unchoke from `run_choker`, and PEX. Each peer's queue is
+`sync_channel(OUTGOING_QUEUE = 256)`, drained by a writer thread that blocks in
+`write_message`.
+
+A peer that pipelines requests and never reads its socket therefore fills its
+socket buffer, then its 256-deep queue — and from then on **any** other peer's
+reader thread that produces a message for it blocks in `send`, forever. There is
+no timeout anywhere on that path.
+
+Reproduced: a leecher holding half a torrent, one hostile peer that sends
+`Interested` plus a flood of `Request`s and never reads, then an honest seeder
+attaches. The download stops one piece later —
+`honest download stalled at 5/8 pieces` — because the seeder's reader thread is
+parked broadcasting `Have` to the wedged peer.
+
+This is precisely the property `tests/evil_peer.rs` claims to hold ("A
+misbehaving peer cannot deny service to an honest one"); the existing slow-loris
+case only covers a peer that *says nothing*, which never fills a queue.
+
+**Fix sketch.** Use `try_send` and treat a full queue as a dead peer: drop it
+(`remove_peer`) rather than waiting on it. `finish_attach` already uses `try_send`
+for the opening messages, so the pattern is in the file. If backpressure to a
+slow-but-honest peer matters, give the writer thread a bounded overflow policy
+(coalesce `Have`s, drop keep-alives) — but never block a foreign reader thread.
+
+### 3. An empty token file authenticates every local client
+
+`load_or_create_token` (`cloved/src/main.rs:664`) reads
+`<data_dir>/token`, trims it, and uses it as the shared secret. An empty file
+yields `""`, and `constant_time_eq(b"", b"")` is `true` — the daemon's own test
+asserts that. A request carrying a bare `x-clove-token:` header then passes.
+
+Verified against the built daemon with a zero-byte token file:
+
+```
+no header      : ('HTTP/1.1 401 Unauthorized', ...)
+empty token    : ('HTTP/1.1 200 OK', '{"version":"0.0.1",...}')
+bare colon     : ('HTTP/1.1 200 OK', ...)
+wrong token    : ('HTTP/1.1 401 Unauthorized', ...)
+```
+
+Reachable because the token is the one file written *non*-atomically — no temp,
+no rename, no fsync:
+
+```rust
+let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+file.write_all(token.as_bytes())?;
+```
+
+A crash, SIGKILL, or ENOSPC between `create_new` and `write_all` leaves a 0-byte
+token behind, and every later start reads it as "the empty secret". `SECURITY.md`
+names "Local API authentication bypass" as in scope, so this is the project's own
+definition of a vulnerability.
+
+**Fix sketch.** Write the token through the same `atomic_write` used for state,
+and on load refuse a token that is empty or shorter than the 64 hex characters
+the daemon generates — regenerate it (and log that) or refuse to start. Consider
+requiring the header to be exactly the expected length before comparing.
+
+---
+
+## Medium
+
+### 4. Availability leak: repeated `Have`/`Bitfield`/`HaveAll`/`HaveNone`
+
+`Shared::handle` counts availability unconditionally while the peer's own record
+is idempotent or replaced wholesale:
+
+- `Have(p)`: `peer.has.set(p)` (idempotent) then `picker.add_single(p)` (always
+  `+= 1`). N `Have`s for one piece add N; the peer's departure subtracts 1,
+  because `remove_bitfield` reads the bitfield.
+- `Bitfield` / `HaveAll`: `add_bitfield(&new)` then `peer.has = new`, with no
+  `remove_bitfield(&old)` — a second piece-set message double-counts the first.
+- `HaveNone`: replaces `has` with an empty field and withdraws nothing.
+
+Verified: 1000 `add_single(0)` then one peer leaving leaves `availability(0) ==
+999`. Effect is a permanently distorted rarest-first order for the whole torrent
+— a cheap way for one peer to steer everyone's piece selection — and in a debug
+build `availability[i] += 1` is an overflow panic waiting on a long-lived
+connection. The debug invariant net does not cover availability, which is why it
+stays silent here.
+
+**Fix sketch.** Only count when the bit actually changes (`if !peer.has.has(p)`);
+on a second bitfield/have-all, `remove_bitfield(&old)` first, or — per BEP 3 —
+reject a second piece-set message and drop the peer. Add the missing cross-check
+to `debug_check_state`: availability must equal the column sums of the peers'
+bitfields.
+
+### 5. Duplicate file paths in a `.torrent` alias on disk, and the torrent can never complete
+
+`metainfo::parse_files` validates each path *component* but never checks that the
+resulting paths are distinct. `Storage::create` then opens the same file twice as
+two regions at different global offsets, so their writes overlap.
+
+Verified: a two-file torrent whose entries share the path `same.bin` (16384 + 100
+bytes, two pieces) parses fine, both pieces are written correctly, and
+`verify_all` reports `1/2` — piece 0 was clobbered by piece 1's write. A leecher
+in that state re-downloads the piece forever against every peer it meets.
+
+The related collision — `["a"]` and `["a", "b"]` — fails loudly instead
+(`create_dir_all` over a regular file), which merely makes the add fail.
+
+**Fix sketch.** Reject duplicate paths, and reject a path that is a strict prefix
+of another, in `parse_files`. Both are cheap set checks on data that is already
+collected there.
+
+### 6. `fetch_metadata` has no bound on frames, pieces, or time
+
+`torrent::fetch_metadata` requests every metadata piece up front and then loops
+`while !asm.is_complete()`, reading frames and ignoring anything unexpected
+(`torrent.rs:947`). A peer that re-sends piece 0 forever keeps the loop alive
+indefinitely — `add_piece` is a no-op for a piece already held, so the loop never
+converges and never errors. There is no read timeout on the stream either (see
+finding 9).
+
+Because `try_fetch_round` walks candidate peers sequentially, one such peer in a
+tracker's reply pins a daemon thread and prevents that magnet from ever
+resolving.
+
+**Fix sketch.** Cap total frames and wall-clock time for the exchange, re-request
+only `asm.missing()` after a timeout, and fail the peer rather than the round.
+
+### 7. `known_peers` is unbounded, and our own PEX messages exceed our own PEX limit
+
+Two halves of the same oversight:
+
+- Inbound: `on_extended` inserts every `pex.added` entry into `known_peers` with
+  no cap. The per-message limit is 512, but not the number of messages, so a peer
+  can grow the set without bound — and the dial sweep will then try to dial every
+  entry it holds, spending a tunnel and up to `dial_timeout` on each.
+- Outbound: `send_pex` packs the *entire* `known_peers` set into one message. Any
+  clove peer receiving it rejects the whole thing with `TooManyPeers` once the
+  set exceeds `MAX_PEX_PEERS` (512). So PEX silently stops working exactly on the
+  busy torrents where it matters — a decoder refusing what its own encoder
+  produces, which is the discipline `docs/STATE-FORMAT.md` argues for elsewhere.
+
+**Fix sketch.** Bound `known_peers` (a capped set with eviction), and chunk or
+sample outgoing PEX so a message is always under the limit. A `PexMessage`
+round-trip property test would have caught the second half (see
+[testing](#testing-regime), item H).
+
+### 8. One bad forwarded connection kills the inbound accept loop
+
+`SamListener::accept` (`i2pnet/src/sam.rs:367`) returns `Err` for *per-connection*
+problems: the destination-line read timing out, non-UTF-8, an unparseable
+destination, EOF before the newline. Both consumers treat any `Err` as "the
+listener is gone and will not come back":
+
+```rust
+// swarm.rs accept_loop, and InboundDemux::run
+Err(_) => return,
+```
+
+So a single malformed connection to the loopback forward port stops the daemon
+accepting inbound peers *at all* until the SAM session is rebuilt (up to the 30 s
+health interval plus reconnect backoff). `poke_listener` demonstrates how little
+it takes: connect and close.
+
+**Fix sketch.** Distinguish fatal listener failure from a per-connection one —
+have `accept` return the connection error in a form the loop can `continue` past
+(or move the dest-line read into the per-connection thread, which is where it
+belongs anyway, and where `InboundDemux::route` already reads the BT handshake).
+
+### 9. No timeouts on peer streams; a thread per inbound connection, unbounded
+
+`ForwardedStream::set_timeouts` exists, documents itself as "worth setting on
+anything that serves peers", and is called by nothing but
+`bin/sam-stress.rs`. `SamStream` (outbound, via yosemite) has no timeout API at
+all. So in production every peer stream blocks forever on a silent peer:
+
+- a peer that connects and never sends a handshake parks an `InboundDemux::route`
+  thread for the life of the process — and `route` spawns one thread per accepted
+  connection with no cap;
+- a peer that handshakes and goes quiet parks a reader thread; `disconnect_all`
+  documents this ("reader threads linger inertly … reclaiming them needs the
+  keep-alive/read-timeout work (R5)").
+
+Combined, idle connections are an unbounded thread leak, which is a cheaper
+denial of service than it should be.
+
+Related: `Torrent::threads` is push-only — two `JoinHandle`s per attach, never
+joined or reaped — so peer churn grows it without bound even after the threads
+exit.
+
+**Fix sketch.** Call `set_timeouts` on accepted streams; bound the number of
+in-flight `route` threads; land the R5 keep-alive/idle timeout; reap finished
+handles (or stop storing them and track liveness in the peer table).
+
+### 10. The CLI ignores `clove.conf`
+
+`clove::resolve` (`clove/src/main.rs:611`) builds its configuration from an empty
+string:
+
+```rust
+let config = Config::parse("", &defaults)...;
+let socket = socket.unwrap_or(config.api_socket);
+let token_path = config.data_dir.join("token");
+```
+
+So `data_dir` and `api_socket` from the config file are never read.
+`clove(1)` says the opposite: "The socket path and the API token are read from
+the same configuration the daemon uses, so `clove` normally needs no arguments
+beyond a command." With a non-default `data_dir` the CLI cannot find the token at
+all, and there is no flag to point it at one (`--socket` covers only half the
+problem). XDG environment variables still work, which is why `ci/smoke.sh` does
+not notice.
+
+**Fix sketch.** Read the same config path the daemon defaults to, and add
+`-c/--config` to the CLI.
+
+---
+
+## Low
+
+11. **`event=completed` is re-sent on every announce after completion.**
+    `AnnounceState::next_event` returns `Completed` whenever `complete` is true,
+    and nothing records that it was already reported — so a seeding torrent
+    reports `completed` on every periodic announce, inflating tracker snatch
+    counters. Latch it in `on_success`.
+
+12. **`https://` trackers are kept at parse time and then always fail.**
+    `metainfo::is_i2p_tracker` accepts `http://` and `https://`;
+    `tracker::split_url` strips only `http://`. An https announce URL therefore
+    survives into `MetaInfo::trackers` and then fails `build_announce` with
+    `BadUrl` on every attempt, forever, with nothing user-visible saying why.
+    Also, `build_announce` does not re-check `.i2p`, so it is not a second line
+    of defence for a URL that arrives from somewhere other than `metainfo`.
+
+13. **`left` is under-reported.** `announce_once` computes
+    `have.count() * piece_length`, which over-counts a held short final piece and
+    so under-reports `left` whenever the last piece is present and others are
+    missing. Use the real byte count.
+
+14. **`serve_request` does not bound a request to its piece.** It checks
+    `length > BLOCK_LEN` and `picker.has(req.index)` but not
+    `begin + length <= piece_len(index)`, so a peer can read across into the next
+    piece — bytes we have not verified, possibly not downloaded — labelled as
+    part of a piece we hold. `read_block` only bounds against the whole torrent.
+
+15. **The choker never rotates.** `run_choker` is called only from the
+    `Interested`/`NotInterested` arms; there is no periodic round. So
+    `Choker::plan`'s round counter — and therefore the optimistic-unchoke slot
+    the module is built around, and its tests exercise — effectively never
+    advances in production.
+
+16. **`registry::load_one` does not cross-check the resume piece count.** It
+    verifies `resume.info_hash == meta.info_hash` but not
+    `resume.num_pieces == meta.pieces.len()`, so a stale resume file yields a
+    `Hosted.have` of a different length than the torrent (wrong `progress`,
+    wrong `state`) until the next refresh overwrites it.
+
+17. **`try_fetch_round` calls `peers.dedup()` on an unsorted vector**, which
+    removes only *consecutive* duplicates. Sort first or use a set.
+
+18. **`build_peer_id` fails silently.** If `getrandom` fails, the peer id is the
+    literal `-CV0001-............` — identical across every instance that hits
+    that path. Prefer failing loudly to shipping a shared identity.
+
+19. **`atomic_write` does not fsync the directory.** temp + fsync + rename makes
+    the write atomic against a process crash, which is what `ci/chaos.sh` tests,
+    but not durable against power loss — the rename can be lost, taking the file
+    with it. The module doc's "a crash mid-write never corrupts them" is true
+    only for the tested case.
+
+20. **`i2p_base64_decode`'s doc contract is wrong.** It claims to return `None`
+    "on a truncated final group"; it does not (`"A"` yields `Some(vec![])`).
+    Callers happen to check for emptiness, so nothing is broken today, and the
+    asymmetry with `base32_decode` — which *is* strict about spare bits, for
+    good reasons spelled out in its doc — is worth closing.
+
+21. **Whole-torrent hashing runs under the single registry mutex.**
+    `add_torrent` calls `verify_all`, and `POST /v1/torrents/<ih>/verify` does the
+    same, both holding `daemon.registry`. On a large torrent with data present,
+    every other API request and the persist loop block for the duration.
+
+22. **`Storage::read_block` allocates before validating.** `vec![0u8; len as
+    usize]` precedes the range check in `for_each_segment`. All current callers
+    bound `len`, so this is defence-in-depth, not a live bug.
+
+23. **`supervisor::Supervisor` is dead code.** The tested state machine — backoff,
+    jitter, `Phase`, `report_lost` — is not what runs: `spawn_sam_supervisor`
+    reimplements the loop by hand and never applies jitter at all, so the
+    thundering-herd protection the module exists for is not in the binary. Use it
+    or delete it (the culture-of-deletion rule in SCOPE §9 would say the latter,
+    if the hand-rolled loop is the one that stays).
+
+---
+
+## Testing regime
+
+The invariant net works. Finding 1 was caught by `Picker::check_invariants` the
+instant a test drove the engine into that state — the assertion is exactly right,
+it had just never been reached. That is the shape of the gap: the *assertions* are
+strong and the *drivers* are narrow.
+
+### A. No test ever puts two peers on one torrent
+
+Every engine test is one connection: `torrent.rs`'s mock download, `swarm.rs`'s
+runner tests, the registry tests. `evil_peer.rs` comes closest and still
+deliberately separates them — the hostile peers hit a seeder one at a time, and
+the honest download that follows uses a *fresh* leecher.
+
+That single gap hides findings 1, 2 and 4, plus the entire choker, and it is the
+highest-value fix in this document:
+
+- A multi-peer fixture: one `Torrent` instance, N honest peers and M scripted
+  hostile ones attached *concurrently*, driven to completion.
+- Restate the evil-peer contract to mean what it says: the honest peer must
+  finish **while sharing the torrent instance with** the misbehaving one, not
+  after it has been disconnected. My finding-2 repro is that test.
+- A specific endgame case: two peers asked for the same block, the second
+  answering after the piece verified (finding 1), asserting the piece still
+  verifies afterwards.
+
+### B. Model-based testing for the pure state machines
+
+`Picker` and `Choker` are pure, deterministic and cheap to drive. A seeded
+random-operation test — `pick`, `block_received`, `block_failed`, `set_have`,
+`reset_piece`, add/remove peer, in arbitrary order, with `check_invariants` after
+every step and a printable seed on failure — would have found findings 1 and 4
+without a socket in sight. The same harness shape as
+`addr.rs`'s `mutating_a_real_address_never_panics_and_never_lies`, applied to
+state instead of bytes.
+
+Add the invariants that are currently missing rather than wrong:
+
+- availability equals the column sums of the connected peers' bitfields
+  (finding 4);
+- no piece has block progress *or* accepts a block while it is in `have`
+  (finding 1 — half of this exists, but only as a panic, not as a guard);
+- the have-set never loses a piece and never gains one that failed verification.
+
+### C. Fuzzing stops at `clove-core`'s parsers
+
+`clove-fuzz` depends on `clove-core` only, so `i2pnet::addr` is unfuzzed — and
+`DestHash::from_b32` / `from_b64_destination` take bytes from magnets, PEX,
+tracker replies and the router on every inbound stream. The xorshift sweep in
+`addr.rs` is good, but it is a fixed 20 000 mutations of two seeds, not
+coverage-guided.
+
+Three additions, in value order:
+
+1. **A stateful wire target.** Interpret the fuzz input as a *sequence* of peer
+   messages and feed it through a real `Torrent` over the mock (handshake, then
+   `Message::parse` → `on_message`), with the debug invariants live. That is the
+   layer findings 1 and 4 live at, and no amount of parser fuzzing reaches it.
+2. **`i2pnet::addr` targets** (b32 label, b64 destination, `read_dest_line`).
+3. **A `Storage` geometry target**: derive (file lengths, piece length) from the
+   input, then write and verify pieces, asserting that a correct write always
+   verifies. Finding 5 is a one-line assertion in that target.
+
+Also worth adding to the fuzz matrix in CI: `pex` and `metadata` are covered by
+the `extensions` target, but neither the `MetadataAssembler` nor
+`magnet::torrent_bytes` → `MetaInfo::parse` round-trip is.
+
+### D. The mock cannot express the two faults that matter here
+
+`MockNet` models a dead session, a black hole, a manual read stall, and bounded
+buffers. It cannot express:
+
+- **a peer that stops draining** (finding 2). My repro fakes it with a small
+  capacity and a non-reading peer; a first-class `set_write_stalled` /
+  `set_never_drains` fault would make it a one-liner.
+- **a read timeout**. Mock reads wait forever, which is exactly why finding 9
+  (no timeouts anywhere in production) is invisible in CI. Give `MockStream` an
+  optional read timeout and set it in the fixtures; the missing peer-idle timeout
+  then shows up as a test failure rather than a design note.
+
+### E. Nothing tests the token file's failure modes
+
+`the_token_file_is_created_once_and_kept_private` covers the happy path only.
+Add: empty, whitespace-only, short, and trailing-garbage token files, each
+asserting the API still refuses requests (finding 3). And a chaos case that
+SIGKILLs the daemon during *first* start — before the token exists — then
+restarts and asserts an unauthenticated request is still a 401. `ci/chaos.sh`
+starts its kill storm only after the daemon has answered once, so the token
+always exists by then.
+
+### F. Test the supervisor that actually runs
+
+Either `cloved` uses `supervisor::Supervisor` or the module goes (finding 23).
+Whichever way it lands, the reconnect path deserves the treatment
+`hostile_bridge_tests` already gives session *setup*: a fake bridge that accepts,
+serves a session, then dies mid-operation, asserting that the daemon detaches,
+backs off with jitter, re-attaches, and that torrents come back live. Today the
+tested backoff is not the running backoff.
+
+### G. Nothing starts the daemon with a real config file
+
+`Config::parse` is well covered as a function, but no test writes a `clove.conf`
+with a non-default `data_dir`/`api_socket`, starts `cloved -c` on it, and drives
+`clove` at it. That is why finding 10 survives: the smoke test uses XDG
+environment variables, which both binaries honour. One extra smoke section closes
+it.
+
+### H. Cheap properties that would each have caught a finding here
+
+- Every `PexMessage` we encode parses under our own `parse` (finding 7).
+- Every URL kept by `is_i2p_tracker` is accepted by `build_announce`
+  (finding 12).
+- A parsed `MetaInfo` has pairwise-distinct, non-prefix-colliding file paths
+  (finding 5).
+- `Resume` → registry → `Resume` preserves the piece count and agrees with the
+  `.torrent` (finding 16).
+
+### I. Two mechanical gaps
+
+- **CI never runs the tests in release mode.** The invariant net is
+  `cfg(debug_assertions)`, so the release behaviour of finding 1 — silent
+  corruption instead of a panic — is never exercised anywhere. Add
+  `cargo test --workspace --release` to the `test` job; it is a minute, and it is
+  the configuration users run.
+- **Assertions can rot into no-ops unnoticed.** Add a handful of negative tests
+  that deliberately corrupt state and assert the invariant *fires*
+  (`#[should_panic]` on a debug-only test), so a future refactor that silently
+  weakens `check_invariants` fails the build.
+
+### J. Metrics that would make "test volume > source volume" honest
+
+SCOPE §9 tracks test LOC as the aspiration. Two better proxies, both cheap to
+add on the schedule that already runs nightly fuzzing:
+
+- `cargo llvm-cov` on the workspace, reported (not gated) per milestone. The
+  interesting number is not the total but which *modules* are dark — `torrent.rs`
+  and `registry.rs` carry the most logic and the fewest direct tests.
+- `cargo-mutants` over `picker`, `choker`, `bitfield` and `metainfo`. They are
+  pure, fast, and the modules whose bugs are silent; a surviving mutant there is
+  a missing assertion, stated precisely.
+
+### K. Concurrency scrutiny
+
+The torrent mutex plus per-peer channels is a small protocol with a real
+invariant ("never block a foreign reader thread") that finding 2 violates. A
+ThreadSanitizer run (nightly, scheduled alongside fuzzing) over the multi-peer
+fixture from item A is the cheapest ongoing check; a `loom` model of the
+lock/channel handoff would be the thorough one, and is probably more than this
+warrants today.
+
+---
+
+## Appendix A: repros
+
+Drop into `crates/clove-core/tests/` and run with `cargo test -p clove-core`.
+All four fail on the reviewed commit. They are not committed as tests because
+they are red.
+
+### Findings 1 and 4 — endgame overwrite, availability leak
+
+```rust
+// picker: a duplicate endgame delivery for a piece we already hold trips the
+// debug invariant.
+#[test]
+fn picker_block_received_for_a_held_piece() {
+    let mut p = Picker::new(1, BLOCK_LEN, u64::from(BLOCK_LEN), Mode::RarestFirst);
+    let mut peer = Bitfield::empty(1);
+    peer.set(0);
+    assert_eq!(p.pick(&peer, 1).len(), 1);
+    assert!(p.block_received(0, 0));
+    p.set_have(0);
+    // A second peer's copy of the same block lands after the piece completed.
+    let _ = p.block_received(0, 0);   // panics: "held complete yet still has block progress"
+}
+
+// A peer spamming `Have` for one piece inflates availability permanently.
+#[test]
+fn have_spam_inflates_availability() {
+    let mut p = Picker::new(2, BLOCK_LEN, 2 * u64::from(BLOCK_LEN), Mode::RarestFirst);
+    for _ in 0..1000 {
+        p.add_single(0);
+    }
+    let mut one = Bitfield::empty(2);
+    one.set(0);
+    p.remove_bitfield(&one);          // the peer leaves
+    assert_eq!(p.availability(0), 0); // fails: 999
+}
+```
+
+The engine-level version of finding 1: a one-piece torrent, two raw peers that
+each announce the piece and unchoke, both receiving `Request { index: 0, begin: 0
+}`; peer A answers honestly (the torrent completes and the piece verifies), then
+peer B answers with `vec![0xEE; len]`. Result:
+`after B: complete=true piece_verifies=false`, plus the invariant panic on the
+reader thread.
+
+### Finding 2 — a peer that stops reading stalls the download
+
+A leecher pre-loaded with the first half of an 8-piece torrent; a hostile peer
+sends `Interested` then 2000 `Request`s for piece 0 and never reads; two seconds
+later an honest seeder attaches. Assert the leecher reaches 8/8 within 20 s.
+Actual: `honest download stalled at 5/8 pieces while a peer held its socket`.
+
+### Finding 5 — duplicate file paths
+
+```rust
+// Two `files` entries with the same path, 16384 + 100 bytes, two pieces.
+let meta = MetaInfo::parse(&bytes).expect("rejected");   // accepted
+let st = Storage::create(&meta, &dir, false).unwrap();
+st.write_block(0, 0, &content[..BLOCK_LEN as usize]).unwrap();
+st.write_block(1, 0, &content[BLOCK_LEN as usize..]).unwrap();
+assert!(st.verify_all().unwrap().is_full());              // fails: 1/2 verified
+```
+
+### Finding 3 — empty token
+
+```sh
+mkdir -p data/clove run && : > data/clove/token
+XDG_DATA_HOME=$PWD/data XDG_RUNTIME_DIR=$PWD/run cloved &
+printf 'GET /v1/status HTTP/1.1\r\nHost: clove\r\nx-clove-token: \r\n\r\n' \
+  | nc -U run/clove.sock      # 200 OK
+```
