@@ -589,9 +589,55 @@ Add the invariants that are currently missing rather than wrong:
   (finding 1 — half of this exists, but only as a panic, not as a guard);
 - the have-set never loses a piece and never gains one that failed verification.
 
-Of the invariants named below, availability-versus-the-peer-table is now in
+**Done** — `crates/clove-core/tests/model.rs`. Four sweeps: the picker against a
+state model under 4 000 random operations (both selection orders × two torrent
+shapes × endgame default/disabled/narrow, every combination), a
+drain-to-completion liveness test, and two choker sweeps for plan applicability
+and optimistic-slot rotation.
+
+The model deliberately tracks *state, not policy* — it does not decide which
+piece is rarest or whose turn the optimistic slot is, since reimplementing the
+strategy would be the implementation twice over and would prove nothing. It
+tracks what must hold under any strategy: which pieces are held, how many peers
+hold each one (derived from the peer table, never counted separately), which
+blocks are outstanding, and whether work remains to hand out.
+
+The two torrent shapes exist because coverage was measured rather than assumed.
+A first pass used one 18-block fixture, which sits *inside* the default endgame
+threshold of 32 from the first step — so on every default-configured seed the
+picker was in the endgame for all 4 000 steps, and the "a block is not handed out
+twice outside the endgame" rule was never once checked. The 48-block shape
+crosses the threshold part-way through, making the endgame a transition.
+
+The harness was then validated by sabotage — each fix reverted in turn to confirm
+the sweep fails, *in release*, where the `debug_assertions` net is compiled out:
+
+| Sabotage | Caught by | How it presents |
+| --- | --- | --- |
+| finding 1: `progress_mut` reopens a held piece | picker sweep, step 187 | `block_received` reports completion for a piece already held |
+| finding 4: `reset_piece` keeps the have bit | picker sweep, step 22 | held-ness disagrees with the model |
+| duplicate delivery leaks an in-flight count | picker sweep, step 152 | 11 blocks outstanding, model says 10 |
+| `block_failed` never releases the request | picker sweep and drain test, step 2 | outstanding count drifts on the first release |
+| `pick` never offers the last piece | both liveness assertions | work was available but nothing was offered |
+| optimistic slot stops rotating | rotation sweep | only 2 of 5 peers ever unchoked |
+| `plan` re-announces unchanged peers | applicability sweep, round 2 | told to unchoke a peer that already was |
+
+That release column is the point. `Model::check` calls `check_invariants`
+unconditionally, so the debug-only net also runs in release test builds — but
+every row above was additionally confirmed to fail with that call commented out,
+so the model catches these on its own rather than merely driving the existing
+checker.
+
+The last three rows are why the harness is more than a second copy of
+`check_invariants`: a picker that quietly stops offering work, or a choker whose
+optimistic slot freezes, keeps every internal invariant intact. Nothing is
+inconsistent — the download just never finishes. Those are only reachable by
+driving the thing over many steps and asserting on what it *does*, not on what it
+holds.
+
+Of the invariants named above, availability-versus-the-peer-table is also in
 `debug_check_state`, and "no piece has progress while it is held" is enforced
-structurally rather than asserted. The random-operation harness is still missing.
+structurally rather than only asserted.
 
 ### C. Fuzzing stops at `clove-core`'s parsers
 
