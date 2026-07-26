@@ -26,13 +26,13 @@
 use std::env;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use i2pnet::sam::{DEFAULT_SAM_PORT, SamConfig, SamListener, SamSession, unique_nickname};
-use i2pnet::{DestHash, I2pDialer, I2pListener};
+use i2pnet::{DestHash, I2pDialer, I2pListener, I2pNamingLookup};
 
 /// Bytes each stream sends and expects echoed back — enough to exercise a
 /// real round-trip through tunnels, small enough not to dominate timing.
@@ -42,19 +42,38 @@ const PAYLOAD_LEN: usize = 64 * 1024;
 /// router's own `CANT_REACH_PEER` timeout governs — see `PROTOCOL.i2p-bt` 2.3).
 const STREAM_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long a dialer keeps retrying while the target's leaseSet is still
-/// propagating (a fresh destination is briefly unreachable — `CantReachPeer`).
-const WARMUP_DEADLINE: Duration = Duration::from_secs(240);
-
 /// Pause between dial retries during warmup.
 const RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Default budget for the whole run, from "sessions up" to the report.
-///
-/// Comfortably longer than [`WARMUP_DEADLINE`] so a legitimately slow warmup
-/// still finishes, and short enough that a wedged router costs minutes rather
-/// than an afternoon. Override with `CLOVE_STRESS_DEADLINE` (seconds).
+/// Override with `CLOVE_STRESS_DEADLINE` (seconds).
 const RUN_DEADLINE: Duration = Duration::from_secs(360);
+
+/// Slice of the run budget reserved for the echo exchange, so a dialer that
+/// spends its whole life retrying still leaves time to prove a stream works
+/// once it finally connects.
+const ECHO_RESERVE: Duration = Duration::from_secs(60);
+
+/// How long a dialer keeps retrying while the target's leaseSet is still
+/// propagating (a fresh destination is briefly unreachable — `CantReachPeer`),
+/// **derived from the run budget** rather than fixed.
+///
+/// These two numbers used to be independent constants, and the readiness probe
+/// set the run budget to 90s while the warmup budget stayed at 240s. The result
+/// was a probe that could not pass: it killed the run a third of the way into
+/// the retry loop it had just configured, and reported "not completing dials"
+/// for a router that had simply not been given the time the harness itself said
+/// it needed. Deriving one from the other makes that class of mistake
+/// unrepresentable — ask for 90 seconds and you get 90 seconds of retrying, not
+/// 240 seconds of it truncated to 90.
+fn warmup_deadline(run: Duration) -> Duration {
+    // Clamped back under `run` last: a budget smaller than the reserve would
+    // otherwise be widened by the `max` to something the run cannot survive —
+    // reintroducing, in miniature, the exact bug this function exists to
+    // prevent. The dial loop attempts once before it consults this deadline, so
+    // even a zero window still produces one honest attempt.
+    run.saturating_sub(ECHO_RESERVE).max(RETRY_BACKOFF).min(run)
+}
 
 /// How long an echo handler waits on its half of an exchange. Handlers hold a
 /// loopback socket, so unlike the dial side this is enforceable.
@@ -105,13 +124,21 @@ fn run() -> io::Result<()> {
         ..Default::default()
     }))?);
 
+    // Captured before `listen` is consumed by the listener.
+    let listen_b64_head: String = listen.local_dest_b64().chars().take(24).collect();
+    let dialer_dest = dial.local_dest();
+
     let listener = setup_hint(SamListener::forward(Arc::new(listen)))?;
     let target = listener.local_dest();
     let listen_port = listener.local_port();
     let deadline_budget = run_deadline();
+
+    describe_endpoints(&dial, target, dialer_dest, &listen_b64_head);
+
     eprintln!(
-        "sam-stress: sessions up; driving {n} concurrent streams (deadline {}s)…",
-        deadline_budget.as_secs()
+        "sam-stress: driving {n} concurrent streams (deadline {}s, warmup retries {}s)…",
+        deadline_budget.as_secs(),
+        warmup_deadline(deadline_budget).as_secs()
     );
 
     // Listener side: accept up to N streams and echo on each, until told to
@@ -131,11 +158,13 @@ fn run() -> io::Result<()> {
     // Bounded at n: every dialer sends exactly once, so this never blocks a
     // sender, and SCOPE §4 has no unbounded channels.
     let (tx, rx) = mpsc::sync_channel(n);
+    let tries = Arc::new(AtomicU32::new(0));
     for _ in 0..n {
         let dial = Arc::clone(&dial);
+        let tries = Arc::clone(&tries);
         let tx = tx.clone();
         thread::spawn(move || {
-            let _ = tx.send(dial_once(&dial, target));
+            let _ = tx.send(dial_once(&dial, target, &tries));
         });
     }
     drop(tx);
@@ -143,7 +172,6 @@ fn run() -> io::Result<()> {
     let mut connects = Vec::with_capacity(n);
     let mut rtts = Vec::with_capacity(n);
     let mut failures = Vec::new();
-    let mut attempts = 0u32;
     let mut finished = 0usize;
     while finished < n {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -154,7 +182,6 @@ fn run() -> io::Result<()> {
             Ok(Ok(sample)) => {
                 connects.push(sample.connect);
                 rtts.push(sample.rtt);
-                attempts += sample.attempts;
                 finished += 1;
             }
             Ok(Err(e)) => {
@@ -178,7 +205,7 @@ fn run() -> io::Result<()> {
     report(
         n,
         wall,
-        attempts,
+        tries.load(Ordering::Relaxed),
         unfinished,
         &mut connects,
         &mut rtts,
@@ -188,13 +215,13 @@ fn run() -> io::Result<()> {
     // when nothing actually returned an error would send the reader looking
     // for error text that does not exist.
     if unfinished > 0 {
-        return Err(io::Error::other(format!(
-            "{unfinished} of {n} streams had not finished after {}s. The router \
-             accepted the session but is not completing dials — check it has \
-             peers and built tunnels. Raise CLOVE_STRESS_DEADLINE if it is \
-             merely slow.",
-            deadline_budget.as_secs()
-        )));
+        return Err(unfinished_error(
+            unfinished,
+            n,
+            tries.load(Ordering::Relaxed),
+            deadline_budget,
+            &connects,
+        ));
     }
     if connects.is_empty() {
         return Err(io::Error::other(
@@ -221,20 +248,73 @@ fn sam_port() -> u16 {
         .unwrap_or(DEFAULT_SAM_PORT)
 }
 
-/// One dial + echo exchange, timed. `attempts` counts dial tries (>1 means the
-/// target was still warming up); `connect`/`rtt` are measured from the
+/// Name both endpoints, then check the target resolves before dialing it.
+///
+/// **Who is who.** Reading a router's log against a previous run, it was not
+/// possible to tell whether a `connect to destination <id>` line named the
+/// listener or something else entirely — the local and remote ids emissary
+/// prints are not obviously the same encoding, so the two sides of a dial
+/// looked like different destinations when they may well have been one. The
+/// harness knows the answer for certain; printing it here means that question
+/// is never again settled by squinting at two logs.
+///
+/// **Does it resolve.** The lookup separates two failures that are
+/// indistinguishable from the outside: a leaseSet that was never published or
+/// is not visible, versus one that resolves fine but will not carry a stream.
+/// Both present as "not completing dials", and without this the operator has no
+/// way to tell which half to chase.
+///
+/// Diagnostic, not a gate — a router that fails the lookup may still stream,
+/// and being told both facts beats being stopped at the first.
+fn describe_endpoints(dial: &SamSession, target: DestHash, dialer: DestHash, listen_b64: &str) {
+    eprintln!("sam-stress: listener dest {}", target.to_b32());
+    eprintln!("sam-stress:   (b64 head)  {listen_b64}…");
+    eprintln!("sam-stress: dialer  dest  {}", dialer.to_b32());
+    eprintln!(
+        "sam-stress: dialing       {} (== listener)",
+        target.to_b32()
+    );
+
+    let probe = Instant::now();
+    let took = || probe.elapsed().as_secs_f64();
+    match dial.lookup(&target.to_b32()) {
+        Ok(found) if found == target => {
+            eprintln!("sam-stress: leaseSet lookup ok in {:.1}s", took());
+        }
+        Ok(found) => eprintln!(
+            "sam-stress: leaseSet lookup returned a DIFFERENT destination: {} \
+             (expected {}) — a router or harness bug, not a slow network",
+            found.to_b32(),
+            target.to_b32()
+        ),
+        Err(e) => eprintln!(
+            "sam-stress: leaseSet lookup FAILED after {:.1}s ({e}) — the target's \
+             leaseSet is not resolvable from the dialing session, so the dials \
+             below are expected to fail. Chase publication, not streaming.",
+            took()
+        ),
+    }
+}
+
+/// One dial + echo exchange, timed. `connect`/`rtt` are measured from the
 /// successful attempt, so warmup retries do not inflate the reported latency.
 struct Sample {
     connect: Duration,
     rtt: Duration,
-    attempts: u32,
 }
 
-fn dial_once(dialer: &SamSession, target: DestHash) -> io::Result<Sample> {
-    let deadline = Instant::now() + WARMUP_DEADLINE;
-    let mut attempts = 0u32;
+/// `attempts` is a shared counter rather than a field of [`Sample`], because
+/// the runs worth diagnosing are the ones that never produce a `Sample`. When
+/// it was per-sample and summed on the success arm only, a run where every
+/// dial was still retrying at the deadline reported `dial tries: 0` — which
+/// reads as "clove never dialed" while the router's own log showed ten
+/// attempts, and sends the reader looking in entirely the wrong place. A
+/// counter bumped before each attempt is visible whatever the thread goes on
+/// to do, including nothing.
+fn dial_once(dialer: &SamSession, target: DestHash, tries: &AtomicU32) -> io::Result<Sample> {
+    let deadline = Instant::now() + warmup_deadline(run_deadline());
     let (mut stream, connect, start) = loop {
-        attempts += 1;
+        tries.fetch_add(1, Ordering::Relaxed);
         let start = Instant::now();
         match dialer.dial(target, STREAM_TIMEOUT) {
             Ok(stream) => break (stream, start.elapsed(), start),
@@ -252,11 +332,7 @@ fn dial_once(dialer: &SamSession, target: DestHash) -> io::Result<Sample> {
     if back != payload {
         return Err(io::Error::other("echoed bytes did not match what was sent"));
     }
-    Ok(Sample {
-        connect,
-        rtt,
-        attempts,
-    })
+    Ok(Sample { connect, rtt })
 }
 
 /// Accept up to `n` inbound streams and echo `PAYLOAD_LEN` bytes on each, one
@@ -361,6 +437,56 @@ fn millis(d: Duration) -> u128 {
     d.as_millis()
 }
 
+/// Why streams were still running when the clock ran out, with the arithmetic
+/// that usually explains it.
+///
+/// Dial *setup* serializes per session (`PROTOCOL.i2p-bt` §2.6a: yosemite's
+/// sync connect takes `&mut self`, so `SamSession::dial` holds the session
+/// mutex for the whole connect). A run therefore needs roughly N times one
+/// connect, which turns any fixed budget into a silent ceiling on N — at N=128
+/// even a brisk 3s connect wants 384s, more than the default allows. Spelling
+/// that out here stops the reader diagnosing a router for what is the harness's
+/// own arithmetic.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "stream counts are small; this is a printed estimate"
+)]
+fn unfinished_error(
+    unfinished: usize,
+    n: usize,
+    tried: u32,
+    budget: Duration,
+    connects: &[Duration],
+) -> io::Error {
+    let arithmetic = median(connects).map_or_else(String::new, |c| {
+        let need = c.as_secs_f64() * n as f64;
+        format!(
+            " Dial setup serializes per session (PROTOCOL.i2p-bt 2.6a), so {n} \
+             streams need about {need:.0}s at the observed connect time — {}the \
+             budget was {}s.",
+            if need > budget.as_secs_f64() {
+                "more than "
+            } else {
+                ""
+            },
+            budget.as_secs()
+        )
+    });
+    io::Error::other(format!(
+        "{unfinished} of {n} streams had not finished after {}s ({tried} dial \
+         attempts made). The router accepted the session but is not completing \
+         dials — check it has peers and built tunnels, and see the leaseSet \
+         lookup above: if that failed, the target is unreachable rather than \
+         slow. Raise CLOVE_STRESS_DEADLINE if it is merely slow.{arithmetic}",
+        budget.as_secs()
+    ))
+}
+
+/// Median of a pre-sorted slice, or `None` when nothing succeeded.
+fn median(sorted: &[Duration]) -> Option<Duration> {
+    (!sorted.is_empty()).then(|| pct(sorted, 50.0))
+}
+
 /// Nearest-rank percentile of a pre-sorted slice. `p` is 0.0–100.0.
 #[allow(
     clippy::cast_precision_loss,
@@ -375,4 +501,50 @@ fn pct(sorted: &[Duration], p: f64) -> Duration {
     let last = sorted.len() - 1;
     let idx = ((p / 100.0) * last as f64).round() as usize;
     sorted[idx.min(last)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The regression that cost an entire interop run: the readiness probe set
+    /// the run budget to 90s while the retry loop kept its own 240s constant,
+    /// so the harness killed the run a third of the way through the retrying it
+    /// had just asked for and blamed the router. The two numbers must not be
+    /// independently settable — retrying longer than the run can last is never
+    /// a coherent thing to ask for.
+    #[test]
+    fn the_retry_budget_never_outlives_the_run_it_belongs_to() {
+        for secs in [1u64, 5, 30, 60, 90, 240, 360, 3_600] {
+            let run = Duration::from_secs(secs);
+            let warmup = warmup_deadline(run);
+            assert!(
+                warmup <= run,
+                "a {secs}s run allows {}s of retrying, which it cannot survive",
+                warmup.as_secs()
+            );
+        }
+    }
+
+    /// A generous budget must actually reach the dialer, or the probe is slow
+    /// and still useless.
+    #[test]
+    fn a_long_run_spends_most_of_itself_retrying() {
+        let warmup = warmup_deadline(Duration::from_secs(360));
+        assert_eq!(warmup, Duration::from_secs(300));
+    }
+
+    /// A budget below the echo reserve collapses to the budget itself rather
+    /// than being rounded up past it. The dial loop tries once before checking
+    /// this deadline, so a zero window still yields one attempt — and one
+    /// attempt that reports honestly beats a loop that promises more time than
+    /// the run has.
+    #[test]
+    fn a_budget_under_the_reserve_collapses_to_the_budget() {
+        assert_eq!(
+            warmup_deadline(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(warmup_deadline(Duration::ZERO), Duration::ZERO);
+    }
 }
