@@ -20,7 +20,7 @@ use std::io::{self, Read, Write};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{DestHash, I2pDialer, I2pListener, I2pNamingLookup, I2pStream};
 
@@ -338,6 +338,14 @@ pub struct MockStream {
     read: Arc<Pipe>,
     write: Arc<Pipe>,
     closer: Arc<Closer>,
+    /// How long this endpoint's reads and writes may block, in milliseconds;
+    /// zero means block indefinitely.
+    ///
+    /// Per *endpoint*, not per direction: a socket's receive timeout is a local
+    /// option, and one that leaked across the connection would give the peer a
+    /// write timeout it never asked for. Shared between handles onto the same
+    /// endpoint, as the option is shared by duplicated descriptors.
+    timeout_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for MockStream {
@@ -354,11 +362,13 @@ impl MockStream {
             read: Arc::clone(&b_to_a),
             write: Arc::clone(&a_to_b),
             closer: Arc::new(Closer(Arc::clone(&a_to_b), Arc::clone(&b_to_a))),
+            timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let b = MockStream {
             read: Arc::clone(&a_to_b),
             write: Arc::clone(&b_to_a),
             closer: Arc::new(Closer(a_to_b, b_to_a)),
+            timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         (a, b)
     }
@@ -370,6 +380,30 @@ impl MockStream {
         self.read.set_stalled(on);
     }
 
+    /// Bound how long reads and writes on this stream may block, as a real
+    /// socket's `SO_RCVTIMEO`/`SO_SNDTIMEO` would; `None` restores blocking.
+    /// A timed-out read or write returns [`io::ErrorKind::WouldBlock`].
+    ///
+    /// Worth setting in any test that waits for a message it expects: without
+    /// it, a message the engine *fails* to send is a test that hangs rather
+    /// than one that fails, and a hang looks the same as slow progress. Applies
+    /// to every handle on this side of the stream, again like a socket.
+    pub fn set_timeouts(&self, timeout: Option<Duration>) {
+        let ms = timeout.map_or(0, |t| {
+            u64::try_from(t.as_millis()).unwrap_or(u64::MAX).max(1)
+        });
+        self.timeout_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// This endpoint's current blocking bound.
+    fn timeout(&self) -> Option<Duration> {
+        match self.timeout_ms.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
+    }
+
     /// Another handle to the same stream. Infallible for the mock; used by
     /// its own tests and to build the [`I2pStream::split`] halves.
     #[must_use]
@@ -378,19 +412,20 @@ impl MockStream {
             read: Arc::clone(&self.read),
             write: Arc::clone(&self.write),
             closer: Arc::clone(&self.closer),
+            timeout_ms: Arc::clone(&self.timeout_ms),
         }
     }
 }
 
 impl Read for MockStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        Ok(self.read.read(buf))
+        self.read.read(buf, self.timeout())
     }
 }
 
 impl Write for MockStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.write.write(buf)
+        self.write.write(buf, self.timeout())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -406,6 +441,11 @@ impl I2pStream for MockStream {
         let reader = self.try_clone();
         Ok((reader, self))
     }
+
+    fn set_timeouts(&self, timeout: Option<Duration>) -> io::Result<()> {
+        MockStream::set_timeouts(self, timeout);
+        Ok(())
+    }
 }
 
 /// Closes both directions when the last handle of one side drops.
@@ -416,6 +456,12 @@ impl Drop for Closer {
         self.0.close();
         self.1.close();
     }
+}
+
+/// The error a bounded read or write gives up with, matching what a socket
+/// with `SO_RCVTIMEO` set does.
+fn timed_out(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, format!("mock: {what} timed out"))
 }
 
 /// One direction of a stream: a bounded byte queue with blocking
@@ -459,24 +505,39 @@ impl Pipe {
     }
 
     /// Blocking read: buffered data first (even after close), zero at
-    /// EOF, and nothing at all while stalled.
-    fn read(&self, out: &mut [u8]) -> usize {
+    /// EOF, and nothing at all while stalled. Bounded by the direction's
+    /// timeout if one is set, which surfaces as `WouldBlock`.
+    fn read(&self, out: &mut [u8], timeout: Option<Duration>) -> io::Result<usize> {
         if out.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let mut state = locked(&self.state);
+        let deadline = timeout.map(|t| Instant::now() + t);
         loop {
             if !state.stalled {
                 if !state.buf.is_empty() {
                     break;
                 }
                 if state.closed {
-                    return 0;
+                    return Ok(0);
                 }
             } else if state.closed {
-                return 0;
+                return Ok(0);
             }
-            state = wait(&self.readable, state);
+            state = match deadline {
+                None => wait(&self.readable, state),
+                Some(at) => {
+                    let left = at.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(timed_out("read"));
+                    }
+                    let (guard, _) = self
+                        .readable
+                        .wait_timeout(state, left)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    guard
+                }
+            };
         }
         let n = out.len().min(state.buf.len());
         for slot in out.iter_mut().take(n) {
@@ -484,16 +545,17 @@ impl Pipe {
             *slot = state.buf.pop_front().unwrap_or_default();
         }
         self.writable.notify_all();
-        n
+        Ok(n)
     }
 
     /// Blocking write: waits for room (backpressure), fails on a closed
     /// pipe as a broken connection.
-    fn write(&self, data: &[u8]) -> io::Result<usize> {
+    fn write(&self, data: &[u8], timeout: Option<Duration>) -> io::Result<usize> {
         if data.is_empty() {
             return Ok(0);
         }
         let mut state = locked(&self.state);
+        let deadline = timeout.map(|t| Instant::now() + t);
         loop {
             if state.closed {
                 return Err(io::Error::new(
@@ -504,7 +566,20 @@ impl Pipe {
             if state.buf.len() < state.capacity {
                 break;
             }
-            state = wait(&self.writable, state);
+            state = match deadline {
+                None => wait(&self.writable, state),
+                Some(at) => {
+                    let left = at.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(timed_out("write"));
+                    }
+                    let (guard, _) = self
+                        .writable
+                        .wait_timeout(state, left)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    guard
+                }
+            };
         }
         let room = state.capacity - state.buf.len();
         let n = room.min(data.len());
@@ -729,6 +804,66 @@ mod tests {
         }
         assert_eq!(writer.join().unwrap(), 64);
         assert_eq!(received, 64);
+    }
+
+    #[test]
+    fn a_bounded_read_gives_up_instead_of_blocking() {
+        let net = MockNet::new();
+        let alice = net.endpoint();
+        let bob = net.endpoint();
+
+        let mut ours = alice.dial(bob.dest(), LONG).unwrap();
+        let (mut theirs, _) = bob.accept().unwrap();
+
+        // Nothing sent: an unbounded read would block here for ever, which in a
+        // test is a hang rather than a failure.
+        ours.set_timeouts(Some(TICK));
+        let mut buf = [0u8; 4];
+        let err = ours.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        // Data that does arrive is still read, and clearing the timeout puts
+        // the blocking behaviour back.
+        theirs.write_all(b"ping").unwrap();
+        assert_eq!(read_exact_string(&mut ours, 4), "ping");
+        ours.set_timeouts(None);
+        theirs.write_all(b"pong").unwrap();
+        assert_eq!(read_exact_string(&mut ours, 4), "pong");
+
+        // The timeout is this endpoint's alone. A receive timeout that leaked
+        // into the peer's writes would hand it a failure it never asked for —
+        // and would quietly make "the engine dropped a silent peer" pass for
+        // the wrong reason in any test that bounded its own reads.
+        let net = MockNet::new();
+        let alice = net.endpoint();
+        let bob = net.endpoint();
+        let ours = alice.dial(bob.dest(), LONG).unwrap();
+        let (mut theirs, _) = bob.accept().unwrap();
+        ours.set_timeouts(Some(TICK));
+        let mut idle = theirs.try_clone();
+        let waited = thread::spawn(move || {
+            let mut buf = [0u8; 1];
+            idle.read(&mut buf).map(|n| n == 0)
+        });
+        thread::sleep(TICK * 4);
+        assert!(
+            !waited.is_finished(),
+            "the peer's read inherited our timeout"
+        );
+        theirs.write_all(b"x").unwrap();
+        drop(ours);
+        let _ = waited.join();
+
+        // A write to a full pipe is bounded the same way.
+        let net = MockNet::with_capacity(4);
+        let alice = net.endpoint();
+        let bob = net.endpoint();
+        let mut ours = alice.dial(bob.dest(), LONG).unwrap();
+        let (_theirs, _) = bob.accept().unwrap();
+        ours.set_timeouts(Some(TICK));
+        ours.write_all(&[0u8; 4]).unwrap();
+        let err = ours.write(&[1u8; 4]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]
