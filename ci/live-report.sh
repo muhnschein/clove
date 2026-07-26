@@ -171,6 +171,15 @@ unit_of() {
     esac
 }
 
+quadlet_of() {
+    case "$1" in
+        i2pd) echo i2pd.container ;;
+        java) echo i2p-java.container ;;
+        emissary) echo emissary.container ;;
+        *) echo "" ;;
+    esac
+}
+
 # Why a router did not start. `make router-up` reports only that systemctl
 # failed; the reason is in the unit status and the journal, and a report that
 # omits it buys a whole extra round trip. Quadlet's own complaints land here
@@ -311,6 +320,33 @@ for r in $ROUTERS; do
             echo "container:    absent"
         fi
         echo "SAM port:     $(port_answers "$port" && echo answering || echo 'not answering')"
+        # Is the running container actually built from the quadlet in this
+        # checkout? A report once showed a Java router logging "EXT_PORT is
+        # unset" — firewalling itself and skewing every result — while the
+        # repo's quadlet had set EXT_PORT for weeks. The container simply
+        # predated it: `make router-up` copies the file but will not recreate a
+        # container that is already running, and nothing said so. An hour of
+        # test results against a stale router is worse than no results.
+        quadlet_src="contrib/podman/$(quadlet_of "$r")"
+        quadlet_dst="$HOME/.config/containers/systemd/$(quadlet_of "$r")"
+        if [ ! -f "$quadlet_dst" ]; then
+            echo "quadlet:      NOT INSTALLED at $quadlet_dst"
+        elif cmp -s "$quadlet_src" "$quadlet_dst"; then
+            echo "quadlet:      matches this checkout"
+            # Installed file is current, but the container may still predate it.
+            if podman container exists "$container" 2>/dev/null; then
+                started=$(podman inspect -f '{{.State.StartedAt}}' "$container" 2>/dev/null || echo)
+                changed=$(date -Is -r "$quadlet_dst" 2>/dev/null || echo)
+                echo "quadlet mtime:$changed"
+                echo "  (container started $started — if that is EARLIER, the"
+                echo "   container predates the config: make router-down router-up)"
+            fi
+        else
+            echo "quadlet:      STALE — $quadlet_dst differs from $quadlet_src"
+            echo "  Results below are against a router built from older config."
+            echo "  Refresh with: make router-down ROUTER=$r && make router-up ROUTER=$r"
+            diff -u "$quadlet_dst" "$quadlet_src" 2>/dev/null | head -20 | sed 's/^/  /'
+        fi
         # Peer count separates "clove cannot dial" from "this router knows
         # nobody to dial through", which looked identical last time round.
         case "$r" in
