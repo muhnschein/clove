@@ -45,6 +45,12 @@ USAGE
 
 ROUTERS="i2pd java emissary"
 STRESS="16 32 64 128"
+# Budget handed to the readiness probe, and the margin the outer `timeout` adds
+# on top so the wrapper always outlives what it wraps (cargo startup, a slow
+# release link, the report the probe prints on its way out). Every nested
+# deadline in this script derives from the one it contains.
+READY_DEADLINE=${READY_DEADLINE:-240}
+STEP_SLACK=60
 OUT=""
 LINES=250
 BRING_UP=no
@@ -66,6 +72,13 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# Resolve a relative --out against the caller's directory *before* moving to the
+# repo root, so `--out report.txt` writes where the operator is standing rather
+# than dropping an untracked file into the checkout.
+case "${OUT:-}" in
+    "" | /*) ;;
+    *) OUT="$PWD/$OUT" ;;
+esac
 cd "$(dirname "$0")/.."
 [ -n "$OUT" ] || OUT="live-report-$(date +%Y%m%d-%H%M%S).txt"
 : > "$OUT"
@@ -329,7 +342,17 @@ for r in $ROUTERS; do
         # test results against a stale router is worse than no results.
         quadlet_src="contrib/podman/$(quadlet_of "$r")"
         quadlet_dst="$HOME/.config/containers/systemd/$(quadlet_of "$r")"
-        if [ ! -f "$quadlet_dst" ]; then
+        if ! podman container exists "$container" 2>/dev/null; then
+            # SAM answers but no container: this router is a host service or was
+            # started some other way, so the quadlet on disk is not what is being
+            # tested and diffing it only misleads. Say what is actually true —
+            # the repo's transport-port settings are not in play, and firewalled
+            # status has to be checked on the router itself.
+            echo "quadlet:      not in use — no container, so this router runs"
+            echo "              outside the quadlet (host service?). The repo's"
+            echo "              settings do not apply; check the router's own"
+            echo "              config for its transport port."
+        elif [ ! -f "$quadlet_dst" ]; then
             echo "quadlet:      NOT INSTALLED at $quadlet_dst"
         elif cmp -s "$quadlet_src" "$quadlet_dst"; then
             echo "quadlet:      matches this checkout"
@@ -393,9 +416,18 @@ for r in $ROUTERS; do
     fi
 
     # One dial before many. A router that cannot carry a single stream will
-    # not carry sixteen, and finding that out costs 90 seconds here versus
+    # not carry sixteen, and finding that out costs four minutes here versus
     # five minutes per stress level below.
-    if ! step "$r: readiness (one stream)" 180 make router-ready ROUTER="$r"; then
+    #
+    # The outer timeout is derived from the budget we hand the probe, never
+    # written independently. It was once a bare `180` next to a 240s
+    # READY_DEADLINE, so the wrapper killed every probe a minute before its own
+    # deadline and turned three FAILs into three uninformative TIMEOUTs — the
+    # same nested-budget mistake this script exists to report, reintroduced one
+    # layer up from where it was fixed. One owner for the number, and the shell
+    # asks rather than assumes.
+    if ! step "$r: readiness (one stream)" "$((READY_DEADLINE + STEP_SLACK))" \
+        make router-ready ROUTER="$r" READY_DEADLINE="$READY_DEADLINE"; then
         skip "$r: live tests" "failed readiness — see above"
         for n in $STRESS; do
             skip "$r: sam-stress N=$n" "router not ready"
@@ -425,6 +457,40 @@ for r in $ROUTERS; do
         podman logs --tail 120 "$container" 2>&1 | sanitise >> "$OUT"
     fi
 done
+
+# -------------------------------------------------------------- cross-router
+
+# A destination on one router, dialed from another — the path a swarm peer
+# actually takes.
+#
+# Every run so far tested two sessions on a *single* router, and that may be the
+# harder case rather than the simpler one: emissary resolves a same-router
+# destination through a full netDb lookup and times out instead of using the
+# leaseSet it already holds (PROTOCOL.i2p-bt 2.6c). So a same-router failure
+# does not tell us clove is wrong, and until a cross-router pair has been tried
+# the loopback checklist cannot distinguish the two. Runs regardless of whether
+# readiness passed, because when readiness fails this is exactly the question.
+say ""
+say "########## cross-router (a destination on A, dialed from B) ##########"
+
+live_routers=""
+for r in $ROUTERS; do
+    p=$(sam_port_of "$r")
+    [ -n "$p" ] && port_answers "$p" && live_routers="$live_routers $r"
+done
+
+if [ -z "$live_routers" ] || [ "$(echo $live_routers | wc -w)" -lt 2 ]; then
+    skip "cross-router" "needs two routers answering; have:${live_routers:- none}"
+else
+    for a in $live_routers; do
+        for b in $live_routers; do
+            [ "$a" = "$b" ] && continue
+            step "cross: listen $a, dial $b" "$((READY_DEADLINE + STEP_SLACK))" \
+                make sam-stress ROUTER="$a" DIAL="$b" N=1 \
+                CLOVE_STRESS_DEADLINE="$READY_DEADLINE" || true
+        done
+    done
+fi
 
 # ------------------------------------------------------------------ summary
 
