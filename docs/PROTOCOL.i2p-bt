@@ -146,6 +146,40 @@ Status legend:
       (reseed incomplete → no peers → CantReachPeer indefinitely), which is an
       operator/setup problem (see LIVE-TESTING.md troubleshooting).
 
+      Observed 2026-07-26, all three routers, warmup far longer than "~seconds":
+      emissary logged `unable to open stream, lease set not found … Timeout`
+      every ~26s (a ~21s router-side lookup timeout plus our 5s backoff) for the
+      whole run, and i2pd and Java I2P failed the same single dial. All three
+      were young and firewalled (i2pd: 15 min uptime, 33% tunnel build success,
+      LeaseSets 0). Whether the floor is minutes on a *healthy* router, or those
+      routers were simply not ready, is unresolved — the run could not tell,
+      because the harness gave the retry loop 90s of a 240s budget (see 2.6d).
+      Re-measure on warm routers before treating any number here as real.
+
+    2.6c [open] Two destinations on **one** router may be a harder case than two
+      routers, not an easier one. emissary resolves a same-router destination
+      through a full netDb lookup and times out, rather than short-circuiting to
+      the local leaseSet it already holds. If that is general rather than an
+      emissary gap, the loopback topology every tier-2 test uses is testing
+      something stricter than the swarm path it stands in for. Worth an upstream
+      question; worth a cross-router control before concluding anything from a
+      same-router failure.
+
+    2.6d [decided] The harness's own budgets must derive from one another, not
+      sit as independent constants. `make router-ready` set a 90s run budget
+      while sam-stress kept a fixed 240s warmup-retry budget, so the probe killed
+      every run a third of the way into the retrying it had itself configured,
+      then reported the router as "not completing dials". Every router failed
+      there and the whole matrix skipped behind it. The retry window is now
+      computed from the run budget (`warmup_deadline`), with a regression test;
+      READY_DEADLINE is 240s.
+
+      Related: with dial setup serialized (2.6a), a *fixed* run budget is a
+      silent ceiling on N — at N=128 even a 3s connect needs 384s, more than the
+      360s default. sam-stress now prints that arithmetic when streams are left
+      unfinished, so the reader is not sent to diagnose a router for the
+      harness's own limit.
+
 2.7 [decided] yosemite 0.7.0 sets no read or write timeout on its SAM control
     socket. Against a bridge that accepts the TCP connection and then says
     nothing, `Session::new` blocks forever — it does not error, so nothing
