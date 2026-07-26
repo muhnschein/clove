@@ -420,9 +420,16 @@ fn handle(mut stream: ApiStream, daemon: &Arc<Daemon>) -> std::io::Result<()> {
     };
 
     // Token auth on every request, unix socket included (SCOPE §3).
-    let ok = request
-        .header("x-clove-token")
-        .is_some_and(|got| constant_time_eq(got.as_bytes(), daemon.token.as_bytes()));
+    //
+    // The shape check on our *own* token is the important half: an empty
+    // expected value would match an empty `x-clove-token:` header and
+    // authenticate every local caller. `load_or_create_token` will not hand us
+    // one, and this makes that a belt as well as braces — the authentication
+    // path should not depend on a loader elsewhere getting it right.
+    let ok = is_well_formed_token(&daemon.token)
+        && request
+            .header("x-clove-token")
+            .is_some_and(|got| constant_time_eq(got.as_bytes(), daemon.token.as_bytes()));
     if !ok {
         return write_response(&mut stream, &error(401, "missing or invalid API token"));
     }
@@ -659,29 +666,68 @@ fn write_response(stream: &mut ApiStream, response: &Response) -> std::io::Resul
     stream.flush()
 }
 
+/// Length of the API token as stored: 32 random bytes, hex.
+const TOKEN_HEX_LEN: usize = 64;
+
+/// Whether `token` has the shape this daemon writes — exactly
+/// [`TOKEN_HEX_LEN`] hex characters.
+///
+/// Anything else is not a secret we are willing to compare against, the empty
+/// string above all: it would match an empty `x-clove-token:` header.
+fn is_well_formed_token(token: &str) -> bool {
+    token.len() == TOKEN_HEX_LEN && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Read the API token from `<data_dir>/token`, creating it (32 random bytes,
 /// hex, `0600`) on first run.
+///
+/// A file that is present but not a well-formed token is replaced, not trusted.
+/// That case is reachable: the token used to be the one file written in place
+/// rather than temp-and-rename, so a crash, a `SIGKILL`, or a full disk between
+/// creating and filling it left a zero-byte file behind — and a zero-byte token
+/// authenticates every local caller. Nothing can hold the old value either,
+/// because it was never a complete token, so replacing it costs nothing.
 fn load_or_create_token(data_dir: &Path) -> std::io::Result<String> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     let path = data_dir.join("token");
     match std::fs::read_to_string(&path) {
-        Ok(existing) => Ok(existing.trim().to_owned()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut raw = [0u8; 32];
-            getrandom::getrandom(&mut raw)
-                .map_err(|e| std::io::Error::other(format!("getrandom: {e}")))?;
-            let token = registry::hex(&raw);
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)?;
-            file.write_all(token.as_bytes())?;
-            Ok(token)
+        Ok(existing) if is_well_formed_token(existing.trim()) => Ok(existing.trim().to_owned()),
+        Ok(_) => {
+            eprintln!(
+                "cloved: {} is not a well-formed API token (empty or truncated?); \
+                 generating a new one",
+                path.display()
+            );
+            write_new_token(&path)
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => write_new_token(&path),
         Err(e) => Err(e),
     }
+}
+
+/// Generate a token and put it at `path` atomically: a `0600` temp file,
+/// written, fsynced, then renamed over the target. Rename keeps the mode, so
+/// the token is never briefly readable by anyone else and never half-written.
+fn write_new_token(path: &Path) -> std::io::Result<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut raw = [0u8; 32];
+    getrandom::getrandom(&mut raw).map_err(|e| std::io::Error::other(format!("getrandom: {e}")))?;
+    let token = registry::hex(&raw);
+
+    let tmp = path.with_file_name(format!("token.{}.tmp", std::process::id()));
+    // A temp left by an earlier crash of this pid would fail create_new below.
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(token)
 }
 
 /// Length-independent byte comparison, so token checks don't leak length or a
@@ -721,7 +767,10 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    /// A token of the shape the daemon really writes: 32 random bytes as
+    /// hex. The length matters — the auth path refuses to compare against
+    /// anything that is not a well-formed token.
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     struct TempDir(PathBuf);
 
@@ -839,13 +888,9 @@ mod tests {
         let d = daemon(&dir);
         assert_eq!(status_of(&speak(&d, &get("/", Some(TOKEN)))), 404);
         assert_eq!(status_of(&speak(&d, &get("/v2/status", Some(TOKEN)))), 404);
-        assert_eq!(
-            status_of(&speak(
-                &d,
-                b"DELETE /v1/status HTTP/1.1\r\nx-clove-token: 0123456789abcdef0123456789abcdef\r\n\r\n"
-            )),
-            405
-        );
+        let delete_status =
+            format!("DELETE /v1/status HTTP/1.1\r\nx-clove-token: {TOKEN}\r\n\r\n").into_bytes();
+        assert_eq!(status_of(&speak(&d, &delete_status)), 405);
     }
 
     #[test]
@@ -1096,6 +1141,94 @@ mod tests {
         assert_eq!(sam_tcp_port("127.0.0.1"), None);
         assert_eq!(sam_tcp_port("127.0.0.1:notaport"), None);
         assert_eq!(sam_tcp_port("127.0.0.1:99999"), None);
+    }
+
+    #[test]
+    fn an_empty_token_authenticates_nobody() {
+        // The bug this locks down: `constant_time_eq("", "")` is true, so a
+        // daemon whose token file was empty answered any request carrying a
+        // bare `x-clove-token:` header. A zero-byte token file was reachable
+        // from an interrupted first start.
+        let dir = TempDir::new("empty-token");
+        let d = Arc::new(Daemon {
+            start: Instant::now(),
+            sam_address: "127.0.0.1:7656".to_owned(),
+            token: String::new(),
+            registry: Mutex::new(Registry::open(&dir.0).expect("registry")),
+            router: Mutex::new("connecting"),
+        });
+        for header in [Some(""), Some(" "), None, Some(TOKEN)] {
+            assert_eq!(
+                status_of(&speak(&d, &get("/v1/status", header))),
+                401,
+                "token {header:?} was accepted against an empty expected token"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_token_file_is_replaced_not_trusted() {
+        use std::os::unix::fs::PermissionsExt;
+        // Every way the file can be present but useless. Each must produce a
+        // fresh, well-formed, private token rather than a weak secret.
+        for (what, contents) in [
+            ("empty", ""),
+            ("whitespace", "\n\n  \t"),
+            ("truncated", "0123456789abcdef"),
+            ("not hex", &"z".repeat(TOKEN_HEX_LEN)),
+            ("too long", &"a".repeat(TOKEN_HEX_LEN + 1)),
+        ] {
+            let dir = TempDir::new(&format!("bad-token-{what}"));
+            let path = dir.0.join("token");
+            std::fs::write(&path, contents).expect("write");
+            let token = load_or_create_token(&dir.0).expect("load");
+            assert!(
+                is_well_formed_token(&token),
+                "{what}: got {token:?} back as a token"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("re-read").trim(),
+                token,
+                "{what}: the new token was not persisted"
+            );
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{what}: replacement token is not private");
+            // No temp file left behind.
+            let strays: Vec<_> = std::fs::read_dir(&dir.0)
+                .expect("read dir")
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+                .collect();
+            assert!(strays.is_empty(), "{what}: left a temp file behind");
+        }
+    }
+
+    #[test]
+    fn a_well_formed_token_file_is_left_alone() {
+        // The other half: a valid token must survive a restart untouched,
+        // including a trailing newline, or every running CLI breaks.
+        let dir = TempDir::new("good-token");
+        let path = dir.0.join("token");
+        std::fs::write(&path, format!("{TOKEN}\n")).expect("write");
+        assert_eq!(
+            load_or_create_token(&dir.0).expect("load"),
+            TOKEN,
+            "a valid token was rotated"
+        );
+    }
+
+    #[test]
+    fn token_shape_check() {
+        assert!(is_well_formed_token(&"a".repeat(TOKEN_HEX_LEN)));
+        assert!(is_well_formed_token(&"F".repeat(TOKEN_HEX_LEN)));
+        assert!(!is_well_formed_token(""));
+        assert!(!is_well_formed_token(&"a".repeat(TOKEN_HEX_LEN - 1)));
+        assert!(!is_well_formed_token(&"a".repeat(TOKEN_HEX_LEN + 1)));
+        assert!(!is_well_formed_token(&"g".repeat(TOKEN_HEX_LEN)));
+        // Same length, one non-hex byte.
+        let mut nearly = "a".repeat(TOKEN_HEX_LEN - 1);
+        nearly.push('-');
+        assert!(!is_well_formed_token(&nearly));
     }
 
     #[test]

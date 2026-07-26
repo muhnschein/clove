@@ -115,6 +115,34 @@ fn seeding_torrent(meta: &MetaInfo, content: &[u8], dir: &TempDir) -> Arc<Torren
     )
 }
 
+/// A torrent that holds the first `pieces` pieces and still wants the rest —
+/// the state a real leecher spends its life in, and the only one in which it
+/// both serves peers and downloads from them at the same time.
+fn partly_seeded_torrent(
+    meta: &MetaInfo,
+    content: &[u8],
+    dir: &TempDir,
+    pieces: u32,
+) -> Arc<Torrent> {
+    let storage = Arc::new(Storage::create(meta, &dir.0, false).expect("storage"));
+    for p in 0..pieces {
+        let start = p as usize * BLOCK_LEN as usize;
+        let end = (start + storage.piece_len(p) as usize).min(content.len());
+        storage
+            .write_block(p, 0, &content[start..end])
+            .expect("partial write");
+    }
+    let have = storage.verify_all().expect("verify partial");
+    assert_eq!(have.count(), pieces, "fixture should hold {pieces} pieces");
+    Torrent::new(
+        meta,
+        storage,
+        &have,
+        Mode::RarestFirst,
+        *b"-CV0001-halfhalfhalf",
+    )
+}
+
 /// An empty torrent that will try to download `meta`.
 fn leeching_torrent(meta: &MetaInfo, dir: &TempDir) -> Arc<Torrent> {
     let storage = Arc::new(Storage::create(meta, &dir.0, false).expect("storage"));
@@ -164,6 +192,39 @@ where
         return;
     }
     let _ = attack(&mut stream);
+}
+
+/// Read frames until `want` of them are `Request`s, or give up.
+///
+/// Anything else the engine sends (its bitfield, extension handshake,
+/// interest, choke changes) is skipped: this is about what it *asks* for.
+fn read_requests(stream: &mut MockStream, want: usize) -> Vec<wire::BlockRequest> {
+    let deadline = Instant::now() + DEADLINE;
+    let mut out = Vec::with_capacity(want);
+    while out.len() < want {
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {want} requests arrived",
+            out.len()
+        );
+        let Ok(frame) = wire::read_frame(stream, wire::MAX_MESSAGE_LEN) else {
+            break;
+        };
+        if let Ok(Message::Request(req)) = Message::parse(&frame) {
+            out.push(req);
+        }
+    }
+    out
+}
+
+/// Announce every piece and unchoke, so the engine starts requesting from us.
+fn claim_everything(stream: &mut MockStream, num_pieces: u32) -> std::io::Result<()> {
+    let mut full = vec![0u8; (num_pieces as usize).div_ceil(8)];
+    for p in 0..num_pieces as usize {
+        full[p / 8] |= 0x80 >> (p % 8);
+    }
+    wire::write_message(stream, &Message::Bitfield(full))?;
+    wire::write_message(stream, &Message::Unchoke)
 }
 
 /// Accept connections for `torrent` until the returned handle is dropped.
@@ -429,4 +490,190 @@ fn corrupt_blocks_never_become_verified_pieces() {
     let seed_dest = seed_ep.dest();
     let _acceptor = spawn_acceptor(&seeder, seed_ep);
     honest_download_completes(&net, &meta, seed_dest, "after-liar");
+}
+
+/// The endgame hands one block to more than one peer on purpose. The peer that
+/// answers second must not be able to put its bytes over a piece that already
+/// verified — in a debug build that tripped the picker's own invariant, and in
+/// release it silently corrupted a finished piece the leecher went on to
+/// announce and serve.
+#[test]
+fn a_late_duplicate_block_cannot_corrupt_a_verified_piece() {
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+    let num_pieces = u32::try_from(meta.pieces.len()).expect("piece count");
+
+    let dir = TempDir::new("late-dup");
+    let leecher = leeching_torrent(&meta, &dir);
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&leecher, ep);
+
+    // Two peers, both claiming the whole torrent. The fixture is small enough
+    // that the whole download is inside the endgame window, so the second peer
+    // is handed the same blocks as the first — which the assertion below
+    // states rather than assumes.
+    let honest_ep = net.endpoint();
+    let mut honest = honest_ep
+        .dial(dest, Duration::from_secs(5))
+        .expect("honest dial");
+    handshake(&mut honest, info_hash).expect("honest handshake");
+    claim_everything(&mut honest, num_pieces).expect("honest claim");
+    let first = read_requests(&mut honest, num_pieces as usize);
+
+    let late_ep = net.endpoint();
+    let mut late = late_ep
+        .dial(dest, Duration::from_secs(5))
+        .expect("late dial");
+    handshake(&mut late, info_hash).expect("late handshake");
+    claim_everything(&mut late, num_pieces).expect("late claim");
+    let second = read_requests(&mut late, num_pieces as usize);
+    assert_eq!(
+        first, second,
+        "the endgame should have offered both peers the same blocks"
+    );
+
+    // The honest peer answers truthfully; the torrent completes and verifies.
+    for req in &first {
+        let start = req.index as usize * BLOCK_LEN as usize + req.begin as usize;
+        let block = content[start..start + req.length as usize].to_vec();
+        wire::write_message(
+            &mut honest,
+            &Message::Piece {
+                index: req.index,
+                begin: req.begin,
+                block,
+            },
+        )
+        .expect("honest block");
+    }
+    let deadline = Instant::now() + DEADLINE;
+    while leecher.have().count() < num_pieces {
+        assert!(
+            Instant::now() < deadline,
+            "honest peer did not complete the download: {}/{num_pieces}",
+            leecher.have().count()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Now the late peer answers the same requests with rubbish of exactly the
+    // right shape. Every one of them is for a piece that is already verified.
+    for req in &second {
+        wire::write_message(
+            &mut late,
+            &Message::Piece {
+                index: req.index,
+                begin: req.begin,
+                block: vec![0xEE; req.length as usize],
+            },
+        )
+        .expect("late block");
+    }
+
+    // Give the reader thread time to process all of it, then check the bytes.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        leecher.have().count(),
+        num_pieces,
+        "the leecher gave up pieces it had verified"
+    );
+    let storage = Storage::create(&meta, &dir.0, false).expect("re-open storage");
+    let on_disk = storage.verify_all().expect("verify");
+    assert_eq!(
+        on_disk.count(),
+        num_pieces,
+        "a late duplicate block overwrote verified data on disk"
+    );
+    let mut fetched = Vec::new();
+    for p in 0..num_pieces {
+        fetched.extend(
+            storage
+                .read_block(p, 0, storage.piece_len(p))
+                .expect("read back"),
+        );
+    }
+    assert_eq!(
+        fetched, content,
+        "the file on disk is not the file we wanted"
+    );
+}
+
+/// A peer that asks for data and then stops reading its socket. Its own
+/// connection may starve — that is its choice — but it must not park the
+/// threads serving anybody else: outgoing messages for one peer are queued by
+/// whichever *other* peer's reader thread caused them (a broadcast `have`, a
+/// choke round), so a blocking send here stalls the whole torrent.
+#[test]
+fn a_peer_that_stops_reading_cannot_stall_an_honest_one() {
+    // Small stream buffers so "stopped reading" bites in a few messages
+    // instead of a few thousand.
+    let net = MockNet::with_capacity(32 * 1024);
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+    let num_pieces = u32::try_from(meta.pieces.len()).expect("piece count");
+    let held_at_start = num_pieces / 2;
+
+    // The torrent under test holds half the pieces: enough to serve the
+    // hostile peer, not enough to be finished.
+    let dir = TempDir::new("no-read");
+    let leecher = partly_seeded_torrent(&meta, &content, &dir, held_at_start);
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&leecher, ep);
+
+    // The hostile peer: interested, so it gets unchoked and served, then a
+    // flood of requests whose answers it never reads.
+    let evil_ep = net.endpoint();
+    let mut evil = evil_ep
+        .dial(dest, Duration::from_secs(5))
+        .expect("evil dial");
+    handshake(&mut evil, info_hash).expect("evil handshake");
+    wire::write_message(&mut evil, &Message::Interested).expect("evil interest");
+    let flood = std::thread::spawn(move || {
+        for _ in 0..2000 {
+            let req = Message::Request(wire::BlockRequest {
+                index: 0,
+                begin: 0,
+                length: BLOCK_LEN,
+            });
+            if wire::write_message(&mut evil, &req).is_err() {
+                break;
+            }
+        }
+        // Hold the connection open, still not reading, well past the deadline
+        // below. This has to outlast it: dropping the stream would close the
+        // queue the engine is stuck on and release the stall, and the test
+        // would then pass for the wrong reason.
+        std::thread::sleep(DEADLINE * 3);
+    });
+    // Let the engine fill that peer's outgoing queue.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Only now does an honest seeder appear. The download must finish.
+    let seed_dir = TempDir::new("no-read-seed");
+    let seeder = seeding_torrent(&meta, &content, &seed_dir);
+    let seed_ep = net.endpoint();
+    let seed_dest = seed_ep.dest();
+    let _seed_acceptor = spawn_acceptor(&seeder, seed_ep);
+    let dial_ep = net.endpoint();
+    let stream = dial_ep
+        .dial(seed_dest, Duration::from_secs(5))
+        .expect("dial seeder");
+    leecher.attach(stream, seed_dest).expect("attach seeder");
+
+    let deadline = Instant::now() + DEADLINE;
+    while leecher.have().count() < num_pieces {
+        assert!(
+            Instant::now() < deadline,
+            "honest download stalled at {}/{num_pieces} pieces behind a peer that \
+             stopped reading (it held {held_at_start} before the hostile peer attached)",
+            leecher.have().count()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(flood);
 }
