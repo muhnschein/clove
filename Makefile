@@ -124,10 +124,18 @@ router-line:
 ## Can this router do the one thing the live tests need — carry a stream from
 ## one of its own destinations to another? Two sessions, one dial, bounded.
 ##
-## Worth 90 seconds before spending 500 on a test that fails the same way. A
-## fresh router says "unfinished": its netDb is too thin to resolve a leaseSet
+## Worth four minutes before spending twenty on a test that fails the same way.
+## A fresh router says "unfinished": its netDb is too thin to resolve a leaseSet
 ## yet, and the answer is to wait, not to debug clove.
-READY_DEADLINE ?= 90
+##
+## This was 90s, which could not work: sam-stress retries a warming-up leaseSet
+## on its own budget, and at ~26s per attempt (dial timeout plus backoff) 90s
+## bought three tries against a router that wanted nine. Every observed run
+## failed here and skipped the whole matrix behind it. The budget now drives the
+## retry loop instead of racing it (see sam-stress's `warmup_deadline`), so this
+## number means what it says — but it still has to be large enough for a real
+## router, and 90 was not.
+READY_DEADLINE ?= 240
 router-ready: check-router router-wait
 	@echo "== $(ROUTER): one stream between two of its own destinations =="
 	CLOVE_SAM_PORT=$(SAM_PORT) CLOVE_STRESS_DEADLINE=$(READY_DEADLINE) 		cargo run --release -p i2pnet --bin sam-stress -- 1

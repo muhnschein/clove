@@ -7,9 +7,10 @@
 # faults: the two registry-lock deadlocks in Phase F passed every unit test and
 # were found only by running the daemon.
 #
-# No router is needed. The daemon reports "waiting-for-router" and torrents sit
-# in that state, which is exactly what we assert. Live-router coverage is
-# `make test-live` (docs/LIVE-TESTING.md).
+# No router is needed — and, importantly, none is *used* even if one happens to
+# be running: the daemon is pointed at a loopback port nothing listens on, so
+# "waiting-for-router" is a property of the fixture rather than of the machine.
+# Live-router coverage is `make test-live` (docs/LIVE-TESTING.md).
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -62,15 +63,47 @@ expect_status() {
     [ "$got" = "$want" ] || fail "$what: expected exit $want, got $got"
 }
 
+# A loopback port nothing listens on, so the SAM connect is refused at once and
+# the daemon lands in "waiting-for-router" deterministically.
+#
+# Without this the smoke test pointed at the default SAM port and asserted
+# "waiting-for-router" — which holds only on a machine with no router. It
+# therefore failed on exactly the machines this script most wants to run on:
+# an operator's box with a live i2pd on 7656, where the daemon reports
+# "connecting" or "connected" and the assertion blows up on a working setup.
+# Tier 1 must not depend on ambient machine state.
+DEAD_SAM_PORT=1
+
 start_daemon() {
+    printf 'sam_address 127.0.0.1:%s\n' "$DEAD_SAM_PORT" > "$work/smoke.conf"
     # A previous run's socket file may still be on disk; the daemon replaces
     # it, so waiting for the file alone would race. Wait for an answer.
-    timeout 60 "$cloved" >"$work/daemon.log" 2>&1 &
+    timeout 60 "$cloved" -c "$work/smoke.conf" >"$work/daemon.log" 2>&1 &
     daemon_pid=$!
     i=0
     until timeout 5 "$clove" status >/dev/null 2>&1; do
         i=$((i + 1))
         [ "$i" -gt 200 ] && fail "daemon never answered (log: $(cat "$work/daemon.log"))"
+        sleep 0.05
+    done
+}
+
+# Wait for the daemon to report a router state, rather than sampling once.
+#
+# The daemon starts in "connecting" and only moves to "waiting-for-router"
+# after its first SAM attempt fails, so a single read races that transition
+# even against a dead port. The race is narrow, which is worse than wide: it
+# passes locally and fails on a loaded CI runner.
+expect_router_state() {
+    want=$1
+    i=0
+    while :; do
+        got=$("$clove" status 2>/dev/null || true)
+        case "$got" in
+        *"$want"*) return 0 ;;
+        esac
+        i=$((i + 1))
+        [ "$i" -gt 200 ] && fail "router never reached '$want'; last status: $got"
         sleep 0.05
     done
 }
@@ -103,8 +136,8 @@ timeout 20 "$cloved" -C >/dev/null || fail "cloved -C failed"
 
 echo "smoke: daemon starts and answers"
 start_daemon
-status=$(run status) || fail "clove status failed"
-expect_contains "$status" "waiting-for-router" "status without a router"
+run status >/dev/null || fail "clove status failed"
+expect_router_state "waiting-for-router"
 
 echo "smoke: add, list, show"
 added=$(run add "$work/demo.torrent") || fail "add failed"
@@ -211,7 +244,7 @@ done
 expect_contains "$(timeout 5 "$clove" -c "$conf_dir/clove.conf" list)" \
     "no torrents" "list against the configured daemon"
 # Without -c the CLI looks at the default socket, which is a different daemon.
-expect_contains "$(timeout 5 "$clove" status)" "waiting-for-router" "default socket still works"
+expect_router_state "waiting-for-router"
 kill "$conf_pid" 2>/dev/null
 wait "$conf_pid" 2>/dev/null || true
 
