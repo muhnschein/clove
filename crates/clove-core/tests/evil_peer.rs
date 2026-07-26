@@ -194,6 +194,36 @@ where
     let _ = attack(&mut stream);
 }
 
+/// How long a raw peer waits for a frame before deciding none is coming.
+///
+/// Every read below goes through this. Without a bound, a message the engine
+/// *fails* to send is a test that hangs rather than one that fails — and a hang
+/// looks exactly like slow progress, in CI most of all. Generous enough that a
+/// loaded machine does not produce a false negative.
+const FRAME_WAIT: Duration = Duration::from_secs(2);
+
+/// The next message from a peer, or `None` if nothing arrived in [`FRAME_WAIT`].
+///
+/// The stream must have a read timeout set (see [`raw_peer`]). A timeout partway
+/// through a frame would desynchronise the stream, but the mock delivers a
+/// written frame in one piece, so a timeout here always lands on a boundary.
+fn next_message(stream: &mut MockStream) -> Option<Message> {
+    match wire::read_frame(stream, wire::MAX_MESSAGE_LEN) {
+        Ok(frame) => Message::parse(&frame).ok(),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+        Err(_) => None,
+    }
+}
+
+/// Dial `dest`, handshake, and return a stream whose reads are bounded.
+fn raw_peer(net: &MockNet, dest: DestHash, info_hash: [u8; 20]) -> MockStream {
+    let ep = net.endpoint();
+    let mut stream = ep.dial(dest, Duration::from_secs(5)).expect("peer dial");
+    handshake(&mut stream, info_hash).expect("peer handshake");
+    stream.set_timeouts(Some(FRAME_WAIT));
+    stream
+}
+
 /// Read frames until `want` of them are `Request`s, or give up.
 ///
 /// Anything else the engine sends (its bitfield, extension handshake,
@@ -207,10 +237,7 @@ fn read_requests(stream: &mut MockStream, want: usize) -> Vec<wire::BlockRequest
             "only {} of {want} requests arrived",
             out.len()
         );
-        let Ok(frame) = wire::read_frame(stream, wire::MAX_MESSAGE_LEN) else {
-            break;
-        };
-        if let Ok(Message::Request(req)) = Message::parse(&frame) {
+        if let Some(Message::Request(req)) = next_message(stream) {
             out.push(req);
         }
     }
@@ -701,11 +728,7 @@ fn re_announcing_a_piece_set_does_not_distort_availability() {
     let dest = ep.dest();
     let _acceptor = spawn_acceptor(&leecher, ep);
 
-    let peer_ep = net.endpoint();
-    let mut peer = peer_ep
-        .dial(dest, Duration::from_secs(5))
-        .expect("peer dial");
-    handshake(&mut peer, info_hash).expect("peer handshake");
+    let mut peer = raw_peer(&net, dest, info_hash);
 
     // Every way to say "what I have" — repeatedly, and in combinations no
     // honest peer sends.
@@ -802,11 +825,7 @@ fn a_request_may_not_reach_past_its_piece() {
     let dest = ep.dest();
     let _acceptor = spawn_acceptor(&server, ep);
 
-    let peer_ep = net.endpoint();
-    let mut peer = peer_ep
-        .dial(dest, Duration::from_secs(5))
-        .expect("peer dial");
-    handshake(&mut peer, info_hash).expect("peer handshake");
+    let mut peer = raw_peer(&net, dest, info_hash);
     wire::write_message(&mut peer, &Message::Interested).expect("interest");
 
     // Wait to be unchoked, or the requests below are refused for that reason
@@ -814,8 +833,7 @@ fn a_request_may_not_reach_past_its_piece() {
     let deadline = Instant::now() + DEADLINE;
     loop {
         assert!(Instant::now() < deadline, "never unchoked");
-        let frame = wire::read_frame(&mut peer, wire::MAX_MESSAGE_LEN).expect("frame");
-        if matches!(Message::parse(&frame), Ok(Message::Unchoke)) {
+        if matches!(next_message(&mut peer), Some(Message::Unchoke)) {
             break;
         }
     }
@@ -849,12 +867,11 @@ fn a_request_may_not_reach_past_its_piece() {
             Instant::now() < deadline,
             "the legal request went unanswered"
         );
-        let frame = wire::read_frame(&mut peer, wire::MAX_MESSAGE_LEN).expect("frame");
-        if let Ok(Message::Piece {
+        if let Some(Message::Piece {
             index,
             begin,
             block,
-        }) = Message::parse(&frame)
+        }) = next_message(&mut peer)
         {
             assert_eq!(
                 (index, begin, block.len()),
@@ -902,11 +919,7 @@ fn peer_exchange_stays_within_the_limit_it_enforces() {
     let dest = ep.dest();
     let _acceptor = spawn_acceptor(&seeder, ep);
 
-    let peer_ep = net.endpoint();
-    let mut peer = peer_ep
-        .dial(dest, Duration::from_secs(5))
-        .expect("peer dial");
-    handshake(&mut peer, info_hash).expect("peer handshake");
+    let mut peer = raw_peer(&net, dest, info_hash);
     // Advertise i2p_pex, which is what prompts the engine to send its set.
     let mut m = BTreeMap::new();
     m.insert(b"i2p_pex".to_vec(), Ben::Int(1));
@@ -924,8 +937,7 @@ fn peer_exchange_stays_within_the_limit_it_enforces() {
     let deadline = Instant::now() + DEADLINE;
     loop {
         assert!(Instant::now() < deadline, "no PEX message arrived");
-        let frame = wire::read_frame(&mut peer, wire::MAX_MESSAGE_LEN).expect("frame");
-        if let Ok(Message::Extended { id: 1, payload }) = Message::parse(&frame) {
+        if let Some(Message::Extended { id: 1, payload }) = next_message(&mut peer) {
             let parsed = clove_core::pex::PexMessage::parse(&payload)
                 .expect("our own PEX message must parse under our own parser");
             assert!(parsed.added.len() <= clove_core::pex::MAX_PEX_PEERS);
@@ -942,6 +954,12 @@ fn peer_exchange_stays_within_the_limit_it_enforces() {
 /// that arrives after the slots are taken ever gets served. Without a round on
 /// a timer, whoever was unchoked first keeps the slot for the life of the
 /// connection and the peers behind them wait forever.
+///
+/// This is the traffic-driven path — the fallback for an embedder driving
+/// `Torrent` with no maintenance tick. The tick itself is covered by
+/// `choke_rounds_run_without_any_traffic_at_all`, which is the case that
+/// matters: a connection with nothing moving on it is exactly when the slots
+/// need reconsidering.
 #[test]
 fn every_interested_peer_eventually_gets_a_turn() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1002,4 +1020,230 @@ fn every_interested_peer_eventually_gets_a_turn() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The same rotation, with no traffic at all. Nothing is sent by these peers
+/// after their initial interest, so only the maintenance tick can be running the
+/// rounds — which is the honest version of the requirement, since a torrent with
+/// four busy peers and two idle ones has no reason to generate messages for the
+/// idle ones.
+#[test]
+fn choke_rounds_run_without_any_traffic_at_all() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("choke-tick");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    seeder.set_choke_interval(Duration::from_millis(50));
+    // Long enough that nothing here is dropped for being quiet, which is the
+    // whole premise of the test.
+    seeder.set_idle_timeout(Duration::from_secs(600));
+    seeder.set_keepalive_interval(Duration::from_secs(600));
+    let _tick = seeder.spawn_maintenance(Duration::from_millis(20));
+
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    let count = 6;
+    let seen: Vec<Arc<AtomicBool>> = (0..count)
+        .map(|_| Arc::new(AtomicBool::new(false)))
+        .collect();
+    let mut held = Vec::new();
+    for flag in &seen {
+        let peer_ep = net.endpoint();
+        let mut peer = peer_ep
+            .dial(dest, Duration::from_secs(5))
+            .expect("peer dial");
+        handshake(&mut peer, info_hash).expect("peer handshake");
+        wire::write_message(&mut peer, &Message::Interested).expect("interest");
+        let mut reader = peer.try_clone();
+        let flag = Arc::clone(flag);
+        std::thread::spawn(move || {
+            while let Ok(frame) = wire::read_frame(&mut reader, wire::MAX_MESSAGE_LEN) {
+                if matches!(Message::parse(&frame), Ok(Message::Unchoke)) {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        held.push(peer);
+    }
+
+    let deadline = Instant::now() + DEADLINE;
+    while !seen.iter().all(|f| f.load(Ordering::Relaxed)) {
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {count} peers were ever unchoked with no traffic to drive rounds",
+            seen.iter().filter(|f| f.load(Ordering::Relaxed)).count()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(held);
+}
+
+/// A peer we have nothing to say to still has to hear from us. Clients drop a
+/// connection that has gone quiet for a few minutes, so without keep-alives the
+/// *other* side hangs up — and on I2P redialling costs tunnel setup, which makes
+/// this more expensive than the clearnet equivalent.
+#[test]
+fn a_quiet_connection_still_gets_keep_alives() {
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    // A seeder with nothing to say: the peer below never claims a piece, never
+    // asks for one, and is never interested, so no other message is due.
+    let dir = TempDir::new("keepalive");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    seeder.set_keepalive_interval(Duration::from_millis(50));
+    seeder.set_idle_timeout(Duration::from_secs(600));
+    let _tick = seeder.spawn_maintenance(Duration::from_millis(20));
+
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    let mut peer = raw_peer(&net, dest, info_hash);
+
+    // Two of them, so this is a repeating clock and not one opening flourish.
+    let deadline = Instant::now() + DEADLINE;
+    let mut got = 0;
+    while got < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "only {got} keep-alives arrived on an otherwise silent connection"
+        );
+        if matches!(next_message(&mut peer), Some(Message::KeepAlive)) {
+            got += 1;
+        }
+    }
+}
+
+/// A peer that says nothing at all is eventually dropped, so its slot and its
+/// bookkeeping come back. The connection is held open throughout: this is the
+/// silent-but-connected case, not a disconnect.
+#[test]
+fn a_peer_that_says_nothing_is_eventually_dropped() {
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("idle-drop");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    seeder.set_idle_timeout(Duration::from_millis(200));
+    // No keep-alives: they would be the only thing we send, and this is about
+    // what we *hear*.
+    seeder.set_keepalive_interval(Duration::from_secs(600));
+    let _tick = seeder.spawn_maintenance(Duration::from_millis(20));
+
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    let peer = raw_peer(&net, dest, info_hash);
+    let deadline = Instant::now() + DEADLINE;
+    while seeder.connected_peers().is_empty() {
+        assert!(Instant::now() < deadline, "the peer never attached");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Now it goes quiet while staying connected.
+    let deadline = Instant::now() + DEADLINE;
+    while !seeder.connected_peers().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "a peer that said nothing for well past the idle timeout was kept"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(peer);
+}
+
+/// The tick must not disturb a working transfer: a peer sending and receiving is
+/// never idle, and keep-alives are just another message in the stream.
+#[test]
+fn maintenance_does_not_disturb_a_live_download() {
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let num_pieces = u32::try_from(meta.pieces.len()).expect("piece count");
+
+    let seed_dir = TempDir::new("tick-seed");
+    let seeder = seeding_torrent(&meta, &content, &seed_dir);
+    seeder.set_keepalive_interval(Duration::from_millis(30));
+    seeder.set_idle_timeout(Duration::from_millis(400));
+    let _seed_tick = seeder.spawn_maintenance(Duration::from_millis(10));
+    let seed_ep = net.endpoint();
+    let seed_dest = seed_ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, seed_ep);
+
+    let leech_dir = TempDir::new("tick-leech");
+    let leecher = leeching_torrent(&meta, &leech_dir);
+    leecher.set_keepalive_interval(Duration::from_millis(30));
+    leecher.set_idle_timeout(Duration::from_millis(400));
+    let _leech_tick = leecher.spawn_maintenance(Duration::from_millis(10));
+
+    let ep = net.endpoint();
+    let stream = ep
+        .dial(seed_dest, Duration::from_secs(5))
+        .expect("dial seeder");
+    leecher.attach(stream, seed_dest).expect("attach");
+
+    let deadline = Instant::now() + DEADLINE;
+    while leecher.have().count() < num_pieces {
+        assert!(
+            Instant::now() < deadline,
+            "download stalled at {}/{num_pieces} with maintenance running",
+            leecher.have().count()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The tick stops when its handle is dropped, and cannot keep a torrent (and the
+/// files it holds open) alive by itself.
+#[test]
+fn the_maintenance_tick_outlives_neither_its_handle_nor_its_torrent() {
+    let content = content();
+    let meta = meta_for(&content);
+
+    let dir = TempDir::new("tick-life");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    let weak = Arc::downgrade(&seeder);
+
+    // Dropping the handle stops the thread; dropping the torrent must then be
+    // the last reference, or the tick is holding it open.
+    let tick = seeder.spawn_maintenance(Duration::from_millis(10));
+    std::thread::sleep(Duration::from_millis(50));
+    drop(tick);
+    drop(seeder);
+    let deadline = Instant::now() + DEADLINE;
+    while weak.upgrade().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "something is still holding the torrent after its handle and its Arc went"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // And the other way round: a handle nobody drops must not pin the torrent.
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    let weak = Arc::downgrade(&seeder);
+    let forgotten = seeder.spawn_maintenance(Duration::from_millis(10));
+    drop(seeder);
+    let deadline = Instant::now() + DEADLINE;
+    while weak.upgrade().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "a forgotten maintenance handle kept the torrent alive"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(forgotten);
 }

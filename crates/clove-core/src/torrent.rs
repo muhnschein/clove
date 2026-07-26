@@ -65,6 +65,29 @@ const OUR_METADATA_ID: u8 = 2;
 /// [`Torrent::set_choke_interval`].
 pub const DEFAULT_CHOKE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How often a keep-alive goes out to a peer we have said nothing else to.
+///
+/// BEP 3's convention is every two minutes, and clients drop a connection that
+/// has been silent for a few — so this is the interval that stops *other* peers
+/// hanging up on us. It matters more here than on clearnet: an I2P connection
+/// costs tunnel setup, so being dropped and redialling is expensive, and a
+/// leecher waiting on a rare piece or a seeder nobody is requesting from can
+/// legitimately have nothing else to send for a long time.
+pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(100);
+
+/// How long a peer may say nothing at all before we drop it.
+///
+/// Three missed keep-alives at the interval above. Generous on purpose: tunnel
+/// latency and a router under load are both normal, and disconnecting a healthy
+/// peer costs more than waiting out a dead one.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How often [`Torrent::spawn_maintenance`] wakes to do the periodic work.
+///
+/// Fine enough that the intervals above are honoured to within a tick, coarse
+/// enough to be free.
+pub const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Largest number of peer destinations one torrent will remember.
 ///
 /// `known_peers` grows from tracker replies and from peer exchange, and PEX is
@@ -181,6 +204,10 @@ struct State {
     last_choke_round: Instant,
     /// How long between choke rounds.
     choke_interval: Duration,
+    /// How long we may leave a peer with nothing from us before a keep-alive.
+    keepalive_interval: Duration,
+    /// How long a peer may say nothing before we drop it.
+    idle_timeout: Duration,
     peers: Vec<Peer>,
     next_id: u64,
     /// Peer destinations we know about (from connections, PEX, or the
@@ -222,12 +249,30 @@ struct Peer {
     we_interested: bool,
     /// Blocks we have requested from them, as (piece, block).
     in_flight: HashSet<(u32, u32)>,
+    /// When we last queued anything for them, for keep-alive timing.
+    last_sent: Instant,
+    /// When we last heard anything from them, for the idle timeout.
+    last_seen: Instant,
     /// Bytes served to them, the choker's ranking signal.
     uploaded: u64,
     /// The message id the peer listens on for `i2p_pex`, once it handshakes.
     pex_id: Option<u8>,
     /// The message id the peer listens on for `ut_metadata`.
     metadata_id: Option<u8>,
+}
+
+/// A running maintenance tick (see [`Torrent::spawn_maintenance`]).
+///
+/// Dropping it stops the thread, so an owner cannot forget to; there is nothing
+/// to join, because the tick holds no state anyone waits on.
+pub struct Maintenance {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Maintenance {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A message queued to a specific peer, collected under the lock and sent
@@ -275,6 +320,8 @@ impl Torrent {
                 choker: Choker::default(),
                 last_choke_round: Instant::now(),
                 choke_interval: DEFAULT_CHOKE_INTERVAL,
+                keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
+                idle_timeout: DEFAULT_IDLE_TIMEOUT,
                 peers: Vec::new(),
                 next_id: 0,
                 known_peers: HashSet::new(),
@@ -326,6 +373,52 @@ impl Torrent {
     /// Set how long this torrent waits between choke rounds (R5 tunable).
     pub fn set_choke_interval(&self, interval: Duration) {
         lock(&self.shared.state).choke_interval = interval;
+    }
+
+    /// Set how long a peer may go without hearing anything from us before a
+    /// keep-alive is sent (R5 tunable).
+    pub fn set_keepalive_interval(&self, interval: Duration) {
+        lock(&self.shared.state).keepalive_interval = interval;
+    }
+
+    /// Set how long a peer may say nothing before it is dropped (R5 tunable).
+    pub fn set_idle_timeout(&self, timeout: Duration) {
+        lock(&self.shared.state).idle_timeout = timeout;
+    }
+
+    /// Start the periodic work this torrent needs: keep-alives to peers we have
+    /// nothing else to say to, dropping peers that have gone silent, and choke
+    /// rounds.
+    ///
+    /// All three are things a torrent owes the swarm on a clock rather than in
+    /// response to traffic — a connection with nothing moving on it is exactly
+    /// when a keep-alive matters and exactly when a choke round should be
+    /// reconsidering its slots. `period` is how often the thread wakes;
+    /// [`DEFAULT_MAINTENANCE_INTERVAL`] in production, something short in tests.
+    ///
+    /// Dropping the returned handle stops the thread within one period, and the
+    /// thread also exits on its own if the torrent is dropped first, so neither
+    /// can outlive the other by more than a tick.
+    #[must_use]
+    pub fn spawn_maintenance(&self, period: Duration) -> Maintenance {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        // Weak, so a forgotten handle cannot keep the torrent (and its open
+        // files) alive for the life of the process.
+        let shared = Arc::downgrade(&self.shared);
+        std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(period);
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let Some(shared) = shared.upgrade() else {
+                    return;
+                };
+                shared.maintain();
+            }
+        });
+        Maintenance { stop }
     }
 
     /// The peer destinations this torrent currently knows about.
@@ -568,6 +661,8 @@ impl Shared {
             they_interested: false,
             we_interested: false,
             in_flight: HashSet::new(),
+            last_sent: Instant::now(),
+            last_seen: Instant::now(),
             uploaded: 0,
             pex_id: None,
             metadata_id: None,
@@ -608,36 +703,78 @@ impl Shared {
         let mut out: Vec<Outgoing> = Vec::new();
         {
             let mut st = lock(&self.state);
+            let now = Instant::now();
+            // Anything at all from a peer — a keep-alive included — is proof it
+            // is still there, which is what the idle timeout measures.
+            if let Some(peer) = st.peers.iter_mut().find(|p| p.id == id) {
+                peer.last_seen = now;
+            }
             self.handle(&mut st, id, msg, &mut out);
-            // Choke rounds are periodic in BEP 3, and the optimistic slot only
-            // rotates when one runs: without this the peers unchoked first keep
-            // their slots for the life of the connection and a new peer is
-            // never given a chance to prove itself. Driven off traffic rather
-            // than a timer thread — with no messages there is nothing to
-            // reconsider, and the engine keeps its "no threads we do not need"
-            // shape (Q5).
+            // A choke round is due on a clock, not on traffic, so the
+            // maintenance tick is what normally runs it. This second check
+            // costs one comparison per message and keeps the choker honest for
+            // an embedder driving `Torrent` without a tick of its own.
             if st.last_choke_round.elapsed() >= st.choke_interval {
-                st.last_choke_round = Instant::now();
+                st.last_choke_round = now;
                 run_choker(&mut st, &mut out);
             }
+            record_sent(&mut st, &out, now);
             // Every peer message can move piece accounting; check the whole
             // picture while the lock is still held and the state is settled.
             debug_check_state(&st);
         }
+        self.send_all(out);
+        self.check_done();
+    }
+
+    /// The periodic work, one tick's worth: drop peers that have gone silent,
+    /// keep-alive the ones we have nothing else to say to, and run a choke round
+    /// if one is due.
+    fn maintain(&self) {
+        let mut out: Vec<Outgoing> = Vec::new();
+        let mut idle: Vec<u64> = Vec::new();
+        {
+            let mut st = lock(&self.state);
+            let now = Instant::now();
+            let (keepalive, timeout) = (st.keepalive_interval, st.idle_timeout);
+            for peer in &st.peers {
+                if now.duration_since(peer.last_seen) >= timeout {
+                    idle.push(peer.id);
+                } else if now.duration_since(peer.last_sent) >= keepalive {
+                    out.push((peer.id, peer.out.clone(), Message::KeepAlive));
+                }
+            }
+            if st.last_choke_round.elapsed() >= st.choke_interval {
+                st.last_choke_round = now;
+                run_choker(&mut st, &mut out);
+            }
+            record_sent(&mut st, &out, now);
+            debug_check_state(&st);
+        }
+        // Outside the lock: remove_peer takes it, and so does the send path.
+        for id in idle {
+            self.remove_peer(id);
+        }
+        self.send_all(out);
+    }
+
+    /// Hand every collected message to its peer's writer, dropping any peer
+    /// whose queue will not take it.
+    ///
+    /// `try_send`, never `send`: the calling thread usually belongs to some
+    /// *other* peer — a reader that completed a piece, or the maintenance tick —
+    /// and a peer that has stopped reading fills its socket and then its queue.
+    /// Blocking here would park that thread behind it, which is one silent peer
+    /// stalling the whole torrent. A full queue means the peer is not reading
+    /// (see [`OUTGOING_QUEUE`]); a closed one means its writer is already gone.
+    /// Either way the connection is finished, and dropping it returns its
+    /// in-flight blocks to the picker.
+    fn send_all(&self, out: Vec<Outgoing>) {
         for (id, tx, msg) in out {
-            // try_send, never send: this thread belongs to whichever peer's
-            // message triggered the work, not to the peer being written to. A
-            // peer that stops reading fills its socket and then its queue, and
-            // a blocking send here would park *every* other peer's reader
-            // thread behind it — one silent peer stalling the whole torrent.
-            // A full queue means the peer is not reading (see OUTGOING_QUEUE);
-            // a closed one means its writer is already gone. Drop it either
-            // way, which also returns its in-flight blocks to the picker.
             if tx.try_send(msg).is_err() {
                 self.remove_peer(id);
             }
         }
-        self.check_done();
     }
 
     #[allow(clippy::too_many_lines)] // one dispatch table; splitting hurts readability
@@ -923,6 +1060,19 @@ impl Shared {
                 *done = true;
                 self.done_cv.notify_all();
             }
+        }
+    }
+}
+
+/// Note that each peer named in `out` has had something queued for it, so the
+/// keep-alive clock starts again for them.
+///
+/// Done once over the batch rather than at each `out.push` site: queuing is what
+/// matters for the clock, and there are a dozen places that queue.
+fn record_sent(st: &mut State, out: &[Outgoing], now: Instant) {
+    for (id, _, _) in out {
+        if let Some(peer) = st.peers.iter_mut().find(|p| p.id == *id) {
+            peer.last_sent = now;
         }
     }
 }

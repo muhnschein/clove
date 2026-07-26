@@ -315,11 +315,17 @@ fn spawn_metadata_fetch(daemon: &Arc<Daemon>, info_hash: [u8; 20]) {
             if let Some(ctx) = context
                 && let Some(bytes) = try_fetch_round(&ctx, info_hash, first_round)
             {
-                match lock(&daemon.registry).complete_magnet(&info_hash, &bytes) {
-                    Ok(()) => eprintln!(
-                        "cloved: magnet {} resolved; torrent added",
-                        registry::hex(&info_hash)
-                    ),
+                let completed = lock(&daemon.registry).complete_magnet(&info_hash, &bytes);
+                match completed {
+                    Ok(job) => {
+                        // Unlocked, like every other scan; a magnet's files were
+                        // only just laid out, so this one is quick.
+                        let _ = run_scan(&daemon, &job);
+                        eprintln!(
+                            "cloved: magnet {} resolved; torrent added",
+                            registry::hex(&info_hash)
+                        );
+                    }
                     Err(e) => eprintln!(
                         "cloved: magnet {} fetched but add failed: {e}",
                         registry::hex(&info_hash)
@@ -521,8 +527,17 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response 
             Err(e) => error(500, &format!("adding magnet: {e}")),
         };
     }
-    match lock(&daemon.registry).add_torrent(&request.body) {
-        Ok(info_hash) => {
+    let added = lock(&daemon.registry).add_torrent(&request.body);
+    match added {
+        Ok((info_hash, job)) => {
+            // The initial pass over whatever is already on disk runs with the
+            // registry unlocked: on a re-add over a finished download it hashes
+            // the whole torrent, and every other request would otherwise wait
+            // for it. The torrent is registered and marked "verifying" already,
+            // so it shows up in `clove list` while this happens.
+            // The add already succeeded; a scan that fails only means the
+            // torrent shows nothing on disk, which `clove verify` can retry.
+            let _ = run_scan(daemon, &job);
             let body = Value::Object(vec![(
                 "info_hash".to_owned(),
                 Value::from(registry::hex(&info_hash)),
@@ -535,6 +550,16 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response 
         Err(AddError::Duplicate) => error(409, "torrent already added"),
         Err(AddError::Io(e)) => error(500, &format!("adding torrent: {e}")),
     }
+}
+
+/// Run a scan with the registry unlocked, then publish it.
+///
+/// Reporting back is not optional: a torrent whose scan never finishes stays
+/// marked as scanning and never starts, so the result goes in whether the pass
+/// succeeded or failed.
+fn run_scan(daemon: &Daemon, job: &registry::ScanJob) -> Result<u32, ActionError> {
+    let scanned = job.run();
+    lock(&daemon.registry).finish_scan(job, scanned)
 }
 
 /// Route a request against a specific torrent: `<info-hash>` or
@@ -589,18 +614,26 @@ fn torrent_action(
             Some(on) => action_result(lock(&daemon.registry).set_sequential(&info_hash, on)),
             None => error(400, "body must be \"true\" or \"false\""),
         },
-        ("POST", Some("verify")) => match lock(&daemon.registry).verify(&info_hash) {
-            Ok(verified) => {
-                let body = Value::Object(vec![(
-                    "verified".to_owned(),
-                    Value::UInt(u64::from(verified)),
-                )])
-                .encode()
-                .into_bytes();
-                Response::new(200, "application/json", body)
+        ("POST", Some("verify")) => {
+            let job = match lock(&daemon.registry).begin_verify(&info_hash) {
+                Ok(job) => job,
+                Err(e) => return action_error(&e),
+            };
+            // Hashing happens here, with nothing locked. This request waits for
+            // it — the operator asked — but nothing else does.
+            match run_scan(daemon, &job) {
+                Ok(verified) => {
+                    let body = Value::Object(vec![(
+                        "verified".to_owned(),
+                        Value::UInt(u64::from(verified)),
+                    )])
+                    .encode()
+                    .into_bytes();
+                    Response::new(200, "application/json", body)
+                }
+                Err(e) => action_error(&e),
             }
-            Err(e) => action_error(&e),
-        },
+        }
         ("PUT", Some("priorities")) => match parse_priorities(&request.body) {
             Some(priorities) => action_result(
                 lock(&daemon.registry)
@@ -1142,6 +1175,86 @@ mod tests {
         assert_eq!(parse_priorities(&[0xFF, 0xFE]), None);
         // 256 wraps to 0 in a u8 parse only if the parser is careless.
         assert_eq!(parse_priorities(b"256"), None);
+    }
+
+    /// The API must stay answerable while a torrent is being hashed. The whole
+    /// point of handing the scan out of the lock is that `verify` on a large
+    /// torrent — minutes of SHA-1 — no longer stops `status`, `list`, `pause` and
+    /// the periodic resume writer dead.
+    #[test]
+    fn the_api_answers_while_a_torrent_is_being_scanned() {
+        use clove_core::bencode::{self, Value as Ben};
+        use sha1::{Digest, Sha1};
+        use std::collections::BTreeMap;
+
+        let dir = TempDir::new("scan-lock");
+        let d = daemon(&dir);
+
+        // A torrent big enough that hashing it is not instant.
+        let content: Vec<u8> = (0..(64 * 16 * 1024u32))
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let pieces: Vec<u8> = content
+            .chunks(16 * 1024)
+            .flat_map(|c| <[u8; 20]>::from(Sha1::digest(c)))
+            .collect();
+        let mut info = BTreeMap::new();
+        info.insert(b"name".to_vec(), Ben::Bytes(b"scan-lock".to_vec()));
+        info.insert(b"piece length".to_vec(), Ben::Int(16 * 1024));
+        info.insert(b"pieces".to_vec(), Ben::Bytes(pieces));
+        info.insert(
+            b"length".to_vec(),
+            Ben::Int(i64::try_from(content.len()).expect("fits")),
+        );
+        let mut root = BTreeMap::new();
+        root.insert(b"info".to_vec(), Ben::Dict(info));
+        let bytes = bencode::encode(&Ben::Dict(root));
+
+        // Add it, and write the data so the scan has something to hash.
+        let (info_hash, job) = lock(&d.registry).add_torrent(&bytes).expect("add");
+        let downloads = dir.0.join("downloads/scan-lock");
+        std::fs::write(&downloads, &content).expect("write the data");
+        let published = run_scan(&d, &job).expect("first scan");
+        assert_eq!(published, 64, "the data on disk should have verified");
+
+        // Now a second pass, with the registry watched from another thread.
+        let job = lock(&d.registry)
+            .begin_verify(&info_hash)
+            .expect("begin verify");
+        let watcher = {
+            let d = Arc::clone(&d);
+            std::thread::spawn(move || {
+                // If the scan held the lock, this would block until it finished.
+                let mut answered = 0;
+                for _ in 0..20 {
+                    let _ = lock(&d.registry).count();
+                    answered += 1;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                answered
+            })
+        };
+        let scanned = job.run();
+        assert_eq!(watcher.join().expect("watcher"), 20);
+        let verified = lock(&d.registry)
+            .finish_scan(&job, scanned)
+            .expect("finish");
+        assert_eq!(verified, 64);
+
+        // And the state string says what is going on while it runs.
+        let job = lock(&d.registry).begin_verify(&info_hash).expect("begin");
+        let listing = lock(&d.registry).list().encode();
+        assert!(
+            listing.contains("verifying"),
+            "a torrent being scanned should say so: {listing}"
+        );
+        // A second verify while one is running is refused rather than queued.
+        assert!(matches!(
+            lock(&d.registry).begin_verify(&info_hash),
+            Err(ActionError::BadInput(_))
+        ));
+        let scanned = job.run();
+        let _ = lock(&d.registry).finish_scan(&job, scanned);
     }
 
     #[test]
