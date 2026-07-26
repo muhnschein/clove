@@ -20,8 +20,13 @@
 //!
 //! Usage:
 //!   sam-stress [N]                  # N concurrent streams (default 32)
-//!   `CLOVE_SAM_PORT=7656` ...       # SAM control port (default 7656)
+//!   `CLOVE_SAM_PORT=7656` ...       # SAM port the listener uses (default 7656)
+//!   `CLOVE_SAM_PORT_DIAL=7666` ...  # SAM port the dialer uses (default: same)
 //!   `CLOVE_STRESS_DEADLINE=360` ... # seconds for the whole run (default 360)
+//!
+//! Setting `CLOVE_SAM_PORT_DIAL` to a *different* router makes this a
+//! cross-router test — one destination on router A dialed from router B, which
+//! is the path a real swarm peer takes. `make cross` sweeps the pairs.
 
 use std::env;
 use std::io::{self, Read, Write};
@@ -94,14 +99,30 @@ fn main() -> ExitCode {
 /// Only to setup failures: once the sessions are up the router is plainly
 /// running, and repeating the question there sends the reader to check
 /// something they have already proved.
-fn setup_hint<T>(result: io::Result<T>) -> io::Result<T> {
+///
+/// The port is passed rather than re-read from the environment, because in a
+/// cross-router run the two sessions sit on different routers and a hint that
+/// always named the listener's port would send the reader to the wrong one.
+fn setup_hint<T>(port: u16, result: io::Result<T>) -> io::Result<T> {
     result.inspect_err(|_| {
         eprintln!(
-            "sam-stress: could not bring up a SAM session on 127.0.0.1:{}. \
-             Is a router running with SAM enabled there? (CLOVE_SAM_PORT changes the port)",
-            sam_port()
+            "sam-stress: could not bring up a SAM session on 127.0.0.1:{port}. \
+             Is a router running with SAM enabled there? \
+             (CLOVE_SAM_PORT / CLOVE_SAM_PORT_DIAL change the ports)"
         );
     })
+}
+
+/// One SAM session on `port`, named so it is findable in the router's log.
+fn session_on(port: u16, prefix: &str) -> io::Result<SamSession> {
+    setup_hint(
+        port,
+        SamSession::connect(&SamConfig {
+            samv3_tcp_port: port,
+            nickname: unique_nickname(prefix),
+            ..Default::default()
+        }),
+    )
 }
 
 fn run() -> io::Result<()> {
@@ -111,24 +132,17 @@ fn run() -> io::Result<()> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "N must be a positive integer"))?
         .max(1);
     let port = sam_port();
+    let dialing = dial_port();
+    announce_topology(port, dialing);
 
-    eprintln!("sam-stress: connecting to SAM on 127.0.0.1:{port} (two sessions)…");
-    let listen = setup_hint(SamSession::connect(&SamConfig {
-        samv3_tcp_port: port,
-        nickname: unique_nickname("clove-stress-listen"),
-        ..Default::default()
-    }))?;
-    let dial = Arc::new(setup_hint(SamSession::connect(&SamConfig {
-        samv3_tcp_port: port,
-        nickname: unique_nickname("clove-stress-dial"),
-        ..Default::default()
-    }))?);
+    let listen = session_on(port, "clove-stress-listen")?;
+    let dial = Arc::new(session_on(dialing, "clove-stress-dial")?);
 
     // Captured before `listen` is consumed by the listener.
     let listen_b64_head: String = listen.local_dest_b64().chars().take(24).collect();
     let dialer_dest = dial.local_dest();
 
-    let listener = setup_hint(SamListener::forward(Arc::new(listen)))?;
+    let listener = setup_hint(port, SamListener::forward(Arc::new(listen)))?;
     let target = listener.local_dest();
     let listen_port = listener.local_port();
     let deadline_budget = run_deadline();
@@ -240,12 +254,48 @@ fn run_deadline() -> Duration {
         .map_or(RUN_DEADLINE, Duration::from_secs)
 }
 
-/// The SAM control port from `CLOVE_SAM_PORT`, or the `SAMv3` default.
+/// The SAM control port the *listening* session uses: `CLOVE_SAM_PORT`, or the
+/// `SAMv3` default.
 fn sam_port() -> u16 {
     env::var("CLOVE_SAM_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SAM_PORT)
+}
+
+/// The SAM control port the *dialing* session uses — `CLOVE_SAM_PORT_DIAL`,
+/// defaulting to the listener's, which is the original one-router behaviour.
+///
+/// Two routers is the more faithful test, and possibly the easier one. Both
+/// sessions on one router means a destination dialing a sibling it shares a
+/// netDb with, and at least emissary resolves that through a full lookup and
+/// times out rather than short-circuiting to the leaseSet it already holds
+/// (`PROTOCOL.i2p-bt` 2.6c). A swarm peer is never in that position: it is on
+/// somebody else's router, reached the ordinary way. Splitting the ports lets
+/// the same harness measure the path clove will actually use, and tells us
+/// whether a same-router failure is about clove at all.
+fn dial_port() -> u16 {
+    env::var("CLOVE_SAM_PORT_DIAL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(sam_port)
+}
+
+/// Say which routers the two sessions live on, before anything can fail.
+fn announce_topology(listen: u16, dialing: u16) {
+    if listen == dialing {
+        eprintln!("sam-stress: connecting to SAM on 127.0.0.1:{listen} (two sessions)…");
+        eprintln!(
+            "sam-stress: both sessions share one router — see PROTOCOL.i2p-bt 2.6c \
+             on why that may be the harder case. CLOVE_SAM_PORT_DIAL points the \
+             dialer at another router."
+        );
+    } else {
+        eprintln!(
+            "sam-stress: listening on 127.0.0.1:{listen}, dialing from \
+             127.0.0.1:{dialing} (cross-router — the swarm path)…"
+        );
+    }
 }
 
 /// Name both endpoints, then check the target resolves before dialing it.
@@ -258,14 +308,23 @@ fn sam_port() -> u16 {
 /// harness knows the answer for certain; printing it here means that question
 /// is never again settled by squinting at two logs.
 ///
-/// **Does it resolve.** The lookup separates two failures that are
-/// indistinguishable from the outside: a leaseSet that was never published or
-/// is not visible, versus one that resolves fine but will not carry a stream.
-/// Both present as "not completing dials", and without this the operator has no
-/// way to tell which half to chase.
+/// **Does a b32 resolve at all.** The lookup was added to separate "the
+/// leaseSet is not visible" from "it resolves but will not carry a stream".
+/// First contact with three routers showed it cannot carry that claim on its
+/// own: i2pd answered `InvalidKey`, Java I2P `KeyNotFound` after 3.6s, and
+/// emissary `KeyNotFound` in 0.0s — and a lookup that fails in no time did not
+/// consult the network. SAM `NAMING LOOKUP` is specified for address-book names
+/// and `ME`; whether it resolves a `.b32.i2p` label is router-dependent, and at
+/// least one router rejects the form outright. So the probe now *reports* what
+/// the router said and leaves the diagnosis alone.
 ///
-/// Diagnostic, not a gate — a router that fails the lookup may still stream,
-/// and being told both facts beats being stopped at the first.
+/// The dialer's own destination is looked up as a control. Both are local
+/// destinations on the same router queried the same way, so if the dialer
+/// cannot resolve *itself* the answer says nothing about the listener's
+/// publication — it says this router does not answer b32 lookups for its own
+/// session destinations, which is a fact about the router's naming service.
+/// Divergence between the two is the interesting case and the only one that
+/// implicates the target.
 fn describe_endpoints(dial: &SamSession, target: DestHash, dialer: DestHash, listen_b64: &str) {
     eprintln!("sam-stress: listener dest {}", target.to_b32());
     eprintln!("sam-stress:   (b64 head)  {listen_b64}…");
@@ -275,24 +334,51 @@ fn describe_endpoints(dial: &SamSession, target: DestHash, dialer: DestHash, lis
         target.to_b32()
     );
 
+    let listener_ok = report_lookup(dial, "listener", target);
+    let control_ok = report_lookup(dial, "dialer (control)", dialer);
+    match (listener_ok, control_ok) {
+        (false, false) => eprintln!(
+            "sam-stress: neither b32 resolves, including the dialer's own — this \
+             router does not answer NAMING LOOKUP for its own session \
+             destinations, so the failures say nothing about publication. Judge \
+             the dials below on their own."
+        ),
+        (false, true) => eprintln!(
+            "sam-stress: the dialer resolves but the listener does not — b32 \
+             lookup works on this router, so the listener's leaseSet really is \
+             not visible. Chase publication."
+        ),
+        (true, _) => {}
+    }
+}
+
+/// One `NAMING LOOKUP`, reported as fact. Returns whether it resolved.
+fn report_lookup(dial: &SamSession, what: &str, expect: DestHash) -> bool {
     let probe = Instant::now();
-    let took = || probe.elapsed().as_secs_f64();
-    match dial.lookup(&target.to_b32()) {
-        Ok(found) if found == target => {
-            eprintln!("sam-stress: leaseSet lookup ok in {:.1}s", took());
+    match dial.lookup(&expect.to_b32()) {
+        Ok(found) if found == expect => {
+            eprintln!(
+                "sam-stress: lookup {what}: resolved in {:.1}s",
+                probe.elapsed().as_secs_f64()
+            );
+            true
         }
-        Ok(found) => eprintln!(
-            "sam-stress: leaseSet lookup returned a DIFFERENT destination: {} \
-             (expected {}) — a router or harness bug, not a slow network",
-            found.to_b32(),
-            target.to_b32()
-        ),
-        Err(e) => eprintln!(
-            "sam-stress: leaseSet lookup FAILED after {:.1}s ({e}) — the target's \
-             leaseSet is not resolvable from the dialing session, so the dials \
-             below are expected to fail. Chase publication, not streaming.",
-            took()
-        ),
+        Ok(found) => {
+            eprintln!(
+                "sam-stress: lookup {what}: resolved to a DIFFERENT destination {} \
+                 (expected {}) — a router or harness bug, not a slow network",
+                found.to_b32(),
+                expect.to_b32()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!(
+                "sam-stress: lookup {what}: router said {e} after {:.1}s",
+                probe.elapsed().as_secs_f64()
+            );
+            false
+        }
     }
 }
 

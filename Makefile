@@ -38,7 +38,7 @@ WAIT ?= 180
 
 QUADLET_DIR := $(HOME)/.config/containers/systemd
 
-.PHONY: test smoke chaos test-live sam-stress matrix routers report router-ready \
+.PHONY: test smoke chaos test-live sam-stress matrix cross routers report router-ready \
         router-up router-down router-wait router-build router-sam-enable \
         fmt lint man-lint fuzz install uninstall
 
@@ -141,8 +141,44 @@ router-ready: check-router router-wait
 	CLOVE_SAM_PORT=$(SAM_PORT) CLOVE_STRESS_DEADLINE=$(READY_DEADLINE) 		cargo run --release -p i2pnet --bin sam-stress -- 1
 
 ## R2 stress harness: N concurrent streams on one session (docs/PROTOCOL §2.6).
+CLOVE_STRESS_DEADLINE ?=
 sam-stress:
-	CLOVE_SAM_PORT=$(SAM_PORT) cargo run --release -p i2pnet --bin sam-stress -- $(N)
+	CLOVE_SAM_PORT=$(SAM_PORT) CLOVE_SAM_PORT_DIAL=$(DIAL_SAM_PORT) \
+		$(if $(CLOVE_STRESS_DEADLINE),CLOVE_STRESS_DEADLINE=$(CLOVE_STRESS_DEADLINE),) \
+		cargo run --release -p i2pnet --bin sam-stress -- $(N)
+
+## Which router the *dialer* uses. Defaults to the listener's, i.e. both
+## sessions on one router. Point it elsewhere for a cross-router run:
+##   make sam-stress ROUTER=i2pd DIAL=java
+DIAL ?= $(ROUTER)
+DIAL_SAM_PORT ?= $(SAM_PORT_$(DIAL))
+
+## Every ordered pair of routers: a destination on one, dialed from another.
+##
+## This is the path a swarm peer actually takes, and it sidesteps the question
+## in PROTOCOL 2.6c — both sessions on one router means dialing a sibling that
+## shares a netDb, which at least emissary resolves through a full lookup and
+## fails. A same-router failure therefore does not tell us clove is wrong; a
+## cross-router failure would. Run this before concluding anything from the
+## loopback checklist.
+cross:
+	@fail=""; pass=""; \
+	for a in $(ROUTERS); do \
+		for b in $(ROUTERS); do \
+			[ "$$a" = "$$b" ] && continue; \
+			echo; echo "######## listen on $$a, dial from $$b ########"; \
+			if $(MAKE) --no-print-directory sam-stress ROUTER=$$a DIAL=$$b N=1 \
+				CLOVE_STRESS_DEADLINE=$(READY_DEADLINE); then \
+				pass="$$pass $$a<-$$b"; \
+			else \
+				fail="$$fail $$a<-$$b"; \
+			fi; \
+		done; \
+	done; \
+	echo; echo "== cross-router summary =="; \
+	echo "passed:$${pass:- none}"; \
+	echo "failed:$${fail:- none}"; \
+	[ -z "$$fail" ]
 
 ## Build the router image, for routers that have no published one. Only
 ## emissary needs this; it is a no-op for the others.
