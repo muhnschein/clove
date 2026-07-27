@@ -32,6 +32,22 @@ commit. Closure sizes are recorded when the dependency is actually added.
   the one library that speaks SAM, and it is wrapped so the engine never
   sees it. Reviewed for socket capability: none of the closure beyond
   `yosemite` itself opens sockets.
+
+  **Narrowed 2026-07-27.** clove no longer dials through yosemite. Its session
+  controller is one state machine shared by the control connection and every
+  stream operation, and a stream failure on an unexpected path leaves it
+  poisoned for the life of the session — which cost a session rebuild every
+  60–90 seconds against a live router (`docs/PROTOCOL.i2p-bt` §2.12). SAMv3
+  does not require that shape: a stream is its own connection, so `i2pnet`
+  speaks `HELLO`/`STREAM CONNECT` on a socket it opens per dial. yosemite
+  still owns `SESSION CREATE`, `STREAM FORWARD` and `NAMING LOOKUP`, where its
+  state machine runs once at setup and a failure is just a failed bring-up.
+
+  This is not a step towards dropping it — the session and naming paths are
+  real work we are glad not to be doing — but it does mean the dependency now
+  carries less of clove's runtime than the paragraph above implies. R1's
+  "vendor if upstream stalls" is correspondingly cheaper than it was.
+
 - **`landlock` 0.4** (`cloved`, Linux only) — entered Phase G. Layer-2
   filesystem (and, on ABI 4+, outbound-TCP) self-restriction; see
   `crates/cloved/src/sandbox.rs`. The raw `landlock_*` syscalls are unsafe and

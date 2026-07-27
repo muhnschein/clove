@@ -65,6 +65,10 @@ mock network, including mid-transfer fault injection.
   `PROTOCOL.i2p-bt` notes.
 - Inbound topology settled as SAM `FORWARD` to a loopback listener, not
   `ACCEPT` (avoids the `&mut self` serialization point) — see `LIVE-TESTING.md`.
+- Outbound streams speak SAM directly rather than through yosemite, after the
+  library's shared session controller proved to poison itself on any
+  unexpected stream reply (`PROTOCOL.i2p-bt` §2.12). Inbound and outbound are
+  now the same socket type, with the same timeouts and the same close-on-drop.
 
 Exit (M1): a stream between two instances over a real router — a swarm peer
 dialing us counts, and is the stronger result; survives router restart. Live

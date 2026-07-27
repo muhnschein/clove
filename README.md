@@ -6,10 +6,12 @@ construction: the engine has no IP vocabulary, and only the `i2pnet` crate
 may touch a socket — enforced by lint and CI, not convention.
 
 **Status: pre-alpha.** The client is feature-complete against its v1 scope and
-proven end to end over an in-memory network — daemon, CLI, engine, tracker,
-PEX, magnets, persistence. What it has *not* had is a live I2P router: that
-sign-off is the outstanding work before 0.1 (see
-[`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md)).
+downloads from live I2P swarms — daemon, CLI, engine, tracker, PEX, magnets,
+persistence. First contact with real routers and real trackers (2026-07)
+turned up seven defects that no router-free test could reach; they are fixed,
+and the findings are in [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt). The
+remaining work before 0.1 is the interop sign-off across all three routers
+(see [`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md)).
 
 ## Documents
 
