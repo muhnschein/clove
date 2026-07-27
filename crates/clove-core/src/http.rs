@@ -9,9 +9,18 @@
 //!
 //! It stays transport-agnostic: everything reads from and writes to any
 //! `Read`/`Write` — an `i2pnet` stream, a unix socket, or a cursor in tests.
-//! No chunked transfer encoding, no keep-alive reuse: one request, one
-//! `Content-Length`-delimited (or close-delimited) response, connection
-//! closed. Anything fancier is a parse error, not a silent guess.
+//! No keep-alive reuse: one request, one response, connection closed.
+//! Anything fancier is a parse error, not a silent guess.
+//!
+//! Response bodies arrive `Content-Length`-delimited, `chunked`, or
+//! close-delimited. Chunked was not supported until a live announce to
+//! postman's tracker failed on it: the reader fell through to
+//! read-until-close and handed the *chunk framing* to the bencode parser,
+//! which reported "not bencode" — an accurate description of `1a4\r\n…` and a
+//! useless one. Every announce failed identically, so the client acquired no
+//! peers at all. A tracker written in PHP behind an ordinary webserver
+//! chunks its output as a matter of course; declining to implement it was
+//! declining to talk to trackers.
 
 use std::io::{self, Read};
 
@@ -131,6 +140,7 @@ pub fn read_response<R: Read>(reader: &mut R, max_body: usize) -> Result<Respons
 
     let mut headers = Vec::new();
     let mut content_length: Option<usize> = None;
+    let mut chunked = false;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -149,10 +159,24 @@ pub fn read_response<R: Read>(reader: &mut R, max_body: usize) -> Result<Respons
             }
             content_length = Some(n);
         }
+        // RFC 9112 §6.1: chunked is the last encoding when present, and it
+        // overrides Content-Length if a (non-conforming) sender sends both.
+        if name == "transfer-encoding"
+            && value
+                .rsplit(',')
+                .next()
+                .is_some_and(|last| last.trim().eq_ignore_ascii_case("chunked"))
+        {
+            chunked = true;
+        }
         headers.push((name, value));
     }
 
-    let body = read_body(reader, leftover, content_length, max_body)?;
+    let body = if chunked {
+        read_chunked_body(reader, max_body)?
+    } else {
+        read_body(reader, leftover, content_length, max_body)?
+    };
     Ok(Response {
         status,
         headers,
@@ -178,6 +202,80 @@ fn read_head<R: Read>(reader: &mut R) -> Result<(Vec<u8>, Vec<u8>), Error> {
         if buf.ends_with(b"\r\n\r\n") {
             buf.truncate(buf.len() - 4);
             return Ok((buf, Vec::new()));
+        }
+    }
+}
+
+/// Longest chunk-size line (with extensions) clove will buffer. A conforming
+/// one is a handful of hex digits; this only has to be generous enough not to
+/// refuse a real tracker while refusing a sender that never sends the CRLF.
+const MAX_CHUNK_LINE: usize = 1024;
+
+/// Cap on trailer-section bytes after the final chunk, for the same reason.
+const MAX_TRAILER_BYTES: usize = 8 * 1024;
+
+/// Read one CRLF-terminated line, without the terminator, refusing anything
+/// past `cap`. Byte at a time: this reader has no pushback, so it must not
+/// consume beyond the line it was asked for — the bytes after it are body.
+fn read_line<R: Read>(reader: &mut R, cap: usize) -> Result<Vec<u8>, Error> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if line.len() > cap {
+            return Err(Error::BadResponse("line too long"));
+        }
+        if reader.read(&mut byte)? == 0 {
+            return Err(Error::BadResponse("connection closed mid-line"));
+        }
+        line.push(byte[0]);
+        if line.ends_with(b"\r\n") {
+            line.truncate(line.len() - 2);
+            return Ok(line);
+        }
+    }
+}
+
+/// Decode a `Transfer-Encoding: chunked` body (RFC 9112 §7.1).
+///
+/// `max_body` is enforced across the *decoded* total, checked before each
+/// chunk is read rather than after: a sender announcing a 4 GiB chunk is
+/// refused on the strength of its own size line, never by allocating for it.
+fn read_chunked_body<R: Read>(reader: &mut R, max_body: usize) -> Result<Vec<u8>, Error> {
+    let mut body = Vec::new();
+    loop {
+        let line = read_line(reader, MAX_CHUNK_LINE)?;
+        // "1a4" or "1a4;name=value" — extensions are parsed off and ignored.
+        let size_text = line.split(|&b| b == b';').next().unwrap_or_default();
+        let size_text = std::str::from_utf8(size_text)
+            .map_err(|_| Error::BadResponse("non-UTF-8 chunk size"))?;
+        let size = usize::from_str_radix(size_text.trim(), 16)
+            .map_err(|_| Error::BadResponse("bad chunk size"))?;
+        if size == 0 {
+            break;
+        }
+        if body.len().saturating_add(size) > max_body {
+            return Err(Error::BodyTooLarge);
+        }
+        let start = body.len();
+        body.resize(start + size, 0);
+        reader.read_exact(&mut body[start..])?;
+        // Each chunk's data is followed by its own CRLF, which is framing
+        // rather than content and must not reach the caller.
+        if !read_line(reader, MAX_CHUNK_LINE)?.is_empty() {
+            return Err(Error::BadResponse("chunk not terminated by CRLF"));
+        }
+    }
+    // Trailers, then the blank line closing the body. A tracker sends none,
+    // but reading them is what leaves the stream where the caller expects.
+    let mut trailer_bytes = 0usize;
+    loop {
+        let line = read_line(reader, MAX_CHUNK_LINE)?;
+        if line.is_empty() {
+            return Ok(body);
+        }
+        trailer_bytes = trailer_bytes.saturating_add(line.len());
+        if trailer_bytes > MAX_TRAILER_BYTES {
+            return Err(Error::BadResponse("trailer section too large"));
         }
     }
 }
@@ -459,6 +557,95 @@ mod tests {
         let mut cur = Cursor::new(raw.to_vec());
         let resp = read_response(&mut cur, 1024).unwrap();
         assert_eq!(resp.body, b"bencoded-body-here");
+    }
+
+    /// The shape a live announce to postman's tracker actually came back in,
+    /// and which this client used to hand to the bencode parser verbatim —
+    /// chunk framing and all — reporting "not bencode" every single time.
+    #[test]
+    fn reads_a_chunked_response() {
+        // Split mid-token across two chunks, which is the case that matters:
+        // the decoder has to rejoin them, and the framing bytes between them
+        // must not survive into the body.
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                    5\r\nd8:in\r\nd\r\ntervali1800ee\r\n0\r\n\r\n";
+        let mut cur = Cursor::new(raw.to_vec());
+        let resp = read_response(&mut cur, 1024).unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"d8:intervali1800ee");
+    }
+
+    /// Chunk extensions are legal and ignorable; a trailer section after the
+    /// last chunk is legal and must be consumed rather than mistaken for body.
+    #[test]
+    fn reads_chunked_with_extensions_and_trailers() {
+        let raw = b"HTTP/1.1 200 OK\r\ntransfer-encoding: gzip, chunked\r\n\r\n\
+                    4;name=value\r\nabcd\r\n0\r\nX-Trailer: yes\r\n\r\n";
+        let mut cur = Cursor::new(raw.to_vec());
+        let resp = read_response(&mut cur, 1024).unwrap();
+        assert_eq!(resp.body, b"abcd");
+    }
+
+    /// An empty chunked body is a legitimate answer, not a parse failure.
+    #[test]
+    fn reads_an_empty_chunked_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let mut cur = Cursor::new(raw.to_vec());
+        assert!(read_response(&mut cur, 1024).unwrap().body.is_empty());
+    }
+
+    /// Chunked wins over a Content-Length a non-conforming sender also set,
+    /// per RFC 9112 §6.1 — otherwise the framing bytes leak into the body.
+    #[test]
+    fn chunked_overrides_a_content_length_sent_alongside_it() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\nTransfer-Encoding: chunked\r\n\r\n\
+                    2\r\nhi\r\n0\r\n\r\n";
+        let mut cur = Cursor::new(raw.to_vec());
+        assert_eq!(read_response(&mut cur, 1024).unwrap().body, b"hi");
+    }
+
+    /// The hostile cases: a size that is not hex, a size line that never
+    /// ends, a chunk whose data is not CRLF-terminated, a body that exceeds
+    /// the cap by accumulation, and a stream that stops mid-chunk. None may
+    /// hang, over-allocate, or be mistaken for a body.
+    #[test]
+    fn refuses_hostile_chunked_bodies() {
+        let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for (name, body) in [
+            ("not hex", "zz\r\nabcd\r\n0\r\n\r\n".to_owned()),
+            ("size line never ends", "1".repeat(4096)),
+            ("chunk not CRLF-terminated", "2\r\nhiXX0\r\n\r\n".to_owned()),
+            ("truncated mid-chunk", "8\r\nhi\r\n".to_owned()),
+            ("no terminating chunk", "2\r\nhi\r\n".to_owned()),
+        ] {
+            let mut cur = Cursor::new(format!("{head}{body}").into_bytes());
+            assert!(
+                read_response(&mut cur, 1024).is_err(),
+                "{name} was accepted"
+            );
+        }
+
+        // Accumulated size, refused on the size line rather than by reading.
+        let mut over = String::from(head);
+        for _ in 0..5 {
+            over.push_str("100\r\n");
+            over.push_str(&"x".repeat(256));
+            over.push_str("\r\n");
+        }
+        over.push_str("0\r\n\r\n");
+        let mut cur = Cursor::new(over.into_bytes());
+        assert!(matches!(
+            read_response(&mut cur, 1000),
+            Err(Error::BodyTooLarge)
+        ));
+
+        // A single chunk claiming more than memory: refused from the header.
+        let huge = format!("{head}ffffffffffffff\r\n");
+        let mut cur = Cursor::new(huge.into_bytes());
+        assert!(matches!(
+            read_response(&mut cur, 1024),
+            Err(Error::BodyTooLarge)
+        ));
     }
 
     #[test]

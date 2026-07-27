@@ -206,6 +206,24 @@ pub struct SamSession {
     local: DestHash,
     local_b64: String,
     samv3_tcp_port: u16,
+    /// Set once this session's controller is known to be unusable, so
+    /// [`healthy`](SamSession::healthy) stops claiming otherwise.
+    ///
+    /// yosemite 0.7's session controller is one state machine shared by the
+    /// control connection and every stream operation, and each entry point
+    /// begins `mem::replace(&mut self.state, Poisoned)` and only restores the
+    /// state on paths it expects. A stream `HELLO` that gets an unparseable
+    /// reply, or a write that fails mid-`connect`, therefore leaves the
+    /// controller `Poisoned` — and every later `connect` returns
+    /// `InvalidState`, for the life of the session. There is no way to reset
+    /// it from out here: the state is private and the only cure is a new
+    /// session (`PROTOCOL.i2p-bt` §2.12).
+    ///
+    /// A router refusing one dial is *not* this: yosemite restores the state
+    /// on `STREAM STATUS RESULT=<error>`, so an unreachable peer costs one
+    /// dial and nothing more. Only the paths that cannot be recovered set
+    /// this flag.
+    wedged: std::sync::atomic::AtomicBool,
 }
 
 impl SamSession {
@@ -252,6 +270,7 @@ impl SamSession {
             local,
             local_b64,
             samv3_tcp_port: config.samv3_tcp_port,
+            wedged: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -266,11 +285,28 @@ impl SamSession {
     /// `false` means the router is gone or the session is dead — time to tear
     /// down and rebuild the session tree.
     pub fn healthy(&self) -> bool {
+        // A wedged controller answers PING perfectly well — the control
+        // connection is a live socket and `send_command` does not consult the
+        // state machine — while refusing every dial with `invalid state`. So
+        // the flag is checked first, or the supervisor waits for a symptom
+        // that is never going to arrive and torrents dial into a dead session
+        // indefinitely.
+        if self.is_wedged() {
+            return false;
+        }
         let mut session = self
             .session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         session.send_command("PING clove\n").is_ok()
+    }
+
+    /// Whether this session's controller has been left unusable by a failed
+    /// stream operation (see [`SamSession::wedged`]). Once true, never false:
+    /// the cure is a new session.
+    #[must_use]
+    pub fn is_wedged(&self) -> bool {
+        self.wedged.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// This session's own destination hash — the identity peers reach us at
@@ -478,14 +514,36 @@ impl I2pDialer for SamSession {
     type Stream = SamStream;
 
     fn dial(&self, peer: DestHash, _timeout: Duration) -> io::Result<SamStream> {
+        // A session already known to be wedged cannot dial, and saying so at
+        // once beats issuing a command whose only possible answer is
+        // `invalid state`.
+        if self.is_wedged() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "SAM session is wedged and is being rebuilt (see PROTOCOL.i2p-bt 2.12)",
+            ));
+        }
         // yosemite's synchronous `connect` has no timeout parameter; the
         // caller's timeout is honored at the supervision layer, not here.
         let mut session = self
             .session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stream = session.connect(&peer.to_b32()).map_err(map_err)?;
-        Ok(SamStream { inner: stream })
+        match session.connect(&peer.to_b32()) {
+            Ok(stream) => Ok(SamStream { inner: stream }),
+            Err(e) => {
+                if wedges_the_session(&e) {
+                    self.wedged
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "i2pnet: SAM session unusable after a failed dial ({e}); \
+                         it will be rebuilt. Every later dial on it would fail \
+                         the same way (PROTOCOL.i2p-bt 2.12)."
+                    );
+                }
+                Err(map_err(e))
+            }
+        }
     }
 }
 
@@ -540,6 +598,38 @@ fn map_err(e: yosemite::Error) -> io::Error {
     match e {
         yosemite::Error::IoError(io) => io,
         other => io::Error::other(other),
+    }
+}
+
+/// Whether a failed `connect` has left yosemite's session controller in a
+/// state no later call can recover from.
+///
+/// The distinction is exact, and it is the difference between "one peer was
+/// unreachable" and "this session is over":
+///
+/// - **`Protocol(Router(_))`** — the router answered `STREAM STATUS` with an
+///   error (`CANT_REACH_PEER` and friends). yosemite restores the stream
+///   state to `Uninitialized` on this path, so the session is fine. This is
+///   the common case on I2P and must not cost a rebuild.
+/// - **`Protocol(InvalidState | InvalidMessage)`, `Malformed`, `IoError`** —
+///   the controller was left `Poisoned` or mid-handshake and never restored.
+///   Every subsequent `connect` returns `InvalidState` forever.
+///
+/// Erring towards the second class would rebuild the session tree on every
+/// unreachable peer, which on a real swarm is most of them; erring towards
+/// the first is what produced a client that dialled into `invalid state` for
+/// ten minutes at a stretch. Hence the explicit match rather than a catch-all.
+fn wedges_the_session(e: &yosemite::Error) -> bool {
+    match e {
+        // The router refused the dial and yosemite reset the stream state on
+        // the way out; a bare `I2p` error never reached the state machine at
+        // all. Either way nothing is poisoned and the session is still good.
+        yosemite::Error::Protocol(yosemite::ProtocolError::Router(_)) | yosemite::Error::I2p(_) => {
+            false
+        }
+        yosemite::Error::Protocol(_) | yosemite::Error::Malformed | yosemite::Error::IoError(_) => {
+            true
+        }
     }
 }
 
@@ -841,5 +931,46 @@ mod hostile_bridge_tests {
     fn a_healthy_hello_is_accepted_and_its_version_reported() {
         let port = fake_bridge(Misbehaviour::HelloThenStall);
         assert_eq!(probe_bridge(port, PROBE).expect("hello accepted"), "3.3");
+    }
+
+    /// Which dial failures condemn the session, and which are just Tuesday.
+    ///
+    /// This is the line that decides whether a swarm works at all. Put
+    /// `CANT_REACH_PEER` on the wrong side of it and every unreachable peer
+    /// tears down the session tree — on a real swarm, most of them, and the
+    /// destination changes each time. Put a poisoned controller on the wrong
+    /// side and the daemon dials into `invalid state` until something else
+    /// happens to notice, which is what a live run spent ten minutes doing.
+    #[test]
+    fn only_unrecoverable_dial_failures_condemn_the_session() {
+        use yosemite::{Error, I2pError, ProtocolError};
+
+        // The router refused this one dial and yosemite reset the stream
+        // state; the session is still good for every other peer.
+        for ordinary in [
+            I2pError::CantReachPeer,
+            I2pError::PeerNotFound,
+            I2pError::Timeout,
+        ] {
+            let e = Error::Protocol(ProtocolError::Router(ordinary));
+            assert!(
+                !wedges_the_session(&e),
+                "a router-refused dial must not condemn the session: {e}"
+            );
+        }
+
+        // These left the controller Poisoned or mid-handshake. Nothing this
+        // side of a new session recovers from them.
+        for fatal in [
+            Error::Protocol(ProtocolError::InvalidState),
+            Error::Protocol(ProtocolError::InvalidMessage),
+            Error::Malformed,
+            Error::IoError(io::Error::from(io::ErrorKind::ConnectionReset)),
+        ] {
+            assert!(
+                wedges_the_session(&fatal),
+                "an unrecoverable controller state must condemn the session: {fatal}"
+            );
+        }
     }
 }
