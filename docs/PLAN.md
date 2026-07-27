@@ -66,9 +66,11 @@ mock network, including mid-transfer fault injection.
 - Inbound topology settled as SAM `FORWARD` to a loopback listener, not
   `ACCEPT` (avoids the `&mut self` serialization point) — see `LIVE-TESTING.md`.
 
-Exit (M1): loopback download between two instances over a real local i2pd;
-survives router restart. Live sign-off checklist and the podman-quadlet test
-environment are in `LIVE-TESTING.md` §6.1.
+Exit (M1): a stream between two instances over a real router — a swarm peer
+dialing us counts, and is the stronger result; survives router restart. Live
+sign-off checklist and the podman-quadlet test environment are in
+`LIVE-TESTING.md` §6.1, and §0 there explains why the loopback form of this
+criterion stopped being the one to chase first.
 
 ## Phase E — Swarm citizen (`clove-core`)
 
@@ -80,7 +82,8 @@ environment are in `LIVE-TESTING.md` §6.1.
 - `magnet`: BEP 9 metadata exchange, i2p-style magnet handling.
 - Naming cache with negative backoff (R6) wired into peer acquisition.
 
-Exit (M3 demo): download from and sustained seed to a live i2psnark swarm.
+Exit (M3 demo): download from and sustained seed to a live i2psnark swarm —
+`make swarm TORRENT=…`, whose milestone table ticks most of the checklist.
 Live sign-off checklist in `LIVE-TESTING.md` §6.2.
 
 ## Phase F — Operable (`cloved`, `clove`)

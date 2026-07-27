@@ -39,7 +39,7 @@ WAIT ?= 180
 QUADLET_DIR := $(HOME)/.config/containers/systemd
 
 .PHONY: test smoke chaos test-live sam-stress matrix cross routers report router-ready \
-        router-up router-down router-wait router-build router-sam-enable \
+        swarm router-up router-down router-wait router-build router-sam-enable \
         fmt lint man-lint fuzz install uninstall
 
 # Fail early and clearly on a typo'd ROUTER, rather than in the middle of a
@@ -101,6 +101,33 @@ matrix:
 	echo "passed:$${pass:- none}"; \
 	echo "failed:$${fail:- none}"; \
 	[ -z "$$fail" ]
+
+## Tier 3: the real binaries, a real router, a real swarm. `cloved` downloads a
+## torrent you name from live i2psnark peers, then seeds it back.
+##
+##   make swarm TORRENT='magnet:?xt=urn:btih:…'
+##   make swarm TORRENT=~/thing.torrent ROUTER=java SWARM_ARGS='--deadline 7200'
+##
+## This is the test worth running first, not last. Every tier below it puts two
+## destinations on one router and asks that router to resolve a leaseSet it
+## published seconds ago — the most fragile thing a young router does, and the
+## thing every failed run so far died on (PROTOCOL.i2p-bt 2.6c, 2.8). The swarm
+## path asks for less (published destinations, resolved the ordinary way) and
+## proves more (tracker, BEP 9, picker, choker, storage, PEX, and the inbound
+## path, against the client SCOPE 6 calls normative).
+##
+## You supply the torrent: a magnet baked into the repo would be dead in months
+## and every failure after that would be blamed on clove.
+SWARM_ARGS ?=
+swarm: check-router
+	@if [ -z "$(TORRENT)" ]; then \
+		echo "make swarm needs a torrent:"; \
+		echo "    make swarm TORRENT='magnet:?xt=urn:btih:…'"; \
+		echo "    make swarm TORRENT=path/to/file.torrent"; \
+		echo "Pick a well-seeded one from a tracker index; see ci/live-swarm.sh --help."; \
+		exit 2; \
+	fi
+	./ci/live-swarm.sh --router $(ROUTER) $(SWARM_ARGS) "$(TORRENT)"
 
 ## Everything that applies on this machine, into one report file to hand over.
 ## Adds router versions, netDb counts and container logs, so a failure arrives
