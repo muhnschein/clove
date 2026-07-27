@@ -298,8 +298,20 @@ fn announce_loop<D, N>(
                 continue;
             }
             match announce_once(torrent, url, state, target, dialer, naming, config) {
-                Ok((interval, sent)) => state.on_success(unix_now(), interval, sent),
-                Err(_) => state.on_failure(unix_now()),
+                Ok((interval, sent)) => {
+                    state.on_success(unix_now(), interval, sent);
+                    torrent.note_announce(Ok(()));
+                }
+                // Discarding this is how a torrent came to sit at
+                // "downloading, 0 peers" for ten minutes with nothing
+                // anywhere saying why — the magnet path had already been
+                // fixed for exactly this and the running announcer, which is
+                // the one a real torrent uses, still swallowed everything.
+                Err(e) => {
+                    eprintln!("clove: announce to {url} failed: {e}");
+                    state.on_failure(unix_now());
+                    torrent.note_announce(Err(format!("{url}: {e}")));
+                }
             }
         }
         match stop.wait_for(config.poll_interval) {
@@ -377,7 +389,14 @@ where
     let mut stream = dialer
         .dial(dest, config.dial_timeout)
         .map_err(tracker::Error::Io)?;
-    let response = tracker::announce_over(&mut stream, &request)?;
+    // Which destination the host resolved to, on every announce that then
+    // goes wrong. A tracker answering 200 with somebody else's web page is
+    // indistinguishable from a tracker that is broken, unless you can see
+    // that the name resolved somewhere unexpected — and an address book is a
+    // file of assertions, not a fact.
+    let response = tracker::announce_over(&mut stream, &request).inspect_err(|_| {
+        eprintln!("clove: {host} resolved to {}", dest.to_b32());
+    })?;
     torrent.add_peers(&response.peers);
     Ok((response.interval, event))
 }

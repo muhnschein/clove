@@ -232,6 +232,15 @@ struct State {
     /// watching it climb during a live run proves nothing about which one was
     /// responsible. This number is only ever bumped on the PEX path.
     pex_learned: u64,
+    /// Announces attempted, and why the last one failed if it did.
+    ///
+    /// A torrent with no peers has exactly one interesting question — did the
+    /// tracker answer? — and the answer used to live only in a discarded
+    /// `Err(_)` inside the announce loop. A live run sat at "downloading, 0
+    /// peers" for ten minutes with nothing anywhere saying why.
+    announces_ok: u32,
+    announces_failed: u32,
+    last_announce_error: Option<String>,
 }
 
 impl State {
@@ -350,6 +359,9 @@ impl Torrent {
                 next_id: 0,
                 known_peers: HashSet::new(),
                 pex_learned: 0,
+                announces_ok: 0,
+                announces_failed: 0,
+                last_announce_error: None,
             }),
             done: Mutex::new(false),
             done_cv: Condvar::new(),
@@ -454,6 +466,37 @@ impl Torrent {
             .iter()
             .copied()
             .collect()
+    }
+
+    /// Record the outcome of one announce, for `clove show` to report.
+    ///
+    /// The announcer is the only thing that knows whether a torrent's lack of
+    /// peers is a tracker problem, and it is a background thread whose errors
+    /// nobody was reading.
+    pub fn note_announce(&self, outcome: Result<(), String>) {
+        let mut st = lock(&self.shared.state);
+        match outcome {
+            Ok(()) => {
+                st.announces_ok = st.announces_ok.saturating_add(1);
+                st.last_announce_error = None;
+            }
+            Err(e) => {
+                st.announces_failed = st.announces_failed.saturating_add(1);
+                st.last_announce_error = Some(e);
+            }
+        }
+    }
+
+    /// Announces that succeeded, announces that failed, and the last failure
+    /// reason — the answer to "why does this torrent have no peers".
+    #[must_use]
+    pub fn announce_status(&self) -> (u32, u32, Option<String>) {
+        let st = lock(&self.shared.state);
+        (
+            st.announces_ok,
+            st.announces_failed,
+            st.last_announce_error.clone(),
+        )
     }
 
     /// How many peers this run reached us inbound, through the router's

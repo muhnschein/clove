@@ -78,6 +78,26 @@ Status legend:
     prefix of what did arrive, so the next surprise is one log line rather
     than a session.
 
+5.1b [open] `tracker2.postman.i2p` answered an announce with **HTTP 200 and a
+    styled HTML page** (observed 2026-07-27, i2pd 2.x, live). Not a bencoded
+    `failure reason`, not an error status — a web page, served where an
+    announce belongs.
+
+    Three explanations remain open, and they have three different fixes:
+      (a) the tracker serves its own site for a request it does not accept,
+          in which case the announce parameters are the thing to look at
+          (§5.1's `ip=` form is still [assumed]);
+      (b) the tracker is unwell and serving its front page to everything;
+      (c) the host resolved to a destination that is not the tracker — an
+          address book is a file of assertions, and a stale or wrong entry
+          would look exactly like this.
+
+    The first run could not separate them: the error carried 96 characters,
+    which reached the inline CSS and stopped before the `<title>`. The
+    preview is now 512 bytes, the response's `Content-Type` and length travel
+    with it, and the announcer logs the b32 the host resolved to whenever an
+    announce fails. One more run should close this.
+
 5.2 [decided] Any query already present in the announce URL (e.g. postman's
     `/announce.php?...`) is preserved; clove appends its params with the
     correct `?`/`&` separator.
