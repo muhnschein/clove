@@ -15,7 +15,7 @@
 //!            build() Ok
 //!   Down ───────────────────► Up(session)
 //!    ▲  │                        │
-//!    │  │ build() Err            │ session lost (health probe fails)
+//!    │  │ build() Err            │ session lost (the watchdog says so)
 //!    │  ▼                        │
 //!    └ Backoff(delay) ◄──────────┘
 //!        │  delay elapses, retry build()
