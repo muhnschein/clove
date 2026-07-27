@@ -255,19 +255,15 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str) {
                 }
             }
 
-            // Phase 3: teardown, then rebuild from phase 1. Say which of the
-            // two reasons it was: "the router went away" and "our session
-            // became unusable while the router stayed up" call for entirely
-            // different investigations, and reporting both as "router lost"
-            // sent one live run looking at i2pd for a fault in clove.
-            if session.is_wedged() {
-                eprintln!(
-                    "cloved: SAM session wedged (not a router fault); rebuilding. \
-                     Torrents wait, and our destination changes with it."
-                );
-            } else {
-                eprintln!("cloved: router lost; torrents wait while the session tree rebuilds");
-            }
+            // Phase 3: teardown, then rebuild from phase 1.
+            //
+            // This used to have to distinguish "the router went away" from
+            // "our session wedged while the router stayed up", because the
+            // second happened every 60–90 seconds and looked like the first.
+            // Dials no longer share any state that can wedge
+            // (`PROTOCOL.i2p-bt` §2.12), so a lost session means what it says
+            // again: the control connection died.
+            eprintln!("cloved: router lost; torrents wait while the session tree rebuilds");
             *lock(&daemon.router) = "waiting-for-router";
             demux.stop();
             let _ = i2pnet::sam::poke_listener(forward_port);

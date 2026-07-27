@@ -583,22 +583,22 @@ it just is not a clean sign-off.
 ## 7a. Troubleshooting (live-run findings)
 
 **`state` flapping between `downloading` and `waiting-for-router` every
-~90–120s, with zero peers.** The session is not being lost — it is being
-*wedged* and rebuilt. yosemite 0.7's session controller is one state machine
-shared by the control connection and every stream operation, and a stream
-failure on an unexpected path leaves it `Poisoned`, after which every dial
-returns `invalid state` (`PROTOCOL.i2p-bt` §2.12). Its signature in the daemon
-log is one `invalid message from router` followed by `invalid state`, over and
-over.
+60–120s, with peers and known-peers dropping to 0.** That was the session
+wedge, and it is fixed (`PROTOCOL.i2p-bt` §2.12): dials no longer go through
+the library whose shared state machine caused it. Each flap cost a new
+destination, every known peer, and a fresh announce — which is why a run could
+be downloading and still unusably slow.
 
-clove now detects it and rebuilds at once, logging `SAM session wedged (not a
-router fault)` so it is not mistaken for a router problem. It is a mitigation:
-each rebuild currently mints a new transient destination, so a run that wedges
-repeatedly cannot hold an identity long enough to be dialed.
+If you see the flap now it is a genuine lost router: the control connection
+died, and the daemon says exactly that.
 
-An ordinary unreachable peer does *not* do this — yosemite recovers from
-`CANT_REACH_PEER` correctly — so a flap means a protocol-level surprise, not a
-thin netDb.
+**The socket count against 127.0.0.1:7656 climbs steadily during a run**
+(`ss -tn 'dport = :7656' | wc -l`). Two causes, both fixed: a goodbye announce
+fired on every teardown including wedge-caused ones, and — the larger one —
+every dialled peer that went silent parked a thread holding a stream clove
+could not close (§2.7a). Outbound streams are ordinary sockets now, with
+timeouts and close-on-drop. Worth re-measuring rather than assuming: if it
+still climbs, there is a third source.
 
 **A `.torrent` sits at `downloading` with 0 peers and says nothing.** Fixed:
 the running announcer used to discard its errors — the magnet path had been

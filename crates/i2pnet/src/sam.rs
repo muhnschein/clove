@@ -6,11 +6,12 @@
 //! logic that does not need a router — address derivation and the forwarded
 //! destination-line parse — is unit-tested here over loopback TCP.
 //!
-//! - [`SamSession`] implements [`I2pDialer`] (SAM `STREAM CONNECT`, via the
-//!   peer's `.b32.i2p` address) and [`I2pNamingLookup`] (SAM `NAMING
-//!   LOOKUP`), and wraps yosemite [`yosemite::Stream`] as [`SamStream`],
-//!   whose [`I2pStream::split`] maps straight onto yosemite's own
-//!   `Stream::split`.
+//! - [`SamSession`] implements [`I2pDialer`] and [`I2pNamingLookup`].
+//!   Dialing speaks SAM directly on a socket clove opens per stream (see
+//!   [`dial_stream`]) rather than going through yosemite, so a stream is a
+//!   [`ForwardedStream`] — a plain TCP socket to the bridge, with real
+//!   timeouts, a real `split`, and close-on-drop. yosemite still owns the
+//!   session itself: `SESSION CREATE`, `STREAM FORWARD` and `NAMING LOOKUP`.
 //! - [`SamListener`] implements [`I2pListener`] for **inbound** streams via
 //!   SAM `STREAM FORWARD` to a loopback [`TcpListener`] we own (an allowed
 //!   Layer-1 IP socket, bound to `127.0.0.1`). This is the topology chosen
@@ -70,23 +71,38 @@ const MAX_HELLO_LINE: usize = 512;
 /// inside yosemite (upstream) or proxying its control connection through one
 /// of ours; see `docs/PROTOCOL.i2p-bt` §2.7.
 fn probe_bridge(port: u16, timeout: Duration) -> io::Result<String> {
-    let addr = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    stream.write_all(b"HELLO VERSION MIN=3.1 MAX=3.3\n")?;
+    let (_socket, reply) = sam_hello(port, timeout, "HELLO")?;
+    Ok(reply
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("VERSION="))
+        .unwrap_or("unknown")
+        .to_owned())
+}
 
-    // The read timeout is per-call, so a bridge dribbling one byte just
-    // inside it could hold the probe open indefinitely. Bound the whole
-    // exchange as well.
-    let deadline = std::time::Instant::now() + timeout;
+/// Read one `\n`-terminated line from `stream`, bounded by both `cap` bytes
+/// and `deadline`.
+///
+/// A byte at a time, because the bytes after the line belong to whoever asked
+/// for it: a SAM control socket becomes a data stream the moment its status
+/// line ends, and a buffered reader that swallowed the first block of a peer's
+/// handshake would be a bug with no symptom until much later.
+///
+/// `what` names the exchange in every error, since "connection closed" is not
+/// a diagnosis and "closed during HELLO" is.
+fn read_sam_line(
+    stream: &mut TcpStream,
+    port: u16,
+    cap: usize,
+    deadline: std::time::Instant,
+    what: &str,
+) -> io::Result<String> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
         if std::time::Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("SAM bridge on 127.0.0.1:{port} did not finish its HELLO reply in time"),
+                format!("SAM bridge on 127.0.0.1:{port} did not finish its {what} reply in time"),
             ));
         }
         // A read timeout surfaces as WouldBlock/TimedOut, whose stock text
@@ -99,9 +115,8 @@ fn probe_bridge(port: u16, timeout: Duration) -> io::Result<String> {
                 io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "127.0.0.1:{port} accepted the connection but did not answer HELLO within \
-                         {}s; is the router still starting, or is something else on that port?",
-                        timeout.as_secs()
+                        "127.0.0.1:{port} accepted the connection but did not answer {what} in \
+                         time; is the router still starting, or is something else on that port?"
                     ),
                 )
             } else {
@@ -111,37 +126,157 @@ fn probe_bridge(port: u16, timeout: Duration) -> io::Result<String> {
         if got == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("SAM bridge on 127.0.0.1:{port} closed the connection during HELLO"),
+                format!("SAM bridge on 127.0.0.1:{port} closed the connection during {what}"),
             ));
         }
         if byte[0] == b'\n' {
             break;
         }
-        if line.len() >= MAX_HELLO_LINE {
+        if line.len() >= cap {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "127.0.0.1:{port} answered HELLO with {MAX_HELLO_LINE}+ bytes and no newline; \
-                     this does not look like a SAM bridge"
+                    "127.0.0.1:{port} answered {what} with {cap}+ bytes and no newline; this does \
+                     not look like a SAM bridge"
                 ),
             ));
         }
         line.push(byte[0]);
     }
+    Ok(String::from_utf8_lossy(&line)
+        .trim_end_matches('\r')
+        .to_owned())
+}
 
-    let reply = String::from_utf8_lossy(&line);
-    let reply = reply.trim_end_matches('\r');
+/// Open a socket to the SAM bridge and complete the `HELLO VERSION`
+/// handshake on it, returning the socket ready for a command.
+///
+/// Every SAM operation that is not the session's own control connection
+/// begins exactly here: a **fresh** socket with its **own** handshake. That
+/// is not incidental — it is the whole reason this exists (see
+/// [`SamSession::dial`] and `docs/PROTOCOL.i2p-bt` §2.12).
+///
+/// Both deadlines are left set on the returned socket; the caller adjusts
+/// them for whatever it does next.
+fn sam_hello(port: u16, timeout: Duration, what: &str) -> io::Result<(TcpStream, String)> {
+    let addr = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(b"HELLO VERSION MIN=3.1 MAX=3.3\n")?;
+
+    // The read timeout is per-call, so a bridge dribbling one byte just
+    // inside it could hold this open indefinitely. Bound the exchange too.
+    let deadline = std::time::Instant::now() + timeout;
+    let reply = read_sam_line(&mut stream, port, MAX_HELLO_LINE, deadline, what)?;
     if !reply.starts_with("HELLO REPLY") || !reply.contains("RESULT=OK") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("SAM bridge on 127.0.0.1:{port} refused HELLO: {reply}"),
         ));
     }
-    Ok(reply
+    Ok((stream, reply))
+}
+
+/// Longest `STREAM STATUS` line accepted. The result and an optional message
+/// are short; a router that sends more than this is not answering us.
+const MAX_STATUS_LINE: usize = 1024;
+
+/// Open an outbound virtual stream to `peer`, by speaking SAM ourselves.
+///
+/// **Why clove does this rather than asking its SAM library.** yosemite 0.7's
+/// session controller is a single state machine shared by the control
+/// connection and every stream operation, and each entry point begins
+/// `mem::replace(&mut self.state, Poisoned)`, restoring the state only on
+/// paths it expects. One unparseable reply — or a write that fails partway —
+/// therefore leaves the controller poisoned, and *every subsequent dial on
+/// that session fails forever* (`docs/PROTOCOL.i2p-bt` §2.12). Live, that cost
+/// a session rebuild every 60–90 seconds: a new destination each time, all
+/// known peers discarded, and a fresh announce needed before anything could
+/// resume. There is no way to reset the state from outside the library.
+///
+/// `SAMv3` does not require any of that. A stream is its own connection: dial
+/// the bridge, `HELLO VERSION`, `STREAM CONNECT`, and the socket you are
+/// holding *is* the stream. Nothing is shared, so nothing can be poisoned by
+/// somebody else's failure — which is how XD does it too, and it cannot have
+/// this bug for the same reason.
+///
+/// Owning the socket buys two more things clove could not have before:
+///
+/// - **The dial timeout is real.** yosemite's `connect` takes no timeout and
+///   the caller's was documented as advisory (§2.3). Here it bounds the wait
+///   for `STREAM STATUS`, which is where a leaseSet lookup spends its time.
+/// - **The stream is closeable and boundable.** A dialled peer that goes
+///   silent parked a thread and leaked a socket for the life of the process
+///   (§2.7a); the returned [`ForwardedStream`] takes read and write timeouts
+///   like any other socket, and dropping it closes it.
+///
+/// # Errors
+///
+/// Connect, handshake or write failure; a `STREAM STATUS` other than
+/// `RESULT=OK`, carrying the router's own words; or `timeout` elapsing first.
+fn dial_stream(
+    port: u16,
+    nickname: &str,
+    peer: DestHash,
+    timeout: Duration,
+) -> io::Result<ForwardedStream> {
+    let (mut stream, _) = sam_hello(port, timeout, "HELLO (for STREAM CONNECT)")?;
+
+    // SILENT=false: the router answers with a STREAM STATUS line before any
+    // peer bytes, which is what makes a failed dial reportable rather than a
+    // stream that simply never says anything.
+    let command = format!(
+        "STREAM CONNECT ID={nickname} DESTINATION={} SILENT=false\n",
+        peer.to_b32()
+    );
+    stream.write_all(command.as_bytes())?;
+
+    // The router may spend most of the budget here resolving a leaseSet, so
+    // the status read gets the caller's full timeout rather than the short
+    // handshake one.
+    stream.set_read_timeout(Some(timeout))?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = read_sam_line(
+        &mut stream,
+        port,
+        MAX_STATUS_LINE,
+        deadline,
+        "STREAM CONNECT",
+    )?;
+    if !status.starts_with("STREAM STATUS") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SAM bridge answered STREAM CONNECT with {status:?}"),
+        ));
+    }
+    let result = status
         .split_whitespace()
-        .find_map(|field| field.strip_prefix("VERSION="))
-        .unwrap_or("unknown")
-        .to_owned())
+        .find_map(|f| f.strip_prefix("RESULT="))
+        .unwrap_or("MISSING");
+    if result != "OK" {
+        // The router's own result word, and its MESSAGE when it sent one.
+        // CANT_REACH_PEER and friends are ordinary on I2P and must read as
+        // "this peer, this time" rather than as a fault in the session.
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!(
+                "router refused the stream to {}: {result}{}",
+                peer.to_b32(),
+                status
+                    .split_once("MESSAGE=")
+                    .map(|(_, m)| format!(" ({})", m.trim_matches('"')))
+                    .unwrap_or_default()
+            ),
+        ));
+    }
+
+    // Handshake done; the socket is now the peer stream. Clear the deadlines
+    // the handshake needed — the engine sets its own per-peer timeouts, and a
+    // stray one here would look to it like a peer that went quiet.
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+    Ok(ForwardedStream::from_socket(stream))
 }
 
 /// A SAM session id unlikely to collide with one already registered.
@@ -206,24 +341,8 @@ pub struct SamSession {
     local: DestHash,
     local_b64: String,
     samv3_tcp_port: u16,
-    /// Set once this session's controller is known to be unusable, so
-    /// [`healthy`](SamSession::healthy) stops claiming otherwise.
-    ///
-    /// yosemite 0.7's session controller is one state machine shared by the
-    /// control connection and every stream operation, and each entry point
-    /// begins `mem::replace(&mut self.state, Poisoned)` and only restores the
-    /// state on paths it expects. A stream `HELLO` that gets an unparseable
-    /// reply, or a write that fails mid-`connect`, therefore leaves the
-    /// controller `Poisoned` — and every later `connect` returns
-    /// `InvalidState`, for the life of the session. There is no way to reset
-    /// it from out here: the state is private and the only cure is a new
-    /// session (`PROTOCOL.i2p-bt` §2.12).
-    ///
-    /// A router refusing one dial is *not* this: yosemite restores the state
-    /// on `STREAM STATUS RESULT=<error>`, so an unreachable peer costs one
-    /// dial and nothing more. Only the paths that cannot be recovered set
-    /// this flag.
-    wedged: std::sync::atomic::AtomicBool,
+    /// The SAM session id every outbound stream attaches itself to.
+    nickname: String,
 }
 
 impl SamSession {
@@ -282,7 +401,7 @@ impl SamSession {
             local,
             local_b64,
             samv3_tcp_port: config.samv3_tcp_port,
-            wedged: std::sync::atomic::AtomicBool::new(false),
+            nickname: config.nickname.clone(),
         })
     }
 
@@ -297,28 +416,11 @@ impl SamSession {
     /// `false` means the router is gone or the session is dead — time to tear
     /// down and rebuild the session tree.
     pub fn healthy(&self) -> bool {
-        // A wedged controller answers PING perfectly well — the control
-        // connection is a live socket and `send_command` does not consult the
-        // state machine — while refusing every dial with `invalid state`. So
-        // the flag is checked first, or the supervisor waits for a symptom
-        // that is never going to arrive and torrents dial into a dead session
-        // indefinitely.
-        if self.is_wedged() {
-            return false;
-        }
         let mut session = self
             .session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         session.send_command("PING clove\n").is_ok()
-    }
-
-    /// Whether this session's controller has been left unusable by a failed
-    /// stream operation (see [`SamSession::wedged`]). Once true, never false:
-    /// the cure is a new session.
-    #[must_use]
-    pub fn is_wedged(&self) -> bool {
-        self.wedged.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// This session's own destination hash — the identity peers reach us at
@@ -470,11 +572,23 @@ fn read_dest_line<R: Read>(reader: &mut R, max_len: usize) -> io::Result<DestHas
 /// us, carrying the tunneled peer stream after its destination header was
 /// consumed. Split via `TcpStream::try_clone` (both halves are the same
 /// socket), matching the reader-thread/writer-thread model (Q5).
+#[derive(Debug)]
 pub struct ForwardedStream {
     inner: TcpStream,
 }
 
 impl ForwardedStream {
+    /// Adopt an already-connected SAM stream socket.
+    ///
+    /// Inbound (the router forwarded it) and outbound (we dialled it with
+    /// [`dial_stream`]) end up as the same thing — a TCP socket to the bridge
+    /// carrying peer bytes — so they get the same type, and with it the same
+    /// timeouts, the same `split`, and the same close-on-drop.
+    #[must_use]
+    pub(crate) fn from_socket(inner: TcpStream) -> ForwardedStream {
+        ForwardedStream { inner }
+    }
+
     /// Bound how long reads and writes on this stream may block.
     ///
     /// The socket is a loopback TCP connection from the router, so this is a
@@ -523,43 +637,17 @@ impl I2pStream for ForwardedStream {
 }
 
 impl I2pDialer for SamSession {
-    type Stream = SamStream;
+    type Stream = ForwardedStream;
 
-    fn usable(&self) -> bool {
-        !self.is_wedged()
-    }
-
-    fn dial(&self, peer: DestHash, _timeout: Duration) -> io::Result<SamStream> {
-        // A session already known to be wedged cannot dial, and saying so at
-        // once beats issuing a command whose only possible answer is
-        // `invalid state`.
-        if self.is_wedged() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "SAM session is wedged and is being rebuilt (see PROTOCOL.i2p-bt 2.12)",
-            ));
-        }
-        // yosemite's synchronous `connect` has no timeout parameter; the
-        // caller's timeout is honored at the supervision layer, not here.
-        let mut session = self
-            .session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match session.connect(&peer.to_b32()) {
-            Ok(stream) => Ok(SamStream { inner: stream }),
-            Err(e) => {
-                if wedges_the_session(&e) {
-                    self.wedged
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!(
-                        "i2pnet: SAM session unusable after a failed dial ({e}); \
-                         it will be rebuilt. Every later dial on it would fail \
-                         the same way (PROTOCOL.i2p-bt 2.12)."
-                    );
-                }
-                Err(map_err(e))
-            }
-        }
+    /// Dial `peer` on a socket of our own (see [`dial_stream`]).
+    ///
+    /// No session mutex is taken and no library state is touched, so dials
+    /// are genuinely concurrent — `PROTOCOL.i2p-bt` §2.6a's serialization
+    /// point was yosemite's `&mut self`, and it is gone with it. The session
+    /// is consulted for exactly one thing, its nickname, which SAM needs to
+    /// attach the new stream to the right session.
+    fn dial(&self, peer: DestHash, timeout: Duration) -> io::Result<ForwardedStream> {
+        dial_stream(self.samv3_tcp_port, &self.nickname, peer, timeout)
     }
 }
 
@@ -574,78 +662,11 @@ impl I2pNamingLookup for SamSession {
     }
 }
 
-/// A SAM virtual stream. Duplex for the handshake, then [`split`] into
-/// yosemite's own read/write halves for the peer's reader/writer threads.
-///
-/// [`split`]: I2pStream::split
-pub struct SamStream {
-    inner: yosemite::Stream,
-}
-
-impl Read for SamStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
-    }
-}
-
-impl Write for SamStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-impl I2pStream for SamStream {
-    type Reader = yosemite::ReadHalf;
-    type Writer = yosemite::WriteHalf;
-
-    fn split(self) -> io::Result<(yosemite::ReadHalf, yosemite::WriteHalf)> {
-        self.inner
-            .split()
-            .ok_or_else(|| io::Error::other("SAM stream could not be split"))
-    }
-}
-
 /// Map a yosemite error into an `io::Error` with operator-readable text.
 fn map_err(e: yosemite::Error) -> io::Error {
     match e {
         yosemite::Error::IoError(io) => io,
         other => io::Error::other(other),
-    }
-}
-
-/// Whether a failed `connect` has left yosemite's session controller in a
-/// state no later call can recover from.
-///
-/// The distinction is exact, and it is the difference between "one peer was
-/// unreachable" and "this session is over":
-///
-/// - **`Protocol(Router(_))`** — the router answered `STREAM STATUS` with an
-///   error (`CANT_REACH_PEER` and friends). yosemite restores the stream
-///   state to `Uninitialized` on this path, so the session is fine. This is
-///   the common case on I2P and must not cost a rebuild.
-/// - **`Protocol(InvalidState | InvalidMessage)`, `Malformed`, `IoError`** —
-///   the controller was left `Poisoned` or mid-handshake and never restored.
-///   Every subsequent `connect` returns `InvalidState` forever.
-///
-/// Erring towards the second class would rebuild the session tree on every
-/// unreachable peer, which on a real swarm is most of them; erring towards
-/// the first is what produced a client that dialled into `invalid state` for
-/// ten minutes at a stretch. Hence the explicit match rather than a catch-all.
-fn wedges_the_session(e: &yosemite::Error) -> bool {
-    match e {
-        // The router refused the dial and yosemite reset the stream state on
-        // the way out; a bare `I2p` error never reached the state machine at
-        // all. Either way nothing is poisoned and the session is still good.
-        yosemite::Error::Protocol(yosemite::ProtocolError::Router(_)) | yosemite::Error::I2p(_) => {
-            false
-        }
-        yosemite::Error::Protocol(_) | yosemite::Error::Malformed | yosemite::Error::IoError(_) => {
-            true
-        }
     }
 }
 
@@ -952,44 +973,136 @@ mod hostile_bridge_tests {
         assert_eq!(probe_bridge(port, PROBE).expect("hello accepted"), "3.3");
     }
 
-    /// Which dial failures condemn the session, and which are just Tuesday.
+    /// A bridge that speaks the outbound-dial half of SAM: `HELLO REPLY`,
+    /// then the `STREAM STATUS` line it was told to give, then it echoes.
     ///
-    /// This is the line that decides whether a swarm works at all. Put
-    /// `CANT_REACH_PEER` on the wrong side of it and every unreachable peer
-    /// tears down the session tree — on a real swarm, most of them, and the
-    /// destination changes each time. Put a poisoned controller on the wrong
-    /// side and the daemon dials into `invalid state` until something else
-    /// happens to notice, which is what a live run spent ten minutes doing.
+    /// Enough to test the whole dial path without a router, which is the
+    /// point: this code is the reason clove no longer needs a live router to
+    /// know whether a failed dial is reportable.
+    fn dial_bridge(status: &'static str, echo: bool) -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                std::thread::spawn(move || {
+                    let mut line = Vec::new();
+                    let mut byte = [0u8; 1];
+                    // HELLO VERSION
+                    while sock.read(&mut byte).unwrap_or(0) == 1 {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                        line.push(byte[0]);
+                    }
+                    let _ = sock.write_all(b"HELLO REPLY RESULT=OK VERSION=3.3\n");
+                    // STREAM CONNECT
+                    let mut command = Vec::new();
+                    while sock.read(&mut byte).unwrap_or(0) == 1 {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                        command.push(byte[0]);
+                    }
+                    let _ = sock.write_all(status.as_bytes());
+                    if echo {
+                        let mut buf = [0u8; 64];
+                        while let Ok(n) = sock.read(&mut buf) {
+                            if n == 0 || sock.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    const PEER: DestHash = DestHash([0x11; 32]);
+
+    /// The happy path: a dialled stream is a socket clove owns, carrying peer
+    /// bytes, with the status line consumed and not one byte more.
     #[test]
-    fn only_unrecoverable_dial_failures_condemn_the_session() {
-        use yosemite::{Error, I2pError, ProtocolError};
+    fn a_dialled_stream_hands_back_the_socket_with_the_status_line_eaten() {
+        let port = dial_bridge("STREAM STATUS RESULT=OK\n", true);
+        let mut stream = dial_stream(port, "clove-test", PEER, PROBE).expect("dial");
+        stream.write_all(b"the-bittorrent-handshake").unwrap();
+        let mut back = [0u8; 24];
+        stream.read_exact(&mut back).unwrap();
+        assert_eq!(
+            &back, b"the-bittorrent-handshake",
+            "the status line must not be mistaken for peer data, nor peer data \
+             swallowed while reading it"
+        );
+    }
 
-        // The router refused this one dial and yosemite reset the stream
-        // state; the session is still good for every other peer.
-        for ordinary in [
-            I2pError::CantReachPeer,
-            I2pError::PeerNotFound,
-            I2pError::Timeout,
-        ] {
-            let e = Error::Protocol(ProtocolError::Router(ordinary));
-            assert!(
-                !wedges_the_session(&e),
-                "a router-refused dial must not condemn the session: {e}"
-            );
-        }
+    /// A router refusing one peer is ordinary on I2P. It must read as "this
+    /// peer, this time", carry the router's own words, and leave nothing
+    /// behind — the failure that used to poison the whole session.
+    #[test]
+    fn a_refused_dial_reports_the_routers_own_words_and_costs_nothing_else() {
+        let port = dial_bridge("STREAM STATUS RESULT=CANT_REACH_PEER\n", false);
+        let e = dial_stream(port, "clove-test", PEER, PROBE).expect_err("refused");
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(e.to_string().contains("CANT_REACH_PEER"), "{e}");
+        assert!(e.to_string().contains(&PEER.to_b32()), "{e}");
 
-        // These left the controller Poisoned or mid-handshake. Nothing this
-        // side of a new session recovers from them.
-        for fatal in [
-            Error::Protocol(ProtocolError::InvalidState),
-            Error::Protocol(ProtocolError::InvalidMessage),
-            Error::Malformed,
-            Error::IoError(io::Error::from(io::ErrorKind::ConnectionReset)),
+        // And the next dial on the same session id works, because the two
+        // share no state at all.
+        let ok = dial_bridge("STREAM STATUS RESULT=OK\n", true);
+        assert!(dial_stream(ok, "clove-test", PEER, PROBE).is_ok());
+    }
+
+    /// A `MESSAGE=` is the router explaining itself; it belongs in the error.
+    #[test]
+    fn a_refusal_message_reaches_the_operator() {
+        let port = dial_bridge(
+            "STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"session not found\"\n",
+            false,
+        );
+        let e = dial_stream(port, "clove-test", PEER, PROBE).expect_err("refused");
+        assert!(e.to_string().contains("session not found"), "{e}");
+    }
+
+    /// Every way a bridge can misbehave during a dial must fail, and fail
+    /// bounded. Before clove owned this socket the caller's timeout was
+    /// advisory (`PROTOCOL.i2p-bt` §2.3) and a silent bridge parked the
+    /// thread for the life of the process.
+    #[test]
+    fn no_misbehaving_bridge_can_park_a_dial() {
+        for how in [
+            Misbehaviour::CloseImmediately,
+            Misbehaviour::Silence,
+            Misbehaviour::Garbage,
+            Misbehaviour::Flood,
+            Misbehaviour::RefuseHello,
+            Misbehaviour::Dribble,
+            Misbehaviour::HelloThenStall,
         ] {
-            assert!(
-                wedges_the_session(&fatal),
-                "an unrecoverable controller state must condemn the session: {fatal}"
-            );
+            let port = fake_bridge(how);
+            let (result, took) =
+                within(LIMIT, move || dial_stream(port, "clove-test", PEER, PROBE))
+                    .expect("dial returned");
+            assert!(result.is_err(), "{how:?} was accepted as a stream");
+            assert!(took < LIMIT, "{how:?} took {took:?}");
         }
+    }
+
+    /// A `RESULT=OK` with no newline is not a status line, however much it
+    /// looks like one. Refusing it is what stops a half-sent reply being
+    /// handed to the engine as a working peer.
+    ///
+    /// The unbounded and dribbled variants — where the bridge keeps the
+    /// socket open — are covered by `Flood` and `Dribble` in the sweep above.
+    /// Here the bridge closes, so the honest answer is end-of-file, and what
+    /// matters is that the error names the exchange it died in.
+    #[test]
+    fn an_unterminated_status_line_is_never_a_stream() {
+        let port = dial_bridge("STREAM STATUS RESULT=OK", false); // no newline
+        let e = dial_stream(port, "clove-test", PEER, PROBE).expect_err("no newline");
+        assert!(
+            e.to_string().contains("STREAM CONNECT"),
+            "the error must name the exchange it failed in: {e}"
+        );
     }
 }

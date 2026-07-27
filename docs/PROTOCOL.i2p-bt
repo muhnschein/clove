@@ -247,6 +247,11 @@ Status legend:
     mock and the SAM backend share one honest abstraction, and it matches
     the reader-thread/writer-thread model (Q5) directly.
 
+2.3 [decided, superseded] clove no longer uses yosemite to dial, and its own
+    `STREAM CONNECT` honours the caller's timeout on a socket it owns
+    (§2.12). The observation below stands as a fact about yosemite 0.7 and is
+    why the trait's `timeout` argument was documented as advisory for so long.
+
 2.3 [assumed] yosemite's `Session::connect` (sync) has no timeout parameter
     and blocks until the STREAM CONNECT resolves. clove's dial() takes a
     timeout for the trait's sake but cannot enforce it at this layer; the
@@ -282,6 +287,12 @@ Status legend:
     factory; its behavior against a *real* router mid-restart, and the
     concurrency ceiling of one session, are the harness's job. First live
     observations against i2pd (M1, in progress):
+
+    2.6a [decided, superseded by §2.12] This was true while dials went through
+      yosemite; they no longer do, and a dial now takes no session lock at
+      all. The engine may initiate peers concurrently. Kept because the
+      reasoning below explains why several budgets in the harness are shaped
+      the way they are.
 
     2.6a [decided] Outbound dial *initiation* serializes per session. yosemite's
       sync `connect` takes `&mut self` and blocks until the router resolves the
@@ -378,7 +389,14 @@ Status legend:
     speaks `HELLO VERSION` itself, and requires `HELLO REPLY RESULT=OK`. All
     six cases now fail cleanly and quickly, with an error naming the address.
 
-2.7a [open] The same gap applies to yosemite's *virtual streams*, and there the
+2.7a [decided, closed by §2.12] Outbound streams are no longer yosemite's.
+    A dialled peer that goes silent is bounded by `I2pStream::set_timeouts`
+    like any other socket, and dropping the stream closes it — so the parked
+    thread and the leaked socket described below are both gone. The entry is
+    kept because it is the reason the socket count climbed all afternoon, and
+    because the *inbound* half of its reasoning is still exactly right.
+
+2.7a [was open] The same gap applies to yosemite's *virtual streams*, and there the
     probe trick does not help: `yosemite::Stream` (and the ReadHalf a peer's
     reader thread owns) exposes no read or write timeout, so a dialled peer that
     completes its handshake and then goes silent parks that thread until the
@@ -564,44 +582,41 @@ Status legend:
     `PING` on the control socket without consulting the state machine — a
     wedged session answers PING perfectly happily while refusing every dial.
 
-    clove's answer, pending an upstream fix (R1: wrap behind the trait,
-    upstream, vendor if it stalls): `SamSession` tracks a `wedged` flag, set
-    only by the unrecoverable error classes above, and `healthy()` reports
-    false the moment it is set. The supervisor then rebuilds at once and says
-    it was a session fault rather than a lost router. `i2pnet::sam`'s
-    `wedges_the_session` holds the classification, with the test that keeps
-    `CANT_REACH_PEER` on the harmless side of it — putting it on the wrong
-    side would rebuild the session tree for every unreachable peer, which on a
-    real swarm is most of them.
+    **FIXED 2026-07-27 by not using yosemite for dials at all.** SAMv3 does
+    not require a shared controller: a stream is its own connection. clove now
+    opens its own socket to the bridge per dial, speaks `HELLO VERSION` then
+    `STREAM CONNECT` on it, and the socket it is holding *is* the stream
+    (`i2pnet::sam::dial_stream`). Nothing is shared, so nothing can be
+    poisoned by another dial's failure. XD does the same thing and cannot have
+    this bug for the same reason.
 
-    Live 2026-07-27, 44 rounds: the wedge follows an announce **one for one**.
-    Every HTTP exchange with the tracker is followed by a dial that fails with
-    `invalid message from router`, then a rebuild, then another exchange. That
-    regularity says the trigger is the stream traffic itself rather than
-    anything random, and yosemite's `read_response` returning `Some("")` on
-    immediate EOF (2.12 above) says the router closed a *fresh* stream socket
-    without answering `HELLO`.
+    Three other entries close with it, all of which were consequences of not
+    owning the socket:
 
-    **The socket count does climb** (measured 2026-07-27, `ss -tn
-    'dport = :7656' | wc -l` against a live run). One source found and fixed:
-    `Registry::stop_live` fired a detached "goodbye" announce on *every*
-    teardown, including the ones a wedge causes — each spawning a thread that
-    holds a clone of the dead session and opens a fresh naming-lookup socket
-    to deliver a message that cannot arrive. It is now gated on
-    `I2pDialer::usable`, which a wedged `SamSession` answers false to.
+      - **§2.3** — the dial timeout is real. It now bounds the wait for
+        `STREAM STATUS`, which is where a leaseSet lookup spends its time.
+      - **§2.7a** — a dialled peer that goes silent no longer parks a thread
+        and leaks a socket for the life of the process. An outbound stream is
+        a `ForwardedStream` like an inbound one: `set_timeouts` works on it,
+        and dropping it closes it. This was measurable as a socket count
+        against the bridge that climbed all afternoon.
+      - **§2.6a** — dial setup no longer serializes per session. The
+        serialization point was yosemite's `connect(&mut self)` and the
+        session mutex clove needed around it; a dial now takes no session
+        lock at all, consulting it only for the nickname.
 
-    That closes a feedback loop rather than merely a leak: a bridge at its
-    connection ceiling refuses new streams, and a refused stream is what
-    wedges the session, which triggers the teardown that leaked the next
-    socket. Whether it was the *only* source is unmeasured — re-measure
-    before assuming so, and i2pd's own log is still the half nobody has read.
+    The mitigation this replaces is deleted rather than kept: the `wedged`
+    flag, its classification function and the supervisor's two-way teardown
+    message are gone, because nothing can set them any more. So is
+    `SamStream`, the yosemite-backed stream type, which nothing constructs.
 
-    This is a mitigation, not a fix, and it carries a cost worth stating: a
-    rebuild currently mints a *new transient destination* (Q4 persistent keys
-    are still deferred), so every wedge changes the address we just announced.
-    Closing that properly needs either the upstream repair or clove speaking
-    `STREAM CONNECT` itself — which would also close §2.7a, since a socket we
-    open is a socket we can set timeouts on.
+    yosemite keeps what it is good at and what happens once: `SESSION CREATE`,
+    `STREAM FORWARD`, `NAMING LOOKUP`. Its controller can still be poisoned in
+    principle, but only by an operation that runs at setup, where the failure
+    is a failed session bring-up and the supervisor's ordinary retry covers
+    it. Worth reporting upstream regardless (R1) — the next consumer will hit
+    it, and a state machine that poisons itself on an unexpected reply is a
+    defect whether or not clove still depends on it.
 
 3. Reconnect discipline (i2pnet::supervisor, M1)
 ------------------------------------------------
