@@ -19,12 +19,22 @@ Under the data directory (`data_dir`, default `$XDG_DATA_HOME/clove`):
 ```
 <data_dir>/
 ├── token                       API token (32 random bytes, hex, mode 0600)
+├── destination.key             the client's I2P private key blob, mode 0600
 ├── state/
 │   ├── <info-hash>.torrent     the exact .torrent bytes, verbatim
 │   └── <info-hash>.resume      resume data (bencode, see below)
 └── downloads/
     └── <name>/…                the torrent's files
 ```
+
+`destination.key` is the client's identity (Q4): SAM's own base64
+`DESTINATION=` blob, which is the private crypto and signing keys with the
+public destination on the front (`PROTOCOL.i2p-bt` §5.1c). It is written once,
+after the router has accepted a session with it, and replayed on every later
+`SESSION CREATE` so the destination survives restarts and session rebuilds.
+Absent under `ephemeral yes`. **Treat it as a secret**: anyone holding it can
+be you on the network. Deleting it costs your standing in every swarm and
+nothing else — the next start simply comes back as a new peer.
 
 `<info-hash>` is the 40-character lowercase hex of the torrent's info-hash.
 The `.torrent` is stored byte-for-byte so the info dictionary (and thus the

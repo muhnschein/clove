@@ -399,12 +399,17 @@ Status legend:
     speaks `HELLO VERSION` itself, and requires `HELLO REPLY RESULT=OK`. All
     six cases now fail cleanly and quickly, with an error naming the address.
 
-2.7a [decided, closed by §2.12] Outbound streams are no longer yosemite's.
-    A dialled peer that goes silent is bounded by `I2pStream::set_timeouts`
-    like any other socket, and dropping the stream closes it — so the parked
-    thread and the leaked socket described below are both gone. The entry is
-    kept because it is the reason the socket count climbed all afternoon, and
-    because the *inbound* half of its reasoning is still exactly right.
+2.7a [decided, closed by §2.12 and §2.14] Outbound streams are no longer
+    yosemite's. A dialled peer that goes silent is bounded by
+    `I2pStream::set_timeouts` like any other socket, and dropping the stream
+    closes it — so the parked thread and the leaked socket described below are
+    both gone. The entry is kept because it is the reason the socket count
+    climbed all afternoon, and because the *inbound* half of its reasoning is
+    still exactly right.
+
+    §2.12 closed only half of it, and the claim above was too strong when it
+    was written: "dropping the stream closes it" is true of *a* stream and
+    false of a stream that has been split in two. See §2.14.
 
 2.7a [was open] The same gap applies to yosemite's *virtual streams*, and there the
     probe trick does not help: `yosemite::Stream` (and the ReadHalf a peer's
@@ -699,6 +704,69 @@ Status legend:
     being available.
 
     yosemite is left with `NAMING LOOKUP` alone.
+
+
+2.14 [decided] **A split stream is not closed by dropping one half**, and the
+    engine's peer model splits every stream. Found 2026-07-27 while removing
+    the last of §2.7a.
+
+    Q5's model is a reader thread and a writer thread per peer, from
+    `I2pStream::split`. For the SAM backend that is `TcpStream::try_clone`:
+    two handles, one descriptor, one router-side stream. Dropping a peer from
+    the engine's table drops its outgoing queue, which ends the writer, which
+    drops *its* handle — and the connection stays open, because the reader
+    still holds the other one. The reader then sits in a blocking read until
+    the remote hangs up, which a silent peer by definition does not do.
+
+    So every peer clove dropped — paused, idle-timed-out, or disconnected on
+    session teardown, and the session tree was rebuilding every ~90 seconds —
+    leaked a thread, a descriptor and a router-side stream for the life of the
+    process. `Torrent::disconnect_all` carried a comment admitting it and
+    deferring the fix to "the R5 keep-alive/read-timeout work", which is the
+    wrong instrument: a timeout would eventually reclaim the thread, but only
+    after waiting out an idle period on a connection already known to be dead.
+
+    The fix is that the writer **closes the connection in both directions**
+    when it stops (`i2pnet::I2pClose`). Both threads then end promptly, the
+    descriptor is returned, and the router frees the stream. Shutting down only
+    the write side would not do it: the reader is waiting on the read side.
+
+    Recorded as its own entry rather than folded into §2.7a because the
+    reasoning generalises past this bug — an abstraction that hands out two
+    owning halves of one resource has to say who closes it, and `I2pStream`
+    did not. Pinned by `disconnect_all_empties_the_peer_table`, which now
+    asserts thread counts and that the *remote* observes the disconnect;
+    without the close it fails.
+
+
+2.15 [decided] **A client whose destination changes cannot be reached**, and
+    clove's changed on every session rebuild.
+
+    Q4 has always specified one persisted keypair per client, and the config
+    key (`ephemeral`) and its manual page were written long ago — but the
+    daemon passed `persistent_key: None` unconditionally, waiting on "key
+    export confirmed against a live router". §5.1c confirmed it in the course
+    of fixing something else: SAM's `SESSION STATUS DESTINATION=` field *is*
+    the private key blob, so the export needed is simply keeping what the
+    router already hands back on session creation.
+
+    The cost of not having it compounds with everything above. A tracker gives
+    our destination to other clients, PEX propagates it, and peers that reached
+    us hold it — all pointing at an identity that stopped existing when the
+    session was rebuilt. Every rebuild announced a *new* peer and abandoned the
+    old one, so a run seeded the swarm with dead destinations at the rate the
+    session tree cycled, and the `inbound-peer` milestone was unreachable by
+    construction rather than for any of the reasons §2.11 discusses.
+
+    clove now writes `<data_dir>/destination.key` (mode 0600, atomically, after
+    the router has accepted a session with it) and replays it on every later
+    `SESSION CREATE`. A file that is present but not a usable key is refused
+    rather than sent to the router: `SESSION CREATE` with a malformed
+    `DESTINATION=` is refused, and the supervisor would retry into the same
+    refusal forever, which is §2.9's failure mode reached by a truncated file.
+    The check that matters is the length one — a bare *destination* is
+    well-formed, decodes cleanly, and is useless as a `DESTINATION=`, because
+    it is the public half and a router cannot sign with it.
 
 
 3. Reconnect discipline (i2pnet::supervisor, M1)
