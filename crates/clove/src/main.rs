@@ -449,18 +449,26 @@ fn render_detail(value: &Value) -> String {
         "state",
         "sequential",
         "private",
+        "peers",
+        "known_peers",
+        "pex_peers",
+        "inbound_peers",
+        "downloaded",
+        "uploaded",
     ] {
         let Some(field) = value.get(key) else {
             continue;
         };
         let rendered = match key {
-            "size" => field.as_u64().map_or_else(|| field.to_line(), human_size),
+            "size" | "downloaded" | "uploaded" => {
+                field.as_u64().map_or_else(|| field.to_line(), human_size)
+            }
             "progress" => field
                 .as_f64()
                 .map_or_else(|| field.to_line(), |p| format!("{:.0}%", p * 100.0)),
             _ => field.to_line(),
         };
-        let _ = writeln!(out, "{key:<9}  {rendered}");
+        let _ = writeln!(out, "{key:<13}  {rendered}");
     }
     if let Some(files) = value.get("files").and_then(Value::as_array) {
         out.push_str("\nfiles:\n");

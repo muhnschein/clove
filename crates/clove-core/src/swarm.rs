@@ -925,6 +925,19 @@ mod tests {
             leecher_b.wait_complete(Duration::from_secs(20)),
             "torrent B did not complete through the demux"
         );
+
+        // The counter a live swarm run reads to prove the inbound path
+        // carried a stream (PROTOCOL.i2p-bt §2.5). It must count the accepted
+        // side only: both seeders were reached through the demux, and neither
+        // leecher was reached by anybody — they dialed.
+        assert_eq!(seeder_a.inbound_peers(), 1, "seeder A accepted one peer");
+        assert_eq!(seeder_b.inbound_peers(), 1, "seeder B accepted one peer");
+        assert_eq!(
+            (leecher_a.inbound_peers(), leecher_b.inbound_peers()),
+            (0, 0),
+            "a peer we dialed is not an inbound peer"
+        );
+
         swarm_a.shutdown();
         swarm_b.shutdown();
     }

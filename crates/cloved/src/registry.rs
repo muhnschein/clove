@@ -123,6 +123,19 @@ struct Hosted {
     priorities: Vec<u8>,
     uploaded: u64,
     downloaded: u64,
+    /// Peers attached right now, and destinations we could dial. Snapshotted
+    /// by [`Registry::refresh`] alongside the byte counters, because a live
+    /// run's first question is never "how many bytes" but "is anybody there":
+    /// zero peers and zero bytes is a peer-acquisition problem, while eight
+    /// peers and zero bytes is a wire or choking problem, and the two look
+    /// identical without this number.
+    peers: usize,
+    known_peers: usize,
+    /// Of those, how many arrived over `i2p_pex` (M3's PEX criterion).
+    pex_peers: u64,
+    /// Peers that reached us rather than being dialed — the live proof of the
+    /// inbound `STREAM FORWARD` path (`PROTOCOL.i2p-bt` §2.5).
+    inbound_peers: u64,
     paused: bool,
     /// Pick pieces in order rather than rarest-first (SCOPE §3).
     sequential: bool,
@@ -411,6 +424,22 @@ where
                 let (up, down) = live.torrent.stats();
                 hosted.uploaded = live.stats_base.0.saturating_add(up);
                 hosted.downloaded = live.stats_base.1.saturating_add(down);
+                hosted.peers = live.torrent.connected_peers().len();
+                hosted.known_peers = live.torrent.known_peers().len();
+                hosted.pex_peers = live.torrent.pex_learned();
+                hosted.inbound_peers = live.torrent.inbound_peers();
+            } else {
+                // No engine means no peers. Leaving the last live values in
+                // place would show a paused torrent still holding eight peers.
+                //
+                // `pex_peers` is deliberately not cleared: it is a count of
+                // what happened, not a description of the present, and a live
+                // run that proved peer exchange works should not lose that
+                // evidence the moment the operator pauses the torrent. It
+                // resets on its own when a new engine starts, since the
+                // engine's own counter starts at zero.
+                hosted.peers = 0;
+                hosted.known_peers = 0;
             }
         }
     }
@@ -481,6 +510,10 @@ where
             priorities,
             uploaded: 0,
             downloaded: 0,
+            peers: 0,
+            known_peers: 0,
+            pex_peers: 0,
+            inbound_peers: 0,
             paused: false,
             sequential: false,
             scanning: true,
@@ -926,6 +959,13 @@ where
                 priorities: resume.priorities,
                 uploaded: resume.uploaded,
                 downloaded: resume.downloaded,
+                // Peer counts are live facts, not persisted ones: a torrent
+                // loaded from disk has no engine and therefore no peers until
+                // `refresh` sees one.
+                peers: 0,
+                known_peers: 0,
+                pex_peers: 0,
+                inbound_peers: 0,
                 paused: resume.paused,
                 sequential: resume.sequential,
                 scanning: false,
@@ -991,6 +1031,10 @@ impl Hosted {
             ("progress".to_owned(), Value::Float(self.progress())),
             ("uploaded".to_owned(), Value::UInt(self.uploaded)),
             ("downloaded".to_owned(), Value::UInt(self.downloaded)),
+            (
+                "peers".to_owned(),
+                Value::UInt(u64::try_from(self.peers).unwrap_or(u64::MAX)),
+            ),
             ("state".to_owned(), Value::from(self.state())),
             ("priorities".to_owned(), Value::Array(priorities)),
         ])
@@ -1029,6 +1073,18 @@ impl Hosted {
             ("pieces".to_owned(), Value::UInt(u64::from(self.have.len()))),
             ("have".to_owned(), Value::UInt(u64::from(self.have.count()))),
             ("progress".to_owned(), Value::Float(self.progress())),
+            ("uploaded".to_owned(), Value::UInt(self.uploaded)),
+            ("downloaded".to_owned(), Value::UInt(self.downloaded)),
+            (
+                "peers".to_owned(),
+                Value::UInt(u64::try_from(self.peers).unwrap_or(u64::MAX)),
+            ),
+            (
+                "known_peers".to_owned(),
+                Value::UInt(u64::try_from(self.known_peers).unwrap_or(u64::MAX)),
+            ),
+            ("pex_peers".to_owned(), Value::UInt(self.pex_peers)),
+            ("inbound_peers".to_owned(), Value::UInt(self.inbound_peers)),
             ("state".to_owned(), Value::from(self.state())),
             ("sequential".to_owned(), Value::Bool(self.sequential)),
             ("private".to_owned(), Value::Bool(self.meta.private)),
