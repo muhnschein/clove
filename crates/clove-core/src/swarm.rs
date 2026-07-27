@@ -396,6 +396,10 @@ where
     // file of assertions, not a fact.
     let response = tracker::announce_over(&mut stream, &request).inspect_err(|_| {
         eprintln!("clove: {host} resolved to {}", dest.to_b32());
+        eprintln!(
+            "clove: the announce that failed was {}",
+            tracker::announced_url(&host, &request)
+        );
     })?;
     torrent.add_peers(&response.peers);
     Ok((response.interval, event))
