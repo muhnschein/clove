@@ -60,6 +60,23 @@ struct PendingMagnet {
     magnet: Magnet,
     /// Set once a fetch thread owns this entry, so it is spawned once.
     claimed: bool,
+    /// What the fetch loop has managed so far. A magnet that never resolves
+    /// used to be indistinguishable from one that resolved a second ago —
+    /// both were the bare word `fetching-metadata` — which is no state at all
+    /// to debug from. Written by [`note_fetch_round`](Registry::note_fetch_round).
+    progress: FetchProgress,
+}
+
+/// The visible half of a metadata fetch: how hard it has tried, and why the
+/// last attempt did not work.
+#[derive(Default)]
+struct FetchProgress {
+    rounds: u32,
+    peers_known: usize,
+    peers_tried: usize,
+    trackers_ok: usize,
+    trackers_failed: usize,
+    last_error: Option<String>,
 }
 
 /// What a metadata-fetch round has to work with.
@@ -559,6 +576,7 @@ where
             PendingMagnet {
                 magnet,
                 claimed: false,
+                progress: FetchProgress::default(),
             },
         );
         Ok(info_hash)
@@ -579,6 +597,26 @@ where
     /// Every pending magnet's info-hash (for spawning fetchers at startup).
     pub(crate) fn pending_hashes(&self) -> Vec<[u8; 20]> {
         self.pending.keys().copied().collect()
+    }
+
+    /// Record what a metadata-fetch round managed, so `clove list` can show
+    /// it. A no-op for a magnet that resolved or was removed mid-round.
+    pub(crate) fn note_fetch_round(
+        &mut self,
+        info_hash: &[u8; 20],
+        rounds: u32,
+        round: &crate::FetchRound,
+    ) {
+        if let Some(pending) = self.pending.get_mut(info_hash) {
+            pending.progress = FetchProgress {
+                rounds,
+                peers_known: round.peers_returned,
+                peers_tried: round.peers_tried,
+                trackers_ok: round.trackers_ok,
+                trackers_failed: round.trackers_failed,
+                last_error: round.last_error.clone(),
+            };
+        }
     }
 
     /// The context a fetch round needs, or `None` when the magnet is gone
@@ -881,12 +919,34 @@ where
                 .display_name
                 .clone()
                 .unwrap_or_else(|| hex(info_hash));
-            items.push(Value::Object(vec![
+            let p = &pending.progress;
+            let mut entry = vec![
                 ("info_hash".to_owned(), Value::from(hex(info_hash))),
                 ("name".to_owned(), Value::from(name)),
                 ("state".to_owned(), Value::from("fetching-metadata")),
                 ("progress".to_owned(), Value::Float(0.0)),
-            ]));
+                ("fetch_rounds".to_owned(), Value::UInt(u64::from(p.rounds))),
+                (
+                    "trackers_ok".to_owned(),
+                    Value::UInt(u64::try_from(p.trackers_ok).unwrap_or(u64::MAX)),
+                ),
+                (
+                    "trackers_failed".to_owned(),
+                    Value::UInt(u64::try_from(p.trackers_failed).unwrap_or(u64::MAX)),
+                ),
+                (
+                    "known_peers".to_owned(),
+                    Value::UInt(u64::try_from(p.peers_known).unwrap_or(u64::MAX)),
+                ),
+                (
+                    "peers_tried".to_owned(),
+                    Value::UInt(u64::try_from(p.peers_tried).unwrap_or(u64::MAX)),
+                ),
+            ];
+            if let Some(err) = &p.last_error {
+                entry.push(("last_error".to_owned(), Value::from(err.clone())));
+            }
+            items.push(Value::Object(entry));
         }
         Value::Array(items)
     }
@@ -923,6 +983,7 @@ where
             PendingMagnet {
                 magnet,
                 claimed: false,
+                progress: FetchProgress::default(),
             },
         );
         Ok(())
@@ -1410,6 +1471,78 @@ mod tests {
             .and_then(Value::as_bool)
     }
 
+    /// The defect the first live swarm run walked into: a magnet whose
+    /// tracker name will not resolve produced no output whatsoever. Nine
+    /// minutes of `fetching-metadata`, no log line, nothing in `clove list`
+    /// beyond the word itself — so "the name is unknown to this router",
+    /// "the tracker returned nothing" and "peers were dialed and none served"
+    /// were one indistinguishable state.
+    ///
+    /// A round that fails must say which stage failed and why.
+    #[test]
+    fn a_metadata_fetch_that_fails_says_which_stage_and_why() {
+        let net = MockNet::new();
+        let (_content, bytes) = fixture("unresolvable-demo");
+        let meta = MetaInfo::parse(&bytes).unwrap();
+        let info_hash = meta.info_hash.0;
+
+        let data = TempDir::new("magnet-unresolvable");
+        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let ep = net.endpoint();
+        registry.attach_network(
+            ep.dialer(),
+            InboundDemux::new(8),
+            *b"-CV0001-magnetmagnet",
+            quick_swarm(),
+            "magnet-b64".to_owned(),
+        );
+
+        // The mock network has no name registered for this tracker, which is
+        // what an address book that has never heard of a host looks like.
+        let uri = format!(
+            "magnet:?xt=urn:btih:{}&dn=nope&tr=http%3A%2F%2Fnobody.i2p%2Fannounce",
+            hex(&info_hash)
+        );
+        registry.add_magnet(&uri).unwrap();
+        let ctx = registry.fetch_context(&info_hash).unwrap().unwrap();
+        let (found, round) = crate::try_fetch_round(&ctx, info_hash, true);
+        assert!(
+            found.is_none(),
+            "an unresolvable tracker yields no metadata"
+        );
+        registry.note_fetch_round(&info_hash, 1, &round);
+
+        let error = round.last_error.expect("a failed round records its reason");
+        assert!(
+            error.contains("resolving tracker") && error.contains("nobody.i2p"),
+            "the reason must name the stage and the host, got: {error}"
+        );
+
+        // And it reaches the operator without reading the daemon's stderr.
+        let listed = registry.list();
+        let entry = listed
+            .as_array()
+            .and_then(|items| items.first().cloned())
+            .expect("the pending magnet is listed");
+        assert_eq!(
+            entry.get("state").and_then(Value::as_str),
+            Some("fetching-metadata")
+        );
+        assert_eq!(entry.get("fetch_rounds").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            entry.get("trackers_failed").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(entry.get("known_peers").and_then(Value::as_u64), Some(0));
+        assert!(
+            entry
+                .get("last_error")
+                .and_then(Value::as_str)
+                .is_some_and(|e| e.contains("nobody.i2p")),
+            "clove list carries the reason: {entry:?}"
+        );
+    }
+
     #[test]
     fn magnet_fetches_metadata_and_becomes_a_live_torrent() {
         let net = MockNet::new();
@@ -1460,10 +1593,32 @@ mod tests {
 
         // Drive the fetch loop by hand (the daemon thread does the same).
         let deadline = Instant::now() + Duration::from_secs(20);
+        let mut rounds = 0;
         loop {
             assert!(Instant::now() < deadline, "metadata fetch did not finish");
             let ctx = registry.fetch_context(&info_hash).unwrap().unwrap();
-            if let Some(bytes) = crate::try_fetch_round(&ctx, info_hash, true) {
+            rounds += 1;
+            let (found, round) = crate::try_fetch_round(&ctx, info_hash, true);
+            registry.note_fetch_round(&info_hash, rounds, &round);
+            // A round that has not resolved the magnet yet must still have
+            // said what it tried, since that is the only thing an operator
+            // watching a stalled fetch has to go on.
+            let listed = registry.list();
+            let pending = listed
+                .as_array()
+                .and_then(|items| items.iter().find(|i| i.get("state").is_some()))
+                .expect("the pending magnet is listed");
+            if found.is_none() {
+                assert_eq!(
+                    pending.get("state").and_then(Value::as_str),
+                    Some("fetching-metadata")
+                );
+                assert!(
+                    pending.get("fetch_rounds").is_some(),
+                    "a pending magnet reports how many rounds have run"
+                );
+            }
+            if let Some(bytes) = found {
                 // Same two steps as the daemon's fetch thread: promote, then run
                 // and publish the initial scan. Skipping the second would leave
                 // the torrent marked as verifying and it would never start.

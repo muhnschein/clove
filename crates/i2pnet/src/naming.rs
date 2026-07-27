@@ -76,9 +76,22 @@ impl<N: I2pNamingLookup> I2pNamingLookup for NamingCache<N> {
                 Some(Entry::Hit(dest)) => return Ok(*dest),
                 Some(Entry::Miss { until, failures }) => {
                     if *until > now {
+                        // Name the hold. Without it, an operator watching a
+                        // stalled announce sees no lookup traffic at all and
+                        // concludes the router is broken — when in fact we
+                        // decided locally not to ask it for another 27
+                        // minutes. The number is the whole message.
                         return Err(io::Error::new(
                             io::ErrorKind::NotFound,
-                            "naming: negative-cached (recent lookup failed; backing off)",
+                            // Plain, not `{name:?}`: this text is read by an
+                            // operator and travels through the daemon's JSON,
+                            // and Rust's debug quoting would bracket the host
+                            // in escaped quotes in both places for no gain.
+                            format!(
+                                "naming: {name} is negative-cached after {failures} failed \
+                                 lookup(s); not asking the router again for {}s",
+                                until.saturating_duration_since(now).as_secs()
+                            ),
                         ));
                     }
                     *failures

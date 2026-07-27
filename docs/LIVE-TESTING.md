@@ -582,6 +582,35 @@ it just is not a clean sign-off.
 
 ## 7a. Troubleshooting (live-run findings)
 
+**A magnet that sits in `fetching-metadata` and never moves.** Found by the
+first live swarm run, 2026-07-27: nine minutes at `fetching-metadata` with no
+output of any kind. The cause was not the fetch failing — it was the fetch
+being *silent*. `try_fetch_round` discarded the error from every stage, so
+"this router has never heard of the tracker's hostname", "the tracker returned
+no peers" and "thirty peers were dialed and none served the metadata" were one
+indistinguishable state, and the daemon's log said nothing at all.
+
+Each stage now names itself, in the daemon's log and in `clove list`:
+
+```
+clove list --json | grep -o '"last_error":"[^"]*"'
+grep 'metadata fetch' <data-dir>/cloved.log | tail -20
+```
+
+The usual cause is the first stage. A magnet's `tr=` is typically a hostname
+(`tracker2.postman.i2p`), which the router resolves from its **address book** —
+and a router that has not yet fetched its subscriptions has never heard of it.
+Worse, a failed lookup is negative-cached with a doubling hold up to 30 minutes
+(`i2pnet::naming`, R6), so the symptom is not a stream of failing lookups but
+silence: retries get *rarer*. The error text now says how long the hold has
+left, so a log with no lookups in it is distinguishable from a router that is
+not being asked.
+
+Fixes, cheapest first: check the router knows the host (i2pd's console has an
+address book page); wait for the subscription fetch on a young router; or
+sidestep naming altogether by using a tracker URL in `b32` form, which resolves
+through the netDb rather than the address book.
+
 **`CantReachPeer` on every dial, immediately after `router-up`.** Two causes,
 distinguish them at the i2pd console (`http://127.0.0.1:7070`, published by the
 quadlet):

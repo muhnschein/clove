@@ -75,6 +75,25 @@ Status legend:
     first announce only, and any tracker-specific quirks (numwant caps,
     `&supportcrypto`, etc.), to be confirmed live at M3 and recorded here.
 
+5.5 [decided] A tracker URL's host is usually an **address-book name**
+    (`tracker2.postman.i2p`), not a b32, and the two resolve through entirely
+    different machinery: the address book is a local file the router fills from
+    HTTP subscriptions, while a b32 resolves through the netDb. A router that
+    has not completed its subscription fetch cannot resolve the first form at
+    all, however healthy it otherwise is.
+
+    This interacts badly with the negative-lookup backoff (R6,
+    `i2pnet::naming`): the hold doubles from 30s to 30 minutes, so a name that
+    is unknown at startup is retried *less* often as time passes. The observable
+    symptom is therefore not a stream of failed lookups but an absence of
+    lookups, which reads from outside like a stalled client.
+
+    Neither behaviour is wrong — caching a miss is the point — but both were
+    invisible. The lookup error now states the remaining hold, and
+    `try_fetch_round` reports which stage failed rather than dropping it
+    (first found live 2026-07-27; see LIVE-TESTING §7a). An operator hitting
+    this can sidestep it with a b32 tracker URL.
+
 
 2. SAM / yosemite behavior (from the 0.7.0 API review, M0/M1)
 ------------------------------------------------------------
