@@ -1277,8 +1277,10 @@ const METADATA_DEADLINE: Duration = Duration::from_secs(120);
 /// The exchange needs a bound of its own because nothing else can end it: a
 /// peer that re-sends a piece we already hold, or sends one of the wrong
 /// length, makes no progress and costs nothing, so "read until complete" is a
-/// loop a peer can keep us in for as long as it cares to. There is no read
-/// timeout underneath us to notice either (`SamStream` cannot set one).
+/// loop a peer can keep us in for as long as it cares to. A read timeout
+/// underneath us would eventually notice — SAM streams take one now — but the
+/// bound belongs here regardless: a peer that answers promptly and uselessly
+/// never trips a timeout at all.
 const METADATA_FRAME_SLACK: u32 = 8;
 
 /// Fetch and verify a torrent's `info` dictionary from one peer over BEP 9
