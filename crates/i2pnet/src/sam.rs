@@ -488,6 +488,12 @@ pub struct SamSession {
     life: Arc<SessionLife>,
     local: DestHash,
     local_b64: String,
+    /// The session's **private key blob** — the whole `DESTINATION=` field,
+    /// of which `local_b64` is only the public prefix. Kept so a persistent
+    /// identity (Q4) can be written to disk once and replayed on every later
+    /// `SESSION CREATE`. Never logged, never published, never serialized: see
+    /// [`SamSession::private_key_b64`].
+    private_key_b64: String,
     samv3_tcp_port: u16,
     probe_timeout: Duration,
     /// The SAM session id every outbound stream attaches itself to.
@@ -555,6 +561,7 @@ impl SamSession {
             )
         })?;
         let local_b64 = crate::addr::i2p_base64_encode(&bytes);
+        let private_key_b64 = blob.to_owned();
 
         // Setup is over; the watchdog owns the reading end from here.
         control.set_read_timeout(None)?;
@@ -573,6 +580,7 @@ impl SamSession {
             life,
             local,
             local_b64,
+            private_key_b64,
             samv3_tcp_port: port,
             probe_timeout: config.probe_timeout,
             nickname: config.nickname.clone(),
@@ -584,6 +592,23 @@ impl SamSession {
     #[must_use]
     pub fn local_dest_b64(&self) -> &str {
         &self.local_b64
+    }
+
+    /// The session's private key blob, for persisting the identity (Q4).
+    ///
+    /// **This is secret material.** SAM's `DESTINATION=` field is the private
+    /// crypto and signing keys with the public destination on the front
+    /// (`docs/PROTOCOL.i2p-bt` §5.1c); handing the whole thing to a tracker is
+    /// what §5.1c is *about*. Anything published — an announce's `ip=`, a PEX
+    /// message, a log line, the control API — wants
+    /// [`local_dest_b64`](SamSession::local_dest_b64) instead, which is the
+    /// public prefix and nothing else.
+    ///
+    /// The only legitimate caller is the daemon writing
+    /// `<data_dir>/destination.key` at `0600`.
+    #[must_use]
+    pub fn private_key_b64(&self) -> &str {
+        &self.private_key_b64
     }
 
     /// Whether the session's control connection is still up.

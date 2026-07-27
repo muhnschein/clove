@@ -54,7 +54,7 @@ pub trait I2pStream: Read + Write + Send + Sized {
     /// The read half yielded by [`split`](Self::split).
     type Reader: Read + Send + 'static;
     /// The write half yielded by [`split`](Self::split).
-    type Writer: Write + Send + 'static;
+    type Writer: Write + Send + I2pClose + 'static;
 
     /// Consume the stream, splitting it into independent read and write
     /// halves. Both must reference the same underlying connection; closing
@@ -78,6 +78,36 @@ pub trait I2pStream: Read + Write + Send + Sized {
     fn set_timeouts(&self, timeout: Option<Duration>) -> io::Result<()> {
         let _ = timeout;
         Ok(())
+    }
+}
+
+/// Ending a connection from a thread that is not the one blocked on it.
+///
+/// The reader-thread/writer-thread model (Q5) has one thread parked in a
+/// blocking read for as long as the connection lives, and dropping the *other*
+/// half does not wake it: both halves reference one connection, and a
+/// duplicated descriptor keeps it open. So a peer dropped from the engine's
+/// table — paused, idle-timed-out, disconnected on session teardown — left its
+/// reader parked forever, holding a thread, a descriptor and a router-side
+/// stream for the life of the process. Measured as a socket count against the
+/// bridge that climbed all afternoon, and half-fixed twice under
+/// `PROTOCOL.i2p-bt` §2.7a before the cause was named.
+///
+/// Implementations close the connection in **both** directions: the point is
+/// to unblock the reader, and shutting down only the write side does not.
+pub trait I2pClose {
+    /// Close the connection. Idempotent, and safe to call while another
+    /// thread is blocked reading or writing it — that is the whole purpose.
+    fn close(&self);
+}
+
+/// The one real implementation: every SAM stream, inbound or outbound, is a
+/// loopback TCP connection to the bridge.
+impl I2pClose for std::net::TcpStream {
+    fn close(&self) {
+        // Already-closed is the ordinary case (the remote hung up first), and
+        // is not worth reporting: the post-condition holds either way.
+        let _ = self.shutdown(std::net::Shutdown::Both);
     }
 }
 

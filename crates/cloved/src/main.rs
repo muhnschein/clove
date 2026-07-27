@@ -169,7 +169,11 @@ fn run() -> Result<(), String> {
         spawn_metadata_fetch(&daemon, info_hash);
     }
 
-    spawn_sam_supervisor(&daemon, &config.sam_address);
+    spawn_sam_supervisor(
+        &daemon,
+        &config.sam_address,
+        Identity::new(&config.data_dir, config.ephemeral),
+    );
     spawn_persist_loop(&daemon);
     serve(&listener, &daemon)
 }
@@ -195,12 +199,97 @@ fn sam_tcp_port(sam_address: &str) -> Option<u16> {
         .and_then(|(_, p)| p.parse::<u16>().ok())
 }
 
+/// The daemon's I2P identity across restarts (Q4).
+///
+/// One destination keypair per client, kept as SAM's own base64 private key
+/// blob in `<data_dir>/destination.key` at `0600`. `ephemeral yes` in
+/// `clove.conf` turns this off and every start gets a fresh transient
+/// destination instead.
+///
+/// Why it matters beyond "nice to have a stable name": a destination that
+/// changes is a peer nobody can reach. Trackers hand our destination to other
+/// clients, PEX propagates it, and peers that dialled us hold it — all of which
+/// point at an identity that no longer exists the moment the session is
+/// rebuilt. With the session tree rebuilding on router loss, clove was
+/// announcing a *new* identity every time, seeding the swarm with dead
+/// destinations and guaranteeing the inbound half could never work.
+struct Identity {
+    /// `None` under `ephemeral yes` — nothing is read and nothing is written.
+    path: Option<PathBuf>,
+}
+
+impl Identity {
+    fn new(data_dir: &Path, ephemeral: bool) -> Identity {
+        Identity {
+            path: (!ephemeral).then(|| data_dir.join("destination.key")),
+        }
+    }
+
+    /// The stored key, or `None` for a transient destination this run.
+    ///
+    /// A file that is present but not a key is refused rather than sent to the
+    /// router. The failure it prevents is specific and nasty: `SESSION CREATE`
+    /// with a malformed `DESTINATION=` is refused, the supervisor backs off and
+    /// retries into the same refusal, and the daemon never connects again —
+    /// §2.9's "back off into the same refusal forever", reached this time by a
+    /// truncated file rather than a stale session id.
+    fn load(&self) -> Option<String> {
+        let path = self.path.as_ref()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        let key = text.trim();
+        if is_private_key_blob(key) {
+            return Some(key.to_owned());
+        }
+        eprintln!(
+            "cloved: {} is not a usable destination key (truncated or corrupt?); \
+             starting with a new identity",
+            path.display()
+        );
+        None
+    }
+
+    /// Persist `key` if we do not already have it stored.
+    ///
+    /// Failure is logged, not fatal: a daemon that cannot write its key still
+    /// works, it just comes back as somebody else next time. Saying so is the
+    /// point — this silently not happening is exactly the bug being fixed.
+    fn remember(&self, key: &str) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        if std::fs::read_to_string(path).is_ok_and(|stored| stored.trim() == key) {
+            return;
+        }
+        match write_private_file(path, key.as_bytes()) {
+            Ok(()) => eprintln!("cloved: identity saved to {}", path.display()),
+            Err(e) => eprintln!(
+                "cloved: could not save the destination key to {}: {e}; this run's \
+                 identity will not survive a restart",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Whether `text` is a SAM private key blob: I2P base64 that decodes to a
+/// complete destination *plus* the private key material behind it.
+///
+/// The length check is the one that matters. A destination alone is a perfectly
+/// well-formed thing to find in this file and completely useless as a
+/// `DESTINATION=` — it is the public half, and a router cannot sign with it.
+fn is_private_key_blob(text: &str) -> bool {
+    let Some(bytes) = i2pnet::addr::i2p_base64_decode(text) else {
+        return false;
+    };
+    i2pnet::addr::destination_len(&bytes).is_some_and(|dest| bytes.len() > dest)
+}
+
 /// Supervise the SAM session in the background: connect on the reconnect
 /// policy's backoff, attach the network, then wait for the session to end; on
 /// session loss, tear the session tree down (detach the registry, stop and
 /// poke the demux's accept loop) and rebuild — the SCOPE §4 reconnect
 /// discipline.
-fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str) {
+fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str, identity: Identity) {
     // The SAM backend dials 127.0.0.1:<port> by construction (Layer 1's
     // loopback rule); a unix-socket SAM path cannot be used by it.
     let Some(port) = sam_tcp_port(sam_address) else {
@@ -215,7 +304,7 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str) {
             let mut failures = 0u32;
             // Phase 1: bring the session tree up, backing off on failure.
             let (session, listener) = loop {
-                match connect_session(port) {
+                match connect_session(port, identity.load()) {
                     Ok(pair) => break pair,
                     Err(e) => {
                         if failures == 0 {
@@ -234,6 +323,9 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str) {
             let dest = session.local_dest();
             let forward_port = listener.local_port();
             eprintln!("cloved: router connected; we are {}", dest.to_b32());
+            // Only now, with the router having accepted it: a key that failed
+            // SESSION CREATE is not one worth keeping.
+            identity.remember(session.private_key_b64());
             let demux = InboundDemux::new(SwarmConfig::default().max_peers);
             let _accept = demux.run(listener);
             lock(&daemon.registry).attach_network(
@@ -268,16 +360,22 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str) {
 }
 
 /// One session bring-up: connect and establish the forwarded listener.
-fn connect_session(port: u16) -> std::io::Result<(Arc<SamSession>, SamListener)> {
+///
+/// `key` is the persisted identity when there is one (Q4); `None` asks the
+/// router for a fresh transient destination, whose key the caller then stores.
+fn connect_session(
+    port: u16,
+    key: Option<String>,
+) -> std::io::Result<(Arc<SamSession>, SamListener)> {
     let session = Arc::new(SamSession::connect(&SamConfig {
         samv3_tcp_port: port,
         // Unique per attempt: a router that has not yet released the previous
         // session would refuse a fixed id with DuplicateId, and the
-        // supervisor would back off into the same refusal forever.
+        // supervisor would back off into the same refusal forever. The session
+        // *id* is not the identity — that is the destination key below — so it
+        // can vary freely per attempt while the destination stays put.
         nickname: i2pnet::sam::unique_nickname("clove"),
-        // Q4 persistent identity lands once key export is confirmed against
-        // a live router; until then every run is transient.
-        persistent_key: None,
+        persistent_key: key,
         ..Default::default()
     })?);
     let listener = SamListener::forward(Arc::clone(&session))?;
@@ -889,13 +987,32 @@ fn load_or_create_token(data_dir: &Path) -> std::io::Result<String> {
 /// written, fsynced, then renamed over the target. Rename keeps the mode, so
 /// the token is never briefly readable by anyone else and never half-written.
 fn write_new_token(path: &Path) -> std::io::Result<String> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     let mut raw = [0u8; 32];
     getrandom::getrandom(&mut raw).map_err(|e| std::io::Error::other(format!("getrandom: {e}")))?;
     let token = registry::hex(&raw);
+    write_private_file(path, token.as_bytes())?;
+    Ok(token)
+}
 
-    let tmp = path.with_file_name(format!("token.{}.tmp", std::process::id()));
+/// Write `contents` to `path` atomically and privately: a `0600` temp file,
+/// written, fsynced, then renamed over the target.
+///
+/// Rename keeps the mode, so the file is never briefly readable by anyone else
+/// and never half-written. Shared by the API token and the destination key —
+/// the two files in the data directory that are secrets, and the two that a
+/// crash mid-write must not leave truncated.
+fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("clove"),
+        std::ffi::OsStr::to_os_string,
+    );
+    let tmp = path.with_file_name(format!(
+        "{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
     // A temp left by an earlier crash of this pid would fail create_new below.
     let _ = std::fs::remove_file(&tmp);
     {
@@ -904,11 +1021,10 @@ fn write_new_token(path: &Path) -> std::io::Result<String> {
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
-        file.write_all(token.as_bytes())?;
+        file.write_all(contents)?;
         file.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
-    Ok(token)
+    std::fs::rename(&tmp, path)
 }
 
 /// Length-independent byte comparison, so token checks don't leak length or a
@@ -1546,6 +1662,139 @@ mod tests {
         let mut nearly = "a".repeat(TOKEN_HEX_LEN - 1);
         nearly.push('-');
         assert!(!is_well_formed_token(&nearly));
+    }
+
+    // ------------------------------------------------- identity (Q4)
+
+    /// A SAM private key blob: a complete destination followed by the private
+    /// crypto and signing keys, the shape §5.1c captured from i2pd.
+    fn key_blob_b64() -> String {
+        let mut blob = vec![0x42u8; 384];
+        blob.push(0x05);
+        blob.extend_from_slice(&4u16.to_be_bytes());
+        blob.extend_from_slice(&[0x00, 0x07, 0x00, 0x00]);
+        blob.extend(std::iter::repeat_n(0xAAu8, 288));
+        i2pnet::addr::i2p_base64_encode(&blob)
+    }
+
+    #[test]
+    fn an_identity_survives_a_restart() {
+        let dir = TempDir::new("identity");
+        let key = key_blob_b64();
+
+        // Nothing stored yet: the first run asks the router for a transient
+        // destination and keeps what comes back.
+        let identity = Identity::new(&dir.0, false);
+        assert_eq!(identity.load(), None);
+        identity.remember(&key);
+
+        // Every later run is the same peer.
+        assert_eq!(Identity::new(&dir.0, false).load().as_deref(), Some(&*key));
+    }
+
+    #[test]
+    fn the_destination_key_is_private_and_written_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("identity-mode");
+        Identity::new(&dir.0, false).remember(&key_blob_b64());
+
+        let path = dir.0.join("destination.key");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the destination key is readable by other users"
+        );
+        let strays: Vec<_> = std::fs::read_dir(&dir.0)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left a temp file behind");
+    }
+
+    #[test]
+    fn ephemeral_neither_reads_nor_writes_a_key() {
+        let dir = TempDir::new("identity-ephemeral");
+        // Even with a perfectly good key sitting there.
+        std::fs::write(dir.0.join("destination.key"), key_blob_b64()).expect("write");
+
+        let identity = Identity::new(&dir.0, true);
+        assert_eq!(
+            identity.load(),
+            None,
+            "ephemeral must not reuse an identity"
+        );
+        identity.remember(&key_blob_b64());
+        // And it must not have touched the file either way.
+        assert_eq!(
+            std::fs::read_dir(&dir.0).expect("read dir").count(),
+            1,
+            "ephemeral wrote something"
+        );
+    }
+
+    /// A key file that is present but unusable must not be sent to the router.
+    ///
+    /// `SESSION CREATE` with a malformed `DESTINATION=` is refused, and the
+    /// supervisor retries into the same refusal forever — the daemon never
+    /// connects again. A truncated file reaching §2.9's failure mode is much
+    /// more likely than a stale session id ever was.
+    #[test]
+    fn a_corrupt_key_file_is_refused_rather_than_sent_to_the_router() {
+        let full = key_blob_b64();
+        for (what, contents) in [
+            ("empty", String::new()),
+            ("whitespace", "\n \t".to_owned()),
+            ("not base64", "!!!not a key!!!".to_owned()),
+            ("truncated mid-blob", full[..40].to_owned()),
+            // The nastiest one: a *valid destination* with no private half.
+            // Well-formed, decodes cleanly, and useless as a DESTINATION= —
+            // the router cannot sign with a public key.
+            (
+                "the public destination only",
+                i2pnet::addr::i2p_base64_encode(
+                    &i2pnet::addr::i2p_base64_decode(&full).expect("decode")[..391],
+                ),
+            ),
+        ] {
+            let dir = TempDir::new(&format!("identity-bad-{}", what.replace(' ', "-")));
+            std::fs::write(dir.0.join("destination.key"), &contents).expect("write");
+            assert_eq!(
+                Identity::new(&dir.0, false).load(),
+                None,
+                "{what}: a key that cannot work was handed to the router"
+            );
+        }
+        // And the real thing still loads, or the check above is just refusing
+        // everything.
+        let dir = TempDir::new("identity-good");
+        std::fs::write(dir.0.join("destination.key"), &full).expect("write");
+        assert_eq!(Identity::new(&dir.0, false).load().as_deref(), Some(&*full));
+    }
+
+    #[test]
+    fn a_stored_identity_is_not_rewritten_on_every_reconnect() {
+        // The supervisor calls `remember` on every successful session, and the
+        // session tree rebuilds whenever the router blips. Rewriting the key
+        // each time is a needless fsync and a needless window in which the
+        // file does not exist.
+        let dir = TempDir::new("identity-idempotent");
+        let identity = Identity::new(&dir.0, false);
+        identity.remember(&key_blob_b64());
+        let path = dir.0.join("destination.key");
+        let first = std::fs::metadata(&path).expect("stat");
+        let before = first.modified().expect("mtime");
+
+        identity.remember(&key_blob_b64());
+        let after = std::fs::metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+        assert_eq!(before, after, "the key was rewritten with the same value");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read").trim(),
+            key_blob_b64()
+        );
     }
 
     #[test]

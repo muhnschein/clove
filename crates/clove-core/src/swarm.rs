@@ -782,6 +782,12 @@ impl Write for NoStream {
     }
 }
 
+impl i2pnet::I2pClose for NoStream {
+    fn close(&self) {
+        match *self {}
+    }
+}
+
 impl I2pStream for NoStream {
     type Reader = NoStream;
     type Writer = NoStream;
@@ -1239,11 +1245,51 @@ mod tests {
         accept.join().unwrap();
         assert_eq!(leecher.connected_peers().len(), 1);
 
+        assert_eq!(seeder.connected_peers().len(), 1);
+        assert_eq!(leecher.live_threads(), 2, "a reader and a writer per peer");
+
         leecher.disconnect_all();
         assert!(
             leecher.connected_peers().is_empty(),
             "peer table must be empty after disconnect_all"
         );
+
+        // The threads that served that peer must go with it. Dropping the
+        // peer's outgoing queue ends the writer, and the writer closing the
+        // connection is what ends the reader — without that last step the
+        // reader sits in a blocking read for the life of the process, holding
+        // a descriptor and a router-side stream.
+        assert!(
+            settles(|| leecher.live_threads() == 0),
+            "{} peer thread(s) survived disconnect_all",
+            leecher.live_threads()
+        );
+
+        // And the close reaches the far end, which is the part that actually
+        // frees anything on the router: the seeder's reader sees end-of-file
+        // and drops us. Before the writer closed the connection this stayed at
+        // one peer forever, because nothing ever closed it.
+        assert!(
+            settles(|| seeder.connected_peers().is_empty()),
+            "the remote never saw the disconnect"
+        );
+        assert!(
+            settles(|| seeder.live_threads() == 0),
+            "the remote's peer threads were never reclaimed"
+        );
+    }
+
+    /// Poll `done` for up to two seconds. Cross-thread teardown is prompt but
+    /// not instantaneous, and a fixed sleep is either flaky or slow.
+    fn settles(done: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        done()
     }
 
     #[test]
