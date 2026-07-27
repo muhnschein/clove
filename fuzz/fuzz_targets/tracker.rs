@@ -8,7 +8,10 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(response) = parse_response(data) {
         let mut state = AnnounceState::new();
         let now = 1_000_000u64;
-        state.on_success(now, response.interval);
+        // Drive it the way the daemon does: ask what the announce should
+        // carry, then report that same event as sent.
+        let sent = state.next_event(false);
+        state.on_success(now, response.interval, sent);
         assert!(!state.due(now + MIN_ANNOUNCE_INTERVAL.as_secs() - 1));
     }
 });

@@ -58,7 +58,10 @@ impl Value {
                 if f.is_finite() {
                     // A whole float would print as "1", which re-parses as an
                     // integer; keep the fraction so encode/parse round-trips.
-                    if f.fract() == 0.0 && f.abs() < 1e15 {
+                    // This holds at every magnitude: `{}` never uses exponent
+                    // notation for f64, so a large whole float prints as a
+                    // bare digit string that reads back as `Int`/`UInt` too.
+                    if f.fract() == 0.0 {
                         let _ = write!(out, "{f:.1}");
                     } else {
                         let _ = write!(out, "{f}");
@@ -482,19 +485,26 @@ impl Parser<'_> {
         }
         let text = std::str::from_utf8(&self.bytes[start..self.pos])
             .map_err(|_| self.err("invalid number"))?;
-        if is_float {
-            text.parse::<f64>()
-                .map(Value::Float)
-                .map_err(|_| self.err("invalid number"))
-        } else if let Ok(n) = text.parse::<i64>() {
-            Ok(Value::Int(n))
-        } else if let Ok(n) = text.parse::<u64>() {
-            Ok(Value::UInt(n))
-        } else {
-            text.parse::<f64>()
-                .map(Value::Float)
-                .map_err(|_| self.err("invalid number"))
+        if !is_float {
+            if let Ok(n) = text.parse::<i64>() {
+                return Ok(Value::Int(n));
+            }
+            if let Ok(n) = text.parse::<u64>() {
+                return Ok(Value::UInt(n));
+            }
         }
+        // Either a genuine float, or an integer literal too wide for u64.
+        let value = text
+            .parse::<f64>()
+            .map_err(|_| self.err("invalid number"))?;
+        if !value.is_finite() {
+            // A literal whose magnitude overflows f64 parses to infinity,
+            // which JSON has no text for: the encoder can only write it back
+            // as `null`. Refuse it here rather than hand the caller a value
+            // that changes meaning the moment it is re-serialised.
+            return Err(self.err("number out of range"));
+        }
+        Ok(Value::Float(value))
     }
 }
 
@@ -541,6 +551,35 @@ mod tests {
         assert_eq!(Value::Float(1.0).encode(), "1.0");
         assert_eq!(Value::Float(-15e9).encode(), "-15000000000.0");
         assert_eq!(parse("1.0").unwrap(), Value::Float(1.0));
+        // Regression, found by the `json` fuzz target: the fraction used to be
+        // kept only below 1e15, so a large whole float encoded as a bare digit
+        // string and read back as `Int(9111111111111111000)`.
+        let big = parse("911111111111111111e1").unwrap();
+        assert_eq!(big, Value::Float(9.111_111_111_111_111e18));
+        assert_eq!(parse(&big.encode()).unwrap(), big);
+        for f in [1e15, -1e15, 1e300, f64::MAX, f64::MIN] {
+            let value = Value::Float(f);
+            assert_eq!(
+                parse(&value.encode()).unwrap(),
+                value,
+                "{f:e} lost its type"
+            );
+        }
+    }
+
+    #[test]
+    fn numbers_beyond_f64_are_refused() {
+        // `1e400` parses to infinity, which the encoder can only write back as
+        // `null`: a value that changes meaning on re-serialisation is an error
+        // here, not something to hand the caller.
+        assert!(parse("1e400").is_err());
+        assert!(parse("-1e400").is_err());
+        // The same literal without an exponent: too wide for u64 and for f64.
+        assert!(parse(&format!("1{}", "0".repeat(400))).is_err());
+        // What still fits is a float, and survives the round trip.
+        assert_eq!(parse("1e308").unwrap(), Value::Float(1e308));
+        let wide = parse("123456789012345678901234567890").unwrap();
+        assert_eq!(parse(&wide.encode()).unwrap(), wide);
     }
 
     #[test]
