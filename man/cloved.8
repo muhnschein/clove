@@ -49,7 +49,7 @@ Print a usage summary and exit.
 .Sh RUNTIME
 On start
 .Nm
-creates its data directory, generates an API token
+creates its data directory, generates an API token and a destination key
 .Pq 32 random bytes, hex, mode 0600
 if none exists, loads previously added torrents from disk, and binds the
 control socket.
@@ -136,6 +136,15 @@ Default configuration file; see
 Data directory.
 .It Pa ~/.local/share/clove/token
 API token, mode 0600.
+.It Pa ~/.local/share/clove/destination.key
+The client's I2P destination keys, mode 0600.
+Written after the router first accepts a session and reused on every start, so
+the destination is stable across restarts.
+Absent when
+.Ic ephemeral
+is set; see
+.Xr clove.conf 5 .
+Anyone holding this file can be you on the network.
 .It Pa ~/.local/share/clove/state/
 Per-torrent state: the original
 .Pa .torrent ,

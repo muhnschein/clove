@@ -433,6 +433,15 @@ impl Write for MockStream {
     }
 }
 
+impl crate::I2pClose for MockStream {
+    /// Both directions, like a socket shutdown: the `Closer` only fires when
+    /// every handle on this side drops, and the reader thread is holding one.
+    fn close(&self) {
+        self.read.close();
+        self.write.close();
+    }
+}
+
 impl I2pStream for MockStream {
     type Reader = MockStream;
     type Writer = MockStream;
