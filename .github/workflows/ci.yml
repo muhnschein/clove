@@ -26,6 +26,12 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # The fuzz crate is outside the workspace, so nothing above compiles it
+      # and a changed signature in clove-core rots a target silently until the
+      # nightly job trips over it (this happened to `tracker`). Checking it
+      # takes seconds and needs no nightly toolchain — only running the fuzzer
+      # does.
+      - run: cargo check --manifest-path fuzz/Cargo.toml
       - run: ./ci/check-net-deps.sh
       # End-to-end: drive the real binaries as an operator does. Unit tests
       # cannot see whole-process faults (the Phase-F registry deadlocks

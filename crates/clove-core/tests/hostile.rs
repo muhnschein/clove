@@ -231,6 +231,11 @@ fn json_survives_hostile_input() {
             .as_bytes()
             .to_vec(),
         b"{}".to_vec(),
+        // Numbers at the edges of every representation the parser picks
+        // between. The variant a literal lands in has to survive its own
+        // encoder, and a magnitude past f64 has to be refused outright —
+        // both were fuzz findings the seeds above were too tame to reach.
+        b"[1e15,911111111111111111e1,-1e308,123456789012345678901234567890,1e400,0.5]".to_vec(),
     ];
     sweep("json", &seeds, 0x5EED_0004, |case| {
         // The parser takes &str; invalid UTF-8 is the caller's problem, so
