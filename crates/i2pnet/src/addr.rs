@@ -55,20 +55,75 @@ impl DestHash {
     /// trimmed; returns `None` if the base64 body is malformed.
     #[must_use]
     pub fn from_b64_destination(dest: &str) -> Option<DestHash> {
-        let trimmed = dest.trim();
-        // SAM sometimes suffixes a base32 label; the destination proper is
-        // the leading base64 run. Cut at the first character outside the
-        // I2P base64 alphabet (e.g. a stray '.' or newline).
-        let body: String = trimmed
-            .chars()
-            .take_while(|&c| c == '=' || I2P_B64_ALPHABET.contains(&(c as u8)))
-            .collect();
-        let bytes = i2p_base64_decode(&body)?;
-        if bytes.is_empty() {
-            return None;
-        }
+        let bytes = destination_bytes(dest)?;
         Some(DestHash(Sha256::digest(&bytes).into()))
     }
+}
+
+/// Offset of the certificate inside a destination: 256-byte public key plus
+/// 128-byte signing key.
+const CERT_OFFSET: usize = 384;
+
+/// A destination is the key material plus a certificate: three bytes of
+/// header (type, then a two-byte big-endian payload length) and the payload.
+const CERT_HEADER: usize = 3;
+
+/// The **public destination** at the front of a SAM `DESTINATION=` field, as
+/// raw bytes.
+///
+/// This exists because `SAMv3`'s `SESSION STATUS` reply does not carry the
+/// destination. It carries the session's **private key blob**, of which the
+/// public destination is merely the first 387-or-so bytes; the rest is the
+/// private crypto and signing keys. The distinction is invisible if you never
+/// look — both are one long base64 run — and clove did not look.
+///
+/// The cost of not looking, measured against a live tracker on 2026-07-27:
+///
+/// - Every announce sent our **private keys** to the tracker in the `ip`
+///   parameter. postman's tracker refused each one as "in violation of the
+///   site's policy", which was the correct and generous response.
+/// - Every `DestHash` we derived for ourselves — the identity printed at
+///   startup, published to peers over PEX, and dialled by the loopback tests
+///   — was the SHA-256 of the private blob rather than of the destination. It
+///   named nothing. A router asked to resolve it could only fail, which is
+///   what "leaseSet not found" had been telling us since the first live run
+///   (`PROTOCOL.i2p-bt` §2.8) while we read it as a router's fault.
+///
+/// The length is not fixed: the certificate's own header says how long its
+/// payload is, so a destination is `387 + payload` bytes. Anything shorter
+/// than a certificate header is not a destination at all.
+///
+/// Returns `None` rather than guessing, because a wrong answer here is a
+/// wrong identity, and a wrong identity fails silently everywhere at once.
+#[must_use]
+pub fn destination_bytes(dest: &str) -> Option<Vec<u8>> {
+    // SAM sometimes suffixes a base32 label; the blob proper is the leading
+    // base64 run. Cut at the first character outside the I2P base64 alphabet
+    // (e.g. a stray '.' or newline).
+    let body: String = dest
+        .trim()
+        .chars()
+        .take_while(|&c| c == '=' || I2P_B64_ALPHABET.contains(&(c as u8)))
+        .collect();
+    let mut bytes = i2p_base64_decode(&body)?;
+    let len = destination_len(&bytes)?;
+    bytes.truncate(len);
+    Some(bytes)
+}
+
+/// How many leading bytes of `blob` are the public destination.
+#[must_use]
+pub fn destination_len(blob: &[u8]) -> Option<usize> {
+    let header_end = CERT_OFFSET + CERT_HEADER;
+    if blob.len() < header_end {
+        return None;
+    }
+    let payload = usize::from(u16::from_be_bytes([
+        blob[CERT_OFFSET + 1],
+        blob[CERT_OFFSET + 2],
+    ]));
+    let total = header_end.checked_add(payload)?;
+    (blob.len() >= total).then_some(total)
 }
 
 /// RFC 4648 base32 encode, lowercase, unpadded.
@@ -194,6 +249,20 @@ pub fn i2p_base64_decode(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// A realistic destination blob: 256-byte key field, 128-byte signing
+    /// field, then a KEY certificate. `extra` bytes of private key material
+    /// are appended, which is what SAM actually hands back and what must
+    /// never reach the wire or the identity (see [`destination_bytes`]).
+    pub(super) fn dest_blob(fill: u8, cert_payload: &[u8], extra: usize) -> Vec<u8> {
+        let mut blob = vec![fill; CERT_OFFSET];
+        blob.push(0x05);
+        let len = u16::try_from(cert_payload.len()).expect("small cert");
+        blob.extend_from_slice(&len.to_be_bytes());
+        blob.extend_from_slice(cert_payload);
+        blob.extend(std::iter::repeat_n(0xAA, extra));
+        blob
+    }
+
     #[test]
     fn base32_rfc4648_vectors() {
         // RFC 4648 vectors, lowercased and unpadded.
@@ -302,13 +371,75 @@ mod tests {
         assert!(DestHash::from_b32(&"A".repeat(52)).is_none());
     }
 
+    /// The bug that made every live run fail, pinned with the shape SAM
+    /// actually returns.
+    ///
+    /// A `SAMv3` `SESSION STATUS DESTINATION=` field is the session's private
+    /// key blob: the public destination, then the private crypto and signing
+    /// keys. Captured from i2pd on 2026-07-27 it was 679 bytes — 391 of
+    /// destination (a KEY certificate with a 4-byte payload) and 288 of key
+    /// material that must never leave the process.
+    ///
+    /// Two things must hold, and neither did:
+    ///   - our identity is the hash of the destination, not of the blob;
+    ///   - what we publish is the destination, not the blob.
+    #[test]
+    fn a_sam_destination_field_is_a_private_key_blob_and_is_cut_to_its_destination() {
+        let cert = [0x00, 0x07, 0x00, 0x00];
+        let blob = dest_blob(0x42, &cert, 288);
+        assert_eq!(blob.len(), 679, "the shape i2pd returned");
+
+        let dest_len = destination_len(&blob).expect("a destination is in there");
+        assert_eq!(
+            dest_len, 391,
+            "384 key bytes + 3 cert header + 4 cert payload"
+        );
+
+        let b64 = i2p_base64_encode(&blob);
+        let cut = destination_bytes(&b64).expect("parses");
+        assert_eq!(cut.len(), dest_len);
+        assert_eq!(cut, blob[..dest_len], "the private half is dropped");
+
+        // The identity is the destination's hash. Hashing the whole blob —
+        // which is what clove did — yields a name nothing can resolve, and a
+        // router asked to look it up can only answer "leaseSet not found".
+        assert_eq!(
+            DestHash::from_b64_destination(&b64).unwrap(),
+            DestHash(Sha256::digest(&blob[..dest_len]).into())
+        );
+        assert_ne!(
+            DestHash::from_b64_destination(&b64).unwrap(),
+            DestHash(Sha256::digest(&blob).into()),
+            "hashing the private keys too is the bug this test exists for"
+        );
+    }
+
+    /// Certificates vary in length, so the destination does too; and anything
+    /// that cannot state its own length is not a destination.
+    #[test]
+    fn destination_length_comes_from_the_certificate_not_a_constant() {
+        assert_eq!(destination_len(&dest_blob(1, &[], 0)), Some(387));
+        assert_eq!(destination_len(&dest_blob(1, &[0; 4], 0)), Some(391));
+        assert_eq!(destination_len(&dest_blob(1, &[0; 64], 999)), Some(451));
+
+        // Too short to hold a certificate header at all.
+        assert_eq!(destination_len(&[0u8; 386]), None);
+        assert_eq!(destination_len(&[]), None);
+        // A certificate claiming more payload than the blob carries.
+        let mut truncated = dest_blob(1, &[0; 64], 0);
+        truncated.truncate(400);
+        assert_eq!(destination_len(&truncated), None);
+        // And the short forms that used to be accepted as whole destinations.
+        assert!(DestHash::from_b64_destination(&i2p_base64_encode(&[0x42; 48])).is_none());
+    }
+
     #[test]
     fn dest_hash_from_b64_matches_sha256() {
-        // A stand-in "destination": some bytes. Its DestHash is the SHA-256
-        // of those bytes, regardless of encoding.
-        let dest_bytes = [0x42u8; 48];
+        // A destination is the key material plus its certificate; its
+        // DestHash is the SHA-256 of exactly those bytes.
+        let dest_bytes = dest_blob(0x42, &[0x00, 0x07, 0x00, 0x00], 0);
         let b64 = i2p_base64_encode(&dest_bytes);
-        let expected = DestHash(Sha256::digest(dest_bytes).into());
+        let expected = DestHash(Sha256::digest(&dest_bytes).into());
         assert_eq!(DestHash::from_b64_destination(&b64).unwrap(), expected);
 
         // Trailing whitespace / suffix is tolerated.
@@ -337,6 +468,7 @@ mod hostile_tests {
     //! to: parse or return `None` — never panic, never loop, never accept
     //! something the encoder would not have produced.
 
+    use super::tests::dest_blob;
     use super::*;
 
     /// A deterministic xorshift, so a failure reproduces from its seed
@@ -412,7 +544,7 @@ mod hostile_tests {
         // the standard characters is not ours, and accepting it would hash a
         // different byte string than the router did — a peer identity that
         // silently disagrees with everyone else's.
-        let dest = i2p_base64_encode(&[0xFB; 48]);
+        let dest = i2p_base64_encode(&dest_blob(0xFB, &[0x00, 0x07, 0x00, 0x00], 0));
         assert!(DestHash::from_b64_destination(&dest).is_some());
         assert!(i2p_base64_decode("+").is_none());
         assert!(i2p_base64_decode("/").is_none());
@@ -436,7 +568,7 @@ mod hostile_tests {
         // SAM may append a base32 label or params after the destination.
         // Everything from the first character outside the alphabet is
         // ignored, and the prefix alone decides the hash.
-        let dest = i2p_base64_encode(&[0x11; 45]);
+        let dest = i2p_base64_encode(&dest_blob(0x11, &[0x00, 0x07, 0x00, 0x00], 0));
         let expected = DestHash::from_b64_destination(&dest).expect("plain destination");
         for suffix in [
             " FROM_PORT=0 TO_PORT=0",

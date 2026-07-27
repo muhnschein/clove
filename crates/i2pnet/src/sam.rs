@@ -258,13 +258,25 @@ impl SamSession {
             ..Default::default()
         };
         let session = Session::<style::Stream>::new(options).map_err(map_err)?;
+        // What SAM hands back is the session's *private key blob*, not its
+        // destination (SAMv3 SESSION STATUS). Everything clove publishes must
+        // be the public destination at the front of it — the hash we call
+        // ourselves by, and the base64 an announce carries. Sending the rest
+        // to a tracker means sending our private keys to a stranger, which is
+        // exactly what clove did until 2026-07-27 (`PROTOCOL.i2p-bt` §5.1c).
+        let bytes = crate::addr::destination_bytes(session.destination()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SAM returned a destination clove cannot parse",
+            )
+        })?;
         let local = DestHash::from_b64_destination(session.destination()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "SAM returned an unparseable destination",
             )
         })?;
-        let local_b64 = session.destination().to_owned();
+        let local_b64 = crate::addr::i2p_base64_encode(&bytes);
         Ok(SamSession {
             session: Mutex::new(session),
             local,
@@ -699,7 +711,10 @@ mod tests {
 
     #[test]
     fn read_dest_line_parses_dest_and_leaves_payload() {
-        let dest_bytes = [0x42u8; 48];
+        // A destination-shaped blob: an inbound peer's header carries a real
+        // destination, and anything shorter is not one.
+        let mut dest_bytes = vec![0x42u8; 384];
+        dest_bytes.extend_from_slice(&[0x05, 0x00, 0x04, 0x00, 0x07, 0x00, 0x00]);
         let b64 = i2p_base64_encode(&dest_bytes);
         let expected = DestHash::from_b64_destination(&b64).unwrap();
 

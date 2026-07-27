@@ -57,9 +57,12 @@ Status legend:
       - `port=6881` as a placeholder — I2P has no port, but trackers/params
         parsers expect the key;
       - `ip=<our base64 destination>` — the I2P convention for telling the
-        tracker our destination, since there is no IP to observe. This is
-        what i2psnark does; verify the exact value form (bare base64 vs.
-        with a suffix) against a live postman/opentracker announce. [open]
+        tracker our destination, since there is no IP to observe.
+
+    [decided] as of 2026-07-27: the parameter is **required** by postman's
+    tracker (omitting it answers `failure reason: Missing key: ip`), and its
+    value is the **public destination** — not the private key blob SAM hands
+    back, which is what clove sent for its whole life. See §5.1c.
 
 5.1a [decided] Trackers answer `Transfer-Encoding: chunked`, and clove's HTTP
     client did not implement it. postman's `announce.php` does, as any PHP
@@ -78,7 +81,7 @@ Status legend:
     prefix of what did arrive, so the next surprise is one log line rather
     than a session.
 
-5.1b [open] `tracker2.postman.i2p` answered an announce with **HTTP 200 and a
+5.1b [decided] `tracker2.postman.i2p` answered an announce with **HTTP 200 and a
     styled HTML page** (observed 2026-07-27, i2pd 2.x, live). Not a bencoded
     `failure reason`, not an error status — a web page, served where an
     announce belongs.
@@ -139,6 +142,44 @@ Status legend:
     its stylesheet. `preview` now summarises HTML — `<title>` plus the first
     visible words — rather than quoting the head, which is what "identify the
     page" actually needs.
+
+5.1c [decided] **SAM's `DESTINATION=` field is the session's private key
+    blob, not its destination — and clove was announcing the whole thing.**
+    Root cause of every failure in §5.1b, found 2026-07-27 by decoding the
+    announce clove actually sent.
+
+    `SESSION STATUS RESULT=OK DESTINATION=<b64>` returns the *private keys*.
+    The public destination is only their first 387-or-so bytes; the remainder
+    is the private crypto and signing key. Captured from i2pd: 908 base64
+    characters, 679 bytes — 391 of destination (a KEY certificate with a
+    4-byte payload) and 288 of key material. Both halves are one unbroken
+    base64 run, so nothing about the string says where one ends.
+
+    Consequences, all of which had been misread as something else:
+
+      - **Every announce carried our private keys** to the tracker in `ip=`.
+        postman's PaTracker refused each one as a policy violation, which was
+        correct and generous. The bisect that found it: dropping `ip=`
+        entirely changes the answer to `failure reason: Missing key: ip`, so
+        the parameter is required *and* ours was wrong.
+      - **Our own `DestHash` was the hash of the private blob.** Every b32
+        clove printed, published over PEX, or dialled in a loopback test named
+        nothing at all. A router asked to resolve it can only fail — which is
+        precisely the "lease set not found" that §2.8 recorded as an emissary
+        defect, and the `CantReachPeer` that §2.6b blamed on young routers.
+        Those entries stand as observations; their attribution was wrong.
+
+    clove now cuts the blob to its destination before using it, at the one
+    place it enters the process (`i2pnet::addr::destination_bytes`). The
+    length comes from the certificate's own header, so it survives whatever
+    key types a router uses. Anything too short to hold a certificate header
+    is refused rather than guessed at: a wrong answer here is a wrong
+    identity, and a wrong identity fails silently everywhere at once.
+
+    The lesson for the rest of this file: **`§2.8` and `§2.6b` were written
+    from live logs and were still wrong**, because the evidence was consistent
+    with a router bug and nobody decoded what we were sending. Prefer decoding
+    your own output before attributing a fault upstream.
 
 5.2 [decided] Any query already present in the announce URL (e.g. postman's
     `/announce.php?...`) is preserved; clove appends its params with the
