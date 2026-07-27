@@ -59,10 +59,26 @@ Status legend:
       - `ip=<our base64 destination>` — the I2P convention for telling the
         tracker our destination, since there is no IP to observe.
 
-    [decided] as of 2026-07-27: the parameter is **required** by postman's
-    tracker (omitting it answers `failure reason: Missing key: ip`), and its
-    value is the **public destination** — not the private key blob SAM hands
-    back, which is what clove sent for its whole life. See §5.1c.
+    [decided] as of 2026-07-27, and now against the normative spec rather than
+    by inference. The I2P BitTorrent specification (i2p.net, "Bittorrent over
+    I2P") states it plainly: *"The value of the ip key is the base 64 of the
+    client's Destination"*, that *"current Destinations for clients are 387 or
+    more bytes (516 or more in Base 64 encoding)"*, and that a tracker
+    *"should probably decode and reject bad Base64 when announced"*.
+
+    All three sentences describe what happened to us. The parameter is
+    required (omitting it answers `failure reason: Missing key: ip`); the
+    value is the 387-plus-byte Destination, not the 679-byte private key blob
+    clove was sending; and postman's tracker rejecting the bad value was the
+    spec's own recommended behaviour. See §5.1c. This closes the oldest
+    [assumed] in this file.
+
+    Observed variant, unconfirmed: XD (`lib/tracker/http.go`) builds `ip` from
+    its network address plus a `.i2p` suffix rather than from a base64
+    Destination. Whether that resolves to the same thing depends on what its
+    SAM layer returns from `Addr()`, which the announce code does not say —
+    recorded because a second form may exist in the wild, not as a licence to
+    send one.
 
 5.1a [decided] Trackers answer `Transfer-Encoding: chunked`, and clove's HTTP
     client did not implement it. postman's `announce.php` does, as any PHP
@@ -612,12 +628,25 @@ Status legend:
     blocks over that are rejected. Matches i2psnark.
 
 4.3 [decided] i2p_pex (clove-core::pex): a bencoded dict with `added` and
-    `dropped` byte strings, each concatenated 32-byte destination hashes.
-    Unlike clearnet ut_pex there are no `added.f` flag bytes and no
-    IPv6/`added6` keys; any extra keys a peer sends are ignored. A message
-    over MAX_PEX_PEERS (512) is rejected as spam. [open] whether i2psnark
-    ever attaches flags we should honor — confirm live, treat i2psnark as
-    normative (R4).
+    `dropped` byte strings, each concatenated 32-byte destination hashes. No
+    IPv6/`added6` keys. A message over MAX_PEX_PEERS (512) is rejected as
+    spam.
+
+    **Correction, 2026-07-27.** This entry previously asserted that "unlike
+    clearnet ut_pex there are no `added.f` flag bytes". That is wrong: the
+    I2P specification says the dict has **up to three keys — `added`,
+    `added.f` and `dropped`** — and that i2p_pex is based on ut_pex, whose
+    flag semantics are documented nowhere except libtorrent's source (which
+    is what R4 has always said).
+
+    No interop cost, by luck rather than judgement: `PexMessage::parse` takes
+    the keys it knows and ignores the rest, so an `added.f` from i2psnark is
+    dropped rather than refused. clove neither sends nor honours flags, which
+    stays true until there is a reason. But the assertion was made without
+    checking, sat in a file whose whole purpose is to be checkable, and was
+    corrected only when somebody read the spec — the same failure as §5.1c,
+    one layer up. [open] remains: what the flags mean and whether any of them
+    should change behaviour.
 
     Whether PEX is working at all is now countable rather than inferable:
     Torrent::pex_learned counts destinations first heard of in a peer's PEX

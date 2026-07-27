@@ -4,7 +4,10 @@
 //! swarm can grow without every client hammering the tracker. The I2P form
 //! (R4: i2psnark is normative, `docs/PROTOCOL.i2p-bt`) is a bencoded dict
 //! with `added` and `dropped` byte strings, each a concatenation of 32-byte
-//! destination hashes — no ports, and none of clearnet `ut_pex`'s `added.f`
+//! destination hashes — no ports, and no IPv6 keys. The I2P specification
+//! also allows an `added.f` flag string, which clove neither sends nor reads;
+//! unknown keys are ignored, so a peer that sends one still interoperates
+//! (`docs/PROTOCOL.i2p-bt` §4.3). Not clearnet `ut_pex`'s
 //! flag bytes or IPv6 keys. Any extra keys a peer sends are ignored.
 //!
 //! Hostile input is a first-class concern here (§10: "PEX spam"): a message
