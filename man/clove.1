@@ -65,8 +65,23 @@ never put into raw mode, so
 .Ic Ctrl-C
 leaves it exactly as it was.
 .It Cm show Ar info-hash Op Fl -json
-One torrent in detail: sizes, progress, state, the file table with per-file
-priorities, and the announce URLs.
+One torrent in detail: sizes, progress, state, peer counts, bytes moved, the
+file table with per-file priorities, and the announce URLs.
+.Pp
+The peer counts answer different questions.
+.Sy peers
+is how many are connected right now;
+.Sy known_peers
+is how many destinations are known and could be dialed;
+.Sy pex_peers
+is how many of those were first learned from another peer's
+.Sy i2p_pex
+message rather than from a tracker; and
+.Sy inbound_peers
+is how many peers dialed
+.Em us .
+The last two count since the torrent started rather than describing the
+present, so a peer that has since disconnected still shows in them.
 .It Cm add Ar file | Ar magnet
 Add a torrent from a
 .Pa .torrent

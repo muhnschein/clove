@@ -30,6 +30,13 @@ usage: ci/live-report.sh [options]
                        Without this, routers that are not already answering are
                        recorded as skipped.
   --routers "a b c"    which routers to test (default: i2pd java emissary)
+  --swarm TORRENT      also run the live-swarm tier (ci/live-swarm.sh) against a
+                       magnet URI or .torrent you supply. This is the tier worth
+                       having; see the note below.
+  --swarm-router NAME  which router the swarm run uses (default: the first one
+                       answering). One download is enough; three is a day.
+  --swarm-deadline N   swarm download budget, seconds (default 3600)
+  --swarm-seed N       swarm seeding budget after completion (default 900)
   --stress "16 32 64"  sam-stress concurrency levels (default: 16 32 64 128)
   --out FILE           report path (default: live-report-<timestamp>.txt)
   --lines N            per-command output cap, head+tail (default: 250)
@@ -38,13 +45,27 @@ usage: ci/live-report.sh [options]
   --help               this
 
 Typical first run:
-    ./ci/live-report.sh --up 2>&1 | tail -20
+    ./ci/live-report.sh --up --swarm 'magnet:?xt=urn:btih:…' 2>&1 | tail -20
 Then send the file it names.
+
+On --swarm: the loopback tiers below it (readiness, the gated tests,
+sam-stress) all put two destinations on one router and need a leaseSet
+published seconds ago to be resolvable — the most fragile thing a young router
+does, and where every run so far died without implicating clove
+(PROTOCOL.i2p-bt 2.6c, 2.8). The swarm tier needs none of that and proves more,
+so it runs first and does not depend on the readiness gate.
 USAGE
 }
 
 ROUTERS="i2pd java emissary"
 STRESS="16 32 64 128"
+SWARM=""
+SWARM_ROUTER=""
+# The swarm tier's two budgets. They live here, and the wrapper timeout below
+# is computed from them rather than written down a second time — the rule this
+# script learned the hard way (PROTOCOL.i2p-bt 2.6d).
+SWARM_DEADLINE=${SWARM_DEADLINE:-3600}
+SWARM_SEED=${SWARM_SEED:-900}
 # Budget handed to the readiness probe, and the margin the outer `timeout` adds
 # on top so the wrapper always outlives what it wraps (cargo startup, a slow
 # release link, the report the probe prints on its way out). Every nested
@@ -61,6 +82,10 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --up) BRING_UP=yes ;;
         --routers) ROUTERS="${2:?--routers needs a value}"; shift ;;
+        --swarm) SWARM="${2:?--swarm needs a magnet or .torrent}"; shift ;;
+        --swarm-router) SWARM_ROUTER="${2:?--swarm-router needs a value}"; shift ;;
+        --swarm-deadline) SWARM_DEADLINE="${2:?--swarm-deadline needs a value}"; shift ;;
+        --swarm-seed) SWARM_SEED="${2:?--swarm-seed needs a value}"; shift ;;
         --stress) STRESS="${2:?--stress needs a value}"; shift ;;
         --out) OUT="${2:?--out needs a value}"; shift ;;
         --lines) LINES="${2:?--lines needs a value}"; shift ;;
@@ -79,6 +104,12 @@ case "${OUT:-}" in
     "" | /*) ;;
     *) OUT="$PWD/$OUT" ;;
 esac
+# A .torrent handed to --swarm gets the same treatment: it names a file in the
+# caller's directory, not one in the checkout. A magnet is left alone.
+case "${SWARM:-}" in
+    "" | /* | magnet:*) ;;
+    *) SWARM="$PWD/$SWARM" ;;
+esac
 cd "$(dirname "$0")/.."
 [ -n "$OUT" ] || OUT="live-report-$(date +%Y%m%d-%H%M%S).txt"
 : > "$OUT"
@@ -92,6 +123,9 @@ T_STRESS=600
 # for the case where even that fails to return.
 STRESS_DEADLINE=${STRESS_DEADLINE:-300}
 T_UP=600
+# The swarm wrapper outlives what it wraps: both of the script's phases, plus
+# a release build and the final verify pass. Derived, never written twice.
+T_SWARM=$((SWARM_DEADLINE + SWARM_SEED + 900))
 
 SUMMARY=""
 
@@ -298,10 +332,49 @@ else
     skip "tier1" "--skip-tier1"
 fi
 
+# ------------------------------------------------------------------- tier 3
+#
+# Ahead of tier 2 on purpose. Tier 2 is the loopback topology — two
+# destinations on one router, dialing each other — which needs a leaseSet
+# published seconds ago to be resolvable by a sibling session on the same
+# router. That is the most fragile netDb operation a young router performs, one
+# router cannot do it at all (PROTOCOL.i2p-bt 2.8), and it is where every
+# recorded run has died without any of those deaths implicating clove.
+#
+# The swarm tier asks the network for strictly less: it resolves destinations
+# that have been published for months, and the download half never needs our
+# own leaseSet resolved by anybody, because I2P bundles it with the stream's
+# opening message. It also proves far more — tracker, BEP 9, picker, choker,
+# storage, PEX, and the inbound path, against i2psnark. So it goes first, and
+# it does not sit behind the readiness gate.
+
+if [ -n "$SWARM" ]; then
+    if [ -z "$SWARM_ROUTER" ]; then
+        for r in $ROUTERS; do
+            p=$(sam_port_of "$r")
+            if [ -n "$p" ] && port_answers "$p"; then SWARM_ROUTER="$r"; break; fi
+        done
+    fi
+    say ""
+    say "########## tier 3 — a live swarm ##########"
+    if [ -z "$SWARM_ROUTER" ]; then
+        skip "tier3: live swarm" "no router is answering"
+    else
+        say "subject: $SWARM"
+        say "router:  $SWARM_ROUTER"
+        step "tier3: live swarm ($SWARM_ROUTER)" "$T_SWARM" \
+            ./ci/live-swarm.sh --router "$SWARM_ROUTER" \
+            --deadline "$SWARM_DEADLINE" --seed-for "$SWARM_SEED" \
+            "$SWARM" || true
+    fi
+else
+    skip "tier3: live swarm" "no --swarm torrent given"
+fi
+
 # ------------------------------------------------------------------- tier 2
 
 say ""
-say "########## tier 2 — live routers ##########"
+say "########## tier 2 — live routers (loopback topology) ##########"
 
 for r in $ROUTERS; do
     port=$(sam_port_of "$r")

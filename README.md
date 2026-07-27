@@ -58,16 +58,25 @@ make chaos                  # SIGKILL storms and failed state writes
 make man-lint               # the manuals still parse
 ```
 
-Everything above runs from a clean checkout with no infrastructure. Two tiers
-need more: `make test-live` (or `make matrix`, for every router) wants a local
-I2P router (see
-[`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md)), and `make fuzz` wants a
-nightly toolchain (see [`fuzz/README.md`](fuzz/README.md)).
+Everything above runs from a clean checkout with no infrastructure. The tiers
+that need more want a local I2P router (see
+[`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md)); `make fuzz` wants a nightly
+toolchain (see [`fuzz/README.md`](fuzz/README.md)).
 
-`make report` runs every tier that applies on the machine — including each
-router in turn — and writes one file with the verdicts, the router versions and
-the container logs, so a live session produces something reviewable rather than
-a scrollback.
+```
+make swarm TORRENT='magnet:?xt=urn:btih:…'   # the real thing, against a real swarm
+make test-live                               # the router-gated loopback tests
+make report ARGS="--up --swarm magnet:?…"    # every tier, into one file
+```
+
+`make swarm` is the one to run first: it builds the binaries, points `cloved`
+at your router, downloads a torrent you name from live i2psnark peers, seeds it
+back, and prints a milestone table saying how far it got — tracker announce,
+metadata, first peer, first verified piece, completion, PEX, bytes served, and
+whether a remote peer dialed us. `make report` runs every tier that applies on
+the machine and writes one file with the verdicts, the router versions and the
+container logs, so a live session produces something reviewable rather than a
+scrollback.
 
 CI runs all of the above plus rustfmt, `clippy::pedantic` denied,
 `cargo deny`, and `ci/check-net-deps.sh` — the gate that fails the build if a

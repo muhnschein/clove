@@ -186,6 +186,16 @@ struct Shared {
     /// Lifetime payload bytes received this run (counted when a solicited
     /// block is written, before verification).
     downloaded: std::sync::atomic::AtomicU64,
+    /// Peers this run that reached *us* — accepted through the router's
+    /// `STREAM FORWARD` rather than dialed by us.
+    ///
+    /// The inbound path is the half of `PROTOCOL.i2p-bt` §2.5 that no
+    /// router-free test can reach: it needs a remote router to resolve our
+    /// leaseSet and open a stream to it. One non-zero reading against a
+    /// public swarm settles that, and settles it more convincingly than the
+    /// loopback test does, because the peer that dialed us is somebody else's
+    /// router doing it for its own reasons.
+    inbound: std::sync::atomic::AtomicU64,
     storage: Arc<Storage>,
     num_pieces: u32,
     max_frame: u32,
@@ -213,6 +223,15 @@ struct State {
     /// Peer destinations we know about (from connections, PEX, or the
     /// tracker), for peer exchange and future dialing.
     known_peers: HashSet<DestHash>,
+    /// How many destinations we first heard of from a peer's `i2p_pex`
+    /// message rather than from a tracker or an inbound connection.
+    ///
+    /// Counted because "PEX acquisition observed" is an M3 exit criterion
+    /// (`docs/LIVE-TESTING.md` §6.2) and there was no way to observe it from
+    /// outside the engine: `known_peers` grows from three sources at once, so
+    /// watching it climb during a live run proves nothing about which one was
+    /// responsible. This number is only ever bumped on the PEX path.
+    pex_learned: u64,
 }
 
 impl State {
@@ -221,9 +240,13 @@ impl State {
     /// Refusing new entries rather than evicting old ones keeps the peers we
     /// learned first — which includes every peer we are connected to, since
     /// registering a connection records its destination.
-    fn remember_peer(&mut self, dest: DestHash) {
+    ///
+    /// Returns whether this destination was new to us.
+    fn remember_peer(&mut self, dest: DestHash) -> bool {
         if self.known_peers.len() < MAX_KNOWN_PEERS || self.known_peers.contains(&dest) {
-            self.known_peers.insert(dest);
+            self.known_peers.insert(dest)
+        } else {
+            false
         }
     }
 }
@@ -311,6 +334,7 @@ impl Torrent {
             peer_id,
             uploaded: std::sync::atomic::AtomicU64::new(0),
             downloaded: std::sync::atomic::AtomicU64::new(0),
+            inbound: std::sync::atomic::AtomicU64::new(0),
             storage,
             num_pieces,
             max_frame,
@@ -325,6 +349,7 @@ impl Torrent {
                 peers: Vec::new(),
                 next_id: 0,
                 known_peers: HashSet::new(),
+                pex_learned: 0,
             }),
             done: Mutex::new(false),
             done_cv: Condvar::new(),
@@ -429,6 +454,30 @@ impl Torrent {
             .iter()
             .copied()
             .collect()
+    }
+
+    /// How many peers this run reached us inbound, through the router's
+    /// `STREAM FORWARD`, rather than being dialed by us.
+    ///
+    /// Cumulative for the run, not a count of live connections: a peer that
+    /// connected and left still proves the inbound path carried a stream,
+    /// which is the fact worth keeping (`PROTOCOL.i2p-bt` §2.5).
+    #[must_use]
+    pub fn inbound_peers(&self) -> u64 {
+        self.shared
+            .inbound
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many peer destinations we first learned from an `i2p_pex` message.
+    ///
+    /// The M3 exit criterion is "peers learned via `i2p_pex` beyond the
+    /// tracker's set" (`docs/LIVE-TESTING.md` §6.2), which was previously
+    /// only checkable by reading a packet capture or trusting a hunch. A
+    /// non-zero value here is that criterion, met.
+    #[must_use]
+    pub fn pex_learned(&self) -> u64 {
+        lock(&self.shared.state).pex_learned
     }
 
     /// The peers currently attached (handshaken, threads running). The swarm
@@ -572,6 +621,14 @@ impl Torrent {
             ));
         }
         stream.write_all(&self.our_handshake().encode())?;
+        // Counted here, not after `finish_attach`: what this number is
+        // evidence *of* is that a remote router resolved our leaseSet and
+        // carried a handshake in both directions, and that is now true. A
+        // later failure to split the stream or spawn its threads is a local
+        // problem and would not make the transport claim any less settled.
+        self.shared
+            .inbound
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.finish_attach(stream, remote, theirs)
     }
 
@@ -892,7 +949,9 @@ impl Shared {
             OUR_PEX_ID => {
                 if let Ok(pex) = PexMessage::parse(payload) {
                     for dest in pex.added {
-                        st.remember_peer(dest);
+                        if st.remember_peer(dest) {
+                            st.pex_learned = st.pex_learned.saturating_add(1);
+                        }
                     }
                 }
             }
@@ -1427,6 +1486,18 @@ mod tests {
         assert!(
             b.known_peers().contains(&x),
             "B never learned peer X via i2p_pex"
+        );
+
+        // The counter M3's "PEX acquisition observed" criterion is read from
+        // (docs/LIVE-TESTING.md §6.2). It must count only what PEX taught us:
+        // B also knows A, from the connection itself, and A knows both B and
+        // X without either arriving over PEX.
+        assert_eq!(b.pex_learned(), 1, "B learned exactly one peer over PEX");
+        assert_eq!(
+            a.pex_learned(),
+            0,
+            "A learned nothing over PEX; its peers came from add_peers and \
+             from the connection"
         );
     }
 

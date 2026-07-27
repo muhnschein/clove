@@ -346,6 +346,41 @@ Status legend:
     succeeds is still unmeasured.
 
 
+2.11 [decided] The loopback topology every tier-2 test uses is *harder* on the
+    router than the swarm path it stands in for, and it was gating the swarm
+    path. Recorded because three live sessions were spent on the strict side of
+    that asymmetry without any of them saying anything about clove.
+
+    What the loopback test needs, and the swarm path does not:
+
+      - a destination created seconds ago to have published its leaseSet, and
+      - a *second session on the same router* to resolve that leaseSet.
+
+    Both are netDb operations on the freshest possible data. The second one is
+    the one emissary cannot do at all with a demonstrably healthy router (2.8),
+    and the first is what a young or firewalled router is worst at (2.6b).
+
+    What a swarm peer does instead: resolve a destination that has been
+    published for months by a router that wants to be found. And for the
+    download half, our own destination need not be resolvable by anyone —
+    I2P bundles the sender's leaseSet with the stream's opening message, so the
+    far side answers without a netDb lookup. A leecher that no floodfill has
+    ever heard of still completes a download.
+
+    Consequence for the test suite, not for the wire: run the swarm tier first
+    (`make swarm`, ci/live-swarm.sh), and treat a loopback failure alongside
+    swarm success as a finding about the router. The loopback tier stays — it
+    is a fine diagnostic, and sam-stress is still the only instrument that
+    answers R2 — but it is no longer the gate, and ci/live-report.sh no longer
+    skips everything behind it.
+
+    Note the direction of the remaining gap: *seeding* does need our leaseSet
+    published and resolvable by a remote router, since that is how a peer
+    reaches us at all. That is exactly what the `inbound-peer` milestone
+    measures (clove_core::torrent::Torrent::inbound_peers), and it is a
+    stronger result than the loopback test's inbound leg, because the router
+    that resolved us is somebody else's and had its own reasons.
+
 3. Reconnect discipline (i2pnet::supervisor, M1)
 ------------------------------------------------
 
@@ -377,6 +412,13 @@ Status legend:
     over MAX_PEX_PEERS (512) is rejected as spam. [open] whether i2psnark
     ever attaches flags we should honor — confirm live, treat i2psnark as
     normative (R4).
+
+    Whether PEX is working at all is now countable rather than inferable:
+    Torrent::pex_learned counts destinations first heard of in a peer's PEX
+    message, and the daemon publishes it as `pex_peers`. known_peers grows from
+    three sources at once, so watching that number climb during a live run
+    proved nothing about which source was responsible — which is why M3's "PEX
+    acquisition observed" box sat unticked with no way to tick it honestly.
 
 4.4 [decided] ut_metadata (BEP 9, clove-core::metadata): standard 16 KiB
     metadata pieces; a data message is a bencoded {msg_type,piece,
