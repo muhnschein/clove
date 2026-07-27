@@ -173,7 +173,13 @@ pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// Malformed bencode, a tracker `failure reason`, a missing/short interval,
 /// or a compact peers string whose length is not a multiple of 32.
 pub fn parse_response(body: &[u8]) -> Result<AnnounceResponse, Error> {
-    let root = bencode::decode(body).map_err(|_| Error::BadResponse("not bencode"))?;
+    // The evidence travels with the complaint. "not bencode" on its own is a
+    // true statement about a chunk-framing header, an HTML error page and an
+    // empty body alike, and telling them apart cost a live session: every
+    // announce failed identically and the reason was one `1a4` away from
+    // obvious. `NotBencode` carries a bounded, printable prefix of whatever
+    // did arrive.
+    let root = bencode::decode(body).map_err(|_| Error::NotBencode(preview(body)))?;
     if let Some(reason) = root.get(b"failure reason").and_then(Value::as_str) {
         return Err(Error::TrackerFailure(reason.to_owned()));
     }
@@ -364,6 +370,40 @@ pub enum Error {
     TrackerFailure(String),
     /// The bencoded response was malformed.
     BadResponse(&'static str),
+    /// The body was not bencode at all, with a printable prefix of what it
+    /// actually was — an HTML error page, chunk framing, or nothing.
+    NotBencode(String),
+}
+
+/// Longest response prefix carried in a [`Error::NotBencode`].
+const PREVIEW_LEN: usize = 96;
+
+/// A bounded, single-line, printable rendering of a response body, for an
+/// error message an operator reads in a log.
+///
+/// Non-printable bytes become `.` rather than being escaped: this is a hint
+/// about what kind of thing arrived, not a hex dump, and a log line full of
+/// `\x1b` would be both longer and less readable. Control characters never
+/// reach the terminal, which matters when the bytes came off the network.
+fn preview(body: &[u8]) -> String {
+    if body.is_empty() {
+        return "<empty body>".to_owned();
+    }
+    let mut out: String = body
+        .iter()
+        .take(PREVIEW_LEN)
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    if body.len() > PREVIEW_LEN {
+        out.push('…');
+    }
+    out
 }
 
 impl std::fmt::Display for Error {
@@ -375,6 +415,9 @@ impl std::fmt::Display for Error {
             Error::HttpStatus(s) => write!(f, "tracker: HTTP status {s}"),
             Error::TrackerFailure(r) => write!(f, "tracker refused: {r}"),
             Error::BadResponse(w) => write!(f, "tracker: malformed response: {w}"),
+            Error::NotBencode(seen) => {
+                write!(f, "tracker: response is not bencode; it begins {seen:?}")
+            }
         }
     }
 }
@@ -592,6 +635,69 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// The live failure, end to end: postman answers chunked, and every
+    /// announce came back "not bencode" with zero peers. The announce path —
+    /// not just the HTTP reader — has to survive it.
+    #[test]
+    fn announce_over_a_chunked_stream() {
+        let mut peers = Vec::new();
+        peers.extend_from_slice(&[0x77; 32]);
+        peers.extend_from_slice(&[0x88; 32]);
+        let body = encode(&dict(vec![
+            ("interval", Value::Int(1800)),
+            ("peers", Value::Bytes(peers)),
+        ]));
+
+        // Two chunks, split at an arbitrary byte, as a webserver would.
+        let split = body.len() / 2;
+        let mut raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for part in [&body[..split], &body[split..]] {
+            raw.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            raw.extend_from_slice(part);
+            raw.extend_from_slice(b"\r\n");
+        }
+        raw.extend_from_slice(b"0\r\n\r\n");
+
+        let (_host, request) = build_announce("http://t.i2p/announce", &params()).unwrap();
+        let mut stub = Stub {
+            to_read: std::io::Cursor::new(raw),
+            written: Vec::new(),
+        };
+        let response = announce_over(&mut stub, &request).expect("chunked announce");
+        assert_eq!(response.interval, 1800);
+        assert_eq!(response.peers.len(), 2);
+    }
+
+    /// A body that is not bencode must arrive with the evidence attached. The
+    /// live run reported "not bencode" for a fortnight of runs and the answer
+    /// was in the first three bytes nobody could see.
+    #[test]
+    fn a_non_bencode_body_reports_what_it_actually_was() {
+        let html = b"<html><head><title>500 Internal Server Error</title></head>";
+        let Err(e) = parse_response(html) else {
+            panic!("HTML is not a valid announce response");
+        };
+        let text = e.to_string();
+        assert!(
+            text.contains("<html>") && text.contains("500"),
+            "the error must quote the body, got: {text}"
+        );
+
+        // Bounded, and control bytes never reach the terminal.
+        let Err(long) = parse_response(&[0x1b; 4096]) else {
+            panic!("escape bytes are not a valid announce response");
+        };
+        let text = long.to_string();
+        assert!(!text.contains('\u{1b}'), "control bytes must be scrubbed");
+        assert!(text.len() < 200, "the preview must be bounded: {text}");
+
+        // An empty body is its own diagnosis and says so.
+        let Err(empty) = parse_response(b"") else {
+            panic!("an empty body is not a valid announce response");
+        };
+        assert!(empty.to_string().contains("empty"));
     }
 
     #[test]
