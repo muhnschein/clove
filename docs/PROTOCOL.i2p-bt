@@ -61,6 +61,23 @@ Status legend:
         what i2psnark does; verify the exact value form (bare base64 vs.
         with a suffix) against a live postman/opentracker announce. [open]
 
+5.1a [decided] Trackers answer `Transfer-Encoding: chunked`, and clove's HTTP
+    client did not implement it. postman's `announce.php` does, as any PHP
+    script behind an ordinary webserver will. The reader fell through to its
+    read-until-close branch and handed the *chunk framing* to the bencode
+    parser, which reported "not bencode" — accurate about `1a4\r\n…` and
+    useless. Every announce failed identically, so the client acquired no
+    peers at all, on any torrent, ever (found live 2026-07-27).
+
+    Decoding is implemented in `clove_core::http` with the same hostile-input
+    discipline as the rest: bounded size lines, extensions parsed off and
+    ignored, `max_body` checked against the announced chunk size before
+    anything is allocated, trailers consumed rather than mistaken for body,
+    and chunked overriding a `Content-Length` sent alongside it (RFC 9112
+    §6.1). Announces that are *not* bencode now carry a bounded printable
+    prefix of what did arrive, so the next surprise is one log line rather
+    than a session.
+
 5.2 [decided] Any query already present in the announce URL (e.g. postman's
     `/announce.php?...`) is preserved; clove appends its params with the
     correct `?`/`&` separator.
@@ -399,6 +416,51 @@ Status legend:
     measures (clove_core::torrent::Torrent::inbound_peers), and it is a
     stronger result than the loopback test's inbound leg, because the router
     that resolved us is somebody else's and had its own reasons.
+
+2.12 [decided] yosemite 0.7.0's session controller is **one state machine
+    shared by the control connection and every stream operation**, and a
+    stream failure on an unexpected path leaves it unusable for the life of
+    the session. Found live 2026-07-27, from a run that spent ten minutes
+    cycling between `downloading` and `waiting-for-router` with zero peers.
+
+    Every entry point (`handshake_stream`, `create_stream`, `handle_response`)
+    opens with `mem::replace(&mut self.state, SessionState::Poisoned)` and
+    restores the state only on the paths it expects. So:
+
+      - `STREAM STATUS RESULT=<error>` — **recovered.** yosemite explicitly
+        resets `stream_state` to `Uninitialized` here, so an unreachable peer
+        (`CANT_REACH_PEER`) costs one dial and nothing else. This is the
+        common case on I2P and it is handled correctly.
+      - an unparseable or unexpected reply to the stream `HELLO`
+        (`InvalidMessage` / `InvalidState`), or a write/read failing partway
+        through `connect` — **not recovered.** The controller stays `Poisoned`
+        or mid-handshake, and every later `connect` on that session returns
+        `InvalidState`. Permanently. The state is private, so nothing outside
+        yosemite can reset it.
+
+    Observed signature, repeating on a ~90–120s cycle: one operation fails
+    with `protocol error: invalid message from router`, the next with
+    `protocol error: invalid state`, and then the session is rebuilt and it
+    starts over. `healthy()` did not catch it, because `send_command` writes a
+    `PING` on the control socket without consulting the state machine — a
+    wedged session answers PING perfectly happily while refusing every dial.
+
+    clove's answer, pending an upstream fix (R1: wrap behind the trait,
+    upstream, vendor if it stalls): `SamSession` tracks a `wedged` flag, set
+    only by the unrecoverable error classes above, and `healthy()` reports
+    false the moment it is set. The supervisor then rebuilds at once and says
+    it was a session fault rather than a lost router. `i2pnet::sam`'s
+    `wedges_the_session` holds the classification, with the test that keeps
+    `CANT_REACH_PEER` on the harmless side of it — putting it on the wrong
+    side would rebuild the session tree for every unreachable peer, which on a
+    real swarm is most of them.
+
+    This is a mitigation, not a fix, and it carries a cost worth stating: a
+    rebuild currently mints a *new transient destination* (Q4 persistent keys
+    are still deferred), so every wedge changes the address we just announced.
+    Closing that properly needs either the upstream repair or clove speaking
+    `STREAM CONNECT` itself — which would also close §2.7a, since a socket we
+    open is a socket we can set timeouts on.
 
 3. Reconnect discipline (i2pnet::supervisor, M1)
 ------------------------------------------------
