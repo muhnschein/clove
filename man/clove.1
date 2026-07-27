@@ -82,6 +82,15 @@ is how many peers dialed
 .Em us .
 The last two count since the torrent started rather than describing the
 present, so a peer that has since disconnected still shows in them.
+.Pp
+.Sy announces_ok ,
+.Sy announces_failed
+and
+.Sy last_announce_error
+answer the first question a torrent with no peers raises: whether its trackers
+are replying at all.
+.Sy last_announce_error
+appears only when an announce has failed, and carries the tracker's own words.
 .It Cm add Ar file | Ar magnet
 Add a torrent from a
 .Pa .torrent

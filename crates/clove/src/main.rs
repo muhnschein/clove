@@ -455,6 +455,11 @@ fn render_detail(value: &Value) -> String {
         "inbound_peers",
         "downloaded",
         "uploaded",
+        "announces_ok",
+        "announces_failed",
+        // Last, and unwrapped: it is a sentence, not a field, and it is the
+        // one line worth reading when a torrent has no peers.
+        "last_announce_error",
     ] {
         let Some(field) = value.get(key) else {
             continue;
@@ -468,7 +473,10 @@ fn render_detail(value: &Value) -> String {
                 .map_or_else(|| field.to_line(), |p| format!("{:.0}%", p * 100.0)),
             _ => field.to_line(),
         };
-        let _ = writeln!(out, "{key:<13}  {rendered}");
+        // Wide enough for the longest key printed here (`last_announce_error`),
+        // so the value column does not step right when a torrent has a
+        // problem — which is exactly when it is being read carefully.
+        let _ = writeln!(out, "{key:<19}  {rendered}");
     }
     if let Some(files) = value.get("files").and_then(Value::as_array) {
         out.push_str("\nfiles:\n");
