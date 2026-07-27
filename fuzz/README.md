@@ -18,6 +18,13 @@ This crate is **excluded from the workspace** (see the root `Cargo.toml`).
 count against the dependency budget, or appear in the workspace `Cargo.lock`
 that `ci/check-net-deps.sh` gates.
 
+Being outside the workspace, these targets are not compiled by
+`cargo test --workspace`, so CI runs `cargo check --manifest-path
+fuzz/Cargo.toml` on every push. Without it a changed signature in `clove-core`
+breaks a target silently and the nightly job is the first to notice, a day
+later. Building the targets needs no nightly toolchain; only *running* them
+does.
+
 ## Running
 
 ```sh
