@@ -307,31 +307,42 @@ fn spawn_metadata_fetch(daemon: &Arc<Daemon>, info_hash: [u8; 20]) {
     let daemon = Arc::clone(daemon);
     std::thread::spawn(move || {
         let mut first_round = true;
+        let mut rounds = 0u32;
         loop {
             // Outer None: the magnet resolved or was removed — stop.
             let Some(context) = lock(&daemon.registry).fetch_context(&info_hash) else {
                 return;
             };
-            if let Some(ctx) = context
-                && let Some(bytes) = try_fetch_round(&ctx, info_hash, first_round)
-            {
-                let completed = lock(&daemon.registry).complete_magnet(&info_hash, &bytes);
-                match completed {
-                    Ok(job) => {
-                        // Unlocked, like every other scan; a magnet's files were
-                        // only just laid out, so this one is quick.
-                        let _ = run_scan(&daemon, &job);
-                        eprintln!(
-                            "cloved: magnet {} resolved; torrent added",
+            if let Some(ctx) = context {
+                rounds += 1;
+                let (bytes, round) = try_fetch_round(&ctx, info_hash, first_round);
+                eprintln!(
+                    "cloved: magnet {} round {rounds}: {}",
+                    registry::hex(&info_hash),
+                    round.summary()
+                );
+                // Publish before acting on the result: a round that failed is
+                // exactly the one whose report has to reach `clove list`.
+                lock(&daemon.registry).note_fetch_round(&info_hash, rounds, &round);
+                if let Some(bytes) = bytes {
+                    let completed = lock(&daemon.registry).complete_magnet(&info_hash, &bytes);
+                    match completed {
+                        Ok(job) => {
+                            // Unlocked, like every other scan; a magnet's files
+                            // were only just laid out, so this one is quick.
+                            let _ = run_scan(&daemon, &job);
+                            eprintln!(
+                                "cloved: magnet {} resolved; torrent added",
+                                registry::hex(&info_hash)
+                            );
+                        }
+                        Err(e) => eprintln!(
+                            "cloved: magnet {} fetched but add failed: {e}",
                             registry::hex(&info_hash)
-                        );
+                        ),
                     }
-                    Err(e) => eprintln!(
-                        "cloved: magnet {} fetched but add failed: {e}",
-                        registry::hex(&info_hash)
-                    ),
+                    return;
                 }
-                return;
             }
             first_round = false;
             std::thread::sleep(FETCH_ROUND_WAIT);
@@ -339,19 +350,64 @@ fn spawn_metadata_fetch(daemon: &Arc<Daemon>, info_hash: [u8; 20]) {
     });
 }
 
+/// What one fetch round did, so the caller can log it and publish it.
+///
+/// This type exists because the round used to be six `let … else { continue }`
+/// arms that dropped every error on the floor. A magnet that never resolved
+/// therefore produced *no output at all* — no log line, no state beyond
+/// `fetching-metadata`, nothing to distinguish "the tracker's name will not
+/// resolve" from "the tracker returned no peers" from "thirty peers were
+/// dialed and none served the metadata". The first live swarm run spent nine
+/// minutes in exactly that hole. Every arm now records its reason
+/// (`SCOPE.md` §9: error text written for the operator reading a log at 2am).
+#[derive(Default)]
+pub(crate) struct FetchRound {
+    /// Trackers that answered with a peer list.
+    pub(crate) trackers_ok: usize,
+    /// Trackers that could not be built, resolved, dialed or announced to.
+    pub(crate) trackers_failed: usize,
+    /// Distinct peer destinations the trackers returned.
+    pub(crate) peers_returned: usize,
+    /// Peers dialed for metadata this round.
+    pub(crate) peers_tried: usize,
+    /// The most recent failure, with the stage that produced it. This is the
+    /// line an operator needs; it is kept rather than merely logged so
+    /// `clove list` can show it without anyone reading the daemon's stderr.
+    pub(crate) last_error: Option<String>,
+}
+
+impl FetchRound {
+    fn fail(&mut self, stage: &str, what: &str, e: &dyn std::fmt::Display) {
+        let text = format!("{stage} {what}: {e}");
+        eprintln!("cloved: metadata fetch: {text}");
+        self.last_error = Some(text);
+    }
+
+    /// One line summarising the round, or `None` when there is nothing worth
+    /// saying — a round that resolved the magnet speaks for itself.
+    fn summary(&self) -> String {
+        format!(
+            "{} tracker(s) answered, {} failed; {} peer(s) known, {} dialed for metadata",
+            self.trackers_ok, self.trackers_failed, self.peers_returned, self.peers_tried
+        )
+    }
+}
+
 /// One fetch round: announce to each tracker for peers, then ask each peer
-/// for the metadata. Returns synthesized `.torrent` bytes on success.
+/// for the metadata. Returns synthesized `.torrent` bytes on success, plus a
+/// report of what happened either way.
 /// Generic so the mock network proves it in tests.
 fn try_fetch_round<D>(
     ctx: &registry::FetchContext<D>,
     info_hash: [u8; 20],
     first_round: bool,
-) -> Option<Vec<u8>>
+) -> (Option<Vec<u8>>, FetchRound)
 where
     D: i2pnet::I2pDialer + i2pnet::I2pNamingLookup + Clone + Send + Sync + 'static,
 {
     use clove_core::tracker;
 
+    let mut round = FetchRound::default();
     let mut peers: Vec<DestHash> = Vec::new();
     for url in &ctx.trackers {
         let params = tracker::AnnounceParams {
@@ -368,33 +424,74 @@ where
             numwant: 30,
             our_dest_b64: &ctx.dest_b64,
         };
-        let Ok((host, request)) = tracker::build_announce(url, &params) else {
-            continue;
+        let (host, request) = match tracker::build_announce(url, &params) {
+            Ok(built) => built,
+            Err(e) => {
+                round.trackers_failed += 1;
+                round.fail("tracker URL", url, &e);
+                continue;
+            }
         };
-        let Ok(dest) = i2pnet::I2pNamingLookup::lookup(&ctx.naming, &host) else {
-            continue;
+        // The stage that most often stalls a magnet, and the one that used to
+        // be invisible: an address-book name the router has never heard of
+        // fails here, and the naming cache then declines to ask again for up
+        // to half an hour (i2pnet::naming) — so the symptom is not even a
+        // stream of lookups, it is silence.
+        let dest = match i2pnet::I2pNamingLookup::lookup(&ctx.naming, &host) {
+            Ok(dest) => dest,
+            Err(e) => {
+                round.trackers_failed += 1;
+                round.fail("resolving tracker", &host, &e);
+                continue;
+            }
         };
-        let Ok(mut stream) = i2pnet::I2pDialer::dial(&ctx.dialer, dest, Duration::from_secs(120))
-        else {
-            continue;
+        let mut stream = match i2pnet::I2pDialer::dial(&ctx.dialer, dest, Duration::from_secs(120))
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                round.trackers_failed += 1;
+                round.fail("dialing tracker", &host, &e);
+                continue;
+            }
         };
-        if let Ok(response) = tracker::announce_over(&mut stream, &request) {
-            peers.extend(response.peers);
+        match tracker::announce_over(&mut stream, &request) {
+            Ok(response) => {
+                round.trackers_ok += 1;
+                peers.extend(response.peers);
+            }
+            Err(e) => {
+                round.trackers_failed += 1;
+                round.fail("announcing to", &host, &e);
+            }
         }
     }
-    for peer in distinct(peers) {
-        let Ok(stream) = i2pnet::I2pDialer::dial(&ctx.dialer, peer, Duration::from_secs(120))
-        else {
-            continue;
+
+    let peers = distinct(peers);
+    round.peers_returned = peers.len();
+    if round.trackers_ok > 0 && peers.is_empty() {
+        // Not an error from anyone's point of view, and precisely the state
+        // that looks identical to a failed announce from outside.
+        round.last_error =
+            Some("trackers answered but returned no peers for this info-hash".to_owned());
+    }
+    for peer in peers {
+        round.peers_tried += 1;
+        let stream = match i2pnet::I2pDialer::dial(&ctx.dialer, peer, Duration::from_secs(120)) {
+            Ok(stream) => stream,
+            Err(e) => {
+                round.fail("dialing peer", &peer.to_b32(), &e);
+                continue;
+            }
         };
-        if let Ok(meta) = clove_core::torrent::fetch_metadata(stream, info_hash, ctx.peer_id) {
-            return Some(clove_core::magnet::torrent_bytes(
-                &meta.raw_info,
-                &ctx.trackers,
-            ));
+        match clove_core::torrent::fetch_metadata(stream, info_hash, ctx.peer_id) {
+            Ok(meta) => {
+                let bytes = clove_core::magnet::torrent_bytes(&meta.raw_info, &ctx.trackers);
+                return (Some(bytes), round);
+            }
+            Err(e) => round.fail("fetching metadata from", &peer.to_b32(), &e),
         }
     }
-    None
+    (None, round)
 }
 
 /// A jitter roll in `[0, 1)` for [`ReconnectPolicy::jittered`].

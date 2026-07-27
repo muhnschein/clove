@@ -210,14 +210,27 @@ trap cleanup EXIT INT TERM
 # into a script that never returns.
 cl() { timeout 30 "$clove" -c "$CONF" "$@" 2>>"$OUT"; }
 
+# The same, for probes whose failure is an expected state rather than news —
+# `show` against a magnet that has not resolved yet. Its stderr goes nowhere:
+# a poll loop that reports one expected 404 per tick fills the report with the
+# one thing the reader already knows and buries what they do not.
+cl_quiet() { timeout 30 "$clove" -c "$CONF" "$@" 2>/dev/null; }
+
 # Pull one scalar out of the daemon's JSON. The objects are flat and
 # hand-encoded (`"key":value`), and the nested arrays in `show` use keys that
 # do not collide with any read here.
 field() {
     printf '%s' "$2" | sed -n "s/.*\"$1\":\\([0-9][0-9]*\\).*/\\1/p" | head -1
 }
+# String fields stop at the first *unescaped* quote and are then unescaped, so
+# a value carrying a quote — an error message quoting a hostname, say — is not
+# truncated at it. The daemon escapes newlines too, so a value always stays on
+# one line.
 field_str() {
-    printf '%s' "$2" | sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" | head -1
+    printf '%s' "$2" \
+        | sed -nE "s/.*\"$1\":\"(([^\"\\\\]|\\\\.)*)\".*/\\1/p" \
+        | head -1 \
+        | sed -e 's/\\"/"/g' -e 's/\\n/ /g' -e 's/\\\\/\\/g'
 }
 # A missing or unparsable number reads as zero, so arithmetic below is total.
 num() { n=$(field "$1" "$2"); echo "${n:-0}"; }
@@ -377,6 +390,12 @@ last_print=-999
 # hung one. The time column is excluded from the comparison, since it changes
 # every poll by definition and would defeat the whole thing.
 HEARTBEAT=300
+# When to say out loud that a magnet is not resolving: a fifth of the download
+# budget, floored at two minutes. Derived rather than fixed, so a short run
+# still gets the warning and a long one is not nagged in its first minute.
+METADATA_STALL=$((DEADLINE / 5))
+[ "$METADATA_STALL" -lt 120 ] && METADATA_STALL=120
+stall_warned=""
 while :; do
     now=$(elapsed)
     if [ -n "$complete_at" ]; then
@@ -392,13 +411,49 @@ while :; do
         break
     fi
 
-    detail=$(cl show "$INFO_HASH" --json || true)
+    # `show` 404s until a magnet's metadata lands — expected, not an error,
+    # and its complaint is muted for exactly that reason. The first version of
+    # this loop let it through, and a run that spent nine minutes fetching
+    # metadata produced thirty-four identical "no such torrent" lines and not
+    # one word about what the fetch was doing.
+    detail=$(cl_quiet show "$INFO_HASH" --json || true)
     if [ -z "$detail" ]; then
-        # A magnet has no torrent entry until its metadata lands; `list` still
-        # knows about it. Nothing to sample yet.
         listing=$(cl list --json || true)
         case "$listing" in
-            *fetching-metadata*) : ;;
+            *fetching-metadata*)
+                # The pending entry carries the fetch's own account of itself:
+                # rounds run, trackers reached, peers returned, and the reason
+                # the last attempt did not work.
+                rounds=$(num fetch_rounds "$listing")
+                tok=$(num trackers_ok "$listing")
+                tfail=$(num trackers_failed "$listing")
+                known=$(num known_peers "$listing")
+                tried=$(num peers_tried "$listing")
+                why=$(field_str last_error "$listing")
+                body=$(printf 'fetching-metadata  round %s · trackers %s ok / %s failed · %s peer(s) known, %s dialed' \
+                    "$rounds" "$tok" "$tfail" "$known" "$tried")
+                [ -n "$why" ] && body="$body
+             last: $why"
+                if [ "$body" != "$last_body" ] || [ "$((now - last_print))" -ge "$HEARTBEAT" ]; then
+                    printf '%-8s %s\n' "${now}s" "$body" | tee -a "$OUT"
+                    last_body="$body"
+                    last_print=$now
+                fi
+                # Metadata is a prerequisite for everything below, so a magnet
+                # stuck here is worth saying out loud once rather than at the
+                # end of an hour. Derived from the budget, not a second
+                # independent constant.
+                if [ -z "$stall_warned" ] && [ "$now" -ge "$METADATA_STALL" ]; then
+                    stall_warned=yes
+                    say ""
+                    say "note: ${now}s without metadata. Nothing below this can start until"
+                    say "the info dictionary arrives. The line above says which stage is"
+                    say "failing; if it is a tracker name, check the router's address book"
+                    say "knows that host — a lookup that fails is negative-cached for up to"
+                    say "30 minutes, so retries get rarer, not more frequent."
+                    say ""
+                fi
+                ;;
             *) note "no detail and no pending entry for $INFO_HASH" ;;
         esac
         sleep "$POLL"
@@ -501,9 +556,17 @@ elif reached peers-known; then
     say "  The tracker gave us peers and not one dial succeeded. Compare with"
     say "  'make cross' — if cross-router dials also fail, the router is the"
     say "  subject, not clove."
+elif reached metadata; then
+    say "  Metadata arrived but no peers were learned. The tracker answered"
+    say "  once and has not since, or it has no peers for this info-hash."
 elif reached torrent-added; then
-    say "  No peers were ever learned: the tracker announce is the thing to"
-    say "  read. 'clove announce' forces one; the daemon log has the reply."
+    say "  The magnet never resolved, so nothing below it could start. The"
+    say "  fetch rounds above name the failing stage; the daemon's own log"
+    say "  has every attempt:"
+    say "      grep 'metadata fetch' $DATA_DIR/cloved.log | tail -20"
+    say "  A tracker name that will not resolve is the usual cause. Check the"
+    say "  router knows the host — i2pd's console has an address book, and a"
+    say "  b32 tracker URL sidesteps the question entirely."
 fi
 say ""
 say "Report: $OUT"
