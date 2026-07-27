@@ -82,6 +82,21 @@ pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(100);
 /// peer costs more than waiting out a dead one.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long a peer has to complete the BEP 3 handshake, in either direction.
+///
+/// The handshake is the first thing that happens on a connection and an I2P
+/// round trip is slow, so this is generous — but it is *finite*, which the
+/// dialled side's was not. `i2pnet`'s dial clears a stream's timeouts once the
+/// router has answered, so [`Torrent::attach`] read the peer's 68 bytes on a
+/// socket with none, and a peer that accepted the stream and then said nothing
+/// blocked its caller for the life of the process. On the swarm's dial sweep
+/// that was one silent peer stalling every subsequent dial for that torrent —
+/// permanently, and invisibly, since the sweep simply never came back.
+///
+/// The bound is per read, not per handshake: a slow peer dribbling its 68
+/// bytes is fine, a silent one is not.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How often [`Torrent::spawn_maintenance`] wakes to do the periodic work.
 ///
 /// Fine enough that the intervals above are honoured to within a tick, coarse
@@ -627,6 +642,11 @@ impl Torrent {
         mut stream: S,
         remote: DestHash,
     ) -> std::io::Result<()> {
+        // Bound the exchange. Best-effort: backends with no timeout of their
+        // own ignore it, which is why this is not a guarantee — but the SAM
+        // backend's streams are loopback sockets clove owns, so there it is a
+        // real one. See [`HANDSHAKE_TIMEOUT`] for what it costs not to have.
+        let _ = stream.set_timeouts(Some(HANDSHAKE_TIMEOUT));
         stream.write_all(&self.our_handshake().encode())?;
         let mut buf = [0u8; wire::HANDSHAKE_LEN];
         stream.read_exact(&mut buf)?;
@@ -638,6 +658,10 @@ impl Torrent {
                 "peer handshaked a different torrent",
             ));
         }
+        // Back to blocking for the connection proper: a peer legitimately sits
+        // quiet between messages, and cutting that off is the keep-alive and
+        // idle-timeout work's job, not a socket option's.
+        let _ = stream.set_timeouts(None);
         self.finish_attach(stream, remote, &theirs)
     }
 
@@ -663,7 +687,12 @@ impl Torrent {
                 "peer handshaked a different torrent",
             ));
         }
+        // The demux bounded the read of *their* handshake; bound our reply
+        // too, so a peer that connects and then stops reading cannot hold this
+        // thread open by never draining 68 bytes.
+        let _ = stream.set_timeouts(Some(HANDSHAKE_TIMEOUT));
         stream.write_all(&self.our_handshake().encode())?;
+        let _ = stream.set_timeouts(None);
         // Counted here, not after `finish_attach`: what this number is
         // evidence *of* is that a remote router resolved our leaseSet and
         // carried a handshake in both directions, and that is now true. A

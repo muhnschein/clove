@@ -1,17 +1,25 @@
-//! `SAMv3` backend over `yosemite` (Phase D, `docs/PLAN.md`).
+//! `SAMv3` backend (Phase D, `docs/PLAN.md`).
 //!
-//! This wraps `yosemite`'s synchronous API behind the crate's traits. It is
-//! the *only* code here that talks to a real router. Its runtime behavior
-//! against a live router is verified out-of-CI (`docs/LIVE-TESTING.md`); the
-//! logic that does not need a router — address derivation and the forwarded
-//! destination-line parse — is unit-tested here over loopback TCP.
+//! This is the *only* code here that talks to a real router. Its runtime
+//! behavior against a live router is verified out-of-CI
+//! (`docs/LIVE-TESTING.md`); everything that does not need a router — address
+//! derivation, the forwarded destination-line parse, and every way a bridge
+//! can misbehave — is unit-tested here over loopback TCP.
 //!
-//! - [`SamSession`] implements [`I2pDialer`] and [`I2pNamingLookup`].
-//!   Dialing speaks SAM directly on a socket clove opens per stream (see
-//!   [`dial_stream`]) rather than going through yosemite, so a stream is a
-//!   [`ForwardedStream`] — a plain TCP socket to the bridge, with real
-//!   timeouts, a real `split`, and close-on-drop. yosemite still owns the
-//!   session itself: `SESSION CREATE`, `STREAM FORWARD` and `NAMING LOOKUP`.
+//! - [`SamSession`] implements [`I2pDialer`] and [`I2pNamingLookup`]. It owns
+//!   its control connection: `HELLO VERSION` and `SESSION CREATE` are spoken
+//!   on a socket clove opens, with real deadlines on both (`PROTOCOL.i2p-bt`
+//!   §2.7, §2.13). Dialing likewise speaks SAM on a socket opened per stream
+//!   (see [`dial_stream`]), so a stream is a [`ForwardedStream`] — a plain TCP
+//!   socket to the bridge, with real timeouts, a real `split`, and
+//!   close-on-drop. yosemite is left with `NAMING LOOKUP` alone, which is a
+//!   one-shot on a socket of its own.
+//! - The control connection is **read continuously** by a watchdog thread for
+//!   as long as the session lives ([`watch_control`]). That is not a nicety:
+//!   `SAMv3.2` lets the router ping the client and Java I2P drops the session
+//!   when nobody answers, so a control connection that is only written to is a
+//!   session with a timer on it. It is also the only place the router's
+//!   account of *why* a session ended is ever spoken (§2.13).
 //! - [`SamListener`] implements [`I2pListener`] for **inbound** streams via
 //!   SAM `STREAM FORWARD` to a loopback [`TcpListener`] we own (an allowed
 //!   Layer-1 IP socket, bound to `127.0.0.1`). This is the topology chosen
@@ -23,17 +31,15 @@
 //!   which we derive its [`DestHash`] (`docs/PROTOCOL.i2p-bt` §1.3, §2.5).
 //!   The exact framing is confirmed against a live router at M1.
 //!
-//! yosemite hardcodes the SAM host to `127.0.0.1` (only the port is
-//! configurable), which happens to match Layer 1's loopback-only rule; the
-//! `--i-know-sam-is-remote` escape hatch is therefore not expressible
-//! through this backend and is noted as such.
+//! Every socket here is opened to `127.0.0.1` by construction, which is
+//! Layer 1's loopback-only rule; the `--i-know-sam-is-remote` escape hatch
+//! (SCOPE §5) is therefore not expressible through this backend and is noted
+//! as such.
 
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
-
-use yosemite::{DestinationKind, Session, SessionOptions, style};
+use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::{DestHash, I2pDialer, I2pListener, I2pNamingLookup, I2pStream};
 
@@ -46,46 +52,45 @@ pub const DEFAULT_SAM_PORT: u16 = 7656;
 /// here costs a full backoff cycle. It only has to be shorter than "forever".
 pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Cap on the probe's `HELLO REPLY` line. A bridge that streams bytes without
-/// a newline is refused rather than buffered — the reason this is a byte cap
-/// and not just a timeout.
+/// Default for [`SamConfig::session_timeout`].
+///
+/// `SESSION CREATE` is where a router builds the destination's tunnels, so it
+/// is legitimately slow — Java I2P has taken tens of seconds from a cold start
+/// (`PROTOCOL.i2p-bt` §2.10) — but it is not legitimately unbounded, which is
+/// what it used to be.
+pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Cap on the `HELLO REPLY` line. A bridge that streams bytes without a
+/// newline is refused rather than buffered — the reason this is a byte cap and
+/// not just a timeout.
 const MAX_HELLO_LINE: usize = 512;
 
-/// Ask the bridge on `port` to prove it is a SAM bridge, within `timeout`.
-///
-/// Returns the version it reports, for the operator's log.
-///
-/// This exists because `yosemite` sets no read or write timeout on its
-/// control socket (checked in 0.7.0). Against a bridge that accepts the
-/// connection and then goes quiet — a router still starting up, a wedged
-/// one, or some other service squatting on 7656 — `Session::new` blocks
-/// forever. It never returns an error, so the supervisor above never backs
-/// off, never retries and never logs: the daemon simply sits in "connecting"
-/// until someone restarts it. That is precisely the failure mode SCOPE §4
-/// exists to prevent, so it is worth one extra connection to rule out.
-///
-/// The probe speaks the SAM handshake itself, with timeouts and a length cap,
-/// on a socket it owns and closes. What it cannot cover is a bridge that
-/// answers `HELLO` correctly and *then* stalls on `SESSION CREATE`:
-/// `Session::new` still hangs there. Closing that gap needs read timeouts
-/// inside yosemite (upstream) or proxying its control connection through one
-/// of ours; see `docs/PROTOCOL.i2p-bt` §2.7.
-fn probe_bridge(port: u16, timeout: Duration) -> io::Result<String> {
-    let (_socket, reply) = sam_hello(port, timeout, "HELLO")?;
-    Ok(reply
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix("VERSION="))
-        .unwrap_or("unknown")
-        .to_owned())
-}
+/// Cap on a `SESSION STATUS` line. It carries the session's whole private key
+/// blob (§5.1c: 908 base64 characters from i2pd, and longer key types exist),
+/// so it needs far more room than a status line — but not an unbounded amount.
+/// i2pd's own SAM read buffer is 8 KiB, so nothing conforming exceeds this.
+const MAX_SESSION_LINE: usize = 8192;
 
-/// Read one `\n`-terminated line from `stream`, bounded by both `cap` bytes
-/// and `deadline`.
+/// Cap on a line the router volunteers on the control connection after setup
+/// (a `PING`, or the `SESSION STATUS` that explains a session ending).
+const MAX_CONTROL_LINE: usize = 8192;
+
+/// How long a `PONG` may take to reach a bridge that has stopped reading
+/// before the watchdog gives up on the session.
+const PONG_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Read one `\n`-terminated line from `stream`, bounded by `cap` bytes and —
+/// when one is given — by `deadline`.
 ///
 /// A byte at a time, because the bytes after the line belong to whoever asked
 /// for it: a SAM control socket becomes a data stream the moment its status
 /// line ends, and a buffered reader that swallowed the first block of a peer's
 /// handshake would be a bug with no symptom until much later.
+///
+/// `deadline` is `None` for the one reader that is *supposed* to wait
+/// indefinitely: the session watchdog, which sits on the control connection
+/// for the life of the session and whose whole job is to be there whenever the
+/// router finally says something.
 ///
 /// `what` names the exchange in every error, since "connection closed" is not
 /// a diagnosis and "closed during HELLO" is.
@@ -93,13 +98,13 @@ fn read_sam_line(
     stream: &mut TcpStream,
     port: u16,
     cap: usize,
-    deadline: std::time::Instant,
+    deadline: Option<Instant>,
     what: &str,
 ) -> io::Result<String> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        if std::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|at| Instant::now() >= at) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("SAM bridge on 127.0.0.1:{port} did not finish its {what} reply in time"),
@@ -167,8 +172,8 @@ fn sam_hello(port: u16, timeout: Duration, what: &str) -> io::Result<(TcpStream,
 
     // The read timeout is per-call, so a bridge dribbling one byte just
     // inside it could hold this open indefinitely. Bound the exchange too.
-    let deadline = std::time::Instant::now() + timeout;
-    let reply = read_sam_line(&mut stream, port, MAX_HELLO_LINE, deadline, what)?;
+    let deadline = Instant::now() + timeout;
+    let reply = read_sam_line(&mut stream, port, MAX_HELLO_LINE, Some(deadline), what)?;
     if !reply.starts_with("HELLO REPLY") || !reply.contains("RESULT=OK") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -236,40 +241,15 @@ fn dial_stream(
     // the status read gets the caller's full timeout rather than the short
     // handshake one.
     stream.set_read_timeout(Some(timeout))?;
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
     let status = read_sam_line(
         &mut stream,
         port,
         MAX_STATUS_LINE,
-        deadline,
+        Some(deadline),
         "STREAM CONNECT",
     )?;
-    if !status.starts_with("STREAM STATUS") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("SAM bridge answered STREAM CONNECT with {status:?}"),
-        ));
-    }
-    let result = status
-        .split_whitespace()
-        .find_map(|f| f.strip_prefix("RESULT="))
-        .unwrap_or("MISSING");
-    if result != "OK" {
-        // The router's own result word, and its MESSAGE when it sent one.
-        // CANT_REACH_PEER and friends are ordinary on I2P and must read as
-        // "this peer, this time" rather than as a fault in the session.
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!(
-                "router refused the stream to {}: {result}{}",
-                peer.to_b32(),
-                status
-                    .split_once("MESSAGE=")
-                    .map(|(_, m)| format!(" ({})", m.trim_matches('"')))
-                    .unwrap_or_default()
-            ),
-        ));
-    }
+    expect_stream_ok(&status, &format!("the stream to {}", peer.to_b32()))?;
 
     // Handshake done; the socket is now the peer stream. Clear the deadlines
     // the handshake needed — the engine sets its own per-peer timeouts, and a
@@ -277,6 +257,37 @@ fn dial_stream(
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
     Ok(ForwardedStream::from_socket(stream))
+}
+
+/// Require a `STREAM STATUS RESULT=OK`, naming `what` was refused otherwise.
+///
+/// The router's own result word, and its `MESSAGE` when it sent one.
+/// `CANT_REACH_PEER` and friends are ordinary on I2P and must read as "this
+/// peer, this time" rather than as a fault in the session.
+fn expect_stream_ok(status: &str, what: &str) -> io::Result<()> {
+    if !status.starts_with("STREAM STATUS") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SAM bridge answered with {status:?} where a STREAM STATUS belongs"),
+        ));
+    }
+    let result = status
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("RESULT="))
+        .unwrap_or("MISSING");
+    if result != "OK" {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!(
+                "router refused {what}: {result}{}",
+                status
+                    .split_once("MESSAGE=")
+                    .map(|(_, m)| format!(" ({})", m.trim_matches('"')))
+                    .unwrap_or_default()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// A SAM session id unlikely to collide with one already registered.
@@ -315,12 +326,15 @@ pub struct SamConfig {
     /// Base64 private key for a stable identity (Q4). `None` requests a
     /// transient destination.
     pub persistent_key: Option<String>,
-    /// How long the pre-flight handshake probe waits for the bridge to
-    /// answer `HELLO` before giving up on this attempt (see
-    /// [`probe_bridge`]). Raise it for a router that is slow to come up; the
-    /// cost of a low value is a wasted backoff cycle, the cost of no value
-    /// at all is a daemon that hangs.
+    /// How long the `HELLO VERSION` handshake waits for the bridge to answer
+    /// before giving up on this attempt. Raise it for a router that is slow to
+    /// come up; the cost of a low value is a wasted backoff cycle, the cost of
+    /// no value at all is a daemon that hangs.
     pub probe_timeout: Duration,
+    /// How long `SESSION CREATE` may take. Much longer than
+    /// [`probe_timeout`](SamConfig::probe_timeout): answering it means the
+    /// router has built the destination's tunnels.
+    pub session_timeout: Duration,
 }
 
 impl Default for SamConfig {
@@ -330,17 +344,152 @@ impl Default for SamConfig {
             nickname: "clove".to_owned(),
             persistent_key: None,
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
+            session_timeout: DEFAULT_SESSION_TIMEOUT,
         }
     }
+}
+
+/// Whether a session's control connection is still up, why it ended, and the
+/// last thing the router said on it.
+///
+/// The last line matters as much as the flag. When a session ends, the reason
+/// is almost always something the router *said* first — a `SESSION STATUS`
+/// carrying an `I2P_ERROR`, or Java I2P's `PONG timeout` — and clove used to
+/// throw every one of those away unread. Four live runs died on a ~90 second
+/// cycle and not one of them could say why, because the only code that ever
+/// touched the control connection was a health probe that wrote a `PING`, read
+/// exactly one line, and looked at nothing in it.
+#[derive(Default)]
+struct Life {
+    /// `None` while the session is alive; why it ended once it is not.
+    ended: Option<String>,
+    /// The most recent line from the router that was not a `PING`.
+    last_line: Option<String>,
+}
+
+/// The shared half of a session's liveness, between the watchdog thread and
+/// everybody asking whether the session is worth handing work to.
+#[derive(Default)]
+struct SessionLife {
+    state: Mutex<Life>,
+    /// Signalled once, when the session ends.
+    ended: Condvar,
+}
+
+impl SessionLife {
+    fn lock(&self) -> MutexGuard<'_, Life> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn alive(&self) -> bool {
+        self.lock().ended.is_none()
+    }
+
+    /// Remember a line the router volunteered, in case it turns out to have
+    /// been the session's last words.
+    fn note(&self, line: &str) {
+        self.lock().last_line = Some(line.to_owned());
+    }
+
+    /// Record the session as ended. The first reason wins: what killed it is
+    /// more informative than whatever noticed second.
+    fn end(&self, why: &str) {
+        let mut state = self.lock();
+        if state.ended.is_none() {
+            state.ended = Some(match &state.last_line {
+                Some(line) => format!("{why}; the router's last words were {line:?}"),
+                None => why.to_owned(),
+            });
+        }
+        drop(state);
+        self.ended.notify_all();
+    }
+
+    /// Block until the session ends, and say why.
+    fn wait_end(&self) -> String {
+        let state = self.lock();
+        let state = self
+            .ended
+            .wait_while(state, |s| s.ended.is_none())
+            .unwrap_or_else(PoisonError::into_inner);
+        state
+            .ended
+            .clone()
+            .unwrap_or_else(|| "the session ended".to_owned())
+    }
+}
+
+/// Sits on the session's control connection for as long as it lives.
+///
+/// Two jobs, and clove had neither:
+///
+/// - **Answer the router's `PING`.** `SAMv3.2` lets the *router* ping the
+///   client; Java I2P's `SAMv3Handler` does it on every read timeout and
+///   answers an unanswered ping with `SESSION_ERROR "PONG timeout"`, killing
+///   the session. Nothing in clove ever read the control connection, so
+///   nothing could ever reply. i2pd does not ping, so this costs nothing
+///   there — and is the whole session on Java I2P.
+/// - **Notice, immediately and with a reason, when the session ends.** The
+///   old 30-second `PING` probe took up to three rounds to report a dead
+///   session, because yosemite's `read_line` maps end-of-file to `Ok("")` and
+///   `is_ok()` called that healthy. Sixty seconds of a torrent dialling into a
+///   session the router had already destroyed, then a rebuild that said only
+///   "router lost".
+fn watch_control(mut socket: TcpStream, port: u16, alive: &SessionLife) {
+    // A PONG must not park this thread forever if the bridge stops reading;
+    // a bridge that will not take ten bytes in ten seconds is gone.
+    let _ = socket.set_write_timeout(Some(PONG_WRITE_TIMEOUT));
+    loop {
+        let said = match read_sam_line(
+            &mut socket,
+            port,
+            MAX_CONTROL_LINE,
+            None,
+            "the session control connection",
+        ) {
+            Ok(said) => said,
+            Err(e) => {
+                alive.end(&format!("the SAM control connection ended: {e}"));
+                return;
+            }
+        };
+        // `PING` alone or `PING <token>`; the token is echoed back verbatim,
+        // which is what Java I2P compares against.
+        if let Some(token) = ping_token(&said) {
+            if socket
+                .write_all(format!("PONG{token}\n").as_bytes())
+                .is_err()
+            {
+                alive.end("the SAM control connection would not take a PONG");
+                return;
+            }
+            continue;
+        }
+        alive.note(&said);
+    }
+}
+
+/// The echo-back part of a router `PING`, or `None` when the line is not one.
+///
+/// `PING` alone and `PING <token>` are both pings; `PINGER` is not, and
+/// answering it would be answering something we did not understand.
+fn ping_token(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("PING")?;
+    (rest.is_empty() || rest.starts_with(' ')).then_some(rest)
 }
 
 /// A live SAM stream session: our destination plus the control connection,
 /// used for outbound streams and naming.
 pub struct SamSession {
-    session: Mutex<Session<style::Stream>>,
+    /// The session's control connection. The router destroys the session when
+    /// this closes, so it is held for the session's whole life; it is read by
+    /// the watchdog thread and written by nothing else.
+    control: TcpStream,
+    life: Arc<SessionLife>,
     local: DestHash,
     local_b64: String,
     samv3_tcp_port: u16,
+    probe_timeout: Duration,
     /// The SAM session id every outbound stream attaches itself to.
     nickname: String,
 }
@@ -348,59 +497,84 @@ pub struct SamSession {
 impl SamSession {
     /// Establish the session against the router named by `config`.
     ///
+    /// Both halves of the exchange are bounded. `HELLO VERSION` gets
+    /// [`SamConfig::probe_timeout`] and `SESSION CREATE` gets
+    /// [`SamConfig::session_timeout`], on a socket clove owns — which is what
+    /// closes the residual hang in `PROTOCOL.i2p-bt` §2.7, where a bridge that
+    /// answered `HELLO` and then stalled blocked the daemon forever with
+    /// nothing above it able to back off, retry, or log.
+    ///
     /// # Errors
     ///
-    /// The router is unreachable, refused the session, or returned a
-    /// destination we cannot parse.
+    /// The router is unreachable, did not answer in time, refused the session,
+    /// or returned a destination we cannot parse.
     pub fn connect(config: &SamConfig) -> io::Result<SamSession> {
-        // Prove the bridge is alive and speaks SAM before yosemite is given
-        // the port. See [`probe_bridge`]: without this, a router that accepts
-        // the connection and then says nothing blocks here forever, and the
-        // supervisor above never gets to back off, retry, or log a word.
-        let version = probe_bridge(config.samv3_tcp_port, config.probe_timeout)?;
-        debug_assert!(!version.is_empty());
+        let port = config.samv3_tcp_port;
+        let (mut control, hello) = sam_hello(port, config.probe_timeout, "HELLO")?;
+        debug_assert!(hello.contains("RESULT=OK"));
 
-        let destination = match &config.persistent_key {
-            Some(key) => DestinationKind::Persistent {
-                private_key: key.clone(),
-            },
-            None => DestinationKind::Transient,
-        };
-        let options = SessionOptions {
-            nickname: config.nickname.clone(),
-            destination,
-            samv3_tcp_port: config.samv3_tcp_port,
-            // Inbound forwarding relies on the router prepending each
-            // connection with the peer's destination line; keep it explicit
-            // rather than inheriting yosemite's default (see [`SamListener`]).
-            silent_forward: false,
-            ..Default::default()
-        };
-        let session = Session::<style::Stream>::new(options).map_err(map_err)?;
+        let destination = config.persistent_key.as_deref().unwrap_or("TRANSIENT");
+        // The parameter set is yosemite's, kept term for term: it is what a
+        // live i2pd accepts today, and quietly changing a destination's tunnel
+        // shape or lease-set encryption is not this commit's business.
+        let command = format!(
+            "SESSION CREATE STYLE=STREAM ID={} DESTINATION={destination} \
+             i2cp.leaseSetEncType=6,4 inbound.length=3 inbound.quantity=2 \
+             outbound.length=3 outbound.quantity=2 SIGNATURE_TYPE=7\n",
+            config.nickname
+        );
+        control.write_all(command.as_bytes())?;
+
+        control.set_read_timeout(Some(config.session_timeout))?;
+        let deadline = Instant::now() + config.session_timeout;
+        let status = read_sam_line(
+            &mut control,
+            port,
+            MAX_SESSION_LINE,
+            Some(deadline),
+            "SESSION CREATE",
+        )?;
+        let blob = parse_session_status(&status)?;
+
         // What SAM hands back is the session's *private key blob*, not its
         // destination (SAMv3 SESSION STATUS). Everything clove publishes must
         // be the public destination at the front of it — the hash we call
         // ourselves by, and the base64 an announce carries. Sending the rest
         // to a tracker means sending our private keys to a stranger, which is
         // exactly what clove did until 2026-07-27 (`PROTOCOL.i2p-bt` §5.1c).
-        let bytes = crate::addr::destination_bytes(session.destination()).ok_or_else(|| {
+        let bytes = crate::addr::destination_bytes(blob).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "SAM returned a destination clove cannot parse",
             )
         })?;
-        let local = DestHash::from_b64_destination(session.destination()).ok_or_else(|| {
+        let local = DestHash::from_b64_destination(blob).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "SAM returned an unparseable destination",
             )
         })?;
         let local_b64 = crate::addr::i2p_base64_encode(&bytes);
+
+        // Setup is over; the watchdog owns the reading end from here.
+        control.set_read_timeout(None)?;
+        let life = Arc::new(SessionLife::default());
+        let watched = control.try_clone()?;
+        let watch_life = Arc::clone(&life);
+        std::thread::spawn(move || {
+            watch_control(watched, port, &watch_life);
+            // Belt and braces: however that returned, the session is over, and
+            // a supervisor waiting on this must not wait forever.
+            watch_life.end("the session watchdog stopped");
+        });
+
         Ok(SamSession {
-            session: Mutex::new(session),
+            control,
+            life,
             local,
             local_b64,
-            samv3_tcp_port: config.samv3_tcp_port,
+            samv3_tcp_port: port,
+            probe_timeout: config.probe_timeout,
             nickname: config.nickname.clone(),
         })
     }
@@ -412,15 +586,22 @@ impl SamSession {
         &self.local_b64
     }
 
-    /// Probe the session's control connection with a SAM `PING` (v3.2).
-    /// `false` means the router is gone or the session is dead — time to tear
-    /// down and rebuild the session tree.
+    /// Whether the session's control connection is still up.
+    ///
+    /// Free, and true up to the instant the router hangs up: the watchdog
+    /// thread is already sitting on the connection, so there is nothing to
+    /// probe and no probe interval to be wrong about.
+    #[must_use]
     pub fn healthy(&self) -> bool {
-        let mut session = self
-            .session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        session.send_command("PING clove\n").is_ok()
+        self.life.alive()
+    }
+
+    /// Block until this session's control connection ends, and return the
+    /// router's account of why — the line an operator needs and the one no
+    /// live run has ever produced.
+    #[must_use]
+    pub fn wait_until_lost(&self) -> String {
+        self.life.wait_end()
     }
 
     /// This session's own destination hash — the identity peers reach us at
@@ -429,6 +610,52 @@ impl SamSession {
     pub fn local_dest(&self) -> DestHash {
         self.local
     }
+}
+
+impl Drop for SamSession {
+    fn drop(&mut self) {
+        // Closing the control connection is how a session is ended in SAMv3,
+        // and it is also what unblocks the watchdog's read. Without it the
+        // router holds the session — and its nickname — after clove has moved
+        // on, which is the DuplicateId hazard of §2.9 from the other side.
+        let _ = self.control.shutdown(Shutdown::Both);
+    }
+}
+
+/// Pull the destination blob out of a `SESSION STATUS` reply, or say what the
+/// router said instead.
+fn parse_session_status(status: &str) -> io::Result<&str> {
+    if !status.starts_with("SESSION STATUS") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SAM bridge answered SESSION CREATE with {status:?}"),
+        ));
+    }
+    let result = status
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("RESULT="))
+        .unwrap_or("MISSING");
+    if result != "OK" {
+        // The router's own result word: DUPLICATED_ID, I2P_ERROR and friends
+        // call for entirely different actions, and "session refused" calls for
+        // none of them.
+        return Err(io::Error::other(format!(
+            "router refused the session: {result}{}",
+            status
+                .split_once("MESSAGE=")
+                .map(|(_, m)| format!(" ({})", m.trim_matches('"')))
+                .unwrap_or_default()
+        )));
+    }
+    status
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("DESTINATION="))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SESSION STATUS said OK but carried no DESTINATION",
+            )
+        })
 }
 
 /// Upper bound on the forwarded destination line (bytes). A full I2P
@@ -453,7 +680,11 @@ pub struct SamListener {
     listener: TcpListener,
     local: DestHash,
     port: u16,
-    // Keeps the SAM session (and thus the router-side forwarding) alive.
+    /// The socket `STREAM FORWARD` was issued on. `SAMv3` keeps forwarding
+    /// only while it is open, so this is held, never used — and dropping the
+    /// listener is therefore how forwarding stops.
+    _forward: TcpStream,
+    // Keeps the SAM session (and thus the destination) alive.
     _session: Arc<SamSession>,
 }
 
@@ -461,27 +692,47 @@ impl SamListener {
     /// Ask the router to forward inbound streams for `session`'s destination
     /// to a fresh loopback listener, and return it.
     ///
+    /// `SILENT=false`: the router then prepends each forwarded connection with
+    /// the peer's base64 destination line, which is the only way we learn who
+    /// dialled us (`docs/PROTOCOL.i2p-bt` §1.3, §2.5).
+    ///
     /// # Errors
     ///
-    /// The loopback listener cannot be bound, or the router refuses the
-    /// `STREAM FORWARD` request.
+    /// The loopback listener cannot be bound, the bridge does not answer, or
+    /// the router refuses the `STREAM FORWARD` request.
     pub fn forward(session: Arc<SamSession>) -> io::Result<SamListener> {
         // The one inbound IP-socket construction site: loopback by
         // construction (Layer 1, SCOPE §5), ephemeral port.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let port = listener.local_addr()?.port();
-        {
-            let mut sam = session
-                .session
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            sam.forward(port).map_err(map_err)?;
-        }
+        let sam_port = session.samv3_tcp_port;
+        let timeout = session.probe_timeout;
+
+        // Its own connection, per SAMv3: the socket that carries STREAM
+        // FORWARD is dedicated to it for as long as forwarding lasts.
+        let (mut forward, _) = sam_hello(sam_port, timeout, "HELLO (for STREAM FORWARD)")?;
+        let command = format!(
+            "STREAM FORWARD ID={} PORT={port} SILENT=false\n",
+            session.nickname
+        );
+        forward.write_all(command.as_bytes())?;
+        let deadline = Instant::now() + timeout;
+        let status = read_sam_line(
+            &mut forward,
+            sam_port,
+            MAX_STATUS_LINE,
+            Some(deadline),
+            "STREAM FORWARD",
+        )?;
+        expect_stream_ok(&status, "STREAM FORWARD")?;
+        forward.set_read_timeout(None)?;
+
         let local = session.local;
         Ok(SamListener {
             listener,
             local,
             port,
+            _forward: forward,
             _session: session,
         })
     }
@@ -649,6 +900,14 @@ impl I2pDialer for SamSession {
     fn dial(&self, peer: DestHash, timeout: Duration) -> io::Result<ForwardedStream> {
         dial_stream(self.samv3_tcp_port, &self.nickname, peer, timeout)
     }
+
+    /// A dial attaches to the session by nickname, so a session the router has
+    /// destroyed cannot carry one however healthy the bridge is. Callers about
+    /// to spend a thread and a socket on best-effort work — a goodbye announce
+    /// during teardown — ask this first.
+    fn usable(&self) -> bool {
+        self.healthy()
+    }
 }
 
 impl I2pNamingLookup for SamSession {
@@ -681,8 +940,9 @@ mod tests {
     //!
     //! - The inbound path's pure logic: splitting the forwarded socket and
     //!   parsing the `SILENT=false` destination header.
-    //! - [`probe_bridge`] against a fake bridge that lies, stalls, floods or
-    //!   dies — SCOPE §9's "SAM bridge lying or dying mid-operation".
+    //! - The `HELLO VERSION` exchange against a fake bridge that lies,
+    //!   stalls, floods or dies — SCOPE §9's "SAM bridge lying or dying
+    //!   mid-operation".
     //! - [`SamSession::connect`] as a whole against the same fakes, which is
     //!   the claim that actually matters: **every one of them must fail, and
     //!   fail in bounded time.** Before the probe existed, four of six hung
@@ -871,6 +1131,19 @@ mod hostile_bridge_tests {
     /// design, and `make test` should not spend half a minute proving it.
     const PROBE: Duration = Duration::from_millis(600);
 
+    /// The `HELLO VERSION` exchange on its own, reporting the version the
+    /// bridge claimed. `SamSession::connect` opens with exactly this and then
+    /// keeps the socket; testing it apart from `SESSION CREATE` is how a
+    /// bridge that fails at the handshake is told from one that fails later.
+    fn hello_version(port: u16, timeout: Duration) -> io::Result<String> {
+        let (_socket, reply) = sam_hello(port, timeout, "HELLO")?;
+        Ok(reply
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("VERSION="))
+            .unwrap_or("unknown")
+            .to_owned())
+    }
+
     #[test]
     fn the_probe_refuses_every_bridge_that_is_not_one() {
         for how in [
@@ -882,8 +1155,8 @@ mod hostile_bridge_tests {
             Misbehaviour::Dribble,
         ] {
             let port = fake_bridge(how);
-            let Some((result, elapsed)) = within(LIMIT, move || probe_bridge(port, PROBE)) else {
-                panic!("{how:?}: probe_bridge never returned");
+            let Some((result, elapsed)) = within(LIMIT, move || hello_version(port, PROBE)) else {
+                panic!("{how:?}: the HELLO exchange never returned");
             };
             let err = result.expect_err(&format!("{how:?} was accepted as a SAM bridge"));
             assert!(elapsed < LIMIT, "{how:?}: probe took {elapsed:?}");
@@ -898,8 +1171,8 @@ mod hostile_bridge_tests {
 
     #[test]
     fn connect_fails_in_bounded_time_against_a_broken_bridge() {
-        // The regression this locks down: before the pre-flight probe,
-        // Silence, Garbage, Flood and Dribble all blocked in
+        // The regression this locks down: before clove spoke the handshake
+        // itself, Silence, Garbage, Flood and Dribble all blocked in
         // yosemite's Session::new forever, and cloved sat in "connecting"
         // with nothing in its log until someone restarted it.
         for how in [
@@ -914,6 +1187,7 @@ mod hostile_bridge_tests {
             let config = SamConfig {
                 samv3_tcp_port: port,
                 probe_timeout: PROBE,
+                session_timeout: PROBE,
                 ..Default::default()
             };
             let Some((result, elapsed)) = within(LIMIT, move || SamSession::connect(&config))
@@ -940,6 +1214,7 @@ mod hostile_bridge_tests {
         let config = SamConfig {
             samv3_tcp_port: port,
             probe_timeout: PROBE,
+            session_timeout: PROBE,
             ..Default::default()
         };
         let (result, elapsed) =
@@ -948,29 +1223,45 @@ mod hostile_bridge_tests {
         assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
     }
 
-    /// The gap the probe does not close, recorded as a test so it cannot be
-    /// forgotten: a bridge that answers `HELLO` and then stalls still hangs
-    /// inside yosemite, which sets no read timeout on its control socket.
+    /// `PROTOCOL.i2p-bt` §2.7's residual gap, now closed and pinned shut.
     ///
-    /// Written as an assertion about the *probe* — which correctly passes
-    /// such a bridge — rather than about `connect`, because asserting the
-    /// hang would mean a test that waits for one.
+    /// A bridge that answers `HELLO` correctly and *then* stalls on `SESSION
+    /// CREATE` used to hang forever inside yosemite, which set no read timeout
+    /// on its control socket. It was recorded as a known gap because the probe
+    /// could not see that far and nothing outside the library could bound it.
+    /// clove owns the control socket now, so the second half is bounded like
+    /// the first.
     #[test]
-    fn a_bridge_that_passes_hello_and_then_stalls_is_a_known_gap() {
+    fn a_bridge_that_passes_hello_and_then_stalls_no_longer_hangs() {
         let port = fake_bridge(Misbehaviour::HelloThenStall);
-        let (result, _) = within(LIMIT, move || probe_bridge(port, PROBE)).expect("probe returned");
+        // The handshake half still passes, which is what made this invisible.
         assert_eq!(
-            result.expect("a valid HELLO REPLY must pass the probe"),
+            hello_version(port, PROBE).expect("a valid HELLO REPLY is accepted"),
             "3.3"
         );
-        // If yosemite ever grows read timeouts, connect() against this bridge
-        // starts failing cleanly and PROTOCOL.i2p-bt §2.7 can be closed.
+        // And the session half now fails, in bounded time, saying so.
+        let config = SamConfig {
+            samv3_tcp_port: port,
+            probe_timeout: PROBE,
+            session_timeout: PROBE,
+            ..Default::default()
+        };
+        // The session itself is dropped on the spot: what is under test is
+        // that `connect` *returned*, and only the error is worth keeping.
+        let (result, elapsed) = within(LIMIT, move || SamSession::connect(&config).map(drop))
+            .expect("connect returned rather than hanging");
+        let err = result.expect_err("a bridge that never answers SESSION CREATE is not a session");
+        assert!(elapsed < LIMIT, "took {elapsed:?}");
+        assert!(
+            err.to_string().contains("SESSION CREATE"),
+            "the error must name the exchange it died in: {err}"
+        );
     }
 
     #[test]
     fn a_healthy_hello_is_accepted_and_its_version_reported() {
         let port = fake_bridge(Misbehaviour::HelloThenStall);
-        assert_eq!(probe_bridge(port, PROBE).expect("hello accepted"), "3.3");
+        assert_eq!(hello_version(port, PROBE).expect("hello accepted"), "3.3");
     }
 
     /// A bridge that speaks the outbound-dial half of SAM: `HELLO REPLY`,
@@ -1104,5 +1395,288 @@ mod hostile_bridge_tests {
             e.to_string().contains("STREAM CONNECT"),
             "the error must name the exchange it failed in: {e}"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    //! The control connection: `SESSION CREATE`, the watchdog, and what the
+    //! session says when it ends.
+    //!
+    //! None of this needed a router before either — it was simply never
+    //! reachable, because the exchange happened inside yosemite and the only
+    //! code clove had on the control connection was a `PING` probe whose reply
+    //! it never looked at. The cost was four live runs that died on the same
+    //! ~90 second cycle and could not say why (`PROTOCOL.i2p-bt` §2.13).
+
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    /// A session's private key blob, shaped like the one i2pd returns: 391
+    /// bytes of destination (384 of key material, a KEY certificate with a
+    /// 4-byte payload) followed by 288 bytes of private key material that must
+    /// never leave the process (§5.1c).
+    fn key_blob() -> Vec<u8> {
+        let mut blob = vec![0x42u8; 384];
+        blob.push(0x05);
+        blob.extend_from_slice(&4u16.to_be_bytes());
+        blob.extend_from_slice(&[0x00, 0x07, 0x00, 0x00]);
+        blob.extend(std::iter::repeat_n(0xAAu8, 288));
+        blob
+    }
+
+    /// The public destination inside [`key_blob`] — the only part of it that
+    /// may ever be published.
+    fn destination() -> Vec<u8> {
+        key_blob()[..391].to_vec()
+    }
+
+    fn read_line_from(socket: &mut TcpStream) -> String {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while socket.read(&mut byte).unwrap_or(0) == 1 {
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+        }
+        String::from_utf8_lossy(&line).trim_end().to_owned()
+    }
+
+    /// What the fake router does once the session is established.
+    #[derive(Clone, Copy, Debug)]
+    enum AfterSession {
+        /// Nothing at all — an ordinary, healthy session.
+        Hold,
+        /// Ping the client, the way Java I2P's `SAMv3Handler` does, and report
+        /// whatever came back.
+        Ping,
+        /// Explain itself and hang up, the way a router ending a session does.
+        ExplainAndClose,
+    }
+
+    /// A fake SAM bridge that can carry a whole session.
+    ///
+    /// The first connection is the control connection; every later one is
+    /// answered as a `STREAM FORWARD`. Everything the client says is echoed
+    /// down the returned channel, so a test can assert on the wire.
+    fn session_bridge(status: &'static str, after: AfterSession) -> (u16, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let seen = AtomicUsize::new(0);
+            while let Ok((mut socket, _)) = listener.accept() {
+                let first = seen.fetch_add(1, Ordering::Relaxed) == 0;
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let _ = read_line_from(&mut socket); // HELLO VERSION
+                    let _ = socket.write_all(b"HELLO REPLY RESULT=OK VERSION=3.3\n");
+                    let command = read_line_from(&mut socket);
+                    let _ = tx.send(command);
+                    if !first {
+                        // A STREAM FORWARD, which this bridge always allows.
+                        let _ = socket.write_all(b"STREAM STATUS RESULT=OK\n");
+                        std::thread::sleep(Duration::from_secs(120));
+                        return;
+                    }
+                    let _ = socket.write_all(status.as_bytes());
+                    match after {
+                        AfterSession::Hold => std::thread::sleep(Duration::from_secs(120)),
+                        AfterSession::Ping => {
+                            let _ = socket.write_all(b"PING 12345\n");
+                            let _ = tx.send(read_line_from(&mut socket));
+                            std::thread::sleep(Duration::from_secs(120));
+                        }
+                        AfterSession::ExplainAndClose => {
+                            let _ = socket.write_all(
+                                b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"tunnel build failed\"\n",
+                            );
+                            // and drop, which closes it
+                        }
+                    }
+                });
+            }
+        });
+        (port, rx)
+    }
+
+    /// A `SESSION STATUS` carrying [`key_blob`], as the router sends it.
+    fn ok_status() -> &'static str {
+        // Leaked once per process, and only in tests: `session_bridge` wants a
+        // 'static line and the blob is computed.
+        Box::leak(
+            format!(
+                "SESSION STATUS RESULT=OK DESTINATION={}\n",
+                crate::addr::i2p_base64_encode(&key_blob())
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    fn config(port: u16) -> SamConfig {
+        SamConfig {
+            samv3_tcp_port: port,
+            nickname: "clove-test".to_owned(),
+            probe_timeout: Duration::from_secs(5),
+            session_timeout: Duration::from_secs(5),
+            persistent_key: None,
+        }
+    }
+
+    #[test]
+    fn a_session_publishes_its_destination_and_never_its_private_keys() {
+        let (port, sent) = session_bridge(ok_status(), AfterSession::Hold);
+        let session = SamSession::connect(&config(port)).expect("session");
+
+        // The command actually put on the wire.
+        let create = sent.recv_timeout(Duration::from_secs(5)).expect("create");
+        assert!(
+            create.starts_with("SESSION CREATE STYLE=STREAM"),
+            "{create}"
+        );
+        assert!(create.contains("ID=clove-test"), "{create}");
+        assert!(create.contains("DESTINATION=TRANSIENT"), "{create}");
+
+        // §5.1c, the defect that sent our private keys to a tracker: what we
+        // publish is the destination at the front of the blob, and the
+        // identity is its hash — not the blob's.
+        let published =
+            crate::addr::i2p_base64_decode(session.local_dest_b64()).expect("published base64");
+        assert_eq!(published, destination(), "the private half must be cut off");
+        assert!(
+            published.len() < key_blob().len(),
+            "the whole blob was published"
+        );
+        assert_eq!(
+            session.local_dest(),
+            DestHash::from_b64_destination(&crate::addr::i2p_base64_encode(&destination()))
+                .expect("hash")
+        );
+        assert!(session.healthy());
+        assert!(I2pDialer::usable(&session), "a live session is usable");
+    }
+
+    /// The keep-alive clove never answered. Java I2P pings the client on every
+    /// read timeout and kills the session with `SESSION_ERROR "PONG timeout"`
+    /// when no `PONG` comes back — and nothing in clove read the control
+    /// connection at all, so nothing ever could.
+    #[test]
+    fn a_router_initiated_ping_is_answered_with_a_pong() {
+        let (port, sent) = session_bridge(ok_status(), AfterSession::Ping);
+        let session = SamSession::connect(&config(port)).expect("session");
+        let _create = sent.recv_timeout(Duration::from_secs(5)).expect("create");
+
+        let reply = sent
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a reply to the PING");
+        assert_eq!(reply, "PONG 12345", "the token must be echoed verbatim");
+        assert!(
+            session.healthy(),
+            "answering a ping is not losing a session"
+        );
+    }
+
+    /// The whole point of the watchdog: when a session ends, say so at once
+    /// and say what the router said. The old probe took up to 90 seconds to
+    /// notice and reported the word "lost".
+    #[test]
+    fn a_lost_session_is_noticed_at_once_and_carries_the_routers_last_words() {
+        let (port, _sent) = session_bridge(ok_status(), AfterSession::ExplainAndClose);
+        let session = SamSession::connect(&config(port)).expect("session");
+
+        let started = Instant::now();
+        let reason = session.wait_until_lost();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?} to notice a closed control connection",
+            started.elapsed()
+        );
+        assert!(!session.healthy());
+        assert!(
+            !I2pDialer::usable(&session),
+            "a dead session must not be handed best-effort work"
+        );
+        assert!(
+            reason.contains("tunnel build failed"),
+            "the router explained itself and we dropped it: {reason}"
+        );
+    }
+
+    /// End-of-file is not health. yosemite's `read_line` returns `Ok("")` at
+    /// end-of-file and the old probe called that success, so a session the
+    /// router had already destroyed read as healthy for two more rounds.
+    #[test]
+    fn a_control_connection_at_end_of_file_is_dead_not_healthy() {
+        let (port, _sent) = session_bridge(ok_status(), AfterSession::ExplainAndClose);
+        let session = SamSession::connect(&config(port)).expect("session");
+        let _ = session.wait_until_lost();
+        assert!(
+            !session.healthy(),
+            "a closed control connection reported itself healthy"
+        );
+    }
+
+    #[test]
+    fn a_refused_session_reports_the_routers_own_word() {
+        // DuplicateId is the §2.9 hazard, and it calls for a different action
+        // than any other refusal — so it has to survive into the error.
+        let (port, _sent) = session_bridge(
+            "SESSION STATUS RESULT=DUPLICATED_ID MESSAGE=\"session clove-test exists\"\n",
+            AfterSession::Hold,
+        );
+        let err = SamSession::connect(&config(port))
+            .map(drop)
+            .expect_err("a refused session is not a session");
+        assert!(err.to_string().contains("DUPLICATED_ID"), "{err}");
+        assert!(
+            err.to_string().contains("session clove-test exists"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_session_status_without_a_destination_is_refused() {
+        let (port, _sent) = session_bridge("SESSION STATUS RESULT=OK\n", AfterSession::Hold);
+        let err = SamSession::connect(&config(port))
+            .map(drop)
+            .expect_err("no DESTINATION means no identity");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn forwarding_asks_for_the_destination_header_and_keeps_its_socket() {
+        let (port, sent) = session_bridge(ok_status(), AfterSession::Hold);
+        let session = Arc::new(SamSession::connect(&config(port)).expect("session"));
+        let _create = sent.recv_timeout(Duration::from_secs(5)).expect("create");
+
+        let listener = SamListener::forward(Arc::clone(&session)).expect("forward");
+        let forward = sent
+            .recv_timeout(Duration::from_secs(5))
+            .expect("forward command");
+        assert!(forward.starts_with("STREAM FORWARD "), "{forward}");
+        assert!(forward.contains("ID=clove-test"), "{forward}");
+        assert!(
+            forward.contains(&format!("PORT={}", listener.local_port())),
+            "the router must be pointed at the listener we bound: {forward}"
+        );
+        // SILENT=false is what makes the peer's destination line arrive, and
+        // without it an inbound peer has no identity at all (§2.5).
+        assert!(forward.contains("SILENT=false"), "{forward}");
+        assert_eq!(listener.local_dest(), session.local_dest());
+    }
+
+    #[test]
+    fn ping_lines_are_recognised_exactly() {
+        assert_eq!(ping_token("PING"), Some(""));
+        assert_eq!(ping_token("PING 12345"), Some(" 12345"));
+        assert_eq!(ping_token("PING  two  spaces"), Some("  two  spaces"));
+        // Not pings, and answering them would be answering something we did
+        // not understand.
+        assert_eq!(ping_token("PINGER 1"), None);
+        assert_eq!(ping_token("PONG 12345"), None);
+        assert_eq!(ping_token("SESSION STATUS RESULT=OK"), None);
+        assert_eq!(ping_token(""), None);
     }
 }

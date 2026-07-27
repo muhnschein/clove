@@ -1332,6 +1332,7 @@ mod tests {
             sweep_interval: Duration::from_millis(50),
             retry_backoff: Duration::from_millis(100),
             max_peers: 8,
+            dial_concurrency: 4,
         }
     }
 

@@ -303,6 +303,16 @@ Status legend:
       multiple dial sessions, or is fine because connects are quick once warm,
       is the N-scaling question the harness still has to answer.
 
+      **Postscript, 2026-07-27.** Deleting the constraint in §2.12 did not
+      delete the code shaped around it. `clove_core::swarm::sweep` went on
+      dialling strictly one peer at a time, its comment still citing this
+      entry, for as long as it took a live run to notice — and the cost was not
+      subtle: fifty tracker peers, a 120s per-dial timeout and a session
+      lifetime under two minutes meant *one* dial attempt per session, usually
+      cut off in flight. `0 peers / 50 known`, run after run, from a sweep that
+      was working exactly as written. A superseded constraint needs its
+      dependants found, not just its entry annotated.
+
     2.6b [assumed] A freshly created transient destination is briefly
       unreachable: a dial to it returns STREAM STATUS RESULT=CANT_REACH_PEER
       (surfaced as Protocol(Router(CantReachPeer))) for the ~seconds it takes
@@ -416,14 +426,15 @@ Status legend:
     torrent dials.
     Budget is SamConfig::probe_timeout (default 10s).
 
-    Residual gap, deliberately not papered over: a bridge that answers HELLO
-    correctly and *then* stalls on SESSION CREATE still hangs inside
-    yosemite. The probe cannot see that far. Closing it needs either read
-    timeouts upstream in yosemite, or proxying yosemite's control connection
-    through a socket clove owns so it can be shut down — the latter is real
-    complexity for a failure mode much rarer than "the router is not up yet",
-    so it waits for evidence from live running. Tracked by the test
-    `a_bridge_that_passes_hello_and_then_stalls_is_a_known_gap`.
+    Residual gap, CLOSED 2026-07-27 by §2.13: a bridge that answered HELLO
+    correctly and *then* stalled on SESSION CREATE used to hang inside
+    yosemite, and the probe could not see that far. clove speaks SESSION
+    CREATE itself now, on the socket the handshake already gave it, so the
+    second half is bounded by SamConfig::session_timeout exactly as the first
+    is by probe_timeout. The pre-flight probe is gone with the gap: there is
+    nothing left to pre-flight *for*, since the connection the handshake opens
+    is the one the session then uses. Tracked by the test
+    `a_bridge_that_passes_hello_and_then_stalls_no_longer_hangs`.
 
 2.8 [decided] emissary 0.4.0, first live run (2026-07-25): every dial between two
     destinations on the *same* emissary router failed. The router's own log is
@@ -617,6 +628,78 @@ Status legend:
     it. Worth reporting upstream regardless (R1) — the next consumer will hit
     it, and a state machine that poisons itself on an unexpected reply is a
     defect whether or not clove still depends on it.
+
+2.13 [decided] **The SAM control connection has to be read, not just written
+    to.** Found 2026-07-27, after a fourth live run reproduced the same
+    ~90-second `downloading` / `waiting-for-router` cycle that §2.12 was
+    supposed to have fixed — with zero peers connected against fifty known,
+    every cycle, for the whole run.
+
+    What clove had was a 30-second health probe: write `PING clove` on the
+    session's control connection, read one line, and call the session healthy
+    if that returned `Ok`. Three things were wrong with it, and together they
+    made the failure it was supposed to detect unattributable.
+
+      - **End-of-file read as health.** yosemite's `read_command` is
+        `BufReader::read_line`, which returns `Ok(0)` at end-of-file, which
+        yosemite maps to `Ok("")` and `is_ok()` calls success. A session the
+        router had already destroyed therefore reported itself healthy for up
+        to two further rounds. The observed cadence follows exactly: the probe
+        that kills or witnesses the session at T+30 reports fine, T+60 reports
+        fine, T+90 finally fails on a write — and the log says
+        `waiting-for-router` at 105s, 211s, 316s, 437s.
+      - **The reply was never examined.** Not the result, not the text,
+        nothing. A `SESSION STATUS RESULT=I2P_ERROR MESSAGE="..."` — a router
+        explaining precisely why it was ending the session — was read off the
+        socket and dropped on the floor. Four live runs died on this cycle and
+        not one produced a reason, because the one place a reason is ever
+        spoken was being read into a variable nobody looked at.
+      - **Nothing answered a router-initiated `PING`.** `SAMv3.2` lets the
+        router ping the client. Java I2P's `SAMv3Handler` does it on every read
+        timeout and answers an unanswered ping with `SESSION_ERROR "PONG
+        timeout"`, ending the session. Since the control connection was only
+        ever read *inside* the probe — one line per thirty seconds, treated as
+        the probe's own reply — clove could not have answered one. That alone
+        is fatal on Java I2P and is a plausible reason clove has never had a
+        Java I2P run reach anything (§2.10).
+
+    A dead end worth recording, so nobody spends the session on it again: i2pd
+    gained SAM `PING`/`PONG` only in **2.58.0** (verified against the 2.44.0,
+    2.50.2, 2.53.1, 2.56.0, 2.57.0 and 2.58.0 sources). On anything older,
+    `HandleMessage` falls through to `Terminate("SAM: unexpected message")`,
+    and for a socket of type `eSAMSocketTypeSession` that is
+    `CloseSession(m_ID)` — so the health probe would have destroyed the very
+    session it was checking, on a 30-second timer. The arithmetic fits the
+    observed cadence perfectly. It is **not** what happened here: the router
+    under test was 2.61.0, which answers `PING` correctly. Recorded because the
+    hazard is real for anyone on an older i2pd, and because a theory fitting
+    four cycles to the second can still be the wrong one.
+
+    clove now owns its control connection outright — `HELLO VERSION` and
+    `SESSION CREATE` are spoken on a socket it opens, which closes §2.7's
+    residual gap on the way past — and a **watchdog thread reads that
+    connection for the session's whole life**:
+
+      - it answers `PING` with `PONG <token>`, echoed verbatim;
+      - it keeps the last non-ping line the router sent;
+      - end-of-file or error ends the session *immediately*, with that line
+        attached to the reason.
+
+    `healthy()` is now a flag read rather than an exchange, and the supervisor
+    blocks on `wait_until_lost()` instead of polling, so teardown happens the
+    moment the router hangs up rather than up to 90 seconds later, and
+    `cloved` logs the router's own words for it.
+
+    **This does not explain the ~90-second cycle**; on i2pd 2.61.0 the cause is
+    still unknown. What it does is make the next run say so. The lesson is
+    §5.1c's again, one layer further out: three theories about this cycle have
+    now been wrong (a router fault, a poisoned library state machine, an
+    unsupported PING), and each cost a live session, because the diagnostic
+    that would have settled it was being read and discarded rather than not
+    being available.
+
+    yosemite is left with `NAMING LOOKUP` alone.
+
 
 3. Reconnect discipline (i2pnet::supervisor, M1)
 ------------------------------------------------
