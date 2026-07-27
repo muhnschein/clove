@@ -582,6 +582,31 @@ it just is not a clean sign-off.
 
 ## 7a. Troubleshooting (live-run findings)
 
+**`state` flapping between `downloading` and `waiting-for-router` every
+~90–120s, with zero peers.** The session is not being lost — it is being
+*wedged* and rebuilt. yosemite 0.7's session controller is one state machine
+shared by the control connection and every stream operation, and a stream
+failure on an unexpected path leaves it `Poisoned`, after which every dial
+returns `invalid state` (`PROTOCOL.i2p-bt` §2.12). Its signature in the daemon
+log is one `invalid message from router` followed by `invalid state`, over and
+over.
+
+clove now detects it and rebuilds at once, logging `SAM session wedged (not a
+router fault)` so it is not mistaken for a router problem. It is a mitigation:
+each rebuild currently mints a new transient destination, so a run that wedges
+repeatedly cannot hold an identity long enough to be dialed.
+
+An ordinary unreachable peer does *not* do this — yosemite recovers from
+`CANT_REACH_PEER` correctly — so a flap means a protocol-level surprise, not a
+thin netDb.
+
+**Every announce fails and no peers are ever learned.** Read the reason, which
+now carries the response: `tracker: response is not bencode; it begins "…"`.
+If it begins with a hex number and a CRLF, that is chunked framing on a client
+too old to decode it (fixed; `PROTOCOL.i2p-bt` §5.1a). If it begins `<html`,
+the tracker returned an error page and the status line is the thing to read.
+If it says `<empty body>`, the stream closed before the tracker said anything.
+
 **A magnet that sits in `fetching-metadata` and never moves.** Found by the
 first live swarm run, 2026-07-27: nine minutes at `fetching-metadata` with no
 output of any kind. The cause was not the fetch failing — it was the fetch
