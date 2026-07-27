@@ -513,6 +513,10 @@ impl I2pStream for ForwardedStream {
 impl I2pDialer for SamSession {
     type Stream = SamStream;
 
+    fn usable(&self) -> bool {
+        !self.is_wedged()
+    }
+
     fn dial(&self, peer: DestHash, _timeout: Duration) -> io::Result<SamStream> {
         // A session already known to be wedged cannot dial, and saying so at
         // once beats issuing a command whose only possible answer is

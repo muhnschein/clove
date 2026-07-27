@@ -92,6 +92,18 @@ pub trait I2pDialer {
     /// Session down, lease-set lookup failure, refusal, or timeout. Errors
     /// carry operator-readable text (a log line at 2 a.m. must make sense).
     fn dial(&self, peer: DestHash, timeout: Duration) -> io::Result<Self::Stream>;
+
+    /// Whether this dialer can still be expected to work.
+    ///
+    /// A session can reach a state no dial will ever succeed from
+    /// (`docs/PROTOCOL.i2p-bt` §2.12), and callers that are about to spend a
+    /// thread and a socket on a best-effort message — a goodbye announce
+    /// during teardown, say — should ask first rather than queue work for a
+    /// corpse. Defaults to `true`, which is right for every backend that
+    /// cannot get into such a state, including the mock.
+    fn usable(&self) -> bool {
+        true
+    }
 }
 
 /// Inbound I2P stream connections (SAM `STREAM ACCEPT`/`FORWARD`), bound to
