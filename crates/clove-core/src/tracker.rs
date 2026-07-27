@@ -26,6 +26,10 @@ use i2pnet::DestHash;
 use crate::bencode::{self, Value};
 use crate::http;
 
+/// What clove calls itself to trackers. Kept in step with the wire peer id
+/// prefix (`-CV0001-`, Q7) so a tracker operator sees one name, not two.
+pub const USER_AGENT: &str = concat!("clove/", env!("CARGO_PKG_VERSION"));
+
 /// Default peers to request per announce.
 pub const DEFAULT_NUMWANT: u32 = 200;
 
@@ -141,11 +145,15 @@ pub fn build_announce(url: &str, params: &AnnounceParams) -> Result<(String, Vec
         target.push_str("&event=");
         target.push_str(event);
     }
+    // Identify ourselves. An announce with no User-Agent at all is another
+    // shape almost no real client sends, and trackers have historically been
+    // choosy about it. It also means an operator reading a tracker's logs can
+    // see which client is misbehaving, which is a courtesy we would want back.
     let request = http::Request {
         method: "GET",
         target: &target,
         host: parsed.host,
-        headers: &[],
+        headers: &[("User-Agent", USER_AGENT)],
         body: &[],
     };
     Ok((parsed.host.to_owned(), request.encode()))
@@ -418,9 +426,19 @@ const PREVIEW_LEN: usize = 512;
 /// about what kind of thing arrived, not a hex dump, and a log line full of
 /// `\x1b` would be both longer and less readable. Control characters never
 /// reach the terminal, which matters when the bytes came off the network.
+/// **HTML is summarised rather than quoted.** A raw prefix of a modern page is
+/// its inline stylesheet, and two live runs proved it: 96 bytes of `:root{`
+/// said nothing, and 512 bytes of the same said nothing at greater length,
+/// while the one useful token — the `<title>` — sat past the cut both times. A
+/// page is identified by its title and its words, so those are what come out.
 fn preview(body: &[u8]) -> String {
     if body.is_empty() {
         return "<empty body>".to_owned();
+    }
+    if looks_like_html(body)
+        && let Ok(text) = std::str::from_utf8(body)
+    {
+        return summarise_html(text);
     }
     let mut out: String = body
         .iter()
@@ -437,6 +455,91 @@ fn preview(body: &[u8]) -> String {
         out.push('…');
     }
     out
+}
+
+/// Whether a body opens like markup, ignoring leading whitespace.
+fn looks_like_html(body: &[u8]) -> bool {
+    let start: Vec<u8> = body
+        .iter()
+        .copied()
+        .skip_while(u8::is_ascii_whitespace)
+        .take(16)
+        .collect();
+    start.starts_with(b"<!DOCTYPE")
+        || start.starts_with(b"<!doctype")
+        || start.starts_with(b"<html")
+        || start.starts_with(b"<HTML")
+}
+
+/// A page's `<title>` and its first visible words — what a person would say if
+/// asked "what page is this?".
+fn summarise_html(text: &str) -> String {
+    let mut out = String::from("HTML page");
+    if let Some(title) = between(text, "<title", "</title>")
+        && let Some((_, inner)) = title.split_once('>')
+    {
+        let title = collapse(inner);
+        if !title.is_empty() {
+            let _ = write!(out, " titled {title:?}");
+        }
+    }
+    let words = collapse(&strip_markup(text));
+    if !words.is_empty() {
+        let shown: String = words.chars().take(PREVIEW_LEN / 2).collect();
+        let _ = write!(out, "; text begins {shown:?}");
+    }
+    out
+}
+
+/// The slice from the first `open` up to the following `close`.
+fn between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = text.find(open)?;
+    let rest = &text[start..];
+    let end = rest.find(close)?;
+    Some(&rest[..end])
+}
+
+/// Drop tags, and the contents of `<head>`/`<style>`/`<script>` with them:
+/// those are the bulk of a modern page and none of its meaning.
+fn strip_markup(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        rest = &rest[open..];
+        let skip_to = if opens_tag(rest, "head") {
+            "</head>"
+        } else if opens_tag(rest, "style") {
+            "</style>"
+        } else if opens_tag(rest, "script") {
+            "</script>"
+        } else {
+            ">"
+        };
+        match rest.find(skip_to) {
+            Some(i) => rest = &rest[i + skip_to.len()..],
+            // An unterminated tag ends the useful text; return what we have
+            // rather than emitting the remains of a stylesheet.
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether `rest` opens the named tag — `<style>` or `<style type=…>`, but not
+/// `<styleish>`.
+fn opens_tag(rest: &str, name: &str) -> bool {
+    let after = &rest[1.min(rest.len())..];
+    after.len() > name.len()
+        && after.is_char_boundary(name.len())
+        && after[..name.len()].eq_ignore_ascii_case(name)
+        && after[name.len()..].starts_with([' ', '>', '\t', '\n', '\r'])
+}
+
+/// Collapse whitespace runs and trim, so a page's text is one readable line.
+fn collapse(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 impl std::fmt::Display for Error {
@@ -721,8 +824,35 @@ mod tests {
         };
         let text = e.to_string();
         assert!(
-            text.contains("<html>") && text.contains("500"),
-            "the error must quote the body, got: {text}"
+            text.contains("HTML page") && text.contains("500 Internal Server Error"),
+            "the error must identify the page, got: {text}"
+        );
+
+        // The shape that defeated two previews: a modern page whose <head> is
+        // mostly inline CSS, so the raw prefix is a stylesheet and the one
+        // identifying token sits well past any sane cut. Summarising beats
+        // quoting, and it is shorter.
+        let page = "<!DOCTYPE html>\n<html>\n<head>\n<style type=\"text/css\">\n:root{\n\
+             --border_table:inset 0 0 0 1px rgba(255,255,255,.3);\n\
+             --postman:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'\
+             %3E%3Cpath fill='%23ffe1b2' d='M19.2 27.4c-1.4-.4-2.4.4-2.4 2 0 2 2 7 4 4z'\
+             /%3E%3C/svg%3E\");\n}\n</style>\n<title>Postman's Tracker</title>\n</head>\n\
+             <body>\n<h1>Welcome</h1>\n<p>Torrent index and tracker.</p>\n</body>\n</html>";
+        let Err(styled) = parse_response(page.as_bytes()) else {
+            panic!("a web page is not a valid announce response");
+        };
+        let text = styled.to_string();
+        assert!(
+            text.contains("Postman's Tracker"),
+            "the title identifies the page, and must survive the stylesheet: {text}"
+        );
+        assert!(
+            text.contains("Welcome") && text.contains("Torrent index"),
+            "the page's visible words must come through: {text}"
+        );
+        assert!(
+            !text.contains("--border_table") && !text.contains("image/svg"),
+            "the stylesheet is the noise this exists to remove: {text}"
         );
 
         // The half a 96-character preview could not give: a tracker answering

@@ -83,20 +83,31 @@ Status legend:
     `failure reason`, not an error status — a web page, served where an
     announce belongs.
 
-    Three explanations remain open, and they have three different fixes:
-      (a) the tracker serves its own site for a request it does not accept,
-          in which case the announce parameters are the thing to look at
-          (§5.1's `ip=` form is still [assumed]);
-      (b) the tracker is unwell and serving its front page to everything;
-      (c) the host resolved to a destination that is not the tracker — an
-          address book is a file of assertions, and a stale or wrong entry
-          would look exactly like this.
+    **It is postman.** The page's own stylesheet declares `--postman:` and
+    embeds an SVG of a postman; 14151 bytes, `content-type text/html;
+    charset=utf-8`. So the destination is right and the address book is not
+    the problem — that candidate is closed. What remains:
+      (a) postman's webserver declines the request and serves the site
+          instead. Two shapes in clove's announce were unusual enough to be
+          worth removing before blaming the endpoint: `Content-Length: 0` on
+          a bodyless GET, which almost nothing on the web sends, and **no
+          `User-Agent` at all**. Both are fixed; §5.1's `ip=` form remains
+          [assumed] and is the next candidate if they were not it.
+      (b) `/announce.php` is no longer the announce endpoint, and the server
+          answers 200 with its front page for paths it does not route.
 
-    The first run could not separate them: the error carried 96 characters,
-    which reached the inline CSS and stopped before the `<title>`. The
-    preview is now 512 bytes, the response's `Content-Type` and length travel
-    with it, and the announcer logs the b32 the host resolved to whenever an
-    announce fails. One more run should close this.
+    Settle it from outside clove before changing anything else — one request
+    through the router's HTTP proxy says which:
+
+        curl -x http://127.0.0.1:4444 -i http://tracker2.postman.i2p/announce.php
+
+    A bencoded `failure reason` means the endpoint is live and clove's request
+    is at fault; the same HTML page means the endpoint is (b).
+
+    Two previews were spent learning that a modern page's first 512 bytes are
+    its stylesheet. `preview` now summarises HTML — `<title>` plus the first
+    visible words — rather than quoting the head, which is what "identify the
+    page" actually needs.
 
 5.2 [decided] Any query already present in the announce URL (e.g. postman's
     `/announce.php?...`) is preserved; clove appends its params with the
@@ -474,6 +485,20 @@ Status legend:
     `CANT_REACH_PEER` on the harmless side of it — putting it on the wrong
     side would rebuild the session tree for every unreachable peer, which on a
     real swarm is most of them.
+
+    Live 2026-07-27, 44 rounds: the wedge follows an announce **one for one**.
+    Every HTTP exchange with the tracker is followed by a dial that fails with
+    `invalid message from router`, then a rebuild, then another exchange. That
+    regularity says the trigger is the stream traffic itself rather than
+    anything random, and yosemite's `read_response` returning `Some("")` on
+    immediate EOF (2.12 above) says the router closed a *fresh* stream socket
+    without answering `HELLO`.
+
+    Why it would: unmeasured. The candidate worth checking first is that clove
+    is accumulating SAM connections — every dial opens a new TCP socket to the
+    bridge, and a bridge at its connection ceiling would refuse the next one
+    exactly this way. `ss -tn 'dport = :7656' | wc -l` against a running
+    daemon answers it, and i2pd's own log is the other half.
 
     This is a mitigation, not a fix, and it carries a cost worth stating: a
     rebuild currently mints a *new transient destination* (Q4 persistent keys
