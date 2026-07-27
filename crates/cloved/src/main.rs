@@ -195,16 +195,14 @@ fn sam_tcp_port(sam_address: &str) -> Option<u16> {
         .and_then(|(_, p)| p.parse::<u16>().ok())
 }
 
-/// How often the SAM session's health is probed once connected.
-const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
-
 /// Supervise the SAM session in the background: connect on the reconnect
-/// policy's backoff, attach the network, then probe health; on session loss,
-/// tear the session tree down (detach the registry, stop and poke the demux's
-/// accept loop) and rebuild — the SCOPE §4 reconnect discipline.
+/// policy's backoff, attach the network, then wait for the session to end; on
+/// session loss, tear the session tree down (detach the registry, stop and
+/// poke the demux's accept loop) and rebuild — the SCOPE §4 reconnect
+/// discipline.
 fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str) {
-    // yosemite speaks SAM on 127.0.0.1:<port> only; a unix-socket SAM path
-    // cannot be used by this backend.
+    // The SAM backend dials 127.0.0.1:<port> by construction (Layer 1's
+    // loopback rule); a unix-socket SAM path cannot be used by it.
     let Some(port) = sam_tcp_port(sam_address) else {
         eprintln!("cloved: sam_address {sam_address:?} is not host:port; running without a router");
         *lock(&daemon.router) = "unsupported-sam-address";
@@ -247,23 +245,20 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str) {
             );
             *lock(&daemon.router) = "connected";
 
-            // Phase 2: watch the session until it dies.
-            loop {
-                std::thread::sleep(HEALTH_INTERVAL);
-                if !session.healthy() {
-                    break;
-                }
-            }
+            // Phase 2: wait for the session to end.
+            //
+            // This used to be a 30-second `PING` probe, which was wrong twice
+            // over: it could not see a dead session for up to 90 seconds
+            // (end-of-file on the control connection read as success), and
+            // when it finally did, it had thrown away everything the router
+            // had said about why. The session now watches its own control
+            // connection, so this returns the moment the router hangs up and
+            // returns its account of it (`PROTOCOL.i2p-bt` §2.13).
+            let reason = session.wait_until_lost();
 
             // Phase 3: teardown, then rebuild from phase 1.
-            //
-            // This used to have to distinguish "the router went away" from
-            // "our session wedged while the router stayed up", because the
-            // second happened every 60–90 seconds and looked like the first.
-            // Dials no longer share any state that can wedge
-            // (`PROTOCOL.i2p-bt` §2.12), so a lost session means what it says
-            // again: the control connection died.
-            eprintln!("cloved: router lost; torrents wait while the session tree rebuilds");
+            eprintln!("cloved: router lost: {reason}");
+            eprintln!("cloved: torrents wait while the session tree rebuilds");
             *lock(&daemon.router) = "waiting-for-router";
             demux.stop();
             let _ = i2pnet::sam::poke_listener(forward_port);

@@ -142,6 +142,14 @@ impl<T: I2pDialer> I2pDialer for std::sync::Arc<T> {
     fn dial(&self, peer: DestHash, timeout: Duration) -> io::Result<Self::Stream> {
         T::dial(self, peer, timeout)
     }
+
+    /// Forwarded, not defaulted. Leaving this to the trait's `true` default
+    /// silently disabled every `usable()` check in the daemon, since the
+    /// dialer it holds is an `Arc` — including the guard that exists to stop a
+    /// dead session being handed goodbye announces (`cloved`'s registry).
+    fn usable(&self) -> bool {
+        T::usable(self)
+    }
 }
 
 /// I2P naming resolution (SAM `NAMING LOOKUP`), e.g. `tracker2.postman.i2p`.

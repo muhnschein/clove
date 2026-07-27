@@ -161,9 +161,10 @@ budget-spending decision — not smuggled in with M4.
      when it lands. Mock-proven: registry-level download to 100% with
      persistence across reopen; pause/resume lifecycle; waiting-for-router.
      ~~Known gaps~~ both closed in 5d's commit: **session-loss supervision**
-     (SAM `PING` health probe every 30s; on failure the session tree is torn
-     down — demux stopped and poked awake, registry detached, torrents back
-     to waiting-for-router — and rebuilt on the reconnect backoff) and
+     (a watchdog thread reads the SAM control connection for the session's
+     life; on loss the session tree is torn down — demux stopped and poked
+     awake, registry detached, torrents back to waiting-for-router — and
+     rebuilt on the reconnect backoff) and
      **pause disconnect** (`Torrent::disconnect_all` empties the peer table
      and stops transfer; idle reader threads reclaim with the R5
      keep-alive/timeout work).
