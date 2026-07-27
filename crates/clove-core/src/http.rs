@@ -61,7 +61,14 @@ impl Request<'_> {
             out.extend_from_slice(value.as_bytes());
             out.extend_from_slice(b"\r\n");
         }
-        out.extend_from_slice(format!("Content-Length: {}\r\n", self.body.len()).as_bytes());
+        // A bodyless GET carries no Content-Length. It is legal either way
+        // (RFC 9110 §8.6), but "GET with Content-Length: 0" is a shape almost
+        // nothing on the web emits, and it is the kind of thing a webserver,
+        // proxy or WAF in front of a tracker may treat as not-a-real-request.
+        // Sending what every other client sends removes it as a variable.
+        if !(self.method == "GET" && self.body.is_empty()) {
+            out.extend_from_slice(format!("Content-Length: {}\r\n", self.body.len()).as_bytes());
+        }
         out.extend_from_slice(b"Connection: close\r\n\r\n");
         out.extend_from_slice(self.body);
         out
@@ -534,10 +541,38 @@ mod tests {
             body: &[],
         };
         let s = String::from_utf8(req.encode()).unwrap();
+        // No Content-Length: a bodyless GET does not carry one, because
+        // almost nothing on the web sends `GET` with `Content-Length: 0` and
+        // a tracker behind a picky webserver is a bad place to be unusual.
         assert_eq!(
             s,
-            "GET /announce?x=1 HTTP/1.1\r\nHost: tracker.i2p\r\nUser-Agent: clove/0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "GET /announce?x=1 HTTP/1.1\r\nHost: tracker.i2p\r\nUser-Agent: clove/0.1\r\nConnection: close\r\n\r\n"
         );
+    }
+
+    /// A request that *does* carry a body still declares its length, and so
+    /// does a non-GET with an empty one — the local API depends on both.
+    #[test]
+    fn bodies_still_declare_their_length() {
+        let post = Request {
+            method: "POST",
+            target: "/v1/torrents",
+            host: "clove",
+            headers: &[],
+            body: b"d4:infod',",
+        };
+        let s = String::from_utf8(post.encode()).unwrap();
+        assert!(s.contains("Content-Length: 10\r\n"), "{s}");
+
+        let empty_post = Request {
+            method: "POST",
+            target: "/v1/torrents/x/pause",
+            host: "clove",
+            headers: &[],
+            body: &[],
+        };
+        let s = String::from_utf8(empty_post.encode()).unwrap();
+        assert!(s.contains("Content-Length: 0\r\n"), "{s}");
     }
 
     #[test]
