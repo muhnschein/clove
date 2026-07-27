@@ -159,6 +159,28 @@ pub fn build_announce(url: &str, params: &AnnounceParams) -> Result<(String, Vec
     Ok((parsed.host.to_owned(), request.encode()))
 }
 
+/// The URL an encoded announce request actually asks for, reassembled from
+/// the bytes on the wire.
+///
+/// Taken from the request rather than rebuilt from the parameters, so what
+/// gets logged is what was sent — the point is to hand an operator something
+/// they can paste into a browser pointed at the same tracker and bisect by
+/// deleting parameters. Three rounds of reasoning about which parameter a
+/// tracker dislikes were worth less than one round of removing them one at a
+/// time, and only the operator can run that test.
+#[must_use]
+pub fn announced_url(host: &str, request: &[u8]) -> String {
+    let line = request
+        .split(|&b| b == b'\r' || b == b'\n')
+        .next()
+        .unwrap_or_default();
+    let target = std::str::from_utf8(line)
+        .ok()
+        .and_then(|l| l.split(' ').nth(1))
+        .unwrap_or("/");
+    format!("http://{host}{target}")
+}
+
 /// A tracker's decoded reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnnounceResponse {
@@ -783,6 +805,32 @@ mod tests {
     /// The live failure, end to end: postman answers chunked, and every
     /// announce came back "not bencode" with zero peers. The announce path —
     /// not just the HTTP reader — has to survive it.
+    /// What gets logged when a tracker refuses an announce must be the URL
+    /// that was actually sent, byte for byte, because its only job is to be
+    /// pasted into a browser and bisected.
+    #[test]
+    fn the_announced_url_is_reassembled_from_the_wire() {
+        let (host, request) =
+            build_announce("http://tracker2.postman.i2p/announce.php", &params()).unwrap();
+        let url = announced_url(&host, &request);
+        assert!(url.starts_with("http://tracker2.postman.i2p/announce.php?info_hash="));
+        assert!(url.contains("&ip=MYDESTb64"), "{url}");
+        assert!(
+            !url.contains("HTTP/1.1"),
+            "the version is not part of it: {url}"
+        );
+        assert!(
+            !url.contains('\r') && !url.contains('\n'),
+            "one line: {url}"
+        );
+
+        // Garbage in, something harmless out — this runs on an error path and
+        // must never be the thing that panics.
+        assert_eq!(announced_url("h", b""), "http://h/");
+        assert_eq!(announced_url("h", b"GET"), "http://h/");
+        assert_eq!(announced_url("h", &[0xff, 0xfe]), "http://h/");
+    }
+
     #[test]
     fn announce_over_a_chunked_stream() {
         let mut peers = Vec::new();
