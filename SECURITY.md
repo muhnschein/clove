@@ -54,7 +54,12 @@ communicate outside I2P, or that ties an I2P identity to a network identity:
 - Remote crashes, hangs, or unbounded memory growth triggered by a peer,
   tracker, `.torrent`, magnet, or resume file. Parsers here are hostile-input
   surfaces by assumption.
-- Local API authentication bypass, or token disclosure to another local user.
+- Local API authentication bypass, or disclosure of the API token or the
+  client's destination key to another local user.
+- The destination key, or any part of the SAM `DESTINATION=` blob behind it,
+  reaching a tracker, a peer, a log or the control API. Only the public
+  destination on the front of that blob may ever leave the process
+  (`docs/PROTOCOL.i2p-bt` §5.1c).
 - State-file corruption that survives a restart, or resume data that causes
   clove to trust unverified pieces.
 - Path traversal from torrent file names.

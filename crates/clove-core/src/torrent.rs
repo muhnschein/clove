@@ -36,7 +36,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use i2pnet::{DestHash, I2pStream};
+use i2pnet::{DestHash, I2pClose, I2pStream};
 
 use crate::bitfield::{self, Bitfield};
 use crate::choker::{Choker, PeerSnapshot};
@@ -576,10 +576,9 @@ impl Torrent {
 
     /// Disconnect every attached peer: each is removed from the peer table
     /// (withdrawing its availability and releasing its in-flight blocks) and
-    /// its outgoing queue is dropped, so its writer thread exits and no
-    /// further data moves in either direction. Reader threads linger inertly
-    /// on their blocking reads until the remote closes — reclaiming them
-    /// needs the keep-alive/read-timeout work (R5).
+    /// its outgoing queue is dropped, so its writer thread exits, closes the
+    /// connection, and the reader blocked on it returns. Both threads and the
+    /// descriptor are reclaimed; nothing is left parked.
     pub fn disconnect_all(&self) {
         let ids: Vec<u64> = lock(&self.shared.state)
             .peers
@@ -589,6 +588,21 @@ impl Torrent {
         for id in ids {
             self.shared.remove_peer(id);
         }
+    }
+
+    /// How many of this torrent's peer threads are still running.
+    ///
+    /// Two per attached connection, a reader and a writer. Exposed because
+    /// "the peer table is empty" and "the threads that served it are gone" are
+    /// different claims, and only the first one was ever checkable — which is
+    /// how a reader parked forever on a dropped peer went unnoticed through
+    /// two rounds of fixing it.
+    #[must_use]
+    pub fn live_threads(&self) -> usize {
+        lock(&self.threads)
+            .iter()
+            .filter(|handle| !handle.is_finished())
+            .count()
     }
 
     /// This torrent's info-hash — its identity on trackers, the wire, and in
@@ -745,7 +759,7 @@ impl Torrent {
     }
 }
 
-fn spawn_writer<W: std::io::Write + Send + 'static>(
+fn spawn_writer<W: std::io::Write + I2pClose + Send + 'static>(
     mut writer: W,
     rx: Receiver<Message>,
 ) -> JoinHandle<()> {
@@ -755,6 +769,17 @@ fn spawn_writer<W: std::io::Write + Send + 'static>(
                 break;
             }
         }
+        // The connection is over — either the peer was removed from the table
+        // (which drops the sender this loop waits on) or a write failed — so
+        // close it, in both directions, before this thread ends.
+        //
+        // This is what reclaims the *reader*. Both halves are one connection,
+        // and dropping this one leaves the descriptor open because the reader
+        // holds the other, so a removed peer's reader used to sit in a
+        // blocking read for the life of the process: a thread, a descriptor
+        // and a router-side stream each, leaked on every pause, idle drop and
+        // session teardown. `disconnect_all` had a comment admitting as much.
+        writer.close();
     })
 }
 
