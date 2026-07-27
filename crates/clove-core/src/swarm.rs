@@ -10,9 +10,18 @@
 //!   dials + attaches the rest, up to [`SwarmConfig::max_peers`]. A failed
 //!   dial (leaseSet warmup `CantReachPeer`, refusal, timeout — see
 //!   `PROTOCOL.i2p-bt` §2.6b) schedules that peer for retry after
-//!   [`SwarmConfig::retry_backoff`] instead of being forgotten. Dial
-//!   *initiation* is sequential by design — it serializes on the session
-//!   anyway (§2.6a).
+//!   [`SwarmConfig::retry_backoff`] instead of being forgotten.
+//!
+//!   Up to [`SwarmConfig::dial_concurrency`] dials run at once. They used to
+//!   run strictly one after another, on the reasoning that they serialized on
+//!   the session anyway (§2.6a) — which stopped being true when clove took
+//!   over dialling (§2.12) and the sweep was never revisited. The cost was
+//!   severe and easy to miss: a tracker hands back fifty destinations, a good
+//!   fraction of any I2P swarm's are unreachable, and each unreachable one is
+//!   worth a whole [`SwarmConfig::dial_timeout`] of doing nothing else. One
+//!   sweep could outlast the session it was running on, so a live run reached
+//!   a *single* peer attempt per session and reported zero peers against fifty
+//!   known.
 //! - the **acceptor**: blocks on [`I2pListener::accept`], attaching each
 //!   inbound peer, refusing (dropping) connections past `max_peers`. It exits
 //!   when `accept` fails — session loss — because re-establishing the session
@@ -24,13 +33,14 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use i2pnet::{DestHash, I2pDialer, I2pListener, I2pNamingLookup, I2pStream};
 
-use crate::torrent::Torrent;
+use crate::torrent::{HANDSHAKE_TIMEOUT, Torrent};
 use crate::tracker;
 use crate::wire::{self, Handshake};
 
@@ -48,6 +58,13 @@ pub struct SwarmConfig {
     pub retry_backoff: Duration,
     /// Stop dialing, and refuse inbound, at this many attached peers.
     pub max_peers: usize,
+    /// How many dials may be in flight at once within one sweep.
+    ///
+    /// Each costs a thread that spends nearly all its life blocked on the
+    /// router, so this is bounded by patience rather than by CPU; what it must
+    /// not be is 1, which made the time to reach *any* peer a function of how
+    /// many dead destinations the tracker happened to list first.
+    pub dial_concurrency: usize,
 }
 
 impl Default for SwarmConfig {
@@ -57,6 +74,7 @@ impl Default for SwarmConfig {
             sweep_interval: Duration::from_secs(10),
             retry_backoff: Duration::from_secs(30),
             max_peers: 50,
+            dial_concurrency: 8,
         }
     }
 }
@@ -78,7 +96,7 @@ impl Swarm {
         config: SwarmConfig,
     ) -> Swarm
     where
-        D: I2pDialer + Send + 'static,
+        D: I2pDialer + Send + Sync + 'static,
         D::Stream: 'static,
         L: I2pListener + Send + 'static,
         L::Stream: 'static,
@@ -104,7 +122,7 @@ impl Swarm {
     /// session's forwarded listener exists.
     pub fn dial_only<D>(torrent: Arc<Torrent>, dialer: D, config: SwarmConfig) -> Swarm
     where
-        D: I2pDialer + Send + 'static,
+        D: I2pDialer + Send + Sync + 'static,
         D::Stream: 'static,
     {
         Swarm::spawn::<D, NoListener>(torrent, dialer, None, config)
@@ -408,7 +426,7 @@ where
 /// One dial sweep after another until stopped, with per-peer retry backoff.
 fn dial_loop<D>(torrent: &Arc<Torrent>, dialer: &D, stop: &StopFlag, config: SwarmConfig)
 where
-    D: I2pDialer,
+    D: I2pDialer + Sync,
     D::Stream: 'static,
 {
     let mut retry_after: HashMap<DestHash, Instant> = HashMap::new();
@@ -420,7 +438,12 @@ where
     }
 }
 
-/// Dial every eligible known peer once, newest state first.
+/// Dial every eligible known peer once, up to [`SwarmConfig::dial_concurrency`]
+/// at a time, and schedule the ones that failed for retry.
+///
+/// Returns when the whole wave has finished, so the caller's `retry_after`
+/// bookkeeping stays single-threaded and the sweep interval means what it
+/// says.
 fn sweep<D>(
     torrent: &Arc<Torrent>,
     dialer: &D,
@@ -428,33 +451,68 @@ fn sweep<D>(
     config: &SwarmConfig,
     retry_after: &mut HashMap<DestHash, Instant>,
 ) where
-    D: I2pDialer,
+    D: I2pDialer + Sync,
     D::Stream: 'static,
 {
     let connected: Vec<DestHash> = torrent.connected_peers();
-    let mut budget = config.max_peers.saturating_sub(connected.len());
+    let budget = config.max_peers.saturating_sub(connected.len());
     if budget == 0 {
         return;
     }
     let now = Instant::now();
     retry_after.retain(|_, at| *at > now);
-    for peer in torrent.known_peers() {
-        if budget == 0 || stop.is_raised() {
-            return;
-        }
-        if connected.contains(&peer) || retry_after.contains_key(&peer) {
-            continue;
-        }
-        let attached = dialer
-            .dial(peer, config.dial_timeout)
-            .and_then(|stream| torrent.attach(stream, peer));
-        match attached {
-            Ok(()) => budget -= 1,
-            Err(_) => {
-                retry_after.insert(peer, Instant::now() + config.retry_backoff);
-            }
-        }
+
+    // Decided up front rather than as we go: one pass over the candidates
+    // with the free-slot count as its cap, so a wave can neither overshoot
+    // `max_peers` nor race itself over who claimed the last slot.
+    let candidates: Vec<DestHash> = torrent
+        .known_peers()
+        .into_iter()
+        .filter(|peer| !connected.contains(peer) && !retry_after.contains_key(peer))
+        .take(budget)
+        .collect();
+    if candidates.is_empty() {
+        return;
     }
+
+    let next = AtomicUsize::new(0);
+    let failed: Mutex<Vec<DestHash>> = Mutex::new(Vec::new());
+    let workers = config.dial_concurrency.clamp(1, candidates.len());
+
+    // Scoped: the workers borrow the torrent, the dialer and the candidate
+    // list, and the sweep does not return until every one of them is done —
+    // so there is no detached thread outliving the swarm that spawned it,
+    // which is the shape that leaked a thread per session rebuild.
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    if stop.is_raised() {
+                        return;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&peer) = candidates.get(index) else {
+                        return;
+                    };
+                    let attached = dialer
+                        .dial(peer, config.dial_timeout)
+                        .and_then(|stream| torrent.attach(stream, peer));
+                    if attached.is_err() {
+                        lock_vec(&failed).push(peer);
+                    }
+                }
+            });
+        }
+    });
+
+    let now = Instant::now();
+    for peer in failed.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        retry_after.insert(peer, now + config.retry_backoff);
+    }
+}
+
+fn lock_vec<T>(m: &Mutex<Vec<T>>) -> std::sync::MutexGuard<'_, Vec<T>> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Accept inbound peers until the listener's session dies. Connections past
@@ -500,13 +558,6 @@ pub struct InboundDemux {
     /// Connections currently waiting for their handshake to be read.
     pending: std::sync::atomic::AtomicUsize,
 }
-
-/// How long an accepted connection has to produce its BEP 3 handshake.
-///
-/// Generous — an I2P round trip is slow — but finite: the read is the first
-/// thing a peer does, and a connection that never gets there is a thread we
-/// hold for nothing.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How many connections may be waiting on their handshake at once.
 ///
@@ -788,6 +839,7 @@ mod tests {
             sweep_interval: Duration::from_millis(50),
             retry_backoff: Duration::from_millis(100),
             max_peers: 8,
+            dial_concurrency: 4,
         }
     }
 
@@ -1218,6 +1270,120 @@ mod tests {
         // outstanding, not zero.
         let done = bytes_present(&field(&[0, 1, 3]), piece, total);
         assert_eq!(total - done, piece, "a missing whole piece went unreported");
+    }
+
+    /// A dialer that records how many dials were in flight at once, and how
+    /// many there were in total. `hold` keeps each dial alive long enough for
+    /// overlap to be observable rather than a race.
+    struct CountingDialer {
+        inner: i2pnet::mock::MockDialer,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        total: AtomicUsize,
+        hold: Duration,
+    }
+
+    impl CountingDialer {
+        fn new(inner: i2pnet::mock::MockDialer, hold: Duration) -> CountingDialer {
+            CountingDialer {
+                inner,
+                in_flight: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                total: AtomicUsize::new(0),
+                hold,
+            }
+        }
+    }
+
+    impl I2pDialer for CountingDialer {
+        type Stream = i2pnet::mock::MockStream;
+
+        fn dial(&self, peer: DestHash, timeout: Duration) -> io::Result<Self::Stream> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            self.total.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.hold);
+            let dialed = self.inner.dial(peer, timeout);
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            dialed
+        }
+    }
+
+    /// The bug this pins down, and the reason a live run reported `0 peers`
+    /// against `50 known`: the sweep dialled strictly one peer at a time with
+    /// a two-minute per-dial timeout, so the time to reach *any* peer was a
+    /// function of how many dead destinations the tracker happened to list
+    /// first — and a single sweep could outlast the session running it.
+    #[test]
+    fn a_sweep_dials_in_parallel_and_stays_inside_its_budget() {
+        let net = MockNet::new();
+        let (_seeder, leecher, _sd, _ld) = seed_and_leech();
+
+        // Twenty destinations that do not exist, so every dial fails and the
+        // wave is decided entirely by the sweep rather than by the network.
+        let peers: Vec<DestHash> = (1..=20u8).map(|i| DestHash([i; 32])).collect();
+        leecher.add_peers(&peers);
+
+        let dialer = CountingDialer::new(net.endpoint().dialer(), Duration::from_millis(50));
+        let config = SwarmConfig {
+            max_peers: 8,
+            dial_concurrency: 4,
+            ..quick_config()
+        };
+        let stop = StopFlag::default();
+        let mut retry_after = HashMap::new();
+        sweep(&leecher, &dialer, &stop, &config, &mut retry_after);
+
+        let peak = dialer.peak.load(Ordering::SeqCst);
+        assert!(
+            peak > 1,
+            "the sweep dialled one peer at a time; peak in flight was {peak}"
+        );
+        assert!(
+            peak <= config.dial_concurrency,
+            "the sweep ran {peak} dials at once, past its concurrency of {}",
+            config.dial_concurrency
+        );
+        // The budget is the free peer slots, not the candidate list: a sweep
+        // that dialled all twenty would blow past max_peers if they answered.
+        assert_eq!(
+            dialer.total.load(Ordering::SeqCst),
+            8,
+            "a sweep must attempt at most the number of free slots"
+        );
+        // And every failure is remembered, so the next sweep tries others
+        // rather than the same eight.
+        assert_eq!(
+            retry_after.len(),
+            8,
+            "failed dials must be scheduled for retry, not forgotten"
+        );
+    }
+
+    /// A sweep must not start dials after a stop is requested — otherwise a
+    /// paused torrent keeps opening tunnels for as long as its candidate list
+    /// lasts.
+    #[test]
+    fn a_stopped_sweep_starts_no_further_dials() {
+        let net = MockNet::new();
+        let (_seeder, leecher, _sd, _ld) = seed_and_leech();
+        leecher.add_peers(&(1..=20u8).map(|i| DestHash([i; 32])).collect::<Vec<_>>());
+
+        let dialer = CountingDialer::new(net.endpoint().dialer(), Duration::from_millis(10));
+        let config = SwarmConfig {
+            max_peers: 20,
+            dial_concurrency: 2,
+            ..quick_config()
+        };
+        let stop = StopFlag::default();
+        stop.raise();
+        let mut retry_after = HashMap::new();
+        sweep(&leecher, &dialer, &stop, &config, &mut retry_after);
+        assert_eq!(
+            dialer.total.load(Ordering::SeqCst),
+            0,
+            "a raised stop flag must be checked before the first dial, not after"
+        );
     }
 
     #[test]

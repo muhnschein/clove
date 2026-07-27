@@ -543,9 +543,12 @@ for what sits above it and none of the earlier ones implies the later:
 1. **The SAM port answers.** `make router-wait`. Proves a process is
    listening. Java I2P's bridge binds early in startup, so this passes while
    the router behind it is still coming up.
-2. **It speaks SAM.** clove's pre-flight probe (§2.7) does a real `HELLO`
-   exchange before yosemite touches the port. Proves it is a SAM bridge and
-   not something else on that port. Still says nothing about tunnels.
+2. **It speaks SAM.** clove opens the session with a real `HELLO VERSION`
+   exchange of its own, bounded and length-capped (§2.7). Proves it is a SAM
+   bridge and not something else on that port. Still says nothing about
+   tunnels — and since §2.13 the `SESSION CREATE` that follows on the same
+   socket is bounded too, so a bridge that passes this and then stalls is an
+   error rather than a hang.
 3. **It can reach the network.** `make swarm` getting as far as
    `peer-connected`: a tracker resolved, a swarm peer dialed, a handshake
    exchanged. This is the gate that matters for the product, and it is the

@@ -43,10 +43,22 @@ commit. Closure sizes are recorded when the dependency is actually added.
   still owns `SESSION CREATE`, `STREAM FORWARD` and `NAMING LOOKUP`, where its
   state machine runs once at setup and a failure is just a failed bring-up.
 
-  This is not a step towards dropping it — the session and naming paths are
-  real work we are glad not to be doing — but it does mean the dependency now
-  carries less of clove's runtime than the paragraph above implies. R1's
-  "vendor if upstream stalls" is correspondingly cheaper than it was.
+  **Narrowed again, same day, to `NAMING LOOKUP` alone.** `SESSION CREATE` and
+  `STREAM FORWARD` came back too, for a reason that is not about yosemite's
+  state machine: clove has to *read* its own control connection for the life of
+  the session — to answer the router's `PING` (Java I2P ends a session that
+  does not) and to hear what the router says when a session ends. yosemite owns
+  that socket and exposes it only through a write-then-read-one-line call, so
+  there is no way to watch it from outside the library. See
+  `docs/PROTOCOL.i2p-bt` §2.13. Closing §2.7's residual `SESSION CREATE` hang
+  fell out of the same change, since the deadline is now ours to set.
+
+  What remains is `RouterApi::lookup_name`: one socket, opened and closed per
+  lookup, with no session state behind it — the shape yosemite is unambiguously
+  good at. The dependency is still worth its place for it, but it now carries
+  very little of clove's runtime, and R1's "vendor if upstream stalls" is
+  cheaper still. Note the closure has not shrunk: `yosemite` is one crate in
+  the `Cargo.toml` either way, and the ~24-crate cost above is unchanged.
 
 - **`landlock` 0.4** (`cloved`, Linux only) — entered Phase G. Layer-2
   filesystem (and, on ABI 4+, outbound-TCP) self-restriction; see
