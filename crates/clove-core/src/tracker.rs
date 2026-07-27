@@ -179,7 +179,11 @@ pub fn parse_response(body: &[u8]) -> Result<AnnounceResponse, Error> {
     // announce failed identically and the reason was one `1a4` away from
     // obvious. `NotBencode` carries a bounded, printable prefix of whatever
     // did arrive.
-    let root = bencode::decode(body).map_err(|_| Error::NotBencode(preview(body)))?;
+    let root = bencode::decode(body).map_err(|_| Error::NotBencode {
+        content_type: None,
+        len: body.len(),
+        preview: preview(body),
+    })?;
     if let Some(reason) = root.get(b"failure reason").and_then(Value::as_str) {
         return Err(Error::TrackerFailure(reason.to_owned()));
     }
@@ -352,7 +356,17 @@ pub fn announce_over<S: std::io::Read + std::io::Write>(
     if response.status != 200 {
         return Err(Error::HttpStatus(response.status));
     }
-    parse_response(&response.body)
+    // `parse_response` is pure and sees only the body, so the content type is
+    // attached here — it is half the diagnosis when a tracker answers 200
+    // with something that is not an announce at all.
+    parse_response(&response.body).map_err(|e| match e {
+        Error::NotBencode { len, preview, .. } => Error::NotBencode {
+            content_type: response.header("content-type").map(ToOwned::to_owned),
+            len,
+            preview,
+        },
+        other => other,
+    })
 }
 
 /// Why an announce failed.
@@ -370,13 +384,32 @@ pub enum Error {
     TrackerFailure(String),
     /// The bencoded response was malformed.
     BadResponse(&'static str),
-    /// The body was not bencode at all, with a printable prefix of what it
-    /// actually was — an HTML error page, chunk framing, or nothing.
-    NotBencode(String),
+    /// The body was not bencode at all. Carries enough of the response to
+    /// identify it without a second live run: what the tracker said it was,
+    /// how much of it there was, and a printable prefix.
+    ///
+    /// The prefix alone was not enough. A run reported 96 characters of
+    /// `<!DOCTYPE html>…<style type="text/css">…` — plainly a web page, and
+    /// plainly *not* an announce, but with the `<title>` still beyond the cut
+    /// there was no telling whose page it was: the tracker's own error page,
+    /// a different site behind a stale address-book entry, or a router
+    /// console. Those have three different fixes. The content type and a
+    /// longer prefix settle it in the same log line.
+    NotBencode {
+        /// The `Content-Type` the tracker sent, if any.
+        content_type: Option<String>,
+        /// Full body length, which the preview may not show all of.
+        len: usize,
+        /// Printable prefix, bounded by [`PREVIEW_LEN`].
+        preview: String,
+    },
 }
 
 /// Longest response prefix carried in a [`Error::NotBencode`].
-const PREVIEW_LEN: usize = 96;
+///
+/// Long enough to reach the `<title>` of a page whose `<head>` opens with
+/// inline CSS, which is what it took to identify the last one.
+const PREVIEW_LEN: usize = 512;
 
 /// A bounded, single-line, printable rendering of a response body, for an
 /// error message an operator reads in a log.
@@ -415,9 +448,16 @@ impl std::fmt::Display for Error {
             Error::HttpStatus(s) => write!(f, "tracker: HTTP status {s}"),
             Error::TrackerFailure(r) => write!(f, "tracker refused: {r}"),
             Error::BadResponse(w) => write!(f, "tracker: malformed response: {w}"),
-            Error::NotBencode(seen) => {
-                write!(f, "tracker: response is not bencode; it begins {seen:?}")
-            }
+            Error::NotBencode {
+                content_type,
+                len,
+                preview,
+            } => write!(
+                f,
+                "tracker: response is not bencode ({} bytes, content-type {}); it begins {preview:?}",
+                len,
+                content_type.as_deref().unwrap_or("unset"),
+            ),
         }
     }
 }
@@ -685,13 +725,38 @@ mod tests {
             "the error must quote the body, got: {text}"
         );
 
+        // The half a 96-character preview could not give: a tracker answering
+        // 200 with a web page says so in its content type, and that is what
+        // separates "the tracker is broken" from "this is not the tracker".
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 6\r\n\r\n<html>";
+        let (_host, request) = build_announce("http://t.i2p/announce", &params()).unwrap();
+        let mut stub = Stub {
+            to_read: std::io::Cursor::new(raw.to_vec()),
+            written: Vec::new(),
+        };
+        let Err(served_a_page) = announce_over(&mut stub, &request) else {
+            panic!("a web page is not an announce response");
+        };
+        assert!(
+            served_a_page.to_string().contains("text/html"),
+            "the content type must reach the operator: {served_a_page}"
+        );
+
         // Bounded, and control bytes never reach the terminal.
         let Err(long) = parse_response(&[0x1b; 4096]) else {
             panic!("escape bytes are not a valid announce response");
         };
         let text = long.to_string();
         assert!(!text.contains('\u{1b}'), "control bytes must be scrubbed");
-        assert!(text.len() < 200, "the preview must be bounded: {text}");
+        // Bounded by PREVIEW_LEN, not by a number written twice: the preview
+        // grew from 96 to 512 on purpose when 96 proved too short to identify
+        // a page, and a hardcoded ceiling here would have made that a test
+        // failure rather than a decision.
+        assert!(
+            text.len() < PREVIEW_LEN + 128,
+            "the preview must stay bounded: {} chars",
+            text.len()
+        );
 
         // An empty body is its own diagnosis and says so.
         let Err(empty) = parse_response(b"") else {

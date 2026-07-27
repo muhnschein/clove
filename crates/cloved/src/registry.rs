@@ -153,6 +153,11 @@ struct Hosted {
     /// Peers that reached us rather than being dialed — the live proof of the
     /// inbound `STREAM FORWARD` path (`PROTOCOL.i2p-bt` §2.5).
     inbound_peers: u64,
+    /// Announces that worked, announces that did not, and the last reason —
+    /// the first question to ask of a torrent with no peers.
+    announces_ok: u32,
+    announces_failed: u32,
+    last_announce_error: Option<String>,
     paused: bool,
     /// Pick pieces in order rather than rarest-first (SCOPE §3).
     sequential: bool,
@@ -445,6 +450,10 @@ where
                 hosted.known_peers = live.torrent.known_peers().len();
                 hosted.pex_peers = live.torrent.pex_learned();
                 hosted.inbound_peers = live.torrent.inbound_peers();
+                let (ok, failed, why) = live.torrent.announce_status();
+                hosted.announces_ok = ok;
+                hosted.announces_failed = failed;
+                hosted.last_announce_error = why;
             } else {
                 // No engine means no peers. Leaving the last live values in
                 // place would show a paused torrent still holding eight peers.
@@ -531,6 +540,9 @@ where
             known_peers: 0,
             pex_peers: 0,
             inbound_peers: 0,
+            announces_ok: 0,
+            announces_failed: 0,
+            last_announce_error: None,
             paused: false,
             sequential: false,
             scanning: true,
@@ -1027,6 +1039,9 @@ where
                 known_peers: 0,
                 pex_peers: 0,
                 inbound_peers: 0,
+                announces_ok: 0,
+                announces_failed: 0,
+                last_announce_error: None,
                 paused: resume.paused,
                 sequential: resume.sequential,
                 scanning: false,
@@ -1124,7 +1139,7 @@ impl Hosted {
             .flatten()
             .map(|url| Value::from(url.clone()))
             .collect();
-        Value::Object(vec![
+        let mut fields = vec![
             (
                 "info_hash".to_owned(),
                 Value::from(hex(&self.meta.info_hash.0)),
@@ -1146,12 +1161,26 @@ impl Hosted {
             ),
             ("pex_peers".to_owned(), Value::UInt(self.pex_peers)),
             ("inbound_peers".to_owned(), Value::UInt(self.inbound_peers)),
+            (
+                "announces_ok".to_owned(),
+                Value::UInt(u64::from(self.announces_ok)),
+            ),
+            (
+                "announces_failed".to_owned(),
+                Value::UInt(u64::from(self.announces_failed)),
+            ),
             ("state".to_owned(), Value::from(self.state())),
             ("sequential".to_owned(), Value::Bool(self.sequential)),
             ("private".to_owned(), Value::Bool(self.meta.private)),
             ("files".to_owned(), Value::Array(files)),
             ("trackers".to_owned(), Value::Array(trackers)),
-        ])
+        ];
+        // Only present when there is one: an absent key reads as "nothing has
+        // gone wrong", which an empty string does not.
+        if let Some(why) = &self.last_announce_error {
+            fields.push(("last_announce_error".to_owned(), Value::from(why.clone())));
+        }
+        Value::Object(fields)
     }
 }
 

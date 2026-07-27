@@ -600,6 +600,13 @@ An ordinary unreachable peer does *not* do this — yosemite recovers from
 `CANT_REACH_PEER` correctly — so a flap means a protocol-level surprise, not a
 thin netDb.
 
+**A `.torrent` sits at `downloading` with 0 peers and says nothing.** Fixed:
+the running announcer used to discard its errors — the magnet path had been
+repaired for exactly this and the path a real torrent takes had not. `clove
+show` now reports `announces_ok`, `announces_failed` and
+`last_announce_error`, and the daemon logs each failure with the destination
+the tracker's host resolved to.
+
 **Every announce fails and no peers are ever learned.** Read the reason, which
 now carries the response: `tracker: response is not bencode; it begins "…"`.
 If it begins with a hex number and a CRLF, that is chunked framing on a client
