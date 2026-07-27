@@ -473,6 +473,15 @@ where
             Err(e) => {
                 round.trackers_failed += 1;
                 round.fail("announcing to", &host, &e);
+                // The literal URL, for pasting into a browser aimed at the
+                // same tracker. A tracker that refuses an announce as a
+                // policy violation will not say which part it objected to,
+                // and deleting parameters one at a time is the only thing
+                // that finds out.
+                eprintln!(
+                    "cloved: the announce that failed was {}",
+                    clove_core::tracker::announced_url(&host, &request)
+                );
             }
         }
     }

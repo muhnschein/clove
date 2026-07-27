@@ -101,6 +101,13 @@ struct Network<D> {
     naming: NamingCache<D>,
 }
 
+impl<D: I2pDialer> Network<D> {
+    /// Whether this network is still worth handing work to.
+    fn usable(&self) -> bool {
+        self.dialer.usable()
+    }
+}
+
 /// A pass over everything a torrent has on disk, to be run *outside* the
 /// registry lock.
 ///
@@ -417,8 +424,21 @@ where
             announcer.request_stop();
         }
         live.torrent.disconnect_all();
-        // Graceful goodbye to the trackers, best-effort and detached.
-        if let Some(network) = &self.network {
+        // Graceful goodbye to the trackers, best-effort and detached — but
+        // only when there is a working session to send it over.
+        //
+        // Without that condition this fires on every session teardown,
+        // including the ones caused by a wedged session (PROTOCOL.i2p-bt
+        // §2.12): each one spawns a detached thread holding a clone of the
+        // dead session and opening a fresh naming-lookup socket to the SAM
+        // bridge, for a goodbye that cannot be delivered. Measured live as a
+        // socket count against the bridge that climbed steadily for the life
+        // of a run — and a bridge at its connection ceiling refuses new
+        // streams, which is what wedges the session in the first place. The
+        // loop fed itself.
+        if let Some(network) = &self.network
+            && network.usable()
+        {
             let urls: Vec<String> = hosted.meta.trackers.iter().flatten().cloned().collect();
             if !urls.is_empty() {
                 clove_core::swarm::announce_stopped(

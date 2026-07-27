@@ -83,6 +83,37 @@ Status legend:
     `failure reason`, not an error status — a web page, served where an
     announce belongs.
 
+    **RESOLVED to a refusal, 2026-07-27.** With HTML summarised rather than
+    quoted, the page names itself:
+
+      HTML page titled "PaTracker 1.7.8 | Blocked Request"; text begins
+      "Request denied! Your request was found to be in violation of the
+       site's policy. In most cases this is caused by issues related to I2P,
+       like incomplete data and such."
+
+    And the endpoint is demonstrably alive: the same URL fetched from a
+    browser through the router's SOCKS proxy answers
+    `d14:failure reason22:Missing key: info_hashe` — correct bencode for a
+    bare GET. So `/announce.php` routes, PaTracker is running, and it is
+    **clove's announce specifically** that it refuses.
+
+    That narrows it to the request. The candidates, in the order they are
+    worth deleting:
+      1. `ip=<base64 destination>` (§5.1, still [assumed]). The tracker sees
+         our destination from the stream itself; a client asserting one in a
+         parameter is the most likely thing a policy check objects to, and
+         "incomplete data related to I2P" reads like a complaint about
+         exactly this field.
+      2. `port=6881`, a placeholder for a protocol with no ports.
+      3. `numwant`, `compact`, `event` — ordinary, but untested here.
+
+    Do not reason about which; delete them one at a time. The daemon now logs
+    the literal URL it sent on every failed announce, so the test is to paste
+    that into the same browser and remove parameters until it stops being
+    refused. One round of that is worth more than another round of theory —
+    three prior theories about this failure (address book, chunked encoding,
+    wrong endpoint) were all wrong, and each cost a live session.
+
     **It is postman.** The page's own stylesheet declares `--postman:` and
     embeds an SVG of a postman; 14151 bytes, `content-type text/html;
     charset=utf-8`. So the destination is right and the address book is not
@@ -494,11 +525,19 @@ Status legend:
     immediate EOF (2.12 above) says the router closed a *fresh* stream socket
     without answering `HELLO`.
 
-    Why it would: unmeasured. The candidate worth checking first is that clove
-    is accumulating SAM connections — every dial opens a new TCP socket to the
-    bridge, and a bridge at its connection ceiling would refuse the next one
-    exactly this way. `ss -tn 'dport = :7656' | wc -l` against a running
-    daemon answers it, and i2pd's own log is the other half.
+    **The socket count does climb** (measured 2026-07-27, `ss -tn
+    'dport = :7656' | wc -l` against a live run). One source found and fixed:
+    `Registry::stop_live` fired a detached "goodbye" announce on *every*
+    teardown, including the ones a wedge causes — each spawning a thread that
+    holds a clone of the dead session and opens a fresh naming-lookup socket
+    to deliver a message that cannot arrive. It is now gated on
+    `I2pDialer::usable`, which a wedged `SamSession` answers false to.
+
+    That closes a feedback loop rather than merely a leak: a bridge at its
+    connection ceiling refuses new streams, and a refused stream is what
+    wedges the session, which triggers the teardown that leaked the next
+    socket. Whether it was the *only* source is unmeasured — re-measure
+    before assuming so, and i2pd's own log is still the half nobody has read.
 
     This is a mitigation, not a fix, and it carries a cost worth stating: a
     rebuild currently mints a *new transient destination* (Q4 persistent keys
