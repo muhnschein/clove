@@ -21,13 +21,16 @@ looking at the second turned up a finding the first pass had missed — **findin
 resource leak filed as part of finding 9, because it makes well-behaved peers
 hang up on *us*.
 
-What remains open is one upstream dependency, recorded in `PROTOCOL.i2p-bt`
-§2.7a rather than here: yosemite's virtual streams expose no read timeout, so a
-*dialled* peer that goes silent parks its reader thread until the router tears
-the stream down. clove drops such a peer from its table on the idle timeout, so
-it stops occupying a slot and its blocks go back to the picker, but the thread
-itself cannot be reclaimed from inside clove. Inbound connections are loopback
-TCP sockets clove owns and are already bounded.
+**Closed.** The one item this review left open — yosemite's virtual streams
+exposing no read timeout, so a dialled peer that went silent parked its reader
+thread — is fixed too, in two steps that took a live run to find: clove dials
+on sockets it owns (`PROTOCOL.i2p-bt` §2.12), and the writer closes the
+connection when it stops, because a split stream is not closed by dropping one
+half (§2.14).
+
+This document is a dated record, not a live task list. Nothing here is
+outstanding; it is kept for the testing-regime analysis below, which is what
+made the difference, and because the repros are worth having.
 
 ---
 

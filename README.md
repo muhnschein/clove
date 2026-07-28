@@ -5,21 +5,28 @@ SAMv3 to an external I2P router (i2pd, Java I2P, or emissary). Leak-proof by
 construction: the engine has no IP vocabulary, and only the `i2pnet` crate
 may touch a socket — enforced by lint and CI, not convention.
 
-**Status: pre-alpha.** The client is feature-complete against its v1 scope and
-downloads from live I2P swarms — daemon, CLI, engine, tracker, PEX, magnets,
-persistence. First contact with real routers and real trackers (2026-07)
-turned up seven defects that no router-free test could reach; they are fixed,
-and the findings are in [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt). The
-remaining work before 0.1 is the interop sign-off across all three routers
-(see [`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md)).
+**Status: pre-alpha.** Feature-complete against its v1 scope — daemon, CLI,
+engine, tracker, PEX, magnets, persistence — and it downloads from and seeds to
+live i2psnark swarms on i2pd and Java I2P.
+
+Every defect that has mattered was found by running it against a real router
+and a real swarm; none was reachable from a router-free test, and the unit
+suite was green through all of them. They are recorded in
+[`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt), each with the test that catches
+it now. Before 0.1: the interop sign-off across all three routers
+([`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) §6.3), where emissary's column
+is still open.
 
 ## Documents
 
 - [`docs/SCOPE.md`](docs/SCOPE.md) — what clove is and is not (the spec)
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — resolved design questions Q1–Q7
 - [`docs/PLAN.md`](docs/PLAN.md) — implementation phases and milestones
-- [`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) — closing M1/M3 against a real router (podman/quadlet)
+- [`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) — running against real routers, and the interop matrix
+- [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt) — the I2P-BitTorrent dialect, and every live finding
 - [`docs/PHASE-F.md`](docs/PHASE-F.md) — daemon/CLI/API design, and the TUI decision
+- [`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md) — the data directory and the resume file
+- [`docs/CODE-REVIEW-2026-07.md`](docs/CODE-REVIEW-2026-07.md) — a whole-tree audit, closed
 - [`DEPENDENCIES.md`](DEPENDENCIES.md) — the dependency allowlist
 - [`SECURITY.md`](SECURITY.md) — how to report a vulnerability, and what counts as one
 
