@@ -51,7 +51,8 @@ usage() {
 usage: ci/live-swarm.sh [options] <magnet-uri | file.torrent>
 
   --router NAME     i2pd | java | emissary — selects the SAM port (default i2pd)
-  --router-version V  the router's version string, recorded in the report
+  --router-version V  the router's version string, recorded in the report.
+                    Detected from the running container when not given.
   --sam-port N      explicit SAM port; overrides --router
   --deadline SECS   whole-run budget, download phase included (default 3600)
   --seed-for SECS   keep seeding after the download completes (default 900)
@@ -252,12 +253,16 @@ human() {
 say "clove live swarm run"
 say "generated:  $(date -Is)"
 say "report:     $OUT"
-# The version is not discoverable over SAM — `HELLO REPLY VERSION=` is the
-# SAM protocol's version, not the router's — and every router publishes its
-# own somewhere different. So it is the operator's to pass, and its absence is
-# said out loud: LIVE-TESTING §6.3 requires a version against every result,
-# because "works on i2pd" is worth very little a year from now, and three
-# routers were once compared in one sitting with only one version recorded.
+# LIVE-TESTING §6.3 requires a version against every result, because "works on
+# i2pd" is worth very little a year from now — and three routers were once
+# compared in one sitting with only one version recorded, because asking the
+# operator to type it is a step that gets skipped.
+#
+# So ask the router. It is not discoverable over SAM (`HELLO REPLY VERSION=`
+# is the SAM protocol's version, not the router's), so this goes through
+# podman per router; best-effort, and `--router-version` still wins when it is
+# given, which is also the answer for a router this cannot see.
+[ -n "$ROUTER_VERSION" ] || ROUTER_VERSION=$(./ci/router-version.sh "$ROUTER" 2>/dev/null || true)
 say "router:     $ROUTER ${ROUTER_VERSION:-(version not recorded)} (SAM 127.0.0.1:$SAM_PORT)"
 say "subject:    $SUBJECT"
 say "budget:     ${DEADLINE}s download, then ${SEED_FOR}s seeding"
@@ -534,9 +539,12 @@ cl show "$INFO_HASH" | tee -a "$OUT" || true
 
 say ""
 if [ -z "$ROUTER_VERSION" ]; then
-    say "note: no --router-version was given, so this report cannot fill in"
-    say "      LIVE-TESTING §6.3's version column. Re-run with e.g."
-    say "      --router-version '$ROUTER 2.61.0' if you are recording a result."
+    say "note: the router's version could not be determined and none was given,"
+    say "      so this report cannot fill in LIVE-TESTING §6.3's version column."
+    say "      ci/router-version.sh asks podman; for a router it cannot see, pass"
+    say "      the version yourself:"
+    say "          make swarm TORRENT=… ROUTER=$ROUTER \\"
+    say "              SWARM_ARGS=\"--router-version '$ROUTER 2.61.0'\""
     say ""
 fi
 say "########## milestones ##########"

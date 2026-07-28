@@ -31,17 +31,34 @@
 # would be a lie the day postman rotates keys, and there is no way to check it
 # from here. The source router is the authority.
 #
-# WHAT IT WRITES
+# WHAT IT WRITES — BOTH STORES, BECAUSE THERE ARE TWO
 #
-# emissary keeps its address book at <base>/addressbook/addresses, one
-# `hostname=<52-char b32 label>` per line, read **once at startup** — which is
-# why this restarts the router afterwards rather than leaving you to wonder
-# why nothing changed.
+# emissary keeps two address books under <base>/addressbook, and which one it
+# consults depends on how it is asked (emissary-core 0.4.0):
 #
-# The label is RFC 4648 base32 (lowercase, unpadded) of SHA-256 over the
-# destination's bytes, which is the same derivation `i2pnet::addr::to_b32`
-# performs; the pipeline below is checked against it in
-# `docs/LIVE-TESTING.md` §7b.
+#   addresses                  `hostname=<52-char b32 label>` per line, read
+#                              into memory **once at startup**. Serves
+#                              `resolve_base32`, which is what a
+#                              `STREAM CONNECT` naming a *hostname* uses.
+#   destinations/<host>.txt    the full base64 destination. Serves
+#                              `resolve_base64`, which is what `NAMING LOOKUP`
+#                              uses, read from disk per query.
+#
+# clove does `NAMING LOOKUP` and then dials the b32 it gets back, so
+# **destinations/<host>.txt is the one that decides whether clove works**. The
+# first version of this script wrote only `addresses`, and emissary went on
+# answering KeyNotFound exactly as before — the entry was there, in the store
+# nothing on clove's path reads.
+#
+# Both are written, since the b32 map is what a hostname-dialling client would
+# want and costs nothing. The b32 label is RFC 4648 base32 (lowercase,
+# unpadded) of SHA-256 over the destination's bytes — the same derivation
+# `i2pnet::addr::to_b32` performs, checked against it in
+# `docs/LIVE-TESTING.md` §7b. The base64 needs no derivation at all: it is
+# what the source router answered with.
+#
+# The restart is still needed for `addresses` (read at startup);
+# `destinations/` is read per query and would take effect without one.
 set -eu
 
 usage() {
@@ -125,7 +142,8 @@ if [ "$DRY_RUN" = no ] && [ "$TO" != emissary ]; then
 fi
 
 [ -n "$FROM_PORT" ] || FROM_PORT=$(sam_port_of "$FROM")
-ADDRESSES=/var/lib/emissary/addressbook/addresses
+ADDRESSBOOK=/var/lib/emissary/addressbook
+ADDRESSES=$ADDRESSBOOK/addresses
 
 if [ "$DRY_RUN" = no ]; then
     TO_CONTAINER=$(container_of "$TO")
@@ -169,7 +187,29 @@ b32_label() {
 echo "seed-addressbook: resolving with $FROM (SAM 127.0.0.1:$FROM_PORT)"
 resolved=""
 failed=""
+# Each destination lands in its own file, named after the host; keeping them
+# here avoids quoting a 600-character base64 blob through two shells.
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT INT TERM
+
 for host in $HOSTS; do
+    # A hostname becomes a file name below, so it has to be one: letters,
+    # digits, dots and dashes only, ending in `.i2p`. Nothing here is hostile,
+    # but a name carrying a slash would write outside the address book, and
+    # that is not a thing to leave to good manners.
+    case "$host" in
+        *[!A-Za-z0-9.-]* | .* | *..*)
+            echo "  $host: not a usable hostname" >&2
+            failed="$failed $host"
+            continue
+            ;;
+        *.i2p) ;;
+        *)
+            echo "  $host: not an .i2p hostname" >&2
+            failed="$failed $host"
+            continue
+            ;;
+    esac
     reply=$(sam_lookup "$host")
     # The *NAMING REPLY* line, not the whole conversation: the handshake that
     # precedes it says `HELLO REPLY RESULT=OK`, so a check against everything
@@ -209,6 +249,10 @@ for host in $HOSTS; do
     echo "  $host -> $label.b32.i2p"
     resolved="$resolved$host=$label
 "
+    # No trailing newline: emissary writes these with `fs::write` of the bare
+    # base64 and hands the file's whole contents back as the NAMING REPLY
+    # value, so anything extra ends up in the reply.
+    printf '%s' "$dest" > "$work/$host.txt"
 done
 
 if [ -z "$resolved" ]; then
@@ -238,10 +282,20 @@ done
 printf '%s\n%s' "$kept" "$resolved" \
     | grep -v '^[[:space:]]*$' \
     | podman exec -i "$TO_CONTAINER" sh -c \
-        "mkdir -p $(dirname $ADDRESSES) && cat > $ADDRESSES"
+        "mkdir -p $ADDRESSBOOK/destinations && cat > $ADDRESSES"
+
+# The store clove's path actually reads. Written per host, verbatim, with the
+# base64 the source router gave us — no derivation, so nothing to get wrong.
+for host in $HOSTS; do
+    [ -f "$work/$host.txt" ] || continue
+    podman exec -i "$TO_CONTAINER" sh -c "cat > $ADDRESSBOOK/destinations/$host.txt" \
+        < "$work/$host.txt"
+done
 
 count=$(podman exec "$TO_CONTAINER" sh -c "wc -l < $ADDRESSES" | tr -d ' ')
-echo "seed-addressbook: $ADDRESSES now has $count entr$([ "$count" = 1 ] && echo y || echo ies)"
+dests=$(podman exec "$TO_CONTAINER" sh -c "ls $ADDRESSBOOK/destinations 2>/dev/null | wc -l" | tr -d ' ')
+echo "seed-addressbook: $ADDRESSES has $count b32 entr$([ "$count" = 1 ] && echo y || echo ies)"
+echo "seed-addressbook: $ADDRESSBOOK/destinations has $dests destination(s) — the store NAMING LOOKUP reads"
 
 # emissary reads the file once, when it builds its AddressBookManager. Without
 # this the entries are on disk and invisible, which is the most confusing
