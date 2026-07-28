@@ -309,6 +309,22 @@ impl AnnounceState {
         Self::default()
     }
 
+    /// A state for a torrent that was **already complete** when this announcer
+    /// started — a resumed seed, or one re-attached after a session rebuild.
+    ///
+    /// `completed` reports a download, so a client that already held the file
+    /// before it announced at all has nothing to report. Without this the
+    /// second announce of every restarted seed carries one, and the tracker
+    /// counts a snatch that never happened — once per restart, and clove
+    /// rebuilds its session tree whenever the router blips.
+    #[must_use]
+    pub fn already_complete() -> Self {
+        AnnounceState {
+            completed: true,
+            ..Self::default()
+        }
+    }
+
     /// Whether an announce is due at `now` (seconds).
     #[must_use]
     pub fn due(&self, now: u64) -> bool {
@@ -321,9 +337,34 @@ impl AnnounceState {
     /// This exists for one caller: an operator asking for a re-announce
     /// (`clove announce`). Nothing automatic may use it — the interval a
     /// tracker hands back is an instruction, and the whole point of
-    /// [`on_success`](Self::on_success) is to obey it.
+    /// [`on_success`](Self::on_success) is to obey it. The one automatic
+    /// bypass there is has its own, much narrower door:
+    /// [`completion_due`](Self::completion_due).
     pub fn make_due(&mut self) {
         self.next_due = 0;
+    }
+
+    /// Bring forward the one announce that is owed on an event rather than on
+    /// a clock: the `completed` that BEP 3 wants when a download finishes.
+    ///
+    /// Deliberately *not* [`make_due`](Self::make_due), whose contract is that
+    /// nothing automatic may use it. `completed` is an event, in the same
+    /// class as `started` (the first announce, which no interval governs) and
+    /// `stopped` (sent on teardown regardless of one) — not a periodic report
+    /// whose cadence the tracker gets to set. Waiting for the next interval to
+    /// mention it means the swarm does not learn there is a new seed for up to
+    /// half an hour, which live cost a whole seeding window: one announce went
+    /// out, as a leecher holding nothing, and nothing after it.
+    ///
+    /// Safe against misuse by construction rather than by discipline. It does
+    /// nothing before the first announce (there is no `completed` without a
+    /// `started`) and nothing after the completion announce has gone out, so
+    /// it can bring forward exactly one announce in a torrent's lifetime and
+    /// cannot be turned into a way to hammer a tracker.
+    pub fn completion_due(&mut self) {
+        if self.started && !self.completed {
+            self.next_due = 0;
+        }
     }
 
     /// The event the next announce should carry, given whether the torrent
@@ -864,6 +905,58 @@ mod tests {
     /// A body that is not bencode must arrive with the evidence attached. The
     /// live run reported "not bencode" for a fortnight of runs and the answer
     /// was in the first three bytes nobody could see.
+    /// `completed` is owed the moment a download finishes, not whenever the
+    /// tracker's interval next comes round — and `completion_due` is the only
+    /// automatic thing allowed to say so.
+    #[test]
+    fn finishing_brings_the_completion_announce_forward_exactly_once() {
+        let mut st = AnnounceState::new();
+        // Nothing to bring forward before the first announce: there is no
+        // `completed` without a `started`.
+        st.completion_due();
+        assert_eq!(st.next_event(false), Event::Started);
+        st.on_success(1_000, 1_800, Event::Started);
+        assert!(!st.due(1_100), "the tracker asked for half an hour");
+
+        // Finishing overrides that, once.
+        st.completion_due();
+        assert!(st.due(1_100), "a finished download waited out the interval");
+        assert_eq!(st.next_event(true), Event::Completed);
+        st.on_success(1_100, 1_800, Event::Completed);
+
+        // And never again: the snatch has been reported, so this cannot become
+        // a way to bypass the interval a second time.
+        assert!(!st.due(1_200));
+        st.completion_due();
+        assert!(!st.due(1_200), "completion_due fired twice");
+        assert_eq!(st.next_event(true), Event::Periodic);
+    }
+
+    /// A client that already held the file has no download to report. Sending
+    /// one has the tracker count a snatch that never happened — once per
+    /// restart, and clove rebuilds its announcers on every session blip.
+    #[test]
+    fn a_torrent_that_was_already_complete_reports_no_snatch() {
+        let mut already = AnnounceState::already_complete();
+        assert_eq!(already.next_event(true), Event::Started, "still says hello");
+        already.on_success(0, 60, Event::Started);
+        assert_eq!(
+            already.next_event(true),
+            Event::Periodic,
+            "a resumed seed reported a download it never did"
+        );
+        already.completion_due();
+        assert!(
+            !already.due(1),
+            "and cannot bring an announce forward either"
+        );
+
+        // The contrast: a torrent that finished while we watched does report.
+        let mut earned = AnnounceState::new();
+        earned.on_success(0, 60, Event::Started);
+        assert_eq!(earned.next_event(true), Event::Completed);
+    }
+
     #[test]
     fn a_non_bencode_body_reports_what_it_actually_was() {
         let html = b"<html><head><title>500 Internal Server Error</title></head>";
