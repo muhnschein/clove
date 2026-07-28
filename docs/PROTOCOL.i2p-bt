@@ -12,6 +12,18 @@ Status legend:
   [assumed]   clove behaves this way; NOT yet verified against a live router.
   [open]      unresolved; needs a router or upstream clarification.
 
+Entries are numbered once and keep their number. A finding that is later
+superseded says so in its own tag and points at what replaced it, rather than
+being deleted or silently rewritten — being able to see that §2.6a's
+constraint was removed, and that the code shaped around it was not revisited
+for another week, is worth more than a tidy file.
+
+  1. Addresses and peer identity
+  2. SAM and the routers — the session, dialing, and every live surprise
+  3. Reconnect discipline
+  4. Wire protocol — peer messages, PEX, metadata, and the picker
+  5. HTTP tracker announces
+
 
 1. Addresses and peer identity
 ------------------------------
@@ -48,277 +60,8 @@ Status legend:
     `ip` key. Both parsed in clove-core::tracker.
 
 
-5. HTTP tracker announces (clove-core::tracker, M3)
----------------------------------------------------
-
-5.1 [assumed] An announce is an HTTP/1.1 GET to the tracker's I2P
-    destination. clove sends the standard BEP 3 query params plus:
-      - `compact=1` (we require the 32-byte-hash compact form, §1.4);
-      - `port=6881` as a placeholder — I2P has no port, but trackers/params
-        parsers expect the key;
-      - `ip=<our base64 destination>` — the I2P convention for telling the
-        tracker our destination, since there is no IP to observe.
-
-    [decided] as of 2026-07-27, and now against the normative spec rather than
-    by inference. The I2P BitTorrent specification (i2p.net, "Bittorrent over
-    I2P") states it plainly: *"The value of the ip key is the base 64 of the
-    client's Destination"*, that *"current Destinations for clients are 387 or
-    more bytes (516 or more in Base 64 encoding)"*, and that a tracker
-    *"should probably decode and reject bad Base64 when announced"*.
-
-    All three sentences describe what happened to us. The parameter is
-    required (omitting it answers `failure reason: Missing key: ip`); the
-    value is the 387-plus-byte Destination, not the 679-byte private key blob
-    clove was sending; and postman's tracker rejecting the bad value was the
-    spec's own recommended behaviour. See §5.1c. This closes the oldest
-    [assumed] in this file.
-
-    Observed variant, unconfirmed: XD (`lib/tracker/http.go`) builds `ip` from
-    its network address plus a `.i2p` suffix rather than from a base64
-    Destination. Whether that resolves to the same thing depends on what its
-    SAM layer returns from `Addr()`, which the announce code does not say —
-    recorded because a second form may exist in the wild, not as a licence to
-    send one.
-
-5.1a [decided] Trackers answer `Transfer-Encoding: chunked`, and clove's HTTP
-    client did not implement it. postman's `announce.php` does, as any PHP
-    script behind an ordinary webserver will. The reader fell through to its
-    read-until-close branch and handed the *chunk framing* to the bencode
-    parser, which reported "not bencode" — accurate about `1a4\r\n…` and
-    useless. Every announce failed identically, so the client acquired no
-    peers at all, on any torrent, ever (found live 2026-07-27).
-
-    Decoding is implemented in `clove_core::http` with the same hostile-input
-    discipline as the rest: bounded size lines, extensions parsed off and
-    ignored, `max_body` checked against the announced chunk size before
-    anything is allocated, trailers consumed rather than mistaken for body,
-    and chunked overriding a `Content-Length` sent alongside it (RFC 9112
-    §6.1). Announces that are *not* bencode now carry a bounded printable
-    prefix of what did arrive, so the next surprise is one log line rather
-    than a session.
-
-5.1b [decided] `tracker2.postman.i2p` answered an announce with **HTTP 200 and a
-    styled HTML page** (observed 2026-07-27, i2pd 2.x, live). Not a bencoded
-    `failure reason`, not an error status — a web page, served where an
-    announce belongs.
-
-    **RESOLVED to a refusal, 2026-07-27.** With HTML summarised rather than
-    quoted, the page names itself:
-
-      HTML page titled "PaTracker 1.7.8 | Blocked Request"; text begins
-      "Request denied! Your request was found to be in violation of the
-       site's policy. In most cases this is caused by issues related to I2P,
-       like incomplete data and such."
-
-    And the endpoint is demonstrably alive: the same URL fetched from a
-    browser through the router's SOCKS proxy answers
-    `d14:failure reason22:Missing key: info_hashe` — correct bencode for a
-    bare GET. So `/announce.php` routes, PaTracker is running, and it is
-    **clove's announce specifically** that it refuses.
-
-    That narrows it to the request. The candidates, in the order they are
-    worth deleting:
-      1. `ip=<base64 destination>` (§5.1, still [assumed]). The tracker sees
-         our destination from the stream itself; a client asserting one in a
-         parameter is the most likely thing a policy check objects to, and
-         "incomplete data related to I2P" reads like a complaint about
-         exactly this field.
-      2. `port=6881`, a placeholder for a protocol with no ports.
-      3. `numwant`, `compact`, `event` — ordinary, but untested here.
-
-    Do not reason about which; delete them one at a time. The daemon now logs
-    the literal URL it sent on every failed announce, so the test is to paste
-    that into the same browser and remove parameters until it stops being
-    refused. One round of that is worth more than another round of theory —
-    three prior theories about this failure (address book, chunked encoding,
-    wrong endpoint) were all wrong, and each cost a live session.
-
-    **It is postman.** The page's own stylesheet declares `--postman:` and
-    embeds an SVG of a postman; 14151 bytes, `content-type text/html;
-    charset=utf-8`. So the destination is right and the address book is not
-    the problem — that candidate is closed. What remains:
-      (a) postman's webserver declines the request and serves the site
-          instead. Two shapes in clove's announce were unusual enough to be
-          worth removing before blaming the endpoint: `Content-Length: 0` on
-          a bodyless GET, which almost nothing on the web sends, and **no
-          `User-Agent` at all**. Both are fixed; §5.1's `ip=` form remains
-          [assumed] and is the next candidate if they were not it.
-      (b) `/announce.php` is no longer the announce endpoint, and the server
-          answers 200 with its front page for paths it does not route.
-
-    Settle it from outside clove before changing anything else — one request
-    through the router's HTTP proxy says which:
-
-        curl -x http://127.0.0.1:4444 -i http://tracker2.postman.i2p/announce.php
-
-    A bencoded `failure reason` means the endpoint is live and clove's request
-    is at fault; the same HTML page means the endpoint is (b).
-
-    Two previews were spent learning that a modern page's first 512 bytes are
-    its stylesheet. `preview` now summarises HTML — `<title>` plus the first
-    visible words — rather than quoting the head, which is what "identify the
-    page" actually needs.
-
-5.1c [decided] **SAM's `DESTINATION=` field is the session's private key
-    blob, not its destination — and clove was announcing the whole thing.**
-    Root cause of every failure in §5.1b, found 2026-07-27 by decoding the
-    announce clove actually sent.
-
-    `SESSION STATUS RESULT=OK DESTINATION=<b64>` returns the *private keys*.
-    The public destination is only their first 387-or-so bytes; the remainder
-    is the private crypto and signing key. Captured from i2pd: 908 base64
-    characters, 679 bytes — 391 of destination (a KEY certificate with a
-    4-byte payload) and 288 of key material. Both halves are one unbroken
-    base64 run, so nothing about the string says where one ends.
-
-    Consequences, all of which had been misread as something else:
-
-      - **Every announce carried our private keys** to the tracker in `ip=`.
-        postman's PaTracker refused each one as a policy violation, which was
-        correct and generous. The bisect that found it: dropping `ip=`
-        entirely changes the answer to `failure reason: Missing key: ip`, so
-        the parameter is required *and* ours was wrong.
-      - **Our own `DestHash` was the hash of the private blob.** Every b32
-        clove printed, published over PEX, or dialled in a loopback test named
-        nothing at all. A router asked to resolve it can only fail — which is
-        precisely the "lease set not found" that §2.8 recorded as an emissary
-        defect, and the `CantReachPeer` that §2.6b blamed on young routers.
-        Those entries stand as observations; their attribution was wrong.
-
-    clove now cuts the blob to its destination before using it, at the one
-    place it enters the process (`i2pnet::addr::destination_bytes`). The
-    length comes from the certificate's own header, so it survives whatever
-    key types a router uses. Anything too short to hold a certificate header
-    is refused rather than guessed at: a wrong answer here is a wrong
-    identity, and a wrong identity fails silently everywhere at once.
-
-    The lesson for the rest of this file: **`§2.8` and `§2.6b` were written
-    from live logs and were still wrong**, because the evidence was consistent
-    with a router bug and nobody decoded what we were sending. Prefer decoding
-    your own output before attributing a fault upstream.
-
-5.6 [decided] **`completed` is an event, and clove was treating it as a
-    periodic report.** Found 2026-07-28 in the first live run that completed a
-    download (i2pd 2.61.0, 20.4 MiB in 227s) and then served nothing at all
-    across a 900-second seeding window.
-
-    `announces_ok 1` for the whole run says it: one announce, sent at 76s while
-    still a leecher with `left` equal to the entire file, and nothing after it.
-    The `AnnounceState` machine was right — `next_event(complete)` returns
-    `Completed` and reports it once — but `announce_loop` only ever announced
-    when the tracker's interval said so, and postman's is half an hour. So the
-    completion announce was scheduled for well after the run ended, and for the
-    whole seeding window the tracker went on handing our destination to peers
-    as a leecher that held nothing. Nobody had any reason to ask us for a byte.
-
-    BEP 3 asks for `completed` at the moment the download finishes, and every
-    client sends it there. It belongs with `started` (the first announce, which
-    no interval governs) and `stopped` (which clove already sends on teardown
-    with no regard for one) — events, not cadence.
-
-    The fix is deliberately *not* `AnnounceState::make_due`, whose documented
-    contract is that nothing automatic may use it, because that rule is a good
-    one and worth keeping intact. `completion_due` is a separate, much narrower
-    door: it does nothing before the first announce and nothing once the
-    completion announce has gone out, so it can bring forward exactly one
-    announce in a torrent's lifetime and cannot become a way to hammer a
-    tracker. The announcer watches for the torrent finishing and opens it.
-
-    Found alongside, and fixed with it: a torrent that was *already* complete
-    when its announcer started would report `Completed` on its second announce.
-    BEP 3 says not to — the client had the file before it announced at all, so
-    there is no download to report — and a tracker counts a snatch every time
-    it sees one. clove rebuilds its announcers on every session blip, so this
-    was one phantom snatch per restart, per seeding torrent.
-    `AnnounceState::already_complete` is the constructor for that case.
-
-5.2 [decided] Any query already present in the announce URL (e.g. postman's
-    `/announce.php?...`) is preserved; clove appends its params with the
-    correct `?`/`&` separator.
-
-5.3 [decided] Announce timing: honor the tracker's `interval`, floored at a
-    local 60s minimum so a misconfigured tracker cannot make us hammer.
-    On failure, exponential backoff from 30s capped at 30 min. A tracker
-    `failure reason` is surfaced to the operator, not retried as if
-    transient.
-
-5.4 [open] Whether i2psnark/opentracker expect `event=started` on the very
-    first announce only, and any tracker-specific quirks (numwant caps,
-    `&supportcrypto`, etc.), to be confirmed live at M3 and recorded here.
-
-5.5 [decided] A tracker URL's host is usually an **address-book name**
-    (`tracker2.postman.i2p`), not a b32, and the two resolve through entirely
-    different machinery: the address book is a local file the router fills from
-    HTTP subscriptions, while a b32 resolves through the netDb. A router that
-    has not completed its subscription fetch cannot resolve the first form at
-    all, however healthy it otherwise is.
-
-    This interacts badly with the negative-lookup backoff (R6,
-    `i2pnet::naming`): the hold doubles from 30s to 30 minutes, so a name that
-    is unknown at startup is retried *less* often as time passes. The observable
-    symptom is therefore not a stream of failed lookups but an absence of
-    lookups, which reads from outside like a stalled client.
-
-    Neither behaviour is wrong — caching a miss is the point — but both were
-    invisible. The lookup error now states the remaining hold, and
-    `try_fetch_round` reports which stage failed rather than dropping it
-    (first found live 2026-07-27; see LIVE-TESTING §7a). An operator hitting
-    this can sidestep it with a b32 tracker URL.
-
-    **Confirmed against emissary, 2026-07-28**, in the run that made the case
-    for this diagnostic. Its SAM session came up normally at 61s and every
-    announce then failed with `router error: KeyNotFound` for
-    `tracker2.postman.i2p`, followed by the negative-cache hold announcing
-    itself:
-
-      resolving tracker tracker2.postman.i2p: protocol error:
-        `router error: KeyNotFound`
-      … negative-cached after 2 failed lookup(s); not asking the router
-        again for 29s
-
-    Nothing here implicates clove, and — the point of §5.5 — it took one
-    glance to say so, where the same failure a week earlier presented as a
-    client that sat silently doing nothing. The router's word (`KeyNotFound`,
-    not `InvalidKey`, not a timeout) also distinguishes an empty address book
-    from a netDb lookup that failed, which is the difference between "wait for
-    the subscription" and "the destination is gone".
-
-    5.5a [decided] **emissary keeps two address books, and which one answers
-      depends on how you ask.** Found 2026-07-28, after seeding its address
-      book changed nothing at all and it went on answering `KeyNotFound`.
-
-      In emissary-core 0.4.0, under `<base>/addressbook`:
-
-        addresses                `hostname=<52-char b32 label>` per line, read
-                                 into memory once at startup. Serves
-                                 `resolve_base32`, which is what a
-                                 `STREAM CONNECT` naming a *hostname* uses.
-        destinations/<host>.txt  the full base64 destination. Serves
-                                 `resolve_base64`, which is what
-                                 `NAMING LOOKUP` uses, read per query.
-
-      Only the subscription fetch writes both. A client that resolves a name
-      and then dials the result — which is clove, and which the SAM spec's
-      `NAMING LOOKUP` exists for — reads exclusively the second. So an address
-      book populated only with b32 labels looks complete, is complete for one
-      access path, and is invisible to the other.
-
-      The first version of `contrib/podman/seed-addressbook.sh` wrote only
-      `addresses`, on the reasonable-looking evidence that it was *the*
-      address book: it is the file `AddressBookManager` loads at startup, and
-      the one whose format is obvious from a directory listing. The entry was
-      there and the lookup still failed. Both are written now.
-
-      Worth stating as a rule, because this is the same shape as §4.7's
-      endgame and §2.7a's split stream: **a store with two readers has two
-      contracts**, and satisfying the one you happened to read the code for
-      proves nothing about the other. The test that would have caught it is
-      the one nobody ran — asking the destination router, rather than
-      inspecting what was written.
-
-
-2. SAM / yosemite behavior (from the 0.7.0 API review, M0/M1)
-------------------------------------------------------------
+2. SAM and the routers — the session, dialing, and every live surprise
+----------------------------------------------------------------------
 
 2.1 [decided] yosemite hardcodes the SAM host to 127.0.0.1; only the TCP
     port is configurable. This happens to enforce Layer 1's loopback-only
@@ -333,16 +76,13 @@ Status legend:
     mock and the SAM backend share one honest abstraction, and it matches
     the reader-thread/writer-thread model (Q5) directly.
 
-2.3 [decided, superseded] clove no longer uses yosemite to dial, and its own
-    `STREAM CONNECT` honours the caller's timeout on a socket it owns
-    (§2.12). The observation below stands as a fact about yosemite 0.7 and is
-    why the trait's `timeout` argument was documented as advisory for so long.
-
-2.3 [assumed] yosemite's `Session::connect` (sync) has no timeout parameter
-    and blocks until the STREAM CONNECT resolves. clove's dial() takes a
-    timeout for the trait's sake but cannot enforce it at this layer; the
-    timeout is a supervision-layer concern. Whether long connects need a
-    watchdog is an [open] R2 question for the stress harness.
+2.3 [decided, superseded by §2.12] The dial timeout is real: clove's own
+    `STREAM CONNECT` bounds the wait for `STREAM STATUS`, which is where a
+    leaseSet lookup spends its time, on a socket it owns. Kept because the
+    trait's `timeout` argument was documented as advisory for a long time and
+    this is why — yosemite's sync `Session::connect` takes no timeout and
+    blocks until the router resolves the stream, so nothing at this layer
+    could enforce one.
 
 2.4 [assumed] `Session::connect`/`accept`/`forward` all take `&mut self` and
     block. A single Session shared between the dial path and an accept path
@@ -374,30 +114,25 @@ Status legend:
     concurrency ceiling of one session, are the harness's job. First live
     observations against i2pd (M1, in progress):
 
-    2.6a [decided, superseded by §2.12] This was true while dials went through
-      yosemite; they no longer do, and a dial now takes no session lock at
-      all. The engine may initiate peers concurrently. Kept because the
-      reasoning below explains why several budgets in the harness are shaped
-      the way they are.
+    2.6a [decided, superseded by §2.12] Outbound dial *initiation* used to
+      serialize per session: yosemite's sync `connect` takes `&mut self` and
+      blocks until the router resolves the stream, so `SamSession::dial` held
+      the session mutex for the whole connect and one session initiated peers
+      one at a time. Established streams always ran concurrently; only setup
+      was serial. Dials no longer go through yosemite and take no session lock
+      at all, so the engine may initiate peers concurrently.
 
-    2.6a [decided] Outbound dial *initiation* serializes per session. yosemite's
-      sync `connect` takes `&mut self` and blocks until the router resolves the
-      stream, so SamSession::dial holds the session mutex for the whole connect.
-      Established streams run concurrently (each is an independent socket once
-      connected); only the setup step is serial. Consequence for the engine:
-      one dial session initiates peers one-at-a-time. Whether that needs
-      multiple dial sessions, or is fine because connects are quick once warm,
-      is the N-scaling question the harness still has to answer.
+      Kept for two reasons. It explains why several budgets in the harness are
+      shaped the way they are — and, **the expensive one**: deleting the
+      constraint did not delete the code shaped around it.
+      `clove_core::swarm::sweep` went on dialling strictly one peer at a time,
+      its comment still citing this entry, until a live run noticed. The cost
+      was not subtle — fifty tracker peers, a 120s per-dial timeout and a
+      session lifetime under two minutes meant *one* dial attempt per session,
+      usually cut off in flight, giving `0 peers / 50 known` run after run from
+      a sweep working exactly as written. **A superseded constraint needs its
+      dependants found, not just its entry annotated.**
 
-      **Postscript, 2026-07-27.** Deleting the constraint in §2.12 did not
-      delete the code shaped around it. `clove_core::swarm::sweep` went on
-      dialling strictly one peer at a time, its comment still citing this
-      entry, for as long as it took a live run to notice — and the cost was not
-      subtle: fifty tracker peers, a 120s per-dial timeout and a session
-      lifetime under two minutes meant *one* dial attempt per session, usually
-      cut off in flight. `0 peers / 50 known`, run after run, from a sweep that
-      was working exactly as written. A superseded constraint needs its
-      dependants found, not just its entry annotated.
 
     2.6b [assumed] A freshly created transient destination is briefly
       unreachable: a dial to it returns STREAM STATUS RESULT=CANT_REACH_PEER
@@ -471,61 +206,43 @@ Status legend:
       unfinished, so the reader is not sent to diagnose a router for the
       harness's own limit.
 
-2.7 [decided] yosemite 0.7.0 sets no read or write timeout on its SAM control
-    socket. Against a bridge that accepts the TCP connection and then says
-    nothing, `Session::new` blocks forever — it does not error, so nothing
-    upstream of it can back off, retry, or log. Measured in-tree against a
-    fake bridge: of six misbehaviours (close, silence, garbage, endless
-    bytes, refuse-hello, one-byte-dribble), four hung indefinitely and only
-    the two that closed or answered returned at all.
+2.7 [decided, closed] yosemite 0.7.0 sets no read or write timeout on its SAM
+    control socket, so against a bridge that accepts the connection and then
+    says nothing, `Session::new` blocks forever. It does not error, so nothing
+    above it can back off, retry or log — the daemon simply sits in
+    "connecting" until someone restarts it, which is the failure mode SCOPE §4
+    exists to prevent. Measured in-tree against a fake bridge: of six
+    misbehaviours (close, silence, garbage, endless bytes, refuse-hello,
+    one-byte-dribble), four hung indefinitely.
 
-    clove's answer is a pre-flight probe (i2pnet::sam::probe_bridge): before
-    yosemite is handed the port, clove opens its own socket with a connect
-    timeout, a per-read timeout, a whole-exchange deadline and a 512-byte cap,
-    speaks `HELLO VERSION` itself, and requires `HELLO REPLY RESULT=OK`. All
-    six cases now fail cleanly and quickly, with an error naming the address.
-
-2.7a [decided, closed by §2.12 and §2.14] Outbound streams are no longer
-    yosemite's. A dialled peer that goes silent is bounded by
-    `I2pStream::set_timeouts` like any other socket, and dropping the stream
-    closes it — so the parked thread and the leaked socket described below are
-    both gone. The entry is kept because it is the reason the socket count
-    climbed all afternoon, and because the *inbound* half of its reasoning is
-    still exactly right.
-
-    §2.12 closed only half of it, and the claim above was too strong when it
-    was written: "dropping the stream closes it" is true of *a* stream and
-    false of a stream that has been split in two. See §2.14.
-
-2.7a [was open] The same gap applies to yosemite's *virtual streams*, and there the
-    probe trick does not help: `yosemite::Stream` (and the ReadHalf a peer's
-    reader thread owns) exposes no read or write timeout, so a dialled peer that
-    completes its handshake and then goes silent parks that thread until the
-    router tears the stream down. clove drops such a peer from its table on the
-    idle timeout (clove_core::torrent, DEFAULT_IDLE_TIMEOUT) so it stops
-    counting against the peer cap and its blocks go back to the picker, but the
-    thread itself is not reclaimable from here.
-
-    Inbound is unaffected: a forwarded connection is a loopback TCP socket clove
-    owns (i2pnet::sam::ForwardedStream), and I2pStream::set_timeouts bounds it —
-    which is what the demux uses to stop a connection that never handshakes from
-    holding a thread for the life of the process.
-
-    Closing this needs a timeout on yosemite's stream types, the same upstream
-    change §2.7 wants for the control socket. Until then the cost is one parked
-    thread per silent outbound peer, bounded in practice by how many peers a
-    torrent dials.
-    Budget is SamConfig::probe_timeout (default 10s).
-
-    Residual gap, CLOSED 2026-07-27 by §2.13: a bridge that answered HELLO
-    correctly and *then* stalled on SESSION CREATE used to hang inside
-    yosemite, and the probe could not see that far. clove speaks SESSION
-    CREATE itself now, on the socket the handshake already gave it, so the
-    second half is bounded by SamConfig::session_timeout exactly as the first
-    is by probe_timeout. The pre-flight probe is gone with the gap: there is
-    nothing left to pre-flight *for*, since the connection the handshake opens
-    is the one the session then uses. Tracked by the test
+    clove first answered this with a pre-flight probe, which left a gap the
+    probe could not see past: a bridge that answered `HELLO` correctly and
+    *then* stalled on `SESSION CREATE` still hung inside yosemite. Both halves
+    are closed now, and the probe is gone with them — clove speaks `HELLO
+    VERSION` and `SESSION CREATE` itself on one socket it owns, bounded by
+    `SamConfig::probe_timeout` and `SamConfig::session_timeout` (§2.13). There
+    is nothing left to pre-flight *for*: the connection the handshake opens is
+    the one the session then uses. Tracked by the test
     `a_bridge_that_passes_hello_and_then_stalls_no_longer_hangs`.
+
+2.7a [decided, closed by §2.12 and §2.14] A dialled peer that went silent
+    parked its reader thread and leaked a socket for the life of the process:
+    `yosemite::Stream` exposed no read or write timeout, so nothing could
+    bound it. Measurable as a socket count against the bridge that climbed all
+    afternoon. clove dropped such a peer from its table on the idle timeout,
+    so its slot and its blocks came back — but the thread did not.
+
+    Closed in two steps, and the first was not enough on its own:
+
+      - §2.12: outbound streams are sockets clove owns, so
+        `I2pStream::set_timeouts` bounds them and dropping one closes it.
+      - §2.14: *except* when it has been split in two, which the engine does
+        to every peer. Both halves are one descriptor, so dropping one closes
+        nothing; the writer closes the connection explicitly now.
+
+    Inbound was never affected: a forwarded connection is a loopback TCP
+    socket clove owns, which is what lets the demux bound a connection that
+    handshakes too slowly or not at all.
 
 2.8 [decided] emissary 0.4.0, first live run (2026-07-25): every dial between two
     destinations on the *same* emissary router failed. The router's own log is
@@ -855,8 +572,8 @@ Status legend:
     it is the public half and a router cannot sign with it.
 
 
-3. Reconnect discipline (i2pnet::supervisor, M1)
-------------------------------------------------
+3. Reconnect discipline (i2pnet::supervisor)
+--------------------------------------------
 
 3.1 [decided] On session loss the whole session tree is rebuilt on an
     exponential backoff (default 1s doubling to 60s) with jitter (default
@@ -868,8 +585,8 @@ Status legend:
     one-off router blip from imposing a long stall.
 
 
-4. Wire protocol (clove-core::wire, M2)
----------------------------------------
+4. Wire protocol — peer messages, PEX, metadata, and the picker
+---------------------------------------------------------------
 
 4.1 [decided] The peer wire protocol above the I2P stream is byte-identical
     to clearnet BEP 3 — no ports appear in any message; the peer is an I2P
@@ -988,3 +705,272 @@ Status legend:
 4.6 [open] I2P `maggot://` links are a distinct, underspecified format.
     Not parsed yet — we will not guess a grammar we cannot verify against
     real examples. Add support (and the grammar) here once confirmed.
+
+
+5. HTTP tracker announces (clove-core::tracker)
+-----------------------------------------------
+
+5.1 [assumed] An announce is an HTTP/1.1 GET to the tracker's I2P
+    destination. clove sends the standard BEP 3 query params plus:
+      - `compact=1` (we require the 32-byte-hash compact form, §1.4);
+      - `port=6881` as a placeholder — I2P has no port, but trackers/params
+        parsers expect the key;
+      - `ip=<our base64 destination>` — the I2P convention for telling the
+        tracker our destination, since there is no IP to observe.
+
+    [decided] as of 2026-07-27, and now against the normative spec rather than
+    by inference. The I2P BitTorrent specification (i2p.net, "Bittorrent over
+    I2P") states it plainly: *"The value of the ip key is the base 64 of the
+    client's Destination"*, that *"current Destinations for clients are 387 or
+    more bytes (516 or more in Base 64 encoding)"*, and that a tracker
+    *"should probably decode and reject bad Base64 when announced"*.
+
+    All three sentences describe what happened to us. The parameter is
+    required (omitting it answers `failure reason: Missing key: ip`); the
+    value is the 387-plus-byte Destination, not the 679-byte private key blob
+    clove was sending; and postman's tracker rejecting the bad value was the
+    spec's own recommended behaviour. See §5.1c. This closes the oldest
+    [assumed] in this file.
+
+    Observed variant, unconfirmed: XD (`lib/tracker/http.go`) builds `ip` from
+    its network address plus a `.i2p` suffix rather than from a base64
+    Destination. Whether that resolves to the same thing depends on what its
+    SAM layer returns from `Addr()`, which the announce code does not say —
+    recorded because a second form may exist in the wild, not as a licence to
+    send one.
+
+5.1a [decided] Trackers answer `Transfer-Encoding: chunked`, and clove's HTTP
+    client did not implement it. postman's `announce.php` does, as any PHP
+    script behind an ordinary webserver will. The reader fell through to its
+    read-until-close branch and handed the *chunk framing* to the bencode
+    parser, which reported "not bencode" — accurate about `1a4\r\n…` and
+    useless. Every announce failed identically, so the client acquired no
+    peers at all, on any torrent, ever (found live 2026-07-27).
+
+    Decoding is implemented in `clove_core::http` with the same hostile-input
+    discipline as the rest: bounded size lines, extensions parsed off and
+    ignored, `max_body` checked against the announced chunk size before
+    anything is allocated, trailers consumed rather than mistaken for body,
+    and chunked overriding a `Content-Length` sent alongside it (RFC 9112
+    §6.1). Announces that are *not* bencode now carry a bounded printable
+    prefix of what did arrive, so the next surprise is one log line rather
+    than a session.
+
+5.1b [decided] `tracker2.postman.i2p` answered an announce with **HTTP 200 and a
+    styled HTML page** (observed 2026-07-27, i2pd 2.x, live). Not a bencoded
+    `failure reason`, not an error status — a web page, served where an
+    announce belongs.
+
+    **RESOLVED to a refusal, 2026-07-27.** With HTML summarised rather than
+    quoted, the page names itself:
+
+      HTML page titled "PaTracker 1.7.8 | Blocked Request"; text begins
+      "Request denied! Your request was found to be in violation of the
+       site's policy. In most cases this is caused by issues related to I2P,
+       like incomplete data and such."
+
+    And the endpoint is demonstrably alive: the same URL fetched from a
+    browser through the router's SOCKS proxy answers
+    `d14:failure reason22:Missing key: info_hashe` — correct bencode for a
+    bare GET. So `/announce.php` routes, PaTracker is running, and it is
+    **clove's announce specifically** that it refuses.
+
+    That narrows it to the request. The candidates, in the order they are
+    worth deleting:
+      1. `ip=<base64 destination>` (§5.1, still [assumed]). The tracker sees
+         our destination from the stream itself; a client asserting one in a
+         parameter is the most likely thing a policy check objects to, and
+         "incomplete data related to I2P" reads like a complaint about
+         exactly this field.
+      2. `port=6881`, a placeholder for a protocol with no ports.
+      3. `numwant`, `compact`, `event` — ordinary, but untested here.
+
+    Do not reason about which; delete them one at a time. The daemon now logs
+    the literal URL it sent on every failed announce, so the test is to paste
+    that into the same browser and remove parameters until it stops being
+    refused. One round of that is worth more than another round of theory —
+    three prior theories about this failure (address book, chunked encoding,
+    wrong endpoint) were all wrong, and each cost a live session.
+
+    **It is postman.** The page's own stylesheet declares `--postman:` and
+    embeds an SVG of a postman; 14151 bytes, `content-type text/html;
+    charset=utf-8`. So the destination is right and the address book is not
+    the problem — that candidate is closed. What remains:
+      (a) postman's webserver declines the request and serves the site
+          instead. Two shapes in clove's announce were unusual enough to be
+          worth removing before blaming the endpoint: `Content-Length: 0` on
+          a bodyless GET, which almost nothing on the web sends, and **no
+          `User-Agent` at all**. Both are fixed; §5.1's `ip=` form remains
+          [assumed] and is the next candidate if they were not it.
+      (b) `/announce.php` is no longer the announce endpoint, and the server
+          answers 200 with its front page for paths it does not route.
+
+    Settle it from outside clove before changing anything else — one request
+    through the router's HTTP proxy says which:
+
+        curl -x http://127.0.0.1:4444 -i http://tracker2.postman.i2p/announce.php
+
+    A bencoded `failure reason` means the endpoint is live and clove's request
+    is at fault; the same HTML page means the endpoint is (b).
+
+    Two previews were spent learning that a modern page's first 512 bytes are
+    its stylesheet. `preview` now summarises HTML — `<title>` plus the first
+    visible words — rather than quoting the head, which is what "identify the
+    page" actually needs.
+
+5.1c [decided] **SAM's `DESTINATION=` field is the session's private key
+    blob, not its destination — and clove was announcing the whole thing.**
+    Root cause of every failure in §5.1b, found 2026-07-27 by decoding the
+    announce clove actually sent.
+
+    `SESSION STATUS RESULT=OK DESTINATION=<b64>` returns the *private keys*.
+    The public destination is only their first 387-or-so bytes; the remainder
+    is the private crypto and signing key. Captured from i2pd: 908 base64
+    characters, 679 bytes — 391 of destination (a KEY certificate with a
+    4-byte payload) and 288 of key material. Both halves are one unbroken
+    base64 run, so nothing about the string says where one ends.
+
+    Consequences, all of which had been misread as something else:
+
+      - **Every announce carried our private keys** to the tracker in `ip=`.
+        postman's PaTracker refused each one as a policy violation, which was
+        correct and generous. The bisect that found it: dropping `ip=`
+        entirely changes the answer to `failure reason: Missing key: ip`, so
+        the parameter is required *and* ours was wrong.
+      - **Our own `DestHash` was the hash of the private blob.** Every b32
+        clove printed, published over PEX, or dialled in a loopback test named
+        nothing at all. A router asked to resolve it can only fail — which is
+        precisely the "lease set not found" that §2.8 recorded as an emissary
+        defect, and the `CantReachPeer` that §2.6b blamed on young routers.
+        Those entries stand as observations; their attribution was wrong.
+
+    clove now cuts the blob to its destination before using it, at the one
+    place it enters the process (`i2pnet::addr::destination_bytes`). The
+    length comes from the certificate's own header, so it survives whatever
+    key types a router uses. Anything too short to hold a certificate header
+    is refused rather than guessed at: a wrong answer here is a wrong
+    identity, and a wrong identity fails silently everywhere at once.
+
+    The lesson for the rest of this file: **`§2.8` and `§2.6b` were written
+    from live logs and were still wrong**, because the evidence was consistent
+    with a router bug and nobody decoded what we were sending. Prefer decoding
+    your own output before attributing a fault upstream.
+
+5.6 [decided] **`completed` is an event, and clove was treating it as a
+    periodic report.** Found 2026-07-28 in the first live run that completed a
+    download (i2pd 2.61.0, 20.4 MiB in 227s) and then served nothing at all
+    across a 900-second seeding window.
+
+    `announces_ok 1` for the whole run says it: one announce, sent at 76s while
+    still a leecher with `left` equal to the entire file, and nothing after it.
+    The `AnnounceState` machine was right — `next_event(complete)` returns
+    `Completed` and reports it once — but `announce_loop` only ever announced
+    when the tracker's interval said so, and postman's is half an hour. So the
+    completion announce was scheduled for well after the run ended, and for the
+    whole seeding window the tracker went on handing our destination to peers
+    as a leecher that held nothing. Nobody had any reason to ask us for a byte.
+
+    BEP 3 asks for `completed` at the moment the download finishes, and every
+    client sends it there. It belongs with `started` (the first announce, which
+    no interval governs) and `stopped` (which clove already sends on teardown
+    with no regard for one) — events, not cadence.
+
+    The fix is deliberately *not* `AnnounceState::make_due`, whose documented
+    contract is that nothing automatic may use it, because that rule is a good
+    one and worth keeping intact. `completion_due` is a separate, much narrower
+    door: it does nothing before the first announce and nothing once the
+    completion announce has gone out, so it can bring forward exactly one
+    announce in a torrent's lifetime and cannot become a way to hammer a
+    tracker. The announcer watches for the torrent finishing and opens it.
+
+    Found alongside, and fixed with it: a torrent that was *already* complete
+    when its announcer started would report `Completed` on its second announce.
+    BEP 3 says not to — the client had the file before it announced at all, so
+    there is no download to report — and a tracker counts a snatch every time
+    it sees one. clove rebuilds its announcers on every session blip, so this
+    was one phantom snatch per restart, per seeding torrent.
+    `AnnounceState::already_complete` is the constructor for that case.
+
+5.2 [decided] Any query already present in the announce URL (e.g. postman's
+    `/announce.php?...`) is preserved; clove appends its params with the
+    correct `?`/`&` separator.
+
+5.3 [decided] Announce timing: honor the tracker's `interval`, floored at a
+    local 60s minimum so a misconfigured tracker cannot make us hammer.
+    On failure, exponential backoff from 30s capped at 30 min. A tracker
+    `failure reason` is surfaced to the operator, not retried as if
+    transient.
+
+5.4 [open] Whether i2psnark/opentracker expect `event=started` on the very
+    first announce only, and any tracker-specific quirks (numwant caps,
+    `&supportcrypto`, etc.), to be confirmed live at M3 and recorded here.
+
+5.5 [decided] A tracker URL's host is usually an **address-book name**
+    (`tracker2.postman.i2p`), not a b32, and the two resolve through entirely
+    different machinery: the address book is a local file the router fills from
+    HTTP subscriptions, while a b32 resolves through the netDb. A router that
+    has not completed its subscription fetch cannot resolve the first form at
+    all, however healthy it otherwise is.
+
+    This interacts badly with the negative-lookup backoff (R6,
+    `i2pnet::naming`): the hold doubles from 30s to 30 minutes, so a name that
+    is unknown at startup is retried *less* often as time passes. The observable
+    symptom is therefore not a stream of failed lookups but an absence of
+    lookups, which reads from outside like a stalled client.
+
+    Neither behaviour is wrong — caching a miss is the point — but both were
+    invisible. The lookup error now states the remaining hold, and
+    `try_fetch_round` reports which stage failed rather than dropping it
+    (first found live 2026-07-27; see LIVE-TESTING §7a). An operator hitting
+    this can sidestep it with a b32 tracker URL.
+
+    **Confirmed against emissary, 2026-07-28**, in the run that made the case
+    for this diagnostic. Its SAM session came up normally at 61s and every
+    announce then failed with `router error: KeyNotFound` for
+    `tracker2.postman.i2p`, followed by the negative-cache hold announcing
+    itself:
+
+      resolving tracker tracker2.postman.i2p: protocol error:
+        `router error: KeyNotFound`
+      … negative-cached after 2 failed lookup(s); not asking the router
+        again for 29s
+
+    Nothing here implicates clove, and — the point of §5.5 — it took one
+    glance to say so, where the same failure a week earlier presented as a
+    client that sat silently doing nothing. The router's word (`KeyNotFound`,
+    not `InvalidKey`, not a timeout) also distinguishes an empty address book
+    from a netDb lookup that failed, which is the difference between "wait for
+    the subscription" and "the destination is gone".
+
+    5.5a [decided] **emissary keeps two address books, and which one answers
+      depends on how you ask.** Found 2026-07-28, after seeding its address
+      book changed nothing at all and it went on answering `KeyNotFound`.
+
+      In emissary-core 0.4.0, under `<base>/addressbook`:
+
+        addresses                `hostname=<52-char b32 label>` per line, read
+                                 into memory once at startup. Serves
+                                 `resolve_base32`, which is what a
+                                 `STREAM CONNECT` naming a *hostname* uses.
+        destinations/<host>.txt  the full base64 destination. Serves
+                                 `resolve_base64`, which is what
+                                 `NAMING LOOKUP` uses, read per query.
+
+      Only the subscription fetch writes both. A client that resolves a name
+      and then dials the result — which is clove, and which the SAM spec's
+      `NAMING LOOKUP` exists for — reads exclusively the second. So an address
+      book populated only with b32 labels looks complete, is complete for one
+      access path, and is invisible to the other.
+
+      The first version of `contrib/podman/seed-addressbook.sh` wrote only
+      `addresses`, on the reasonable-looking evidence that it was *the*
+      address book: it is the file `AddressBookManager` loads at startup, and
+      the one whose format is obvious from a directory listing. The entry was
+      there and the lookup still failed. Both are written now.
+
+      Worth stating as a rule, because this is the same shape as §4.7's
+      endgame and §2.7a's split stream: **a store with two readers has two
+      contracts**, and satisfying the one you happened to read the code for
+      proves nothing about the other. The test that would have caught it is
+      the one nobody ran — asking the destination router, rather than
+      inspecting what was written.
