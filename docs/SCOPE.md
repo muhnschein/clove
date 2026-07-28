@@ -157,7 +157,7 @@ blocker — the amendment and its reversal condition are in `DECISIONS.md` S1.
 | # | Item | Plan |
 |---|---|---|
 | R1 | yosemite maturity (v0.7, few users) | Wrap behind `i2pnet` trait; vendor if needed; upstream fixes (author is responsive/active) |
-| R2 | i2pd SAM behavior under many concurrent streams on one session (possible root of XD flakiness) | Stress-test harness in Phase D, before engine work relies on assumptions |
+| R2 | i2pd SAM behavior under many concurrent streams on one session (possible root of XD flakiness) | **Closed 2026-07-28, negative** (`PROTOCOL.i2p-bt` §2.6e): two `make sam-sweep` ladders on i2pd 2.61.0, 31 runs, every one dialled N of N to 200 concurrent — connect latency uncorrelated with N. Not the root of the flakiness; §2.12 is the better candidate. `sam-stress`/`sam-sweep` stay as regression instruments. A separate finding on SAM-bridge stability under session churn is open as §2.6f |
 | R3 | Datagram2/3 availability in yosemite + routers (gates future UDP announces, DHT) | Not needed for v1; track upstream |
 | R4 | i2p_pex flag semantics underspecified ("review libtorrent source") | Conformance testing vs i2psnark; treat i2psnark behavior as normative |
 | R5 | Tunnel latency vs choker/timeout tuning (clearnet BT timing assumptions are wrong on I2P) | Make all timeouts config-tunable; benchmark on live swarms; expect several rounds |
