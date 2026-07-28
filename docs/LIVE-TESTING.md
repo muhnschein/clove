@@ -1,9 +1,8 @@
-# Live-Router Testing Plan — closing M1 and M3
+# Live-router testing — the tiers, the environment, and the interop matrix
 
-**Status:** Rev 3 — the order of the tiers is inverted from Rev 2. The
-loopback tier is no longer the gate; a live swarm download is. Rev 2's
-apparatus is intact and still runs, but it has stopped being the first thing
-tried, for the reasons in §0.
+**Status:** M1 and M3 are met on i2pd and Java I2P; emissary's column is open.
+The results, per router and dated, are the matrix in §6.3 — that table is the
+point of this document, and everything else here exists to fill it in.
 
 **Start here:**
 
@@ -34,88 +33,50 @@ All three routers in `SCOPE.md` §6 — i2pd, Java I2P and emissary — have a
 quadlet and run side by side on different SAM ports (§5.1); 0.1 needs the
 sign-off on all of them, and §6.3 is the table to record it in.
 
-## 0. Why the order changed (Rev 3, 2026-07-27)
+## 0. Why the swarm tier comes first
 
-Three live sessions have been spent and no result from any of them says
-anything about clove. Reading the failures back (`PROTOCOL.i2p-bt` §2.6b–e,
-§2.8, §2.9, §2.10) they fall into three piles, and none of the piles is a bug
-in this codebase:
+Every tier below the swarm one puts **both** destinations on a single router and
+asks it to resolve a leaseSet for a destination it published seconds ago, on
+behalf of a sibling session it is already hosting. That is the most fragile
+netDb operation a young router performs; emissary cannot do it at all with the
+router demonstrably healthy (`PROTOCOL.i2p-bt` §2.8). For three sessions it was
+also the *gate*, so nothing behind it ever ran.
 
-1. **Harness arithmetic**, twice — a probe that killed its own retry loop
-   a third of the way in, then the same nested-budget mistake reintroduced one
-   layer up in the shell. Both fixed, both with tests, and neither taught us
-   anything about I2P.
-2. **The routers were not fit to be measured against.** Every recorded run
-   used containers between fifteen minutes and an hour old, firewalled, with
-   `LeaseSets 0` and a 33% tunnel build rate. A router in that state cannot
-   carry a stream for anyone, clove included.
-3. **The loopback topology itself** — and this is the one worth acting on.
+**The mission is easier than the gate.** A swarm peer resolves destinations
+published for months by routers that want to be found, and the download half
+never needs *our* leaseSet resolved by anyone — I2P bundles the sender's
+leaseSet with the stream's opening message, so the far side replies without a
+lookup (§2.11). The gate was strictly harder than the thing it gated.
 
-Every tier-2 test puts both destinations on **one** router: `router-ready`,
-`sam-stress` by default, and `two_instances_download_over_sam`. That asks the
-router to resolve a leaseSet for a destination it published seconds ago, on
-behalf of a sibling session it is already hosting. It is the most fragile
-netDb operation a young router performs; emissary cannot do it at all, with
-the router demonstrably healthy at the time (§2.8); and it is the first thing
-every run tried and the thing every run died on.
+So `make swarm` runs first, and a loopback failure alongside swarm success is a
+finding about the router. The loopback tier keeps its place as a diagnostic, and
+`sam-stress` is still the only instrument that answers R2 — it is simply not the
+gate, and a failure in it no longer skips everything behind it.
 
-**The mission is easier than the gate.** A swarm peer never does what the
-loopback test does. It resolves destinations that have been published for
-months, by routers that want to be found. And the download half never needs
-*our* leaseSet resolved by anybody: I2P bundles the sender's leaseSet with the
-stream's opening message, so the far side replies without a lookup at all
-(`PROTOCOL.i2p-bt` §2.11). We built a gate strictly harder than the thing it
-was gating, then spent three sessions failing it.
+One thing no reordering fixes: **a freshly reseeded container is not a peer
+anyone wants to route through.** Give a router hours rather than minutes, and
+forward its transport port (§6.6). A long-running host-installed router is
+usually the better subject than anything this repo can start for you.
 
-So the question "rewrite the report harness, or go straight to real
-torrenting?" has a third answer, which is the one taken here: **the harness is
-fine, its ordering was wrong.** `ci/live-report.sh` is well-built — bounded
-steps, verdict table, container logs, staleness detection — and most of what
-looks like scar tissue in it (unique session ids, derived deadlines,
-host-router awareness) was paid for in exactly these failed runs. Rewriting it
-would reproduce its design minus the lessons. What it needed was a tier above
-it that does not depend on the fragile case, and a reason to run that tier
-first.
+## 1. What is proven, and what is not
 
-`ci/live-swarm.sh` is that tier. It also proves considerably more per run: a
-completed download exercises the tracker announce, BEP 9, the picker, the
-choker, storage, verification and the resume writer against i2psnark — the
-client `SCOPE.md` §6 calls normative — over real tunnels. Bytes served prove
-the wire in the other direction. A peer that dials *us* proves `STREAM
-FORWARD` and that our leaseSet reached the wider netDb, which is the half of
-§2.5 no router-free test can reach and a stronger result than the loopback
-test was ever going to give.
+The results matrix is §6.3; this is the summary it rolls up to.
 
-The loopback tier keeps its place. It is a fine diagnostic and `sam-stress`
-is still the only instrument that answers R2. It is just not the gate any
-more, and a failure in it no longer skips everything behind it.
+**Proven live, on i2pd and Java I2P:** a full download from a public i2psnark
+swarm, peers acquired over PEX beyond the tracker's set, payload served back,
+and a remote peer dialing our destination — which is `STREAM FORWARD` and our
+leaseSet reaching the wider netDb, the half of `PROTOCOL.i2p-bt` §2.5 that no
+router-free test can reach. M1 and M3 are met on those two routers.
 
-**On fitness of subject (pile 2), which no reordering fixes.** A freshly
-reseeded container is not a peer anyone wants to route through. Before
-spending a session, give the router hours rather than minutes, forward its
-transport port (§6.6), and check it is not firewalled. A long-running
-host-installed router is usually the better subject than anything this repo
-can start for you — `ci/live-report.sh` says so when it finds one, and that
-is a recommendation, not an apology.
+**Not proven:** emissary end to end (§7a — its address book, not clove), the
+multi-hour seed soak, a router restart mid-transfer, and `sam-stress` at the
+higher concurrency levels that answer R2. Those are what stands between here
+and the 0.1 interop sign-off.
 
-## 1. The debt, stated plainly
+Worth keeping in view: every defect that has mattered was found *here*, not in
+CI, and the unit suite was green through all of them. That is the argument for
+this document existing, and the reason the tiers are cheap to run.
 
-The engine downloads a torrent between two instances *over the mock network*
-(M2, done). Everything above `i2pnet::sam` is exercised. But the SAM backend's
-inbound path is unwritten, the R2 stress harness the plan calls for does not
-exist, and **not one line has touched a live router.** The three hardest,
-reputation-defining unknowns — the ones `SCOPE.md` names as Suspect #1 for
-XD-style flakiness — are exactly the parts still marked [open] or [assumed]:
-
-- inbound stream topology (`PROTOCOL.i2p-bt` §2.5),
-- one-session concurrency ceiling under load (§2.6, R2),
-- supervision surviving a real router restart (`supervisor` is unit-tested
-  against a fake factory only).
-
-The longer these sit, the more engine code accretes on top of assumptions that
-a live router may not honor. This plan converts them from "unverified" to
-"verified, and re-verified on every change" without waiting for the whole
-product to exist.
 
 ## 2. Why CI cannot do this, and what that forces
 
@@ -128,32 +89,23 @@ machine, not in CI.** That splits the work into two buckets: what we can write
 and verify without a router (Bucket 1, below), and the live sign-off itself
 (Bucket 2). Tier-1 CI stays router-free and green throughout.
 
-## 3. The topology decision, settled in code first
 
-The single biggest structural gap is inbound streams. yosemite 0.7.0 offers two
-shapes (`PROTOCOL.i2p-bt` §2.5):
+## 3. Inbound topology: `STREAM FORWARD`, not `STREAM ACCEPT`
 
-- **(a) `Session::accept()`** — one accept per inbound stream, takes `&mut
-  self`, blocks. Only one accept can be outstanding at a time across the whole
-  session: a hard serialization point for a swarm of inbound peers, and a
-  plausible slice of the R2 flakiness.
-- **(b) `Session::forward(port)`** — the router forwards each inbound stream as
-  a fresh TCP connection to a loopback listener we run; the peer's full base64
-  destination arrives on the first line. Inbound concurrency is then bounded by
-  a plain `TcpListener` accept loop, not the `&mut self` lock.
+yosemite 0.7.0 offered two shapes for inbound streams (`PROTOCOL.i2p-bt` §2.5):
+`accept()` takes `&mut self` and blocks, so only one accept can be outstanding
+across the whole session — a hard serialization point for a swarm of inbound
+peers, and a plausible slice of the R2 flakiness. `forward(port)` has the router
+push each inbound stream to a loopback listener we run, with the peer's full
+base64 destination on the first line, so inbound concurrency is a plain accept
+loop.
 
-**Decision: implement (b).** It matches the "one PRIMARY session + forwarded
-listener" topology in `SCOPE.md` §4, it is the R2-safe answer, and the loopback
-listener it needs is an allowed IP-socket construction site *inside* `i2pnet`
-(the same loopback-validating helper `lib.rs` already promises for the HTTP
-API). This is written and typechecked against the yosemite API with no router
-present; only its runtime behavior is deferred to Bucket 2. Deriving the
-`DestHash` from the forwarded destination reuses `addr` (`PROTOCOL.i2p-bt`
-§1.3), which is already tested against RFC 4648 vectors.
+**(b) was implemented**, and confirmed live: a forwarded peer's derived
+dest-hash reconciles with its dialed hash, and remote peers have dialed us on
+both i2pd and Java I2P. The loopback listener is an allowed IP-socket
+construction site inside `i2pnet`, and the `DestHash` derivation reuses `addr`,
+already tested against RFC 4648 vectors.
 
-When this lands, `PROTOCOL.i2p-bt` §2.5 moves from [open] to [assumed] (written,
-pending a live run), and flips to [decided] the first time Bucket 2 confirms a
-forwarded peer's dest-hash reconciles with its dialed hash.
 
 ## 4. Bucket 1 — buildable now, no router (landed)
 
@@ -402,18 +354,23 @@ something fails and you need to know what it was supposed to prove.
 
 - [ ] `sam-stress` completes at 16/32/64/128/200 concurrent streams on one
       session; latency distribution and any failure cliff recorded (R2, §2.6).
-- [ ] Inbound: a forwarded peer's derived `DestHash` reconciles with the hash it
-      was dialed at (confirms §2.5, §1.3); §2.5 → [decided].
+- [x] Inbound: a forwarded peer's derived `DestHash` reconciles with the hash it
+      was dialed at (confirms §2.5, §1.3); §2.5 → [decided]. **i2pd, 2026-07-28**
+      — `inbound-peer` on two runs (11 and 2 remote peers).
 - [ ] Two-instance loopback download completes **both directions** on i2pd.
 - [ ] Kill-router-mid-transfer: `systemctl --user restart i2pd` (or `podman
       restart`) during a transfer; torrents show "waiting for router", the
       supervisor rebuilds the session tree on backoff, and the transfer
       **completes** without a restart of clove. Confirms `supervisor` §3.1/§3.2
       against a real router.
-- [ ] The above pass on emissary; deltas from i2pd noted. Java I2P sanity pass.
-- [ ] Layer 2 is actually on: `cloved`'s startup line reads
+- [ ] The above pass on emissary; deltas from i2pd noted. **Java I2P sanity
+      pass: done, 2026-07-28** — a full swarm download, faster to a session
+      than either other router. emissary is blocked before the swarm on its
+      address book (§7a), not on anything in this list.
+- [x] Layer 2 is actually on: `cloved`'s startup line reads
       `sandbox: landlock enforced; seccomp filter installed`, and everything
-      above still passes with it enforced. This one belongs here rather than in
+      above still passes with it enforced. **Confirmed on every live run** —
+      `ci/live-swarm.sh` captures that line into each report for this reason. This one belongs here rather than in
       Bucket 1 because container CI does not expose Landlock — the unit test in
       `crates/cloved/src/sandbox.rs` reports it as unenforced and exercises only
       seccomp there, so a bad path set would not surface until an operator with
@@ -426,12 +383,15 @@ something fails and you need to know what it was supposed to prove.
 **Run `make swarm TORRENT=…` (§5.5).** Five of these six boxes are milestones
 in its table; tick them from the run rather than from impressions.
 
-- [ ] Join a well-seeded public i2psnark swarm: full download completes.
+- [x] Join a well-seeded public i2psnark swarm: full download completes.
+      **i2pd and Java I2P, 2026-07-28** — 20.4 MiB in 226s and 286s, 82/82
+      pieces re-verified.
       → `download-complete`, plus the script's closing `verify` pass, which
       re-hashes every byte on disk against the metainfo rather than trusting
       our own counters.
-- [ ] PEX acquisition observed — peers learned via `i2p_pex` beyond the
-      tracker's set (confirms §4.3; resolve the flags [open]).
+- [x] PEX acquisition observed — peers learned via `i2p_pex` beyond the
+      tracker's set (confirms §4.3; the flags stay [open]).
+      **Both routers, 2026-07-28.**
       → `pex-acquisition`, i.e. `pex_peers > 0` in `clove show --json`.
 - [ ] Announce quirks confirmed against a live tracker: the `ip=<base64 dest>`
       value form (§5.1) and `event=started`/numwant behavior (§5.4) → [decided].
@@ -439,7 +399,9 @@ in its table; tick them from the run rather than from impressions.
       still wants a read of the daemon log next to the tracker's reply, so this
       box is the one the script cannot tick for you.
 - [ ] Sustained seed to i2psnark peers over a multi-hour soak; no session
-      starvation under peer load (revisit Q1 only if it appears).
+      starvation under peer load (revisit Q1 only if it appears). *Serving
+      itself is confirmed* — 71 MiB and 69 MiB back on 2026-07-28, on a
+      torrent with real leechers — but not yet over hours.
       → `make swarm … SWARM_ARGS='--seed-for 21600'` after a completed
       download; `bytes-served` and `inbound-peer` are the signals that peers
       are actually taking data from us rather than us merely being up.
@@ -573,25 +535,6 @@ other checks. A loopback row that fails while the swarm rows are green is a
 finding about the *router*, not about clove — §0 and `PROTOCOL.i2p-bt` §2.8
 are why.
 
-## 7. Keeping them closed (anti-decay)
-
-A once-run manual pass rots. Two commitments keep M1/M3 *closed*:
-
-1. **Runnable by anyone** (SCOPE §9 regress doctrine): `make swarm
-   TORRENT=…` against any working router is the whole setup — no quadlet, no
-   second destination, nothing this repo has to install. That is a lower bar
-   than tier 2 ever was, and it is the one that matters: a contributor who
-   already runs i2pd can check clove works before reading a line of this page.
-   Tier 1 needs nothing at all: `make test` (units and the hostile-input
-   sweep), `make smoke` (the daemon end to end), and `make chaos` (SIGKILL
-   storms and failed state writes).
-2. **Nightly, later**: once the operator box is stable, a `systemd` timer (or a
-   self-hosted runner on that box) runs `make swarm` against a long-lived
-   torrent plus `make test-live` and `sam-stress`, so a regression surfaces in
-   a day, not a release. Deferred but
-   designed for — nothing in Bucket 1 blocks adding it, since the harness and
-   tests are already env-driven and non-interactive.
-
 ### 6.4 Before spending 500 seconds on *tier 2*: `make router-ready`
 
 ```
@@ -666,6 +609,25 @@ The quadlets now publish each router's transport port (i2pd 12346, Java
 SAM). If the machine is behind NAT, forward those ports too. If you cannot,
 note it in the §6.3 results table: a firewalled run is still worth recording,
 it just is not a clean sign-off.
+
+## 7. Keeping them closed (anti-decay)
+
+A once-run manual pass rots. Two commitments keep M1/M3 *closed*:
+
+1. **Runnable by anyone** (SCOPE §9 regress doctrine): `make swarm
+   TORRENT=…` against any working router is the whole setup — no quadlet, no
+   second destination, nothing this repo has to install. That is a lower bar
+   than tier 2 ever was, and it is the one that matters: a contributor who
+   already runs i2pd can check clove works before reading a line of this page.
+   Tier 1 needs nothing at all: `make test` (units and the hostile-input
+   sweep), `make smoke` (the daemon end to end), and `make chaos` (SIGKILL
+   storms and failed state writes).
+2. **Nightly, later**: once the operator box is stable, a `systemd` timer (or a
+   self-hosted runner on that box) runs `make swarm` against a long-lived
+   torrent plus `make test-live` and `sam-stress`, so a regression surfaces in
+   a day, not a release. Deferred but
+   designed for — nothing in Bucket 1 blocks adding it, since the harness and
+   tests are already env-driven and non-interactive.
 
 ## 7a. Troubleshooting (live-run findings)
 
@@ -812,11 +774,19 @@ quadlet):
 cold router N attempts run back-to-back at ~60s each. Confirm reachability with
 `make sam-stress N=1` first, then scale N up once the router is warm.
 
-## 8. Sequencing
+## 8. What is left
 
-Bucket 1 lands in-tree in the order of §4 (inbound path → harness → gated tests
-→ quadlets/make), each a normal reviewable change with tier-1 CI green. Bucket 2
-is executed by the operator against the quadlet and reported into
-`PROTOCOL.i2p-bt`; M1 is signed off when §6.1 is fully checked on i2pd + emissary,
-M3 when §6.2 is checked on a live swarm. This maps onto `PLAN.md` Phase D (M1)
-and Phase E (M3) — it is the "needs a live router" tail those phases defer.
+Bucket 1 has landed in full. What stands between here and the 0.1 interop
+sign-off, cheapest first:
+
+1. **emissary end to end** — `make router-addressbook`, then `make swarm
+   TORRENT=… ROUTER=emissary`. Its SAM layer has been fine since the first
+   run; only name resolution has ever blocked it (§7a).
+2. **A router restart mid-transfer** (§6.1), which is the one M1 box no swarm
+   run can tick for you.
+3. **`sam-stress` at 16/32/64/128/200** — R2's ceiling, and the only
+   instrument that answers it.
+4. **The multi-hour seed soak** (§6.2).
+
+Findings from any of these go into `PROTOCOL.i2p-bt`, results into §6.3 with
+the router version.
