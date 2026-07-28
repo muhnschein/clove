@@ -397,11 +397,9 @@ for r in $ROUTERS; do
             echo "image:        $(podman inspect -f '{{.ImageName}}' "$container" 2>/dev/null || echo unknown)"
             echo "started:      $(podman inspect -f '{{.State.StartedAt}}' "$container" 2>/dev/null || echo unknown)"
             echo "restarts:     $(podman inspect -f '{{.RestartCount}}' "$container" 2>/dev/null || echo unknown)"
-            case "$r" in
-                i2pd) echo "version:      $(podman exec "$container" i2pd --version 2>/dev/null | head -1 || echo unknown)" ;;
-                emissary) echo "version:      $(podman exec "$container" emissary-cli --version 2>/dev/null | head -1 || echo unknown)" ;;
-                java) echo "version:      $(podman inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$container" 2>/dev/null || echo 'see image tag')" ;;
-            esac
+            # Shared with ci/live-swarm.sh, so the two reports cannot drift
+            # into disagreeing about what version was under test.
+            echo "version:      $(./ci/router-version.sh "$r" 2>/dev/null || echo unknown)"
         else
             echo "container:    absent"
         fi
