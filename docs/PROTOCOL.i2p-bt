@@ -283,6 +283,39 @@ Status legend:
     from a netDb lookup that failed, which is the difference between "wait for
     the subscription" and "the destination is gone".
 
+    5.5a [decided] **emissary keeps two address books, and which one answers
+      depends on how you ask.** Found 2026-07-28, after seeding its address
+      book changed nothing at all and it went on answering `KeyNotFound`.
+
+      In emissary-core 0.4.0, under `<base>/addressbook`:
+
+        addresses                `hostname=<52-char b32 label>` per line, read
+                                 into memory once at startup. Serves
+                                 `resolve_base32`, which is what a
+                                 `STREAM CONNECT` naming a *hostname* uses.
+        destinations/<host>.txt  the full base64 destination. Serves
+                                 `resolve_base64`, which is what
+                                 `NAMING LOOKUP` uses, read per query.
+
+      Only the subscription fetch writes both. A client that resolves a name
+      and then dials the result — which is clove, and which the SAM spec's
+      `NAMING LOOKUP` exists for — reads exclusively the second. So an address
+      book populated only with b32 labels looks complete, is complete for one
+      access path, and is invisible to the other.
+
+      The first version of `contrib/podman/seed-addressbook.sh` wrote only
+      `addresses`, on the reasonable-looking evidence that it was *the*
+      address book: it is the file `AddressBookManager` loads at startup, and
+      the one whose format is obvious from a directory listing. The entry was
+      there and the lookup still failed. Both are written now.
+
+      Worth stating as a rule, because this is the same shape as §4.7's
+      endgame and §2.7a's split stream: **a store with two readers has two
+      contracts**, and satisfying the one you happened to read the code for
+      proves nothing about the other. The test that would have caught it is
+      the one nobody ran — asking the destination router, rather than
+      inspecting what was written.
+
 
 2. SAM / yosemite behavior (from the 0.7.0 API review, M0/M1)
 ------------------------------------------------------------
