@@ -833,6 +833,68 @@ Status legend:
     then MetaInfo::from_info_dict. Verified in-tree over the mock (a client
     fetches an info dict from a serving instance).
 
+4.7 [decided] **A BEP 3 request nobody answers is permanent unless you give it
+    a deadline**, and two independent stalls follow from not having one. Found
+    2026-07-27 from the first live run that got far enough to stall on
+    something other than the session (48%, 17.6 MiB down, 39 of 82 pieces).
+
+    The wire protocol offers no help here. There is no acknowledgement, no
+    error and no obligation to answer a `request`, so a dropped one is
+    indistinguishable from a slow one. Peers drop them routinely — overloaded,
+    lost the piece, changed their mind — and on I2P a stream can also stay open
+    while its tunnels are useless.
+
+    **First stall: blocks nobody re-offers.** A request that was never answered
+    stayed in the peer's pipeline and in the picker's in-flight set forever.
+    The block was never asked for again and its piece never completed, while
+    the peer's usable pipeline depth shrank by one, permanently. The live
+    signature is unmistakable and was measurable straight off the milestone
+    table: 43 pieces outstanding, holding 502 of the 688 blocks they needed —
+    **every one of them roughly three-quarters finished, none of them
+    finishing**. Throughput decayed from ~39 KiB/s over the first 166 seconds
+    to ~3.4 KiB/s over the next 3400 as slots filled with debts nobody owed.
+
+    Nothing else in the engine reclaimed them. `Choke` already drained
+    in-flight blocks back to the picker (correctly), and the idle timeout
+    dropped a peer that went *silent* — but a peer that keeps sending
+    keep-alives and `have`s while not answering refreshes `last_seen` on every
+    one, so it never looks idle. Politeness was the whole attack surface.
+
+    **Second stall: pipelines that drain and are never refilled.** `fill_requests`
+    ran on exactly two events, a block arriving and an unchoke. A peer whose
+    pipeline emptied at a moment when the picker had nothing to give — because
+    every remaining block was in flight with somebody else — was therefore
+    never asked again: it sat connected, interested, unchoked and permanently
+    idle, and the event that would have woken it is a block arriving on the
+    connection that has nothing outstanding. This one needs no misbehaving peer
+    at all; one slow peer holding the last few blocks is enough. It is also why
+    fixing the first stall alone does not help: by the time the expired blocks
+    go back to the picker, the honest peers that could take them have gone
+    quiet.
+
+    clove now stamps every in-flight block with the time it was requested and,
+    on the maintenance tick, expires anything past `DEFAULT_REQUEST_TIMEOUT`
+    (90s) back to the picker, tops up *every* eligible peer rather than only
+    the ones that timed out, and drops a peer that lets requests expire for
+    `REQUEST_STRIKES` (3) consecutive rounds while delivering nothing — its
+    slot is worth more to the swarm than its connection, and the dial sweep may
+    pick it up again after its retry backoff.
+
+    **The endgame is not a substitute and hid this from every test.** Duplicate
+    requests begin only within `DEFAULT_ENDGAME_BLOCKS` (32) of completion, so
+    a handful of stuck blocks is quietly rescued and a small fixture can never
+    show the defect — the evil-peer suite's five-block torrent is inside the
+    endgame window from the first byte. Live it was ~186 blocks across ~45
+    peers, far outside it. The regression test therefore builds its own
+    128-piece torrent and four peers that take a full pipeline each and answer
+    nothing: without the deadline it stalls at exactly 64 of 128 pieces, four
+    pipelines' worth, which is the live shape in miniature.
+
+    Worth stating as a rule, since this is the second time a test fixture has
+    been too small to contain the bug it was meant to catch: a threshold that
+    rescues small cases must be *exceeded* by any test that claims to exercise
+    what happens without it.
+
 4.5 [decided] Magnet links (clove-core::magnet): `magnet:?xt=urn:btih:<hex
     40 | base32 32>`; `dn` and `tr` are percent-decoded, `tr` filtered to
     I2P-only like .torrent announce URLs.
