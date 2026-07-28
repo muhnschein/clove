@@ -33,32 +33,24 @@ commit. Closure sizes are recorded when the dependency is actually added.
   sees it. Reviewed for socket capability: none of the closure beyond
   `yosemite` itself opens sockets.
 
-  **Narrowed 2026-07-27.** clove no longer dials through yosemite. Its session
-  controller is one state machine shared by the control connection and every
-  stream operation, and a stream failure on an unexpected path leaves it
-  poisoned for the life of the session — which cost a session rebuild every
-  60–90 seconds against a live router (`docs/PROTOCOL.i2p-bt` §2.12). SAMv3
-  does not require that shape: a stream is its own connection, so `i2pnet`
-  speaks `HELLO`/`STREAM CONNECT` on a socket it opens per dial. yosemite
-  still owns `SESSION CREATE`, `STREAM FORWARD` and `NAMING LOOKUP`, where its
-  state machine runs once at setup and a failure is just a failed bring-up.
-
-  **Narrowed again, same day, to `NAMING LOOKUP` alone.** `SESSION CREATE` and
-  `STREAM FORWARD` came back too, for a reason that is not about yosemite's
-  state machine: clove has to *read* its own control connection for the life of
-  the session — to answer the router's `PING` (Java I2P ends a session that
-  does not) and to hear what the router says when a session ends. yosemite owns
-  that socket and exposes it only through a write-then-read-one-line call, so
-  there is no way to watch it from outside the library. See
-  `docs/PROTOCOL.i2p-bt` §2.13. Closing §2.7's residual `SESSION CREATE` hang
-  fell out of the same change, since the deadline is now ours to set.
+  **Narrowed to `NAMING LOOKUP` alone**, over two steps on 2026-07-27/28.
+  Dialing left first: yosemite's session controller is one state machine shared
+  by the control connection and every stream operation, and a stream failure on
+  an unexpected path poisons it for the life of the session
+  (`docs/PROTOCOL.i2p-bt` §2.12). `SESSION CREATE` and `STREAM FORWARD`
+  followed, for a different reason — clove has to *read* its own control
+  connection for the life of the session, to answer the router's `PING` (Java
+  I2P ends a session that does not) and to hear what the router says when a
+  session ends, and yosemite owns that socket and exposes it only through a
+  write-then-read-one-line call (§2.13). Closing §2.7's `SESSION CREATE` hang
+  fell out of the same change, the deadline now being ours to set.
 
   What remains is `RouterApi::lookup_name`: one socket, opened and closed per
   lookup, with no session state behind it — the shape yosemite is unambiguously
-  good at. The dependency is still worth its place for it, but it now carries
-  very little of clove's runtime, and R1's "vendor if upstream stalls" is
-  cheaper still. Note the closure has not shrunk: `yosemite` is one crate in
-  the `Cargo.toml` either way, and the ~24-crate cost above is unchanged.
+  good at. Still worth its place for that, but it now carries very little of
+  clove's runtime, and R1's "vendor if upstream stalls" is cheaper than it was.
+  The closure has not shrunk: `yosemite` is one crate in the `Cargo.toml`
+  either way, and the ~24-crate cost above is unchanged.
 
 - **`landlock` 0.4** (`cloved`, Linux only) — entered Phase G. Layer-2
   filesystem (and, on ABI 4+, outbound-TCP) self-restriction; see

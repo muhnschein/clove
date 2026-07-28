@@ -175,6 +175,8 @@ See `PLAN.md` for the phase-level roadmap (Phases A–G) these map onto.
 
 Each milestone ends in something runnable; M2 onward each produce a demo you can verify on your own router.
 
+Status is not tracked here — it lives in `LIVE-TESTING.md` §6.3, per router and dated, because a milestone is only "met" against a specific router version.
+
 ## 9. Engineering Standards
 
 Reference class: OpenBSD base, OpenSSH (non-portable), doas, opentracker, SQLite. Interpreted as concrete, checkable commitments — not vibes:
