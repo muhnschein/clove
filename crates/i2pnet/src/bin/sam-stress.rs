@@ -84,6 +84,10 @@ fn warmup_deadline(run: Duration) -> Duration {
 /// loopback socket, so unlike the dial side this is enforceable.
 const ECHO_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long the run waits for the echo listener to wind down once the deadline
+/// has passed, before giving up on it and reporting anyway.
+const TEARDOWN_GRACE: Duration = Duration::from_secs(10);
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -161,7 +165,12 @@ fn run() -> io::Result<()> {
     // forever — the original bug this harness had.
     let stop = Arc::new(AtomicBool::new(false));
     let acceptor_stop = Arc::clone(&stop);
-    let acceptor = thread::spawn(move || echo_server(&listener, n, &acceptor_stop));
+    // Counted through a shared cell rather than returned, because the join
+    // below is bounded and may give up before the thread has a value to give.
+    let accepted = Arc::new(AtomicU32::new(0));
+    let acceptor_accepted = Arc::clone(&accepted);
+    let acceptor =
+        thread::spawn(move || echo_server(&listener, n, &acceptor_stop, &acceptor_accepted));
 
     // Dialer side: N threads, each dials the listener's destination once and
     // reports through the channel. Results are collected by deadline, not by
@@ -214,7 +223,7 @@ fn run() -> io::Result<()> {
     // blocking accept() returns and sees it.
     stop.store(true, Ordering::Relaxed);
     let _ = i2pnet::sam::poke_listener(listen_port);
-    let _ = acceptor.join();
+    join_before(acceptor, TEARDOWN_GRACE);
 
     report(
         n,
@@ -225,6 +234,11 @@ fn run() -> io::Result<()> {
         &mut rtts,
         &failures,
     );
+    // Printed under the numbers rather than in place of them: the table is the
+    // measurement, this is the reading of it.
+    if accepted.load(Ordering::Relaxed) == 0 && (unfinished > 0 || connects.is_empty()) {
+        explain_silent_forward();
+    }
     // Unfinished first: it is the more specific diagnosis. "Everything failed"
     // when nothing actually returned an error would send the reader looking
     // for error text that does not exist.
@@ -427,7 +441,13 @@ fn dial_once(dialer: &SamSession, target: DestHash, tries: &AtomicU32) -> io::Re
 /// Stops on the flag rather than on a count: if a dial fails there is no
 /// corresponding inbound stream, and an accept loop counting to `n` waits for
 /// one that is never coming.
-fn echo_server(listener: &SamListener, n: usize, stop: &AtomicBool) {
+///
+/// `arrived` counts inbound streams for the caller. It is a shared cell rather
+/// than a return value because the caller's join is bounded: a run that ends
+/// with this thread still blocked must still be able to say whether the router
+/// ever forwarded anything, and that answer is the whole diagnosis when it did
+/// not (see [`explain_silent_forward`]).
+fn echo_server(listener: &SamListener, n: usize, stop: &AtomicBool, arrived: &AtomicU32) {
     let mut handlers = Vec::with_capacity(n);
     let mut accepted = 0usize;
     while accepted < n && !stop.load(Ordering::Relaxed) {
@@ -440,6 +460,10 @@ fn echo_server(listener: &SamListener, n: usize, stop: &AtomicBool) {
                     break;
                 }
                 accepted += 1;
+                arrived.store(
+                    u32::try_from(accepted).unwrap_or(u32::MAX),
+                    Ordering::Relaxed,
+                );
                 // A handler holds a loopback socket, so its waits are
                 // genuinely boundable — do it, or a peer that connects and
                 // says nothing parks this thread for the run.
@@ -463,6 +487,59 @@ fn echo_server(listener: &SamListener, n: usize, stop: &AtomicBool) {
     for h in handlers {
         let _ = h.join();
     }
+}
+
+/// Wait up to `grace` for the echo listener to wind down, then report anyway
+/// and leave it to the process exit.
+///
+/// Bounded for the same reason the dial results are collected by deadline
+/// rather than by joining (see the module header): an echo handler blocked on
+/// a socket outlives the run's budget, and an unbounded join here quietly
+/// extended a 240-second run past 300 — long enough for the wrapper in
+/// `ci/live-report.sh` to kill the process before it could print the report it
+/// had already computed. Overshooting a deadline by seconds is a nuisance;
+/// overshooting it far enough to lose the numbers is the failure mode this
+/// harness exists to prevent, and it had reintroduced it in its own teardown.
+fn join_before(handle: thread::JoinHandle<()>, grace: Duration) {
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = handle.join();
+        let _ = done_tx.send(());
+    });
+    if done_rx.recv_timeout(grace).is_err() {
+        eprintln!(
+            "sam-stress: the echo listener did not stop within {}s; reporting without it \
+             (its threads go with the process).",
+            grace.as_secs()
+        );
+    }
+}
+
+/// Explain a run in which the router forwarded nothing at all.
+///
+/// [`SamListener::forward`] binds to `127.0.0.1` and issues `STREAM FORWARD`
+/// with no `HOST=`, so the router connects back to whatever address it sees our
+/// SAM control connection arriving from. Those are the same address only when
+/// the router shares this network namespace. A router in a container dials the
+/// peer correctly, accepts the stream, and then cannot hand it over — which
+/// reads from here as a router that will not carry a stream, and is nothing of
+/// the sort.
+///
+/// Printed only when *nothing* arrived. A run where some streams landed has
+/// already disproved it, and a hint that fired on a partial failure would send
+/// the reader somewhere the evidence does not point.
+fn explain_silent_forward() {
+    eprintln!(
+        "sam-stress: the router accepted STREAM FORWARD and then forwarded nothing — not one \
+         inbound stream arrived, so every dial above failed on the listening side."
+    );
+    eprintln!(
+        "sam-stress: our forwarded listener is bound to 127.0.0.1 and the FORWARD carries no \
+         HOST=, so the router connects back to wherever it sees our SAM control connection \
+         coming from. Those agree only when the router shares this network namespace. If this \
+         router runs in a container, the inbound half cannot work here and this result says \
+         nothing about clove — see docs/LIVE-TESTING.md §3.1."
+    );
 }
 
 /// Print the run summary: successes, failures, and connect/RTT percentiles.
@@ -632,5 +709,36 @@ mod tests {
             Duration::from_secs(1)
         );
         assert_eq!(warmup_deadline(Duration::ZERO), Duration::ZERO);
+    }
+
+    /// Teardown is on a deadline too. A listener thread that will not stop —
+    /// the live case is an echo handler parked on a socket read — used to be
+    /// joined without a bound, so the process outlived the budget it had just
+    /// reported against and `ci/live-report.sh` killed it before it could
+    /// print. The wait must end whether or not the thread does.
+    #[test]
+    fn a_wedged_listener_cannot_outlast_the_teardown_grace() {
+        let wedged = thread::spawn(|| thread::sleep(Duration::from_secs(30)));
+        let grace = Duration::from_millis(50);
+        let start = Instant::now();
+        join_before(wedged, grace);
+        let waited = start.elapsed();
+        assert!(
+            waited < Duration::from_secs(5),
+            "join_before waited {waited:?} on a thread that sleeps for 30s"
+        );
+    }
+
+    /// …and it still returns promptly when the thread does stop, rather than
+    /// always spending the whole grace period.
+    #[test]
+    fn a_listener_that_stops_is_not_waited_out() {
+        let quick = thread::spawn(|| {});
+        let start = Instant::now();
+        join_before(quick, Duration::from_secs(30));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "join_before sat on the full grace for a thread that had already finished"
+        );
     }
 }

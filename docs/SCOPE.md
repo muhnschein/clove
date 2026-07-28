@@ -127,14 +127,17 @@ No layer assumes another is present.
 | Router | Priority | Notes |
 |---|---|---|
 | i2pd | P0 | Your deployment target; SAM quirks differ from Java |
-| emissary | P0 | Young router, young SAM impl — expect to find bugs on both sides; coordinate upstream |
-| Java I2P | P1 | Sanity/reference; also what most *remote* peers run behind. When routers disagree, this one is presumed right |
+| Java I2P | P0 | Sanity/reference; also what most *remote* peers run behind. When routers disagree, this one is presumed right |
+| emissary | P2 | Tracked, **not a 0.1 gate** — experimental upstream, and 0.4.0 cannot resolve names in either direction. Revisit at its first stable release; see `DECISIONS.md` S1 |
 
 Priority is where to spend attention first, not what to skip: **0.1 requires
-the live sign-off on all three.** All three have a podman quadlet in
-`contrib/podman/` and publish SAM on different loopback ports, so they run side
-by side and `make matrix` sweeps them in one command; results go in
-`docs/LIVE-TESTING.md` §6.3.
+the live sign-off on i2pd and Java I2P** — the deployment target and the
+reference, one C++ and one Java SAM implementation. All three routers have a
+podman quadlet in `contrib/podman/` and publish SAM on different loopback
+ports, so they run side by side and `make matrix` sweeps them in one command;
+results go in `docs/LIVE-TESTING.md` §6.3, emissary's column included. An
+empty or failing emissary column is a finding to record, not a release
+blocker — the amendment and its reversal condition are in `DECISIONS.md` S1.
 
 **Peer clients (swarm side):**
 
