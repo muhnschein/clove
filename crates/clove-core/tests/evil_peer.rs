@@ -1247,3 +1247,115 @@ fn the_maintenance_tick_outlives_neither_its_handle_nor_its_torrent() {
     }
     drop(forgotten);
 }
+
+/// A peer that takes blocks and never answers — the fault that stalled a live
+/// download at 48%, and the one no other test in this file produces.
+///
+/// Every hostile peer above is hostile in a way the engine can see: it lies,
+/// it sends rubbish, it floods, or it goes silent and trips the idle timeout.
+/// These ones are polite. They handshake, unchoke, claim everything, take
+/// whatever they are offered, and answer none of it — while sending
+/// keep-alives, so they never look idle and are never dropped.
+///
+/// BEP 3 gives the requester nothing to detect that with: no acknowledgement,
+/// no error, no obligation to answer. A dropped request is indistinguishable
+/// from a slow one, and without a deadline it is **permanent** — the block
+/// stays in the peer's pipeline and in the picker's in-flight set, so it is
+/// never asked for again and its piece never completes.
+///
+/// **The endgame does not save you, and that is the whole reason this needs a
+/// torrent of its own.** Duplicate requests only start once the torrent is
+/// within `DEFAULT_ENDGAME_BLOCKS` of done, so a handful of stuck blocks is
+/// quietly rescued — which is why the five-block fixture the rest of this file
+/// uses cannot show the bug at all. Live it was ~186 blocks held across ~45
+/// peers, far outside that window, and the download simply stopped: 43 pieces
+/// outstanding, every one about three-quarters finished, none finishing
+/// (`PROTOCOL.i2p-bt` §4.7). Four peers at a full pipeline each reproduce that
+/// shape in miniature.
+///
+/// The claim is the suite's third contract — a misbehaving peer cannot deny
+/// service to an honest one — in the form the engine used to fail.
+#[test]
+fn peers_that_take_blocks_and_never_answer_cannot_stall_the_download() {
+    /// Comfortably more than `DEFAULT_ENDGAME_BLOCKS`, so the blocks these
+    /// peers sit on cannot be swept up by the endgame instead of by the
+    /// deadline under test.
+    const DROPPERS: usize = 4;
+    /// One block per piece, so a stuck block is a stuck piece and the
+    /// arithmetic above is legible. Enough of them that the seeder has real
+    /// work left after the droppers have taken their fill.
+    const PIECES: u32 = 128;
+
+    let net = MockNet::new();
+    let content: Vec<u8> = (0..(PIECES * BLOCK_LEN))
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let meta = meta_for(&content);
+    let num_pieces = u32::try_from(meta.pieces.len()).expect("piece count");
+    assert_eq!(num_pieces, PIECES, "one block per piece");
+
+    let seed_dir = TempDir::new("drop-seed");
+    let seeder = seeding_torrent(&meta, &content, &seed_dir);
+    let seed_ep = net.endpoint();
+    let seed_dest = seed_ep.dest();
+    let _seed_accept = spawn_acceptor(&seeder, seed_ep);
+
+    let leech_dir = TempDir::new("drop-leech");
+    let leecher = leeching_torrent(&meta, &leech_dir);
+    // Short enough that the test does not take minutes, long enough to be a
+    // real wait rather than a formality.
+    leecher.set_request_timeout(Duration::from_millis(400));
+    let leech_ep = net.endpoint();
+    let leech_dest = leech_ep.dest();
+    let _leech_accept = spawn_acceptor(&leecher, leech_ep);
+    let _tick = leecher.spawn_maintenance(Duration::from_millis(50));
+
+    // The droppers connect first, so they get their pick of the blocks.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for _ in 0..DROPPERS {
+        let mut stream = raw_peer(&net, leech_dest, meta.info_hash.0);
+        claim_everything(&mut stream, num_pieces).expect("claim");
+        let stop = Arc::clone(&stop);
+        threads.push(std::thread::spawn(move || {
+            let mut taken = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // Keep-alives either way, so the idle timeout — the only
+                // mechanism that used to reclaim anything — never fires.
+                if let Some(Message::Request(_)) = next_message(&mut stream) {
+                    taken += 1;
+                }
+                let _ = wire::write_message(&mut stream, &Message::KeepAlive);
+            }
+            taken
+        }));
+    }
+
+    // Let them fill their pipelines before the honest seeder appears, so the
+    // blocks they are sitting on are genuinely lost to the picker.
+    std::thread::sleep(Duration::from_millis(200));
+
+    leecher.add_peers(&[seed_dest]);
+    let stream = net
+        .endpoint()
+        .dialer()
+        .dial(seed_dest, Duration::from_secs(5))
+        .expect("dial the seeder");
+    leecher
+        .attach(stream, seed_dest)
+        .expect("attach to the seeder");
+
+    assert!(
+        leecher.wait_complete(DEADLINE),
+        "peers that never answered a request stalled the whole download at {}/{num_pieces} pieces",
+        leecher.have().count()
+    );
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let taken: u64 = threads.into_iter().map(|t| t.join().unwrap_or(0)).sum();
+    assert!(
+        taken > u64::from(clove_core::picker::DEFAULT_ENDGAME_BLOCKS),
+        "only {taken} block(s) were ever held, which the endgame alone would \
+         have rescued — this test proved nothing"
+    );
+}
