@@ -458,11 +458,11 @@ client works", and because they no longer depend on the loopback rows passing.
 
 | Check | i2pd | Java I2P | emissary |
 |---|---|---|---|
-| Router boots, SAM answers | ok — i2pd 2.61.0, 2026-07-28 | | |
-| **Public i2psnark swarm: full download** (`download-complete`) | **ok** — i2pd 2.61.0, 2026-07-28 | | |
-| **PEX acquisition observed** (`pex_peers > 0`) | **ok** — i2pd 2.61.0, 2026-07-28 | | |
-| **Bytes served to a swarm peer** (`bytes-served`) | not yet — see note below | | |
-| **A remote peer dialed us** (`inbound-peer`, §2.5) | **ok** — i2pd 2.61.0, 2026-07-28 | | |
+| Router boots, SAM answers | ok — 2.61.0, 2026-07-28 | ok — 2026-07-28 † | ok — 2026-07-28 † |
+| **Public i2psnark swarm: full download** (`download-complete`) | **ok** — 2.61.0, 226s | **ok** — 286s, 2026-07-28 † | blocked before the swarm — see below |
+| **PEX acquisition observed** (`pex_peers > 0`) | **ok** — 2.61.0, 68 peers | not seen in 1086s | |
+| **Bytes served to a swarm peer** (`bytes-served`) | not yet — see below | not yet — see below | |
+| **A remote peer dialed us** (`inbound-peer`, §2.5) | **ok** — 2.61.0, 11 peers | not seen in 1086s | |
 | Announce quirks confirmed (§5.1, §5.4) | | | |
 | Multi-hour seed soak | | | |
 | Survives router restart mid-transfer | | | |
@@ -470,6 +470,56 @@ client works", and because they no longer depend on the loopback rows passing.
 | Two-instance loopback download, both directions | | | |
 | `sam-stress` 16/32/64 | | | |
 | `sam-stress` 128/200 | | | |
+
+† **Version not recorded.** These runs predate `--router-version`; the cells
+are honest about what is known rather than guessing. Pass it on any run whose
+result goes in this table.
+
+**Two of three routers carry a full download, 2026-07-28.** Same magnet
+(`i2pupdate-2.13.0.su3`, 20.4 MiB, 82 pieces), same commit, back to back:
+
+| | router-connected | metadata | download-complete |
+|---|---|---|---|
+| i2pd 2.61.0 | 30s | 75s | **226s** |
+| Java I2P † | 15s | 45s | **286s** |
+| emissary † | 61s | — | — |
+
+**Java I2P completed a download for the first time.** Every previous attempt
+died at the session, and §2.13 says why: Java's `SAMv3Handler` pings the client
+and ends the session with `SESSION_ERROR "PONG timeout"` when nobody answers,
+and nothing in clove read the control connection at all. It answers now, and
+the router that had never worked was the *fastest* of the three to a session
+(15s) and reached metadata in 45s.
+
+**emissary never reached the swarm, and not because of clove.** Its SAM session
+came up fine at 61s; the tracker's *name* could not be resolved:
+
+```
+resolving tracker tracker2.postman.i2p: protocol error: `router error: KeyNotFound`
+… negative-cached after 2 failed lookup(s); not asking the router again for 29s
+```
+
+That is §5.5 exactly — an address-book name on a router whose subscription has
+not been fetched — and the diagnostic behaved as designed: it named the stage,
+the host, the router's own word, and how long the negative cache would hold.
+Fix it router-side (subscribe the address book) or sidestep it with a `b32`
+tracker URL; see the troubleshooting section above. Re-run before reading this
+row as anything about clove.
+
+**`bytes-served` is still empty on all three, and the evidence now points away
+from clove.** The Java run announced twice — `announces_ok 2`, so the
+`completed` announce of §5.6 did go out — and still served nothing across 900s
+of seeding. With the tracker correctly told there is a new seed, what remains
+is the swarm: an I2P router update is close to all-seeds, and seeds do not
+request from seeds. Peers decayed toward zero after completion on both routers,
+which is what a swarm of seeds does with a peer that has just said it wants
+nothing. **Test this row against a torrent with real leechers**; until then it
+is untested, not failing.
+
+Also worth watching, not yet a finding: the second i2pd run saw no PEX and no
+inbound peer where the first saw 68 and 11. One run each is not a trend, the
+second was cut short at 603s, and both numbers depend on the swarm rather than
+on us — but if a third run is also empty, that is worth chasing.
 
 **First completed download from a live swarm — i2pd 2.61.0, 2026-07-28.**
 `i2pupdate-2.13.0.su3`, 20.4 MiB in 82 pieces, from postman's tracker:
