@@ -43,7 +43,8 @@ HOSTS ?=
 
 QUADLET_DIR := $(HOME)/.config/containers/systemd
 
-.PHONY: test smoke chaos test-live sam-stress matrix cross routers report router-ready \
+.PHONY: test smoke chaos test-live sam-stress sam-sweep matrix cross routers report \
+        router-ready \
         swarm router-up router-down router-wait router-build router-sam-enable \
         router-addressbook \
         fmt lint man-lint fuzz install uninstall
@@ -179,6 +180,19 @@ sam-stress:
 	CLOVE_SAM_PORT=$(SAM_PORT) CLOVE_SAM_PORT_DIAL=$(DIAL_SAM_PORT) \
 		$(if $(CLOVE_STRESS_DEADLINE),CLOVE_STRESS_DEADLINE=$(CLOVE_STRESS_DEADLINE),) \
 		cargo run --release -p i2pnet --bin sam-stress -- $(N)
+
+## The R2 ladder: sam-stress at rising N, several runs per level, one file.
+##
+## One run at one N cannot answer R2 — whether a session's dial path degrades
+## under concurrency is a question about a *curve*. Five hand-typed runs gave a
+## success rate of 3/16, 30/32, 11/64, 31/128, which is not a curve anyone
+## reads off four scrolled-past terminals.
+##
+##   make sam-sweep
+##   make sam-sweep ROUTER=java SWEEP_ARGS='--levels "16 64" --repeats 5'
+SWEEP_ARGS ?=
+sam-sweep:
+	./ci/sam-stress-sweep.sh --router $(ROUTER) --dial $(DIAL) $(SWEEP_ARGS)
 
 ## Which router the *dialer* uses. Defaults to the listener's, i.e. both
 ## sessions on one router. Point it elsewhere for a cross-router run:
