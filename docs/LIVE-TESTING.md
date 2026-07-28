@@ -458,11 +458,11 @@ something fails and you need to know what it was supposed to prove.
       nothing; `ci/live-report.sh` now skips it there rather than filing a red
       row.
       **Answered, i2pd 2.61.0, 2026-07-28** (`PROTOCOL.i2p-bt` §2.6e): two
-      sweeps, 31 runs with results, **every one dialled N of N** — ~1,580
+      sweeps, 30 runs with results, **every one dialled N of N** — ~1,580
       streams from N=1 to N=200, no dial failures. Connect p50 ranges overlap
-      completely across levels and do not order by N (the fastest run of either
-      sweep was an N=128 one), and p99 sits within ~10 ms of p50 across up to
-      200 dials in a single run. One sweep ran against a machine with another
+      completely across levels and do not order by N (an N=128 run connected
+      faster than any of the six N=1 runs), and p99 sits within ~10 ms of p50
+      across up to 200 dials in a single run. One sweep ran against a machine with another
       I2P client at full load and is indistinguishable from the quiet one.
       The dial path does not degrade with concurrency.
       What remains open is not R2 but §2.6f: i2pd's SAM bridge stopped
@@ -548,7 +548,7 @@ client works", and because they no longer depend on the loopback rows passing.
 | Survives router restart mid-transfer | | | |
 | Cross-router dial (`make cross`) | unfinished at 240s — 2026-07-28 | n/a as listener — §3.1 | n/a as listener — §3.1 |
 | Two-instance loopback download, both directions | | n/a — §3.1 | n/a — §3.1 |
-| `sam-stress` 16/32/64 | **ok** — 2.61.0, 2026-07-28, 12/12 runs dialled N of N | n/a — §3.1 | n/a — §3.1 |
+| `sam-stress` 16/32/64 | **ok** — 2.61.0, 2026-07-28, 17/17 runs dialled N of N | n/a — §3.1 | n/a — §3.1 |
 | `sam-stress` 128/200 | **128 ok** — 6/6 runs dialled 128 of 128. 200: one run of six, the other five blocked by the SAM bridge (§2.6f) | n/a — §3.1 | n/a — §3.1 |
 
 † **Version not recorded at all.** The 20.4 MiB runs further down predate

@@ -172,7 +172,7 @@ for another week, is worth more than a tidy file.
       the one router — the first with another I2P torrent client running at
       full load, the second on a quiet machine.
 
-      **31 runs produced a result, and every one dialed N of N.** About 1,580
+      **30 runs produced a result, and every one dialed N of N.** About 1,580
       streams from N=1 to N=200; not one dial failed. Connect latency by level,
       p50 range across runs:
 
@@ -180,12 +180,13 @@ for another week, is worth more than a tidy file.
           N=16    237–2806 ms        N=128    254–4827 ms
           N=32    265–5209 ms        N=200         384 ms
 
-      The ranges overlap completely and do not order by N: the fastest run in
-      either sweep (254 ms) was an N=128 one, and the slowest (5209 ms) was
-      N=32. Within any single run, p99 sits within ~10 ms of p50 across as many
-      as 200 dials. So dial latency is set by the router's tunnel state when
-      the run starts, not by how many streams are in flight — which is what a
-      control plane that is not degrading looks like.
+      The ranges overlap completely and do not order by N. An N=128 run
+      connected in 254 ms, faster than every one of the six N=1 runs (332 ms at
+      best); the slowest run of either sweep (5209 ms) was N=32. Within any
+      single run, p99 sits within ~10 ms of p50 across as many as 200 dials. So
+      dial latency is set by the router's tunnel state when the run starts, not
+      by how many streams are in flight — which is what a control plane that is
+      not degrading looks like.
 
       The contended sweep and the quiet one are indistinguishable in both
       connect and echo timings. Competing local load was not the variable; the
