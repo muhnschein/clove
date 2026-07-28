@@ -197,6 +197,41 @@ Status legend:
     with a router bug and nobody decoded what we were sending. Prefer decoding
     your own output before attributing a fault upstream.
 
+5.6 [decided] **`completed` is an event, and clove was treating it as a
+    periodic report.** Found 2026-07-28 in the first live run that completed a
+    download (i2pd 2.61.0, 20.4 MiB in 227s) and then served nothing at all
+    across a 900-second seeding window.
+
+    `announces_ok 1` for the whole run says it: one announce, sent at 76s while
+    still a leecher with `left` equal to the entire file, and nothing after it.
+    The `AnnounceState` machine was right — `next_event(complete)` returns
+    `Completed` and reports it once — but `announce_loop` only ever announced
+    when the tracker's interval said so, and postman's is half an hour. So the
+    completion announce was scheduled for well after the run ended, and for the
+    whole seeding window the tracker went on handing our destination to peers
+    as a leecher that held nothing. Nobody had any reason to ask us for a byte.
+
+    BEP 3 asks for `completed` at the moment the download finishes, and every
+    client sends it there. It belongs with `started` (the first announce, which
+    no interval governs) and `stopped` (which clove already sends on teardown
+    with no regard for one) — events, not cadence.
+
+    The fix is deliberately *not* `AnnounceState::make_due`, whose documented
+    contract is that nothing automatic may use it, because that rule is a good
+    one and worth keeping intact. `completion_due` is a separate, much narrower
+    door: it does nothing before the first announce and nothing once the
+    completion announce has gone out, so it can bring forward exactly one
+    announce in a torrent's lifetime and cannot become a way to hammer a
+    tracker. The announcer watches for the torrent finishing and opens it.
+
+    Found alongside, and fixed with it: a torrent that was *already* complete
+    when its announcer started would report `Completed` on its second announce.
+    BEP 3 says not to — the client had the file before it announced at all, so
+    there is no download to report — and a tracker counts a snatch every time
+    it sees one. clove rebuilds its announcers on every session blip, so this
+    was one phantom snatch per restart, per seeding torrent.
+    `AnnounceState::already_complete` is the constructor for that case.
+
 5.2 [decided] Any query already present in the announce URL (e.g. postman's
     `/announce.php?...`) is preserved; clove appends its params with the
     correct `?`/`&` separator.

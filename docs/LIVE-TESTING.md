@@ -458,11 +458,11 @@ client works", and because they no longer depend on the loopback rows passing.
 
 | Check | i2pd | Java I2P | emissary |
 |---|---|---|---|
-| Router boots, SAM answers | | | |
-| **Public i2psnark swarm: full download** (`download-complete`) | | | |
-| **PEX acquisition observed** (`pex_peers > 0`) | | | |
-| **Bytes served to a swarm peer** (`bytes-served`) | | | |
-| **A remote peer dialed us** (`inbound-peer`, §2.5) | | | |
+| Router boots, SAM answers | ok — i2pd 2.61.0, 2026-07-28 | | |
+| **Public i2psnark swarm: full download** (`download-complete`) | **ok** — i2pd 2.61.0, 2026-07-28 | | |
+| **PEX acquisition observed** (`pex_peers > 0`) | **ok** — i2pd 2.61.0, 2026-07-28 | | |
+| **Bytes served to a swarm peer** (`bytes-served`) | not yet — see note below | | |
+| **A remote peer dialed us** (`inbound-peer`, §2.5) | **ok** — i2pd 2.61.0, 2026-07-28 | | |
 | Announce quirks confirmed (§5.1, §5.4) | | | |
 | Multi-hour seed soak | | | |
 | Survives router restart mid-transfer | | | |
@@ -470,6 +470,40 @@ client works", and because they no longer depend on the loopback rows passing.
 | Two-instance loopback download, both directions | | | |
 | `sam-stress` 16/32/64 | | | |
 | `sam-stress` 128/200 | | | |
+
+**First completed download from a live swarm — i2pd 2.61.0, 2026-07-28.**
+`i2pupdate-2.13.0.su3`, 20.4 MiB in 82 pieces, from postman's tracker:
+
+```
+router-connected    30s
+metadata            76s   (BEP 9 from a live peer)
+peer-connected      76s
+first-piece         91s
+download-complete  227s   20.9 MiB transferred for 20.4 MiB of torrent
+pex-acquisition    317s
+inbound-peer       317s
+```
+
+~140 KiB/s sustained, 38–39 peers, and 82/82 pieces re-verified against the
+metainfo after the fact. The 2.5% transfer overhead is the honest cost of
+duplicate blocks near the end; it was 45% before the request deadline (§4.7).
+
+`bytes-served` did **not** happen, across a 900-second seeding window with
+7–40 peers attached. Two causes, and it is worth separating them because only
+one is ours:
+
+  - **clove's**, now fixed: no `completed` announce went out. The run shows
+    `announces_ok 1` — one announce, sent at 76s as a leecher holding nothing,
+    and postman's interval is half an hour. The tracker therefore spent the
+    entire seeding window handing our destination to peers as a leecher, and
+    no peer had a reason to ask us for anything. See §5.6.
+  - **the swarm's**, and not a defect: an I2P router update is close to
+    all-seeds, and seeds do not request from seeds. Peers fell from 38 to 7
+    shortly after completion, which is what a swarm of seeds correctly does
+    with a peer that has just told them it wants nothing.
+
+Re-run against a torrent with real leechers before reading anything into a
+second empty result. Until then this row is *untested*, not *failing*.
 
 Alongside each result, note the router **version** — "i2pd 2.58" not "i2pd" —
 because a behaviour that changes between releases is exactly the kind of thing

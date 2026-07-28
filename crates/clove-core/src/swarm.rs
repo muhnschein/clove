@@ -302,12 +302,38 @@ fn announce_loop<D, N>(
     D: I2pDialer,
     N: I2pNamingLookup,
 {
+    // A torrent that is *already* complete when the announcer starts has no
+    // download to report — see `AnnounceState::already_complete`. This is the
+    // ordinary case for a seed, and for any torrent re-attached after a
+    // session rebuild.
+    let mut was_complete = torrent.is_complete();
     let mut states: Vec<tracker::AnnounceState> = target
         .urls
         .iter()
-        .map(|_| tracker::AnnounceState::new())
+        .map(|_| {
+            if was_complete {
+                tracker::AnnounceState::already_complete()
+            } else {
+                tracker::AnnounceState::new()
+            }
+        })
         .collect();
     loop {
+        // Finishing is an event, and the swarm is owed it now rather than
+        // whenever the tracker's interval next comes round. Without this the
+        // `completed` announce waits out a full interval — up to half an hour
+        // — during which the tracker goes on handing our destination out as a
+        // leecher that holds nothing, and no peer has any reason to ask us for
+        // a byte. Live that was an entire seeding window with one announce in
+        // it (`PROTOCOL.i2p-bt` §5.6).
+        let complete = torrent.is_complete();
+        if complete && !was_complete {
+            for state in &mut states {
+                state.completion_due();
+            }
+        }
+        was_complete = complete;
+
         for (url, state) in target.urls.iter().zip(states.iter_mut()) {
             if stop.is_raised() {
                 return;
@@ -1218,6 +1244,108 @@ mod tests {
             leecher.wait_complete(Duration::from_secs(20)),
             "tracker-bootstrapped download did not complete"
         );
+        announcer.shutdown();
+        leech_swarm.shutdown();
+        seed_swarm.shutdown();
+    }
+
+    /// Finishing must reach the tracker at once, not at the next interval.
+    ///
+    /// The live shape this comes from: a download that completed at 227s and
+    /// then seeded for fifteen minutes serving nothing, with `announces_ok 1`
+    /// for the whole run. The one announce went out early, as a leecher
+    /// holding nothing, and the tracker went on handing that destination to
+    /// peers for the rest of the session — so nobody had any reason to ask us
+    /// for a byte. postman's interval is half an hour; the seeding window was
+    /// a quarter of one.
+    ///
+    /// The tracker here asks for an hour, so *only* the completion path can
+    /// produce a second announce at all.
+    #[test]
+    fn finishing_a_download_announces_it_without_waiting_for_the_interval() {
+        use std::sync::mpsc;
+
+        let net = MockNet::new();
+        let (seeder, leecher, _sd, _ld) = seed_and_leech();
+
+        let seed_ep = net.endpoint();
+        let seed_dest = seed_ep.dest();
+        let seed_swarm = Swarm::spawn(
+            Arc::clone(&seeder),
+            seed_ep.dialer(),
+            Some(seed_ep),
+            quick_config(),
+        );
+
+        // A tracker that reports every announce it is sent, and asks to be
+        // left alone for an hour.
+        // Bounded, like every channel in the engine (SCOPE §4). Two announces
+        // are expected; eight is room to spare without room to grow.
+        let (report, seen) = mpsc::sync_channel::<String>(8);
+        let tracker_ep = net.endpoint();
+        net.register_name("tracker.i2p", tracker_ep.dest());
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _from)) = tracker_ep.accept() {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).map(|n| n == 0).unwrap_or(true) {
+                        break;
+                    }
+                    head.push(byte[0]);
+                }
+                let _ = report.send(String::from_utf8_lossy(&head).into_owned());
+                let mut body = b"d8:intervali3600e5:peers32:".to_vec();
+                body.extend_from_slice(&seed_dest.0);
+                body.push(b'e');
+                let response = crate::http::Response::new(200, "text/plain", body);
+                let _ = stream.write_all(&response.encode());
+            }
+        });
+
+        let leech_ep = net.endpoint();
+        let leech_swarm = Swarm::dial_only(Arc::clone(&leecher), leech_ep.dialer(), quick_config());
+        let announcer = Announcer::spawn(
+            Arc::clone(&leecher),
+            AnnounceTarget {
+                urls: vec!["http://tracker.i2p/announce".to_owned()],
+                our_dest_b64: "leecher-b64-dest".to_owned(),
+                piece_length: u64::from(BLOCK_LEN),
+                total_length: u64::from(3 * BLOCK_LEN + 100),
+            },
+            leech_ep.dialer(),
+            leech_ep.dialer(),
+            AnnouncerConfig {
+                poll_interval: Duration::from_millis(50),
+                dial_timeout: Duration::from_secs(5),
+                numwant: 8,
+            },
+        );
+
+        assert!(
+            leecher.wait_complete(Duration::from_secs(20)),
+            "the download did not complete"
+        );
+
+        // The first announce is the `started` that bootstrapped the download.
+        let first = seen
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a first announce");
+        assert!(first.contains("event=started"), "{first}");
+
+        // The second can only exist because finishing brought it forward.
+        let second = seen
+            .recv_timeout(Duration::from_secs(20))
+            .expect("finishing did not announce; the swarm never learns there is a new seed");
+        assert!(
+            second.contains("event=completed"),
+            "the announce after completing was not a completion: {second}"
+        );
+        assert!(
+            second.contains("left=0"),
+            "a completion announce must report nothing left: {second}"
+        );
+
         announcer.shutdown();
         leech_swarm.shutdown();
         seed_swarm.shutdown();
