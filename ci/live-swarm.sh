@@ -51,6 +51,7 @@ usage() {
 usage: ci/live-swarm.sh [options] <magnet-uri | file.torrent>
 
   --router NAME     i2pd | java | emissary — selects the SAM port (default i2pd)
+  --router-version V  the router's version string, recorded in the report
   --sam-port N      explicit SAM port; overrides --router
   --deadline SECS   whole-run budget, download phase included (default 3600)
   --seed-for SECS   keep seeding after the download completes (default 900)
@@ -66,6 +67,7 @@ USAGE
 }
 
 ROUTER=i2pd
+ROUTER_VERSION=""
 SAM_PORT=""
 DEADLINE=3600
 SEED_FOR=900
@@ -78,6 +80,7 @@ SUBJECT=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --router)    ROUTER="${2:?--router needs a value}"; shift ;;
+        --router-version) ROUTER_VERSION="${2:?--router-version needs a value}"; shift ;;
         --sam-port)  SAM_PORT="${2:?--sam-port needs a value}"; shift ;;
         --deadline)  DEADLINE="${2:?--deadline needs a value}"; shift ;;
         --seed-for)  SEED_FOR="${2:?--seed-for needs a value}"; shift ;;
@@ -249,7 +252,13 @@ human() {
 say "clove live swarm run"
 say "generated:  $(date -Is)"
 say "report:     $OUT"
-say "router:     $ROUTER (SAM 127.0.0.1:$SAM_PORT)"
+# The version is not discoverable over SAM — `HELLO REPLY VERSION=` is the
+# SAM protocol's version, not the router's — and every router publishes its
+# own somewhere different. So it is the operator's to pass, and its absence is
+# said out loud: LIVE-TESTING §6.3 requires a version against every result,
+# because "works on i2pd" is worth very little a year from now, and three
+# routers were once compared in one sitting with only one version recorded.
+say "router:     $ROUTER ${ROUTER_VERSION:-(version not recorded)} (SAM 127.0.0.1:$SAM_PORT)"
 say "subject:    $SUBJECT"
 say "budget:     ${DEADLINE}s download, then ${SEED_FOR}s seeding"
 {
@@ -524,6 +533,12 @@ say "=== final state"
 cl show "$INFO_HASH" | tee -a "$OUT" || true
 
 say ""
+if [ -z "$ROUTER_VERSION" ]; then
+    say "note: no --router-version was given, so this report cannot fill in"
+    say "      LIVE-TESTING §6.3's version column. Re-run with e.g."
+    say "      --router-version '$ROUTER 2.61.0' if you are recording a result."
+    say ""
+fi
 say "########## milestones ##########"
 milestone_list | while IFS='	' read -r name what; do
     at=$(at_of "$name")

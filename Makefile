@@ -35,11 +35,17 @@ UNIT := $(UNIT_$(ROUTER))
 N ?= 32
 # Seconds router-wait polls for the SAM port before giving up.
 WAIT ?= 180
+# Which router `make router-addressbook` resolves names *with*, and which names.
+# Empty HOSTS lets the script pick its own default (the tracker the swarm tier
+# needs), so the common case is a bare `make router-addressbook`.
+FROM ?= i2pd
+HOSTS ?=
 
 QUADLET_DIR := $(HOME)/.config/containers/systemd
 
 .PHONY: test smoke chaos test-live sam-stress matrix cross routers report router-ready \
         swarm router-up router-down router-wait router-build router-sam-enable \
+        router-addressbook \
         fmt lint man-lint fuzz install uninstall
 
 # Fail early and clearly on a typo'd ROUTER, rather than in the middle of a
@@ -236,6 +242,15 @@ router-up: check-router
 ## router has booted; idempotent. i2pd needs nothing.
 router-sam-enable: check-router
 	./contrib/podman/enable-sam.sh $(ROUTER)
+
+## Give emissary the address-book entries the live tiers need, resolved from a
+## router that already has them (i2pd by default). Only emissary needs this:
+## it fetches its own subscription over I2P eventually, and "eventually" is
+## longer than a live run. Restarts the router, which reloads the file.
+##   make router-addressbook            # tracker2.postman.i2p, from i2pd
+##   make router-addressbook FROM=java HOSTS="a.i2p b.i2p"
+router-addressbook:
+	./contrib/podman/seed-addressbook.sh --from $(FROM) $(HOSTS)
 
 ## Stop the router and remove its quadlet unit (the data volume is kept; e.g.
 ## `podman volume rm clove-i2pd-data` to wipe netDb and keys).
