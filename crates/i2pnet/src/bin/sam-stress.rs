@@ -849,10 +849,15 @@ fn result_line(run: &Run, connects: &[Duration], rtts: &[Duration], failed: usiz
         }
     };
     format!(
-        "sam-stress-result\tn={}\tdialed={}\techoed={}\tfailed={}\tunfinished={}\tgave_up={}\t\
-         tries={}\tconnect_p50_ms={}\tconnect_p99_ms={}\trtt_p50_ms={}\twall_s={:.2}\tpayload={}",
+        "sam-stress-result\tn={}\tdialed={}\tarrived={}\techoed={}\tfailed={}\tunfinished={}\t\
+         gave_up={}\ttries={}\tconnect_p50_ms={}\tconnect_p99_ms={}\trtt_p50_ms={}\twall_s={:.2}\t\
+         payload={}",
         run.n,
         run.dialed,
+        // Carried so a sweep can tell "some streams were slow" from "the
+        // listening session went away": the latter is gave_up == arrived, and
+        // without this key that comparison is not reconstructible after the run.
+        run.arrived,
         rtts.len(),
         failed,
         run.unfinished,
@@ -1035,6 +1040,7 @@ mod tests {
         for key in [
             "n=32",
             "dialed=32",
+            "arrived=32",
             "echoed=1",
             "failed=0",
             "unfinished=2",
