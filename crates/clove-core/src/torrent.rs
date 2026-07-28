@@ -30,7 +30,7 @@
 //! instances). The real router backend (Phase D) and swarm features
 //! (trackers, PEX, magnets — Phase E) attach at the same seams.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -74,6 +74,38 @@ pub const DEFAULT_CHOKE_INTERVAL: Duration = Duration::from_secs(10);
 /// leecher waiting on a rare piece or a seeder nobody is requesting from can
 /// legitimately have nothing else to send for a long time.
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(100);
+
+/// How long a block may stay requested before it is offered to somebody else.
+///
+/// BEP 3 has no acknowledgement and no cancellation the peer must honour, so a
+/// request that is dropped — because the peer is overloaded, lost the piece,
+/// or simply chose not to answer — is indistinguishable from one still in
+/// flight. Without a deadline it is *permanent*: the block stays in the peer's
+/// pipeline and in the picker's in-flight set, so it is never asked for again
+/// and its piece can never complete.
+///
+/// Live, that stalled a download at 48% with every one of its 43 outstanding
+/// pieces about three-quarters finished and none finishing, while per-peer
+/// throughput bled away as pipeline slots filled with requests nobody owed
+/// (`docs/PROTOCOL.i2p-bt` §4.7).
+///
+/// Generous, because a re-request is wasted bandwidth if the first answer was
+/// merely slow: an I2P round trip is seconds, and a peer serving many others
+/// is entitled to take its time. Short enough that a stuck piece resolves in
+/// about a minute rather than never.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Consecutive maintenance rounds in which a peer may let requests expire
+/// while delivering nothing before it is dropped.
+///
+/// Freeing the blocks is what unsticks the *download*; dropping the peer is
+/// what unsticks the *slot*. With `max_peers` at 50 and a live swarm offering
+/// well over a hundred destinations, a connection that has owed us blocks for
+/// three rounds running and produced none is worth more as a free slot. It
+/// stays in `known_peers` and the dial sweep may pick it up again after its
+/// retry backoff, which is the right outcome if it was only having a bad
+/// minute.
+pub const REQUEST_STRIKES: u32 = 3;
 
 /// How long a peer may say nothing at all before we drop it.
 ///
@@ -233,6 +265,8 @@ struct State {
     keepalive_interval: Duration,
     /// How long a peer may say nothing before we drop it.
     idle_timeout: Duration,
+    /// How long a requested block may go unanswered (R5 tunable).
+    request_timeout: Duration,
     peers: Vec<Peer>,
     next_id: u64,
     /// Peer destinations we know about (from connections, PEX, or the
@@ -294,8 +328,13 @@ struct Peer {
     they_interested: bool,
     /// We are interested in them.
     we_interested: bool,
-    /// Blocks we have requested from them, as (piece, block).
-    in_flight: HashSet<(u32, u32)>,
+    /// Blocks we have requested from them, as (piece, block), each with the
+    /// moment it was asked for so [`DEFAULT_REQUEST_TIMEOUT`] can expire it.
+    in_flight: HashMap<(u32, u32), Instant>,
+    /// Consecutive maintenance rounds in which this peer let requests expire
+    /// without delivering a block. Reset by any block that arrives; at
+    /// [`REQUEST_STRIKES`] the peer is dropped.
+    strikes: u32,
     /// When we last queued anything for them, for keep-alive timing.
     last_sent: Instant,
     /// When we last heard anything from them, for the idle timeout.
@@ -370,6 +409,7 @@ impl Torrent {
                 choke_interval: DEFAULT_CHOKE_INTERVAL,
                 keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
                 idle_timeout: DEFAULT_IDLE_TIMEOUT,
+                request_timeout: DEFAULT_REQUEST_TIMEOUT,
                 peers: Vec::new(),
                 next_id: 0,
                 known_peers: HashSet::new(),
@@ -436,6 +476,12 @@ impl Torrent {
     /// Set how long a peer may say nothing before it is dropped (R5 tunable).
     pub fn set_idle_timeout(&self, timeout: Duration) {
         lock(&self.shared.state).idle_timeout = timeout;
+    }
+
+    /// Set how long a requested block may go unanswered before it is offered
+    /// to another peer (R5 tunable). See [`DEFAULT_REQUEST_TIMEOUT`].
+    pub fn set_request_timeout(&self, timeout: Duration) {
+        lock(&self.shared.state).request_timeout = timeout;
     }
 
     /// Start the periodic work this torrent needs: keep-alives to peers we have
@@ -814,7 +860,8 @@ impl Shared {
             we_choke: true,
             they_interested: false,
             we_interested: false,
-            in_flight: HashSet::new(),
+            in_flight: HashMap::new(),
+            strikes: 0,
             last_sent: Instant::now(),
             last_seen: Instant::now(),
             uploaded: 0,
@@ -844,7 +891,7 @@ impl Shared {
         if let Some(pos) = st.peers.iter().position(|p| p.id == id) {
             let peer = st.peers.swap_remove(pos);
             st.picker.remove_bitfield(&peer.has);
-            for (piece, block) in peer.in_flight {
+            for (piece, block) in peer.in_flight.into_keys() {
                 st.picker.block_failed(piece, block);
             }
         }
@@ -898,6 +945,7 @@ impl Shared {
                     out.push((peer.id, peer.out.clone(), Message::KeepAlive));
                 }
             }
+            maintain_requests(&mut st, now, &mut idle, &mut out);
             if st.last_choke_round.elapsed() >= st.choke_interval {
                 st.last_choke_round = now;
                 run_choker(&mut st, &mut out);
@@ -955,7 +1003,8 @@ impl Shared {
                 peer.peer_choking = true;
                 // Outstanding requests are dropped by a choking peer (no
                 // fast extension here); release them for re-picking.
-                let dropped: Vec<(u32, u32)> = peer.in_flight.drain().collect();
+                let dropped: Vec<(u32, u32)> =
+                    peer.in_flight.drain().map(|(block, _at)| block).collect();
                 for (piece, block) in dropped {
                     st.picker.block_failed(piece, block);
                 }
@@ -1141,7 +1190,11 @@ impl Shared {
         if block.len() as u64 != u64::from(st.picker.block_len(index, block_no)) {
             return;
         }
-        let was_requested = st.peers[idx].in_flight.remove(&(index, block_no));
+        let was_requested = st.peers[idx].in_flight.remove(&(index, block_no)).is_some();
+        // Any block at all is proof this peer is still working for us, which
+        // is what the strike count measures. Cleared even for a late or
+        // duplicate block: the peer answered, just not usefully.
+        st.peers[idx].strikes = 0;
         // A block for a piece we already hold is a duplicate the endgame asked
         // for: another peer answered first and the piece verified. Writing it
         // would put this peer's bytes over verified ones, and for a piece of
@@ -1260,6 +1313,61 @@ fn update_interest(st: &mut State, idx: usize, out: &mut Vec<Outgoing>) {
     }
 }
 
+/// Give up on blocks nobody answered, on peers that keep not answering, and
+/// top every surviving pipeline back up.
+///
+/// **Expiry.** Three things happen per expired request, and all three matter:
+///
+/// - the block goes back to the picker, so its piece can finish somewhere
+///   else — without this a piece stalls short of complete, permanently;
+/// - the peer's pipeline slot is freed, so it can be given work it might
+///   actually do — without this a peer's capacity bleeds away request by
+///   request until it asks for nothing while still holding a connection;
+/// - the peer earns a strike, and at [`REQUEST_STRIKES`] its slot goes back
+///   to the swarm.
+///
+/// **Topping up.** Every eligible peer is refilled, not just the ones that
+/// timed out. [`fill_requests`] otherwise runs only when a block arrives or a
+/// peer unchokes, so a peer whose pipeline drains at a moment when the picker
+/// has nothing to offer — because every remaining block is in flight with
+/// somebody else — is never asked again. It stays connected, interested,
+/// unchoked and permanently idle, and no event exists that would wake it: the
+/// one that would is a block arriving on the connection that has nothing
+/// outstanding.
+///
+/// That is a second way to stall, independent of the first and reachable
+/// without a single misbehaving peer — a slow peer holding the last few blocks
+/// is enough. It is also why freeing the expired blocks above is not on its
+/// own sufficient: the honest peers that could take them have long since gone
+/// quiet.
+fn maintain_requests(st: &mut State, now: Instant, idle: &mut Vec<u64>, out: &mut Vec<Outgoing>) {
+    let deadline = st.request_timeout;
+    for idx in 0..st.peers.len() {
+        let expired: Vec<(u32, u32)> = st.peers[idx]
+            .in_flight
+            .iter()
+            .filter(|(_, requested_at)| now.duration_since(**requested_at) >= deadline)
+            .map(|(block, _)| *block)
+            .collect();
+        if !expired.is_empty() {
+            for block in &expired {
+                st.peers[idx].in_flight.remove(block);
+                st.picker.block_failed(block.0, block.1);
+            }
+            let peer = &mut st.peers[idx];
+            peer.strikes = peer.strikes.saturating_add(1);
+            if peer.strikes >= REQUEST_STRIKES {
+                // Queued for removal by the caller, which does it outside the
+                // lock; whatever it still holds goes back to the picker there.
+                // No point topping up a peer we are about to drop.
+                idle.push(peer.id);
+                continue;
+            }
+        }
+        fill_requests(st, idx, out);
+    }
+}
+
 /// Top up a peer's request pipeline from the picker.
 fn fill_requests(st: &mut State, idx: usize, out: &mut Vec<Outgoing>) {
     if st.peers[idx].peer_choking || !st.peers[idx].we_interested {
@@ -1279,9 +1387,10 @@ fn fill_requests(st: &mut State, idx: usize, out: &mut Vec<Outgoing>) {
     // those and give the count straight back.
     let mut duplicates = Vec::new();
     let peer = &mut st.peers[idx];
+    let now = Instant::now();
     for req in requests {
         let block = req.begin / BLOCK_LEN;
-        if peer.in_flight.insert((req.index, block)) {
+        if peer.in_flight.insert((req.index, block), now).is_none() {
             out.push((peer.id, peer.out.clone(), Message::Request(req)));
         } else {
             duplicates.push((req.index, block));
