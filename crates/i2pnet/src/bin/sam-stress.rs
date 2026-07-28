@@ -273,6 +273,7 @@ fn run() -> io::Result<()> {
     join_before(acceptor, TEARDOWN_GRACE);
 
     let gave_up = echo_gave_up.load(Ordering::Relaxed);
+    let arrived = u64::from(accepted.load(Ordering::Relaxed));
     report(
         &Run {
             n,
@@ -281,6 +282,7 @@ fn run() -> io::Result<()> {
             dialed,
             unfinished,
             gave_up,
+            arrived,
         },
         &mut connects,
         &mut rtts,
@@ -288,8 +290,8 @@ fn run() -> io::Result<()> {
     );
     // Printed under the numbers rather than in place of them: the table is the
     // measurement, this is the reading of it.
-    if accepted.load(Ordering::Relaxed) == 0 && (unfinished > 0 || rtts.is_empty()) {
-        explain_silent_forward();
+    if arrived == 0 && (unfinished > 0 || rtts.is_empty()) {
+        explain_silent_forward(dialed);
     }
     // Unfinished first: it is the more specific diagnosis. "Everything failed"
     // when nothing actually returned an error would send the reader looking
@@ -512,6 +514,9 @@ struct Run {
     dialed: usize,
     unfinished: usize,
     gave_up: u32,
+    /// Inbound streams the listener actually accepted. Distinguishes "some
+    /// streams were slow" from "the listening session went away".
+    arrived: u64,
 }
 
 /// `attempts` is a shared counter rather than a field of [`Sample`], because
@@ -698,17 +703,29 @@ fn join_before(handle: thread::JoinHandle<()>, grace: Duration) {
 /// Printed only when *nothing* arrived. A run where some streams landed has
 /// already disproved it, and a hint that fired on a partial failure would send
 /// the reader somewhere the evidence does not point.
-fn explain_silent_forward() {
+///
+/// It names two causes rather than one. The first draft asserted the namespace
+/// explanation, and a sweep caught it lying: on a host-installed i2pd — same
+/// namespace, sixteen other runs in the same sweep working — one N=16 run
+/// forwarded nothing and was told its router was probably in a container. The
+/// dials had succeeded, which rules the namespace out on its own: a router that
+/// cannot reach our listener still dials perfectly well, but so does one whose
+/// listening session dropped a moment later. `dialed` is what separates them,
+/// so it is printed rather than guessed at.
+fn explain_silent_forward(dialed: usize) {
     eprintln!(
         "sam-stress: the router accepted STREAM FORWARD and then forwarded nothing — not one \
-         inbound stream arrived, so every dial above failed on the listening side."
+         inbound stream arrived, so every dial above failed on the listening side ({dialed} \
+         dial(s) had succeeded)."
     );
     eprintln!(
-        "sam-stress: our forwarded listener is bound to 127.0.0.1 and the FORWARD carries no \
-         HOST=, so the router connects back to wherever it sees our SAM control connection \
-         coming from. Those agree only when the router shares this network namespace. If this \
-         router runs in a container, the inbound half cannot work here and this result says \
-         nothing about clove — see docs/LIVE-TESTING.md §3.1."
+        "sam-stress: two things do this. (1) The listening session dropped — check the router's \
+         log for a session teardown around this run; if other runs against the same router \
+         worked, this is the likely one. (2) The router cannot reach our forwarded listener at \
+         all: it is bound to 127.0.0.1 and the FORWARD carries no HOST=, so the router connects \
+         back to wherever it sees our SAM control connection coming from, which agrees only when \
+         it shares this network namespace. A containerized router never works; see \
+         docs/LIVE-TESTING.md §3.1."
     );
 }
 
@@ -742,10 +759,21 @@ fn report(run: &Run, connects: &mut [Duration], rtts: &mut [Duration], failures:
     );
     if run.gave_up > 0 {
         println!(
-            "  we hung up: {} (our echo handler timed out mid-stream — these \
-             show as the dialer's `failed to fill whole buffer`)",
+            "  lost by us: {} (the listening side's stream broke before it \
+             echoed — these are the dialer's `failed to fill whole buffer`)",
             run.gave_up
         );
+        // All of them at once is a different event from a few of them, and
+        // the difference is worth naming: streams do not independently decide
+        // to break simultaneously. Observed on i2pd 2.61.0 at N=32 and N=64,
+        // 32/32 and 43/44, each time with the run ending early.
+        if u64::from(run.gave_up) >= run.arrived && run.arrived > 0 {
+            println!(
+                "              …every accepted stream, which is the listening \
+                 session dropping rather than {} slow streams.",
+                run.gave_up
+            );
+        }
     }
     println!(
         "  dial tries: {} (> dialed ⇒ leaseSet-warmup retries)",
@@ -821,10 +849,15 @@ fn result_line(run: &Run, connects: &[Duration], rtts: &[Duration], failed: usiz
         }
     };
     format!(
-        "sam-stress-result\tn={}\tdialed={}\techoed={}\tfailed={}\tunfinished={}\tgave_up={}\t\
-         tries={}\tconnect_p50_ms={}\tconnect_p99_ms={}\trtt_p50_ms={}\twall_s={:.2}\tpayload={}",
+        "sam-stress-result\tn={}\tdialed={}\tarrived={}\techoed={}\tfailed={}\tunfinished={}\t\
+         gave_up={}\ttries={}\tconnect_p50_ms={}\tconnect_p99_ms={}\trtt_p50_ms={}\twall_s={:.2}\t\
+         payload={}",
         run.n,
         run.dialed,
+        // Carried so a sweep can tell "some streams were slow" from "the
+        // listening session went away": the latter is gave_up == arrived, and
+        // without this key that comparison is not reconstructible after the run.
+        run.arrived,
         rtts.len(),
         failed,
         run.unfinished,
@@ -998,6 +1031,7 @@ mod tests {
             dialed: 32,
             unfinished: 2,
             gave_up: 1,
+            arrived: 32,
         };
         let connects = [Duration::from_millis(419), Duration::from_millis(423)];
         let rtts = [Duration::from_millis(78_394)];
@@ -1006,6 +1040,7 @@ mod tests {
         for key in [
             "n=32",
             "dialed=32",
+            "arrived=32",
             "echoed=1",
             "failed=0",
             "unfinished=2",
@@ -1033,6 +1068,7 @@ mod tests {
             dialed: 0,
             unfinished: 0,
             gave_up: 0,
+            arrived: 0,
         };
         let line = result_line(&run, &[], &[], 4);
         assert!(line.contains("connect_p50_ms=-1"), "{line}");
