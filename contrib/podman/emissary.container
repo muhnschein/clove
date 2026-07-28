@@ -21,6 +21,19 @@
 #
 # which sets `host = "0.0.0.0"` under [sam] and restarts. Idempotent.
 #
+# AND ONE MORE, before the swarm tier: emissary starts with an empty address
+# book and fills it from a subscription fetched *over I2P*, which takes longer
+# than a live run does. Until then every announce to a tracker named by
+# hostname fails with `KeyNotFound` — a router-setup problem that reads like a
+# clove bug (PROTOCOL.i2p-bt §5.5). Borrow the entries from a router that has
+# them:
+#
+#   make router-addressbook
+#
+# which resolves the names over i2pd's SAM, writes them into
+# /var/lib/emissary/addressbook/addresses, and restarts (emissary reads that
+# file once, at startup).
+#
 # There is no web console here; `podman logs systemd-emissary` is the
 # diagnostic. Raise detail by editing EMISSARY_LOG below (the syntax is
 # emissary's own, e.g. emissary::sam=debug,emissary::tunnel=debug).

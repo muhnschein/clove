@@ -265,6 +265,24 @@ Status legend:
     (first found live 2026-07-27; see LIVE-TESTING §7a). An operator hitting
     this can sidestep it with a b32 tracker URL.
 
+    **Confirmed against emissary, 2026-07-28**, in the run that made the case
+    for this diagnostic. Its SAM session came up normally at 61s and every
+    announce then failed with `router error: KeyNotFound` for
+    `tracker2.postman.i2p`, followed by the negative-cache hold announcing
+    itself:
+
+      resolving tracker tracker2.postman.i2p: protocol error:
+        `router error: KeyNotFound`
+      … negative-cached after 2 failed lookup(s); not asking the router
+        again for 29s
+
+    Nothing here implicates clove, and — the point of §5.5 — it took one
+    glance to say so, where the same failure a week earlier presented as a
+    client that sat silently doing nothing. The router's word (`KeyNotFound`,
+    not `InvalidKey`, not a timeout) also distinguishes an empty address book
+    from a netDb lookup that failed, which is the difference between "wait for
+    the subscription" and "the destination is gone".
+
 
 2. SAM / yosemite behavior (from the 0.7.0 API review, M0/M1)
 ------------------------------------------------------------
