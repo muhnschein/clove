@@ -730,6 +730,51 @@ address book page); wait for the subscription fetch on a young router; or
 sidestep naming altogether by using a tracker URL in `b32` form, which resolves
 through the netDb rather than the address book.
 
+**On emissary, do this instead** — it starts with an empty address book and
+fetches its subscription over I2P, which takes longer than a live run:
+
+```
+make router-addressbook          # resolves with i2pd, writes into emissary
+```
+
+`contrib/podman/seed-addressbook.sh` asks a router that already knows the name
+(i2pd by default) over SAM, derives the b32 label from the destination it
+answers with, writes `hostname=<label>` into
+`/var/lib/emissary/addressbook/addresses`, and restarts the router — emissary
+reads that file once, at startup, so without the restart the entries are on
+disk and invisible.
+
+Nothing is hardcoded: a destination baked into a script would be a lie the day
+postman rotates keys, and there is no way to check it offline. `--dry-run`
+resolves and prints without touching anything, which is also how the script is
+tested (§7b).
+
+### 7b. Checking the b32 derivation without a router
+
+`seed-addressbook.sh` computes a b32 label in shell — `base32(SHA-256(dest))`,
+lowercase and unpadded — and it has to agree exactly with
+`i2pnet::addr::to_b32`, because an address book entry that resolves to the
+*wrong* destination is worse than one that is missing. Both are checkable
+offline against a fake SAM bridge:
+
+```
+# a bridge that answers HELLO, then NAMING REPLY with a known destination
+./contrib/podman/seed-addressbook.sh --dry-run --sam-port <fake-port> some.i2p
+```
+
+Two things this caught that review did not, and that are worth keeping in mind
+if the script is ever changed:
+
+  - **`RESULT=OK` must be matched against the `NAMING REPLY` line, not the
+    whole conversation.** The handshake before it says `HELLO REPLY
+    RESULT=OK`, so a check against everything received calls every lookup a
+    success — `KEY_NOT_FOUND` included — and writes a hash of the string
+    `KEY_NOT_FOUND` into the address book as if it were the tracker.
+  - **Validate the destination, not the label.** SHA-256 is always 32 bytes,
+    so the label is always 52 base32 characters; a hash of the word "nonsense"
+    is exactly as well-formed as a hash of postman's destination. The gate is
+    that the decoded destination is at least 387 bytes.
+
 **`CantReachPeer` on every dial, immediately after `router-up`.** Two causes,
 distinguish them at the i2pd console (`http://127.0.0.1:7070`, published by the
 quadlet):
