@@ -735,14 +735,26 @@ fetches its subscription over I2P, which takes longer than a live run:
 
 ```
 make router-addressbook          # resolves with i2pd, writes into emissary
+make swarm TORRENT='magnet:…' ROUTER=emissary
 ```
 
+Note the `make swarm` form: the torrent is `TORRENT=`, the router is `ROUTER=`,
+and anything else goes through `SWARM_ARGS='…'`. `make swarm --router emissary`
+is not it — make takes those as goals, not arguments.
+
 `contrib/podman/seed-addressbook.sh` asks a router that already knows the name
-(i2pd by default) over SAM, derives the b32 label from the destination it
-answers with, writes `hostname=<label>` into
-`/var/lib/emissary/addressbook/addresses`, and restarts the router — emissary
-reads that file once, at startup, so without the restart the entries are on
-disk and invisible.
+(i2pd by default) over SAM and writes the answer into **both** of emissary's
+address books, because it has two and they serve different callers (§5.5a):
+
+| file | holds | read by |
+|---|---|---|
+| `addressbook/addresses` | `hostname=<b32 label>` | `resolve_base32` — `STREAM CONNECT` by hostname |
+| `addressbook/destinations/<host>.txt` | the base64 destination | `resolve_base64` — `NAMING LOOKUP` |
+
+**clove's path is the second one.** It does a `NAMING LOOKUP` and dials the
+result, so `destinations/` is what decides whether it works; writing only
+`addresses` leaves the entry present, correct, and invisible. The script also
+restarts the router, which `addresses` needs (it is read once, at startup).
 
 Nothing is hardcoded: a destination baked into a script would be a lie the day
 postman rotates keys, and there is no way to check it offline. `--dry-run`
