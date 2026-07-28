@@ -190,6 +190,11 @@ candidate (§7). Ordered by leverage:
    (16 → 32 → 64 → 128 → 200+). This is the instrument that answers R2. It reads
    the SAM port from `CLOVE_SAM_PORT` and exits with a clear "no router at
    127.0.0.1:<port>" message when unset/unreachable — never hangs.
+   `ci/sam-stress-sweep.sh` (`make sam-sweep`) drives the ladder — every level,
+   repeated, into one file with a summary table — because the answer is a
+   curve and a curve needs more than one point per level. Each run also emits
+   one machine-readable `sam-stress-result` line, which is what the sweep reads
+   rather than parsing the human table.
 3. **Gated tier-2 tests**: a two-instance loopback download and a
    kill-router-mid-transfer chaos test, both `#[ignore]`d and keyed on
    `CLOVE_SAM_PORT` so `cargo test` (tier-1) stays router-free and
@@ -336,8 +341,31 @@ make test-live                    # waits for SAM, runs cargo test -- --ignored
 make test-live ROUTER=java        # …against a different router
 make sam-stress N=128             # the R2 harness at a given concurrency
 make sam-stress N=128 ROUTER=emissary
+make sam-sweep                    # the whole R2 ladder, ×3, into one file
 make matrix                       # the live tier against all three, in turn
 ```
+
+`make sam-sweep` is the one to reach for when the question is R2 rather than
+"does this router work at all". It runs `sam-stress` at 1/16/32/64/128/200,
+three times each, keeps every run's output and prints one table at the end:
+
+```
+make sam-sweep
+make sam-sweep ROUTER=java SWEEP_ARGS='--levels "16 64" --repeats 5'
+./ci/sam-stress-sweep.sh --help
+```
+
+It defaults to a 4 KiB echo rather than `sam-stress`'s 64 KiB, deliberately.
+R2 asks whether the *dial path* degrades under concurrency; at 64 KiB a busy
+router spent a median of 78 seconds per echo, so the ladder measured tunnel
+bandwidth instead, took hours, and buried the answer. `--payload` puts it back
+when throughput is the question.
+
+Read the `dialed` column against N first. If that holds as N climbs, the
+session's dial path is fine whatever the echo columns do — and on a
+same-router run the echo columns are mostly the router carrying every byte
+twice (§2.6c). Nothing aborts on a failing level: the rungs above a bad one
+are the question, so the ladder runs to the top regardless.
 
 Readiness is a TCP probe of `127.0.0.1:$CLOVE_SAM_PORT` plus a trial transient
 session (SAM answering ≠ tunnels built); the target polls with a timeout and
@@ -418,10 +446,19 @@ something fails and you need to know what it was supposed to prove.
 
 - [ ] `sam-stress` completes at 16/32/64/128/200 concurrent streams on one
       session; latency distribution and any failure cliff recorded (R2, §2.6).
+      **Run it as `make sam-sweep`** (§5.4) — repeats per level, one file, one
+      table. The first hand-run ladder produced a success rate of 3/16, 30/32,
+      11/64, 31/128, which is noise wearing a cliff's clothes, and no single
+      run per level can tell those apart.
       **Needs a router in clove's own network namespace** — §3.1. Against the
       containerized routers here it fails on the listening side and measures
       nothing; `ci/live-report.sh` now skips it there rather than filing a red
       row.
+      *First data, i2pd 2.61.0, 2026-07-28:* dial latency is sub-second and
+      flat from N=32 to N=128 (p50 419→596 ms, p99 within 10 ms of p50), so
+      the control plane shows no degradation over that range. Recorded in
+      `PROTOCOL.i2p-bt` §2.6a with its caveats; it wants re-taking with the
+      sweep before it is written into §6.3 as a result.
 - [x] Inbound: a forwarded peer's derived `DestHash` reconciles with the hash it
       was dialed at (confirms §2.5, §1.3); §2.5 → [decided]. **i2pd, 2026-07-28**
       — `inbound-peer` on three runs (11, 2 and 2 remote peers). Only on the

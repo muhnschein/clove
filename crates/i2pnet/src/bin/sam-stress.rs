@@ -41,7 +41,28 @@ use i2pnet::{DestHash, I2pDialer, I2pListener, I2pNamingLookup};
 
 /// Bytes each stream sends and expects echoed back — enough to exercise a
 /// real round-trip through tunnels, small enough not to dominate timing.
+///
+/// "Small enough not to dominate timing" turned out to be false on a busy
+/// router: at 32 concurrent streams a 64 KiB echo took a median of 78 seconds,
+/// so the payload, not the concurrency, was what the run measured. R2 asks
+/// about the *control plane* — whether one session's dial path degrades as
+/// streams pile up — and that question is answered by a payload small enough
+/// to prove the stream carries bytes at all. Override with
+/// `CLOVE_STRESS_PAYLOAD` (bytes); the default is unchanged so old and new
+/// reports stay comparable.
 const PAYLOAD_LEN: usize = 64 * 1024;
+
+/// Payload size for this run, from `CLOVE_STRESS_PAYLOAD` (bytes).
+///
+/// Floored at one byte: a zero-length echo would "succeed" without the stream
+/// ever carrying anything, which is precisely the claim the echo exists to
+/// make.
+fn payload_len() -> usize {
+    env::var("CLOVE_STRESS_PAYLOAD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map_or(PAYLOAD_LEN, |n: usize| n.max(1))
+}
 
 /// Per-attempt dial timeout passed to the trait (yosemite ignores it; the
 /// router's own `CANT_REACH_PEER` timeout governs — see `PROTOCOL.i2p-bt` 2.3).
@@ -80,13 +101,47 @@ fn warmup_deadline(run: Duration) -> Duration {
     run.saturating_sub(ECHO_RESERVE).max(RETRY_BACKOFF).min(run)
 }
 
-/// How long an echo handler waits on its half of an exchange. Handlers hold a
-/// loopback socket, so unlike the dial side this is enforceable.
-const ECHO_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long an echo handler waits on its half of an exchange, **derived from
+/// the run budget** rather than fixed. Handlers hold a loopback socket, so
+/// unlike the dial side this is enforceable.
+///
+/// It was a flat 120 seconds, chosen when a 64 KiB echo was assumed quick. It
+/// is a *per-read* timeout, so it never cut a slow-but-steady transfer — but
+/// under real congestion a 120-second gap between reads is reachable, and when
+/// it fires the handler drops the stream without echoing. The dialer then sees
+/// EOF and reports `failed to fill whole buffer`, which reads as the router
+/// dropping the stream and is in fact us hanging up on ourselves. A stall
+/// bound inside the measurement's own range does not measure, it censors.
+///
+/// The run's deadline is the bound that matters — nothing outlives it, and
+/// teardown is separately bounded by [`TEARDOWN_GRACE`] — so the handler is
+/// given the whole run and the stall it reports is a real one.
+fn echo_timeout(run: Duration) -> Duration {
+    run.max(RETRY_BACKOFF)
+}
 
 /// How long the run waits for the echo listener to wind down once the deadline
 /// has passed, before giving up on it and reporting anyway.
 const TEARDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// How many descriptor-exhausted accepts to ride out before the listener gives
+/// up. Each retry costs [`RETRY_BACKOFF`], and handlers hand descriptors back
+/// as they finish, so a few retries clear a transient squeeze; a persistent one
+/// means N is simply past what `ulimit -n` allows.
+const FD_RETRY_LIMIT: u32 = 5;
+
+/// Is this the process (`EMFILE`) or the system (`ENFILE`) out of file
+/// descriptors?
+///
+/// `std::io::ErrorKind` has no stable variant for either, so the raw errno is
+/// the only way to ask. Both values are the same across every Linux ABI clove
+/// targets, and a wrong answer here costs a misleading hint rather than a
+/// wrong result.
+fn is_fd_exhaustion(e: &io::Error) -> bool {
+    const EMFILE: i32 = 24;
+    const ENFILE: i32 = 23;
+    matches!(e.raw_os_error(), Some(EMFILE | ENFILE))
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -169,8 +224,23 @@ fn run() -> io::Result<()> {
     // below is bounded and may give up before the thread has a value to give.
     let accepted = Arc::new(AtomicU32::new(0));
     let acceptor_accepted = Arc::clone(&accepted);
-    let acceptor =
-        thread::spawn(move || echo_server(&listener, n, &acceptor_stop, &acceptor_accepted));
+    // Streams the *listening* side abandoned. Without this, a handler that
+    // times out mid-echo shows up only as the dialer's "failed to fill whole
+    // buffer" — an error that reads like the router dropped the stream when in
+    // fact we hung up on ourselves.
+    let echo_gave_up = Arc::new(AtomicU32::new(0));
+    let acceptor_gave_up = Arc::clone(&echo_gave_up);
+    let echo_budget = echo_timeout(deadline_budget);
+    let acceptor = thread::spawn(move || {
+        echo_server(
+            &listener,
+            n,
+            &acceptor_stop,
+            &acceptor_accepted,
+            &acceptor_gave_up,
+            echo_budget,
+        );
+    });
 
     // Dialer side: N threads, each dials the listener's destination once and
     // reports through the channel. Results are collected by deadline, not by
@@ -178,46 +248,23 @@ fn run() -> io::Result<()> {
     // interrupted (no socket to time out), so it must not be waited on.
     let start = Instant::now();
     let deadline = start + deadline_budget;
-    // Bounded at n: every dialer sends exactly once, so this never blocks a
-    // sender, and SCOPE §4 has no unbounded channels.
-    let (tx, rx) = mpsc::sync_channel(n);
+    // Two slots per dialer: each reports its connect the moment the dial
+    // returns and its outcome later, so a thread never blocks on a full
+    // channel. Bounded, per SCOPE §4.
+    let (tx, rx) = mpsc::sync_channel(2 * n);
     let tries = Arc::new(AtomicU32::new(0));
     for _ in 0..n {
         let dial = Arc::clone(&dial);
         let tries = Arc::clone(&tries);
         let tx = tx.clone();
-        thread::spawn(move || {
-            let _ = tx.send(dial_once(&dial, target, &tries));
-        });
+        thread::spawn(move || dial_once(&dial, target, &tries, &tx));
     }
     drop(tx);
 
-    let mut connects = Vec::with_capacity(n);
-    let mut rtts = Vec::with_capacity(n);
-    let mut failures = Vec::new();
-    let mut finished = 0usize;
-    while finished < n {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        match rx.recv_timeout(left) {
-            Ok(Ok(sample)) => {
-                connects.push(sample.connect);
-                rtts.push(sample.rtt);
-                finished += 1;
-            }
-            Ok(Err(e)) => {
-                failures.push(e.to_string());
-                finished += 1;
-            }
-            // Out of time, or every sender is gone and nothing further can
-            // arrive. Either way there is nothing left to wait for.
-            Err(_) => break,
-        }
-    }
+    let (mut connects, mut rtts, failures) = collect_events(&rx, n, deadline);
     let wall = start.elapsed();
-    let unfinished = n - finished;
+    let unfinished = n - (rtts.len() + failures.len());
+    let dialed = connects.len();
 
     // Unblock the acceptor: raise the flag, then poke its loopback port so a
     // blocking accept() returns and sees it.
@@ -225,18 +272,23 @@ fn run() -> io::Result<()> {
     let _ = i2pnet::sam::poke_listener(listen_port);
     join_before(acceptor, TEARDOWN_GRACE);
 
+    let gave_up = echo_gave_up.load(Ordering::Relaxed);
     report(
-        n,
-        wall,
-        tries.load(Ordering::Relaxed),
-        unfinished,
+        &Run {
+            n,
+            wall,
+            tried: tries.load(Ordering::Relaxed),
+            dialed,
+            unfinished,
+            gave_up,
+        },
         &mut connects,
         &mut rtts,
         &failures,
     );
     // Printed under the numbers rather than in place of them: the table is the
     // measurement, this is the reading of it.
-    if accepted.load(Ordering::Relaxed) == 0 && (unfinished > 0 || connects.is_empty()) {
+    if accepted.load(Ordering::Relaxed) == 0 && (unfinished > 0 || rtts.is_empty()) {
         explain_silent_forward();
     }
     // Unfinished first: it is the more specific diagnosis. "Everything failed"
@@ -246,17 +298,54 @@ fn run() -> io::Result<()> {
         return Err(unfinished_error(
             unfinished,
             n,
+            dialed,
             tries.load(Ordering::Relaxed),
             deadline_budget,
-            &connects,
+            &rtts,
         ));
     }
-    if connects.is_empty() {
+    if rtts.is_empty() {
         return Err(io::Error::other(
             "every stream failed — see the failures above",
         ));
     }
     Ok(())
+}
+
+/// Drain dialer events until every stream reaches a terminal state or the
+/// deadline passes, returning connects, round-trips, and failure texts.
+///
+/// Collected by deadline rather than by joining the dialer threads: a thread
+/// blocked in a read on a live stream cannot be interrupted, so waiting on one
+/// is how a harness hangs. A stream still in flight when the clock runs out is
+/// simply absent from the terminal counts, and the caller reports it as
+/// unfinished — with its connect time already banked here.
+fn collect_events(
+    rx: &mpsc::Receiver<Event>,
+    n: usize,
+    deadline: Instant,
+) -> (Vec<Duration>, Vec<Duration>, Vec<String>) {
+    let mut connects = Vec::with_capacity(n);
+    let mut rtts = Vec::with_capacity(n);
+    let mut failures = Vec::new();
+    while rtts.len() + failures.len() < n {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            // Not terminal: the stream dialed and is now echoing. Banked here
+            // so the connect distribution covers every dial that happened, not
+            // only those whose echo also beat the deadline.
+            Ok(Event::Connected(connect)) => connects.push(connect),
+            Ok(Event::Echoed(rtt)) => rtts.push(rtt),
+            Ok(Event::Failed(e)) => failures.push(e),
+            // Out of time, or every sender is gone and nothing further can
+            // arrive. Either way there is nothing left to wait for.
+            Err(_) => break,
+        }
+    }
+    (connects, rtts, failures)
 }
 
 /// The whole-run budget from `CLOVE_STRESS_DEADLINE` (seconds), or
@@ -396,11 +485,33 @@ fn report_lookup(dial: &SamSession, what: &str, expect: DestHash) -> bool {
     }
 }
 
-/// One dial + echo exchange, timed. `connect`/`rtt` are measured from the
-/// successful attempt, so warmup retries do not inflate the reported latency.
-struct Sample {
-    connect: Duration,
-    rtt: Duration,
+/// What a dialer thread reports, as it happens.
+///
+/// Two messages rather than one result, because the single-result shape hid
+/// the measurement R2 actually wants. A stream that dialed in 400 ms and was
+/// still echoing at the deadline used to be counted "unfinished" with its
+/// connect time discarded, so the connect percentiles described only streams
+/// whose echo *also* finished in time — a survivorship filter that made a
+/// congested router look like it had a tight, healthy dial path. Reporting the
+/// connect the moment it happens makes the dial distribution cover every dial.
+enum Event {
+    /// The dial returned; the stream now exists and is echoing.
+    Connected(Duration),
+    /// The echo came back and matched, `Duration` measured from dial start.
+    Echoed(Duration),
+    /// Terminal failure, already rendered for the report.
+    Failed(String),
+}
+
+/// Counts and timings for one whole run, grouped so [`report`] takes an
+/// argument list a reader can hold in their head.
+struct Run {
+    n: usize,
+    wall: Duration,
+    tried: u32,
+    dialed: usize,
+    unfinished: usize,
+    gave_up: u32,
 }
 
 /// `attempts` is a shared counter rather than a field of [`Sample`], because
@@ -411,28 +522,49 @@ struct Sample {
 /// attempts, and sends the reader looking in entirely the wrong place. A
 /// counter bumped before each attempt is visible whatever the thread goes on
 /// to do, including nothing.
-fn dial_once(dialer: &SamSession, target: DestHash, tries: &AtomicU32) -> io::Result<Sample> {
+fn dial_once(
+    dialer: &SamSession,
+    target: DestHash,
+    tries: &AtomicU32,
+    tx: &mpsc::SyncSender<Event>,
+) {
     let deadline = Instant::now() + warmup_deadline(run_deadline());
-    let (mut stream, connect, start) = loop {
+    let (mut stream, start) = loop {
         tries.fetch_add(1, Ordering::Relaxed);
         let start = Instant::now();
         match dialer.dial(target, STREAM_TIMEOUT) {
-            Ok(stream) => break (stream, start.elapsed(), start),
+            Ok(stream) => {
+                // Reported before the echo is attempted: this is the fact R2
+                // turns on, and it must survive a stream that never echoes.
+                let _ = tx.send(Event::Connected(start.elapsed()));
+                break (stream, start);
+            }
             Err(_) if Instant::now() < deadline => thread::sleep(RETRY_BACKOFF),
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _ = tx.send(Event::Failed(e.to_string()));
+                return;
+            }
         }
     };
 
-    let payload = vec![0xA5u8; PAYLOAD_LEN];
-    stream.write_all(&payload)?;
-    let mut back = vec![0u8; PAYLOAD_LEN];
-    stream.read_exact(&mut back)?;
-    let rtt = start.elapsed();
-
-    if back != payload {
-        return Err(io::Error::other("echoed bytes did not match what was sent"));
-    }
-    Ok(Sample { connect, rtt })
+    let len = payload_len();
+    let payload = vec![0xA5u8; len];
+    let mut back = vec![0u8; len];
+    let outcome = stream
+        .write_all(&payload)
+        .and_then(|()| stream.read_exact(&mut back))
+        .map_err(|e| e.to_string())
+        .and_then(|()| {
+            if back == payload {
+                Ok(start.elapsed())
+            } else {
+                Err("echoed bytes did not match what was sent".to_owned())
+            }
+        });
+    let _ = tx.send(match outcome {
+        Ok(rtt) => Event::Echoed(rtt),
+        Err(e) => Event::Failed(e),
+    });
 }
 
 /// Accept up to `n` inbound streams and echo `PAYLOAD_LEN` bytes on each, one
@@ -447,9 +579,17 @@ fn dial_once(dialer: &SamSession, target: DestHash, tries: &AtomicU32) -> io::Re
 /// with this thread still blocked must still be able to say whether the router
 /// ever forwarded anything, and that answer is the whole diagnosis when it did
 /// not (see [`explain_silent_forward`]).
-fn echo_server(listener: &SamListener, n: usize, stop: &AtomicBool, arrived: &AtomicU32) {
+fn echo_server(
+    listener: &SamListener,
+    n: usize,
+    stop: &AtomicBool,
+    arrived: &AtomicU32,
+    gave_up: &Arc<AtomicU32>,
+    echo_budget: Duration,
+) {
     let mut handlers = Vec::with_capacity(n);
     let mut accepted = 0usize;
+    let mut exhausted = 0u32;
     while accepted < n && !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             // A connection that never sent its destination header is not an
@@ -467,14 +607,44 @@ fn echo_server(listener: &SamListener, n: usize, stop: &AtomicBool, arrived: &At
                 // A handler holds a loopback socket, so its waits are
                 // genuinely boundable — do it, or a peer that connects and
                 // says nothing parks this thread for the run.
-                let _ = stream.set_timeouts(Some(ECHO_TIMEOUT));
+                let _ = stream.set_timeouts(Some(echo_budget));
+                let gave_up = Arc::clone(gave_up);
                 handlers.push(thread::spawn(move || {
                     let mut stream = stream;
-                    let mut buf = vec![0u8; PAYLOAD_LEN];
+                    let mut buf = vec![0u8; payload_len()];
                     if stream.read_exact(&mut buf).is_ok() {
-                        let _ = stream.write_all(&buf);
+                        if stream.write_all(&buf).is_err() {
+                            gave_up.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        gave_up.fetch_add(1, Ordering::Relaxed);
                     }
                 }));
+            }
+            // Running out of descriptors is the operator's `ulimit -n`, not
+            // the router's verdict, and it is recoverable: handlers finishing
+            // hand their descriptors back. Stopping the whole listener on the
+            // first one turned a partial limit into a total loss — every
+            // remaining dial then had nothing to accept it, and a run reported
+            // 1024 identical failures about a machine that ran out of files.
+            Err(e) if is_fd_exhaustion(&e) => {
+                exhausted += 1;
+                if exhausted == 1 {
+                    eprintln!(
+                        "sam-stress: out of file descriptors at {accepted} accepted stream(s) \
+                         ({e}). Each stream costs two — raise `ulimit -n` (N={n} wants about \
+                         {} plus headroom) or lower N. Continuing with what fits.",
+                        2 * n + 16
+                    );
+                }
+                if exhausted > FD_RETRY_LIMIT {
+                    eprintln!(
+                        "sam-stress: still out of descriptors after {FD_RETRY_LIMIT} retries; \
+                         listener stopping."
+                    );
+                    break;
+                }
+                thread::sleep(RETRY_BACKOFF);
             }
             Err(e) => {
                 if !stop.load(Ordering::Relaxed) {
@@ -549,25 +719,39 @@ fn explain_silent_forward() {
 /// deadline arrived told us nothing except that it was sitting there, and
 /// folding the two together would hide exactly the symptom worth chasing.
 #[allow(clippy::too_many_arguments, reason = "a report of eight numbers")]
-fn report(
-    n: usize,
-    wall: Duration,
-    attempts: u32,
-    unfinished: usize,
-    connects: &mut [Duration],
-    rtts: &mut [Duration],
-    failures: &[String],
-) {
+fn report(run: &Run, connects: &mut [Duration], rtts: &mut [Duration], failures: &[String]) {
     connects.sort_unstable();
     rtts.sort_unstable();
-    let ok = connects.len();
+    let n = run.n;
+    let ok = rtts.len();
 
     println!("── sam-stress: {n} concurrent streams ──");
-    println!("  succeeded : {ok}/{n}");
+    // Dialed first: it is the control-plane number, and the one that stays
+    // meaningful when the echoes are still in flight.
+    println!(
+        "  dialed    : {}/{n} (the stream was established)",
+        run.dialed
+    );
+    println!("  echoed    : {ok}/{n} (…and carried {} bytes back)", {
+        payload_len()
+    });
     println!("  failed    : {}", failures.len());
-    println!("  unfinished: {unfinished} (still running when the deadline hit)");
-    println!("  dial tries: {attempts} (> succeeded ⇒ leaseSet-warmup retries)");
-    println!("  wall clock: {:.2}s", wall.as_secs_f64());
+    println!(
+        "  unfinished: {} (dialed, echo still in flight at the deadline)",
+        run.unfinished
+    );
+    if run.gave_up > 0 {
+        println!(
+            "  we hung up: {} (our echo handler timed out mid-stream — these \
+             show as the dialer's `failed to fill whole buffer`)",
+            run.gave_up
+        );
+    }
+    println!(
+        "  dial tries: {} (> dialed ⇒ leaseSet-warmup retries)",
+        run.tried
+    );
+    println!("  wall clock: {:.2}s", run.wall.as_secs_f64());
     if !connects.is_empty() {
         println!(
             "  connect ms: min {} · p50 {} · p90 {} · p99 {} · max {}",
@@ -577,6 +761,8 @@ fn report(
             millis(pct(connects, 99.0)),
             millis(pct(connects, 100.0)),
         );
+    }
+    if !rtts.is_empty() {
         println!(
             "  rtt ms    : min {} · p50 {} · p90 {} · p99 {} · max {}",
             millis(pct(rtts, 0.0)),
@@ -586,30 +772,84 @@ fn report(
             millis(pct(rtts, 100.0)),
         );
     }
-    for (i, f) in failures.iter().enumerate() {
-        if i < 10 {
-            println!("  fail[{i}] : {f}");
+    report_failures(failures);
+    println!("{}", result_line(run, connects, rtts, failures.len()));
+}
+
+/// Failures, grouped by text with a count.
+///
+/// A run that hits the descriptor limit produces a thousand identical lines,
+/// of which the report used to print ten and then "… 1014 more failures" —
+/// hiding whether those 1014 were the same thing or fourteen different things.
+/// The distinct causes are what a reader needs; the multiplicity is one number.
+fn report_failures(failures: &[String]) {
+    let mut grouped: Vec<(&str, usize)> = Vec::new();
+    for f in failures {
+        if let Some(entry) = grouped.iter_mut().find(|(text, _)| *text == f.as_str()) {
+            entry.1 += 1;
+        } else {
+            grouped.push((f.as_str(), 1));
         }
     }
-    if failures.len() > 10 {
-        println!("  … {} more failures", failures.len() - 10);
+    grouped.sort_by(|a, b| b.1.cmp(&a.1));
+    for (text, count) in grouped.iter().take(10) {
+        if *count == 1 {
+            println!("  fail      : {text}");
+        } else {
+            println!("  fail ×{count:<4}: {text}");
+        }
     }
+    if grouped.len() > 10 {
+        println!("  … {} further distinct failures", grouped.len() - 10);
+    }
+}
+
+/// One stable, greppable line per run, for `ci/sam-stress-sweep.sh`.
+///
+/// A sweep that scraped the pretty table would break the first time a column
+/// was reworded — and this table has been reworded twice. Keys are explicit so
+/// a field can be added without shifting the ones already there.
+fn result_line(run: &Run, connects: &[Duration], rtts: &[Duration], failed: usize) -> String {
+    // An empty sample reports -1 rather than 0: a run where nothing dialed has
+    // no median, and a 0 there would average into a sweep's table as if it
+    // were an impossibly fast connect.
+    let stat = |xs: &[Duration], p: f64| -> String {
+        if xs.is_empty() {
+            "-1".to_owned()
+        } else {
+            millis(pct(xs, p)).to_string()
+        }
+    };
+    format!(
+        "sam-stress-result\tn={}\tdialed={}\techoed={}\tfailed={}\tunfinished={}\tgave_up={}\t\
+         tries={}\tconnect_p50_ms={}\tconnect_p99_ms={}\trtt_p50_ms={}\twall_s={:.2}\tpayload={}",
+        run.n,
+        run.dialed,
+        rtts.len(),
+        failed,
+        run.unfinished,
+        run.gave_up,
+        run.tried,
+        stat(connects, 50.0),
+        stat(connects, 99.0),
+        stat(rtts, 50.0),
+        run.wall.as_secs_f64(),
+        payload_len(),
+    )
 }
 
 fn millis(d: Duration) -> u128 {
     d.as_millis()
 }
 
-/// Why streams were still running when the clock ran out, with the arithmetic
-/// that usually explains it.
+/// Why streams were still running when the clock ran out — and, first, *which
+/// half* ran out of time, because the two have opposite answers.
 ///
-/// Dial *setup* serializes per session (`PROTOCOL.i2p-bt` §2.6a: yosemite's
-/// sync connect takes `&mut self`, so `SamSession::dial` holds the session
-/// mutex for the whole connect). A run therefore needs roughly N times one
-/// connect, which turns any fixed budget into a silent ceiling on N — at N=128
-/// even a brisk 3s connect wants 384s, more than the default allows. Spelling
-/// that out here stops the reader diagnosing a router for what is the harness's
-/// own arithmetic.
+/// Streams that never dialed point at the router: no peers, no tunnels, an
+/// unresolvable target. Streams that dialed and are still moving payload point
+/// at the budget and the payload size, and say nothing about the router's
+/// willingness to carry streams. Reporting both as "not completing dials" sent
+/// an operator to check tunnels on a router that had established all 128.
 #[allow(
     clippy::cast_precision_loss,
     reason = "stream counts are small; this is a printed estimate"
@@ -617,30 +857,46 @@ fn millis(d: Duration) -> u128 {
 fn unfinished_error(
     unfinished: usize,
     n: usize,
+    dialed: usize,
     tried: u32,
     budget: Duration,
-    connects: &[Duration],
+    rtts: &[Duration],
 ) -> io::Error {
-    let arithmetic = median(connects).map_or_else(String::new, |c| {
-        let need = c.as_secs_f64() * n as f64;
+    // Which half ran out of time decides where the reader should look, and the
+    // two have opposite answers. This used to say "is not completing dials"
+    // unconditionally and then append arithmetic from PROTOCOL 2.6a's
+    // per-session dial serialization — an entry marked [superseded by §2.12]
+    // since dials stopped going through yosemite. It was the *second* piece of
+    // code left shaped around that removed constraint, which is the exact cost
+    // §2.6a stayed in the file to warn about. The observation that caught it:
+    // thirty concurrent dials landing within a 5 ms band, which no serialized
+    // queue produces.
+    let diagnosis = if dialed >= n {
+        let pace = median(rtts).map_or_else(String::new, |r| {
+            format!(
+                " Completed echoes took a median of {:.0}s each, so the payload \
+                 is the cost here, not the dialing — shrink it with \
+                 CLOVE_STRESS_PAYLOAD to measure the dial path alone.",
+                r.as_secs_f64()
+            )
+        });
         format!(
-            " Dial setup serializes per session (PROTOCOL.i2p-bt 2.6a), so {n} \
-             streams need about {need:.0}s at the observed connect time — {}the \
-             budget was {}s.",
-            if need > budget.as_secs_f64() {
-                "more than "
-            } else {
-                ""
-            },
-            budget.as_secs()
+            "every stream dialed — all {n} established — and {unfinished} were \
+             still moving payload when the deadline hit. That is throughput, \
+             not a router refusing streams: raise CLOVE_STRESS_DEADLINE, or \
+             lower the payload.{pace}"
         )
-    });
+    } else {
+        format!(
+            "only {dialed} of {n} streams established. The router accepted the \
+             session but is not completing dials — check it has peers and built \
+             tunnels, and see the leaseSet lookup above: if that failed, the \
+             target is unreachable rather than slow."
+        )
+    };
     io::Error::other(format!(
         "{unfinished} of {n} streams had not finished after {}s ({tried} dial \
-         attempts made). The router accepted the session but is not completing \
-         dials — check it has peers and built tunnels, and see the leaseSet \
-         lookup above: if that failed, the target is unreachable rather than \
-         slow. Raise CLOVE_STRESS_DEADLINE if it is merely slow.{arithmetic}",
+         attempts made): {diagnosis}",
         budget.as_secs()
     ))
 }
@@ -727,6 +983,60 @@ mod tests {
             waited < Duration::from_secs(5),
             "join_before waited {waited:?} on a thread that sleeps for 30s"
         );
+    }
+
+    /// The sweep greps this line, so its keys are a contract. Adding a field is
+    /// fine; renaming or reordering one silently empties a column of
+    /// `ci/sam-stress-sweep.sh`'s table, which is the kind of break that looks
+    /// like a bad run rather than a bad parse.
+    #[test]
+    fn the_result_line_carries_every_key_the_sweep_reads() {
+        let run = Run {
+            n: 32,
+            wall: Duration::from_secs_f64(360.0),
+            tried: 33,
+            dialed: 32,
+            unfinished: 2,
+            gave_up: 1,
+        };
+        let connects = [Duration::from_millis(419), Duration::from_millis(423)];
+        let rtts = [Duration::from_millis(78_394)];
+        let line = result_line(&run, &connects, &rtts, 0);
+
+        for key in [
+            "n=32",
+            "dialed=32",
+            "echoed=1",
+            "failed=0",
+            "unfinished=2",
+            "gave_up=1",
+            "tries=33",
+            "connect_p50_ms=",
+            "connect_p99_ms=",
+            "rtt_p50_ms=78394",
+            "wall_s=360.00",
+            "payload=",
+        ] {
+            assert!(line.contains(key), "result line is missing {key}: {line}");
+        }
+        assert!(line.starts_with("sam-stress-result\t"));
+    }
+
+    /// A run with nothing to measure must not report a zero, which a sweep
+    /// would average in as an impossibly fast connect.
+    #[test]
+    fn an_empty_sample_reports_minus_one_not_zero() {
+        let run = Run {
+            n: 4,
+            wall: Duration::from_secs(1),
+            tried: 4,
+            dialed: 0,
+            unfinished: 0,
+            gave_up: 0,
+        };
+        let line = result_line(&run, &[], &[], 4);
+        assert!(line.contains("connect_p50_ms=-1"), "{line}");
+        assert!(line.contains("rtt_p50_ms=-1"), "{line}");
     }
 
     /// …and it still returns promptly when the thread does stop, rather than
