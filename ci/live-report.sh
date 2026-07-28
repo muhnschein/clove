@@ -71,7 +71,14 @@ SWARM_SEED=${SWARM_SEED:-900}
 # release link, the report the probe prints on its way out). Every nested
 # deadline in this script derives from the one it contains.
 READY_DEADLINE=${READY_DEADLINE:-240}
-STEP_SLACK=60
+# The margin has to cover everything the probe does *outside* its own budget:
+# a cargo release build, session setup, and the bounded teardown it now waits
+# through (sam-stress's TEARDOWN_GRACE) before it prints. It was 60s, and an
+# i2pd probe with a 240s budget was killed at 300s with its report already
+# computed and unprinted — a TIMEOUT row where an honest "unfinished 1" was one
+# second away. A backstop that fires before the thing it backs up is not a
+# backstop.
+STEP_SLACK=150
 OUT=""
 LINES=250
 BRING_UP=no
@@ -261,6 +268,28 @@ container_of() {
         emissary) echo systemd-emissary ;;
         *) echo "" ;;
     esac
+}
+
+# Does this router run in a container, i.e. in a network namespace that is not
+# ours? Everything that needs the *inbound* half turns on this.
+#
+# `STREAM FORWARD` carries no HOST= and clove's forwarded listener is bound to
+# 127.0.0.1, so the router connects back to whatever address our SAM control
+# connection appears to come from — the same address only when the router
+# shares our namespace (docs/LIVE-TESTING.md §3.1). A containerized router
+# therefore dials out perfectly well and can never hand us an inbound stream.
+#
+# This is not a subtlety worth rediscovering per run. A whole matrix sweep once
+# reported FAIL for every containerized router — readiness, the loopback tier,
+# every stress level, and half the cross pairs — while `make swarm` was
+# downloading happily against those same routers minutes earlier. The swarm
+# tier only needs the outbound half; these tiers need both. Skipping with the
+# reason beats a red row that means nothing.
+is_containerised() {
+    # Not named `container`: this runs inside the router loop, which holds that
+    # name, and POSIX sh has no locals.
+    _ctr=$(container_of "$1")
+    [ -n "$_ctr" ] && podman container exists "$_ctr" 2>/dev/null
 }
 
 # ---------------------------------------------------------------- environment
@@ -488,6 +517,25 @@ for r in $ROUTERS; do
         continue
     fi
 
+    # Everything from here down dials a destination whose listener is on *this*
+    # router, so all of it needs the inbound half — which a containerized router
+    # cannot give us (see `is_containerised`). Say so once and move on, rather
+    # than spending READY_DEADLINE proving it again and filing six red rows
+    # about clove for a namespace boundary.
+    if is_containerised "$r"; then
+        skip "$r: readiness (one stream)" \
+            "router runs in a container — the inbound path needs a shared netns (§3.1)"
+        skip "$r: live tests" "needs the inbound half; see above"
+        for n in $STRESS; do
+            skip "$r: sam-stress N=$n" "needs the inbound half; see above"
+        done
+        note ""
+        note "To test the inbound half against this router, run clove inside its"
+        note "network namespace:  podman run --network=container:$container …"
+        note "or use a host-installed router. LIVE-TESTING.md §3.1 has the detail."
+        continue
+    fi
+
     # One dial before many. A router that cannot carry a single stream will
     # not carry sixteen, and finding that out costs four minutes here versus
     # five minutes per stress level below.
@@ -556,6 +604,18 @@ if [ -z "$live_routers" ] || [ "$(echo $live_routers | wc -w)" -lt 2 ]; then
     skip "cross-router" "needs two routers answering; have:${live_routers:- none}"
 else
     for a in $live_routers; do
+        # Only the *listener's* router needs the inbound half, so a
+        # containerized router is still a perfectly good dialer. Skipping the
+        # pair rather than the router keeps the half of the matrix that a
+        # host-installed listener can still answer.
+        if is_containerised "$a"; then
+            for b in $live_routers; do
+                [ "$a" = "$b" ] && continue
+                skip "cross: listen $a, dial $b" \
+                    "listener is in a container — needs a shared netns (§3.1)"
+            done
+            continue
+        fi
         for b in $live_routers; do
             [ "$a" = "$b" ] && continue
             step "cross: listen $a, dial $b" "$((READY_DEADLINE + STEP_SLACK))" \
