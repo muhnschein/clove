@@ -71,9 +71,12 @@ remote peer dialing our destination: `STREAM FORWARD` and our leaseSet reaching
 the wider netDb, the half of `PROTOCOL.i2p-bt` §2.5 that no router-free test
 can reach. M1 and M3 are met on those two routers.
 
-**Not proven:** the multi-hour seed soak, a router restart mid-transfer, and
-`sam-stress` at the higher concurrency levels that answer R2. Those are what
-stands between here and the 0.1 interop sign-off.
+**Also proven, on i2pd:** `sam-stress` to 200 concurrent streams on one
+session, twice over — the R2 question, answered in the negative and closed in
+`SCOPE.md` §7. The dial path does not degrade with concurrency (§2.6e).
+
+**Not proven:** the multi-hour seed soak, and a router restart mid-transfer.
+Those are what stands between here and the 0.1 interop sign-off.
 
 **Not reachable in this environment:** the inbound half against a containerized
 router (§3.1), and with it every tier that needs a listener of ours — the
@@ -454,11 +457,17 @@ something fails and you need to know what it was supposed to prove.
       containerized routers here it fails on the listening side and measures
       nothing; `ci/live-report.sh` now skips it there rather than filing a red
       row.
-      *First data, i2pd 2.61.0, 2026-07-28:* dial latency is sub-second and
-      flat from N=32 to N=128 (p50 419→596 ms, p99 within 10 ms of p50), so
-      the control plane shows no degradation over that range. Recorded in
-      `PROTOCOL.i2p-bt` §2.6a with its caveats; it wants re-taking with the
-      sweep before it is written into §6.3 as a result.
+      **Answered, i2pd 2.61.0, 2026-07-28** (`PROTOCOL.i2p-bt` §2.6e): two
+      sweeps, 30 runs with results, **every one dialled N of N** — ~1,580
+      streams from N=1 to N=200, no dial failures. Connect p50 ranges overlap
+      completely across levels and do not order by N (an N=128 run connected
+      faster than any of the six N=1 runs), and p99 sits within ~10 ms of p50
+      across up to 200 dials in a single run. One sweep ran against a machine with another
+      I2P client at full load and is indistinguishable from the quiet one.
+      The dial path does not degrade with concurrency.
+      What remains open is not R2 but §2.6f: i2pd's SAM bridge stopped
+      answering at the top of both ladders, which is why 200 has one run of six
+      rather than six.
 - [x] Inbound: a forwarded peer's derived `DestHash` reconciles with the hash it
       was dialed at (confirms §2.5, §1.3); §2.5 → [decided]. **i2pd, 2026-07-28**
       — `inbound-peer` on three runs (11, 2 and 2 remote peers). Only on the
@@ -539,8 +548,8 @@ client works", and because they no longer depend on the loopback rows passing.
 | Survives router restart mid-transfer | | | |
 | Cross-router dial (`make cross`) | unfinished at 240s — 2026-07-28 | n/a as listener — §3.1 | n/a as listener — §3.1 |
 | Two-instance loopback download, both directions | | n/a — §3.1 | n/a — §3.1 |
-| `sam-stress` 16/32/64 | | n/a — §3.1 | n/a — §3.1 |
-| `sam-stress` 128/200 | | n/a — §3.1 | n/a — §3.1 |
+| `sam-stress` 16/32/64 | **ok** — 2.61.0, 2026-07-28, 17/17 runs dialled N of N | n/a — §3.1 | n/a — §3.1 |
+| `sam-stress` 128/200 | **128 ok** — 6/6 runs dialled 128 of 128. 200: one run of six, the other five blocked by the SAM bridge (§2.6f) | n/a — §3.1 | n/a — §3.1 |
 
 † **Version not recorded at all.** The 20.4 MiB runs further down predate
 `--router-version`. Left as they are: an undated, unversioned "works" is worth
@@ -703,9 +712,10 @@ from now.
 **M1** closes on: router boots, a remote peer dialed us (the inbound half of
 §2.5, whose dest-hash reconciliation is what accepting the peer *is*),
 survives a router restart mid-transfer, a dial succeeds — cross-router or
-loopback, either settles it — and `sam-stress` at 16/32/64. **M3** closes on
-the four swarm rows plus the announce quirks and the soak. `sam-stress`
-128/200 is R2's ceiling and informs tuning; it is not a release gate.
+loopback, either settles it — and `sam-stress` at 16/32/64, **which is done on
+i2pd** (§2.6e). **M3** closes on the four swarm rows plus the announce quirks
+and the soak. `sam-stress` 128/200 is R2's ceiling and informs tuning; it is
+not a release gate, and 128 is done on i2pd too.
 
 A row that fails on one router and passes on the others is a finding to file,
 not a reason to stop: record it, open the issue, and carry on with the other
@@ -968,10 +978,17 @@ sign-off, cheapest first:
    measurable without one, and it is configuration rather than code.
 2. **A router restart mid-transfer** (§6.1), which is the one M1 box no swarm
    run can tick for you.
-3. **`sam-stress` at 16/32/64/128/200** — R2's ceiling, and the only
-   instrument that answers it. Needs item 1.
-4. **The multi-hour seed soak** (§6.2) — worth settling the post-completion
+3. **The multi-hour seed soak** (§6.2) — worth settling the post-completion
    peer decay noted in §6.3 first, or the soak will measure an empty swarm.
+4. **§2.6f, if it recurs**: i2pd's SAM bridge stopped answering at the top of
+   both stress ladders. Watch `systemctl --user status i2pd` across the next
+   sweep — whether the router exited or only its bridge stopped decides
+   between an upstream bug report and a local limit. Not a release gate, and
+   not something a torrent client's usage pattern provokes (§2.6f), but it is
+   the one open question the sweeps raised.
+
+*`sam-stress` at 16/32/64/128/200 has left this list: R2 is answered (§2.6e),
+and the ladder is a regression instrument now rather than an open question.*
 
 emissary is off this list (`DECISIONS.md` S1). It is welcome back when it
 reaches a stable release: `make router-addressbook`, then `make swarm

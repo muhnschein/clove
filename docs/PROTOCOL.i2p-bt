@@ -166,6 +166,76 @@ for another week, is worth more than a tidy file.
       because one run per level cannot distinguish a curve from noise. Note
       the non-monotonic success rate above, which is what noise looks like.
 
+    2.6e [decided] **R2 is answered in the negative: one SAM session's dial
+      path does not degrade with concurrency, at least to N=200 on i2pd
+      2.61.0.** Two sweeps, 2026-07-28, host-installed i2pd, both sessions on
+      the one router — the first with another I2P torrent client running at
+      full load, the second on a quiet machine.
+
+      **30 runs produced a result, and every one dialed N of N.** About 1,580
+      streams from N=1 to N=200; not one dial failed. Connect latency by level,
+      p50 range across runs:
+
+          N=1     332–2149 ms        N=64     437–2238 ms
+          N=16    237–2806 ms        N=128    254–4827 ms
+          N=32    265–5209 ms        N=200         384 ms
+
+      The ranges overlap completely and do not order by N. An N=128 run
+      connected in 254 ms, faster than every one of the six N=1 runs (332 ms at
+      best); the slowest run of either sweep (5209 ms) was N=32. Within any
+      single run, p99 sits within ~10 ms of p50 across as many as 200 dials. So
+      dial latency is set by the router's tunnel state when the run starts, not
+      by how many streams are in flight — which is what a control plane that is
+      not degrading looks like.
+
+      The contended sweep and the quiet one are indistinguishable in both
+      connect and echo timings. Competing local load was not the variable; the
+      per-run tunnel build was.
+
+      **This makes SAM-under-concurrency an unlikely explanation for XD-style
+      flakiness**, and leaves §2.12 (the shared session controller poisoning
+      itself on an unexpected stream reply) the better candidate. R2 in
+      SCOPE §7 can close; the ladder stays as a regression instrument.
+
+      What did *not* survive is the echo half — see §2.6f. That is throughput
+      and session stability, not the dial path, and the two are worth keeping
+      apart because only one of them was ever R2's question.
+
+
+    2.6f [open] i2pd 2.61.0's SAM bridge becomes unstable under sustained
+      session churn, in two forms observed across the 2026-07-28 sweeps.
+
+      **Whole-session collapse mid-run.** Several runs ended early with *every*
+      accepted stream broken at once — N=32 with 32/32, N=64 with 43/44, N=32
+      again with 31/32 — each after ~100–175s against a 360s budget. Streams do
+      not independently break simultaneously; that is the listening session
+      going away and taking its forwarded streams with it. sam-stress now says
+      so explicitly rather than reporting N separate stream failures.
+
+      **The bridge stops answering entirely.** Both sweeps died at the top of
+      the ladder. First sweep: N=64 run 2 got no answer to SESSION CREATE after
+      201s, recovered for run 3, then N=200 run 2 had the bridge close the
+      connection during SESSION CREATE and run 3 got `Connection refused`.
+      Second sweep: all three N=200 runs failed, the first during SESSION
+      CREATE and the next two with `Connection refused` after 0s — nothing
+      listening on 7656 at all.
+
+      `Connection refused` is not a router declining 200 streams; it is no
+      process on the port. Whether i2pd exited or only its bridge stopped is
+      unresolved — the sweeps do not capture router liveness, and nobody looked
+      while it was down. **Next run should watch `systemctl --user status
+      i2pd` (or the console on 7070) across the ladder**, because the answer
+      picks between an i2pd bug worth reporting upstream and a local resource
+      limit.
+
+      Each sam-stress run creates two fresh destinations, so a full sweep asks
+      the router for ~36 of them inside an hour, most abandoned. That churn is
+      the obvious suspect and is not what a torrent client does — clove holds
+      one identity for its lifetime (Q4). So this is a finding about the
+      harness's usage pattern before it is a finding about clove's, and it
+      should not be read as a limit on peer concurrency: the same sweeps
+      dialled 200 concurrent streams on a single session without losing one.
+
 
     2.6b [assumed] A freshly created transient destination is briefly
       unreachable: a dial to it returns STREAM STATUS RESULT=CANT_REACH_PEER
