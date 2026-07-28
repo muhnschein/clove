@@ -133,6 +133,39 @@ for another week, is worth more than a tidy file.
       a sweep working exactly as written. **A superseded constraint needs its
       dependants found, not just its entry annotated.**
 
+      And it had a second dependant, found 2026-07-28 — after the warning
+      above was written, in the harness that measures this entry.
+      `sam-stress`'s "unfinished" diagnosis multiplied N by the median connect
+      time and told the operator how long a serialized ladder would need,
+      citing §2.6a. Nothing serializes any more, so the arithmetic described a
+      constraint that had not existed for weeks, on the one screen an operator
+      reads when a stress run disappoints. Removed; the message now reports
+      which half ran out of time instead of predicting a queue.
+
+      The measurement that caught it, i2pd 2.61.0, host-installed, both
+      sessions on the one router:
+
+          N     dialed   connect p50   connect spread
+          16      3/16         24 ms         6–28 ms
+          32     30/32        419 ms       418–423 ms
+          64     11/64        598 ms       597–601 ms
+          128    31/128       596 ms       589–605 ms
+
+      Thirty concurrent dials landing inside a 5 ms band is not a queue: a
+      serialized one would fan out across N×d. Sub-second and flat from 32 to
+      128 also says the SAM control plane does not degrade over that range —
+      the R2 question — which makes control-plane collapse an unlikely
+      explanation for XD-style flakiness and leaves §2.12 the better candidate.
+
+      Two caveats, both being addressed rather than argued with. The `dialed`
+      column above is reconstructed: the harness only reported a connect when
+      the *echo* also completed, so those distributions describe survivors and
+      could hide slow dials entirely. That is fixed — connect is now reported
+      when the dial returns — and the numbers want re-taking with `make
+      sam-sweep`, which runs the ladder repeatedly into one file precisely
+      because one run per level cannot distinguish a curve from noise. Note
+      the non-monotonic success rate above, which is what noise looks like.
+
 
     2.6b [assumed] A freshly created transient destination is briefly
       unreachable: a dial to it returns STREAM STATUS RESULT=CANT_REACH_PEER
