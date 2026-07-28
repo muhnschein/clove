@@ -1,6 +1,7 @@
 # Live-router testing — the tiers, the environment, and the interop matrix
 
-**Status:** M1 and M3 are met on i2pd and Java I2P; emissary's column is open.
+**Status:** M1 and M3 are met on i2pd and Java I2P — the two routers 0.1 gates
+on. emissary is tracked but no longer gating (`DECISIONS.md` S1).
 The results, per router and dated, are the matrix in §6.3 — that table is the
 point of this document, and everything else here exists to fill it in.
 
@@ -30,8 +31,9 @@ make report ARGS="--up --swarm magnet:?…"   # all of it, into one file (§5.3)
 ```
 
 All three routers in `SCOPE.md` §6 — i2pd, Java I2P and emissary — have a
-quadlet and run side by side on different SAM ports (§5.1); 0.1 needs the
-sign-off on all of them, and §6.3 is the table to record it in.
+quadlet and run side by side on different SAM ports (§5.1). **0.1 needs the
+sign-off on i2pd and Java I2P**; emissary is recorded but not gating, per
+`DECISIONS.md` S1. §6.3 is the table all of it goes in.
 
 ## 0. Why the swarm tier comes first
 
@@ -63,15 +65,25 @@ usually the better subject than anything this repo can start for you.
 The results matrix is §6.3; this is the summary it rolls up to.
 
 **Proven live, on i2pd and Java I2P:** a full download from a public i2psnark
-swarm, peers acquired over PEX beyond the tracker's set, payload served back,
-and a remote peer dialing our destination — which is `STREAM FORWARD` and our
-leaseSet reaching the wider netDb, the half of `PROTOCOL.i2p-bt` §2.5 that no
-router-free test can reach. M1 and M3 are met on those two routers.
+swarm — twice each, at 20.4 MiB and at 286 MiB — peers acquired over PEX beyond
+the tracker's set, and payload served back to real leechers. On i2pd, also a
+remote peer dialing our destination: `STREAM FORWARD` and our leaseSet reaching
+the wider netDb, the half of `PROTOCOL.i2p-bt` §2.5 that no router-free test
+can reach. M1 and M3 are met on those two routers.
 
-**Not proven:** emissary end to end (§7a — its address book, not clove), the
-multi-hour seed soak, a router restart mid-transfer, and `sam-stress` at the
-higher concurrency levels that answer R2. Those are what stands between here
-and the 0.1 interop sign-off.
+**Not proven:** the multi-hour seed soak, a router restart mid-transfer, and
+`sam-stress` at the higher concurrency levels that answer R2. Those are what
+stands between here and the 0.1 interop sign-off.
+
+**Not reachable in this environment:** the inbound half against a containerized
+router (§3.1), and with it every tier that needs a listener of ours — the
+loopback download, `sam-stress`, and the cross pairs whose listener is a
+container. These need a host-installed router or clove inside the router's
+namespace; they are blocked on the test rig, not on clove.
+
+**No longer gating:** emissary end to end. Its 0.4.0 fails naming in two
+independent ways (§6.3), it is experimental upstream, and 0.1 now signs off on
+i2pd and Java I2P — `DECISIONS.md` S1, with the condition for putting it back.
 
 Worth keeping in view: every defect that has mattered was found *here*, not in
 CI, and the unit suite was green through all of them. That is the argument for
@@ -102,9 +114,60 @@ loop.
 
 **(b) was implemented**, and confirmed live: a forwarded peer's derived
 dest-hash reconciles with its dialed hash, and remote peers have dialed us on
-both i2pd and Java I2P. The loopback listener is an allowed IP-socket
-construction site inside `i2pnet`, and the `DestHash` derivation reuses `addr`,
-already tested against RFC 4648 vectors.
+i2pd. The loopback listener is an allowed IP-socket construction site inside
+`i2pnet`, and the `DestHash` derivation reuses `addr`, already tested against
+RFC 4648 vectors.
+
+Only on i2pd, and §3.1 is why: the host-installed i2pd is the only router in
+this environment that *can* forward to us. An earlier revision of this section
+claimed both i2pd and Java I2P, which its own §6.3 row contradicted.
+
+### 3.1 The inbound half needs a shared network namespace
+
+`SamListener::forward` binds its loopback listener to `127.0.0.1` and issues:
+
+```
+STREAM FORWARD ID=<nick> PORT=<port> SILENT=false
+```
+
+with **no `HOST=`**. Per SAMv3 the router then connects back to the address it
+sees our SAM control connection arriving from. That is our loopback only when
+the router shares our network namespace. **A router in a podman container does
+not.** It dials peers correctly, accepts the inbound stream, and then cannot
+hand it over. emissary says so in its own log, once per attempt:
+
+```
+emissary::streaming: inbound stream accepted local=… remote=… payload_len=0
+emissary::streaming: failed to open tcp stream to forwarded listener
+```
+
+This is a deployment constraint, not a passing bug, and it is deliberate:
+binding `0.0.0.0` and naming a routable `HOST=` would put a listening socket on
+a real interface, which is exactly what `SCOPE.md` §5 Layer 1 constrains. The
+supported shapes are a **host-installed router**, or **clove inside the
+router's namespace**:
+
+```
+podman run --network=container:systemd-i2p-java …
+```
+
+What it costs, and where it shows up:
+
+- **`make swarm` is unaffected in the main.** A download needs only the
+  outbound half — dial peers, leech, serve on connections we opened. The
+  inbound half is a bonus, and its absence shows up as one blank
+  `inbound-peer` milestone. This is why the swarm tier passes against
+  containerized routers that every tier below it fails.
+- **`router-ready`, `test-live`, `sam-stress` and the cross pairs need both
+  halves.** Each dials a destination whose listener is ours, so a containerized
+  router fails all of them — with symptoms (`failed to fill whole buffer`,
+  streams that never finish) that look like router or clove faults and are
+  neither. `ci/live-report.sh` now detects this and skips those steps with the
+  reason instead of filing red rows; `sam-stress` says so directly when not one
+  forwarded stream arrives.
+- **Java I2P's empty `inbound-peer` row in §6.3 is this**, not the
+  `EXT_PORT`/firewalled note in §6.6. Its container cannot receive a forward.
+  Judge that row again from a Java router that shares clove's namespace.
 
 
 ## 4. Bucket 1 — buildable now, no router (landed)
@@ -151,8 +214,8 @@ teardown dance:
 | ROUTER | Implementation | Image | SAM (host) | Console |
 |---|---|---|---|---|
 | `i2pd` | C++ (deployment target, P0) | `docker.io/purplei2p/i2pd` | 127.0.0.1:**7656** | 127.0.0.1:7070 |
-| `java` | Java I2P (the reference, P1) | `docker.io/geti2p/i2p` | 127.0.0.1:**7666** | 127.0.0.1:7657 |
-| `emissary` | Rust (young SAM, P0) | built here, no registry image | 127.0.0.1:**7676** | none; read the log |
+| `java` | Java I2P (the reference, P0) | `docker.io/geti2p/i2p` | 127.0.0.1:**7666** | 127.0.0.1:7657 |
+| `emissary` | Rust (young SAM, P2, not gating) | built here, no registry image | 127.0.0.1:**7676** | none; read the log |
 
 Inside every container SAM is on 7656; only the published host port differs, so
 nothing but `CLOVE_SAM_PORT` changes between routers — which is exactly what
@@ -337,15 +400,16 @@ Run against routers in `SCOPE.md` §6 priority order. Each run records its
 findings straight into `PROTOCOL.i2p-bt`, flipping [assumed]/[open] entries to
 [decided] (or filing a new observation when the router surprises us).
 
-**Router order:** i2pd (P0, deployment target) → emissary (P0, young SAM, expect
-bugs on both sides, coordinate upstream) → Java I2P (P1, reference).
+**Router order:** i2pd (P0, deployment target) → Java I2P (P0, reference) →
+emissary (P2, tracked, expect bugs on both sides, coordinate upstream).
 
 The order is about where to spend attention, not what to skip: **the checklists
-below are per-router and 0.1 needs all three.** A finding on one router is not
-a finding until you know whether the other two agree — that is the whole value
-of having a reference implementation (Java I2P) in the matrix. When they
+below are per-router, and 0.1 needs both P0 routers.** A finding on one router
+is not a finding until you know whether the other agrees — that is the whole
+value of having a reference implementation (Java I2P) in the matrix. When they
 disagree, Java I2P is presumed right and the deviation goes in
-`PROTOCOL.i2p-bt` naming the router.
+`PROTOCOL.i2p-bt` naming the router. emissary's results are recorded on the
+same terms and gate nothing (`DECISIONS.md` S1).
 
 Run `make matrix` to sweep all three; the per-router detail below is for when
 something fails and you need to know what it was supposed to prove.
@@ -354,19 +418,27 @@ something fails and you need to know what it was supposed to prove.
 
 - [ ] `sam-stress` completes at 16/32/64/128/200 concurrent streams on one
       session; latency distribution and any failure cliff recorded (R2, §2.6).
+      **Needs a router in clove's own network namespace** — §3.1. Against the
+      containerized routers here it fails on the listening side and measures
+      nothing; `ci/live-report.sh` now skips it there rather than filing a red
+      row.
 - [x] Inbound: a forwarded peer's derived `DestHash` reconciles with the hash it
       was dialed at (confirms §2.5, §1.3); §2.5 → [decided]. **i2pd, 2026-07-28**
-      — `inbound-peer` on two runs (11 and 2 remote peers).
+      — `inbound-peer` on three runs (11, 2 and 2 remote peers). Only on the
+      host-installed router, and §3.1 is why.
 - [ ] Two-instance loopback download completes **both directions** on i2pd.
+      Same §3.1 constraint: both instances need the router to forward to them.
 - [ ] Kill-router-mid-transfer: `systemctl --user restart i2pd` (or `podman
       restart`) during a transfer; torrents show "waiting for router", the
       supervisor rebuilds the session tree on backoff, and the transfer
       **completes** without a restart of clove. Confirms `supervisor` §3.1/§3.2
       against a real router.
-- [ ] The above pass on emissary; deltas from i2pd noted. **Java I2P sanity
-      pass: done, 2026-07-28** — a full swarm download, faster to a session
-      than either other router. emissary is blocked before the swarm on its
-      address book (§7a), not on anything in this list.
+- [x] **Java I2P pass: done, 2026-07-28** — two full swarm downloads, faster to
+      a session than either other router, PEX and bytes served. Its one blank
+      is `inbound-peer`, which §3.1 accounts for and which no amount of clove
+      work would change while the router sits in a container.
+      *(emissary is no longer on this list: `DECISIONS.md` S1. Its deltas are
+      still worth recording in §6.3 when a run happens.)*
 - [x] Layer 2 is actually on: `cloved`'s startup line reads
       `sandbox: landlock enforced; seccomp filter installed`, and everything
       above still passes with it enforced. **Confirmed on every live run** —
@@ -418,24 +490,80 @@ Rows are ordered by what they prove, not by which tier they came from. The
 swarm rows are first because they are the ones a user would recognise as "the
 client works", and because they no longer depend on the loopback rows passing.
 
-| Check | i2pd | Java I2P | emissary |
+| Check | i2pd | Java I2P | emissary (not gating) |
 |---|---|---|---|
-| Router boots, SAM answers | ok — 2.61.0, 2026-07-28 | ok — 2026-07-28 † | ok — 2026-07-28 † |
-| **Public i2psnark swarm: full download** (`download-complete`) | **ok** — 2.61.0, 226s | **ok** — 286s, 2026-07-28 † | blocked before the swarm — see below |
-| **PEX acquisition observed** (`pex_peers > 0`) | **ok** — 2.61.0, 68 peers | not seen in 1086s | |
-| **Bytes served to a swarm peer** (`bytes-served`) | not yet — see below | not yet — see below | |
-| **A remote peer dialed us** (`inbound-peer`, §2.5) | **ok** — 2.61.0, 11 peers | not seen in 1086s | |
+| Router boots, SAM answers | ok — 2.61.0, 2026-07-28 | ok — 2026-07-28 ‡ | ok — 0.4.0, 2026-07-28 |
+| **Public i2psnark swarm: full download** (`download-complete`) | **ok** — 2.61.0, 226s and 4450s | **ok** — 286s and 4345s, 2026-07-28 ‡ | blocked before the swarm — see below |
+| **PEX acquisition observed** (`pex_peers > 0`) | **ok** — 2.61.0, 68 peers | **ok** — 2 peers at 76s, 2026-07-28 ‡ | |
+| **Bytes served to a swarm peer** (`bytes-served`) | **ok** — 2.61.0, 95.0 MiB | **ok** — 54.0 MiB, 2026-07-28 ‡ | |
+| **A remote peer dialed us** (`inbound-peer`, §2.5) | **ok** — 2.61.0, 11 and 2 peers | not reachable in this environment — §3.1 | |
 | Announce quirks confirmed (§5.1, §5.4) | | | |
 | Multi-hour seed soak | | | |
 | Survives router restart mid-transfer | | | |
-| Cross-router dial (`make cross`) | | | |
-| Two-instance loopback download, both directions | | | |
-| `sam-stress` 16/32/64 | | | |
-| `sam-stress` 128/200 | | | |
+| Cross-router dial (`make cross`) | unfinished at 240s — 2026-07-28 | n/a as listener — §3.1 | n/a as listener — §3.1 |
+| Two-instance loopback download, both directions | | n/a — §3.1 | n/a — §3.1 |
+| `sam-stress` 16/32/64 | | n/a — §3.1 | n/a — §3.1 |
+| `sam-stress` 128/200 | | n/a — §3.1 | n/a — §3.1 |
 
-† **Version not recorded.** These runs predate `--router-version`; the cells
-are honest about what is known rather than guessing. Pass it on any run whose
-result goes in this table.
+† **Version not recorded at all.** The 20.4 MiB runs further down predate
+`--router-version`. Left as they are: an undated, unversioned "works" is worth
+little, and rewriting it to look better would be worth less.
+
+‡ **Version approximate.** The Java rows come from a container whose image tag
+is `:latest` (digest `b06b16a5fc4ea3d1853`, log line `Starting I2P
+2.12.0-17-rc`); the cells stay honest about the difference between a digest and
+a version. `ci/router-version.sh` now also asks a *host-installed* binary, so
+i2pd names itself without `--router-version`.
+
+**`n/a — §3.1`** is not a failure and not "not yet run". Those rows need the
+inbound half, and every containerized router in this environment is
+structurally unable to provide it. They become runnable against a
+host-installed router, or clove inside the router's namespace.
+
+**A 286 MiB torrent, three routers, one sweep — 2026-07-28.** Same magnet
+(an audiobook `.m4b`, 286.1 MiB, 1145 pieces), same commit, all three started
+within 80 seconds of each other:
+
+| | router-connected | metadata | complete | served | inbound | PEX |
+|---|---|---|---|---|---|---|
+| i2pd 2.61.0 (host) | 30s | 45s | **4450s** | **95.0 MiB** | **2** | 1 |
+| Java I2P ‡ (container) | 16s | 31s | **4345s** | **54.0 MiB** | 0 — §3.1 | 2 |
+| emissary 0.4.0 (container) | 15s | — | — | — | — | — |
+
+Both completions re-verified 1145/1145 pieces against the metainfo.
+
+**Do not read the two completion times against each other.** Three routers and
+three daemons shared one box and one swarm for the whole run: ~66 KiB/s each,
+against ~140 KiB/s for the same client alone on the 20.4 MiB run below. The
+number this table wants from a sweep is *whether* it completed; throughput
+needs a run that is not competing with itself.
+
+**`bytes-served` closed, and the swarm was the culprit all along.** That row
+was empty on all three routers, and the note below argued the cause was the
+torrent — an I2P router update is close to all-seeds, and seeds do not request
+from seeds — recording it as *untested, not failing* and asking for a re-run
+against real leechers. This is that re-run: bytes moved at **105s on i2pd and
+46s on Java**, both long before completion, i.e. ordinary reciprocation while
+still leeching. The diagnosis held.
+
+**Java I2P's PEX row closed with it** (2 peers at 76s, against "not seen in
+1086s" previously), which also answers the note below about the second i2pd run
+seeing neither PEX nor an inbound peer: a third run saw both. Swarm-dependent,
+as suspected, not a trend.
+
+**Transfer overhead at scale:** 286.2 MiB moved for 286.1 MiB of torrent —
+about 0.04%, against 2.5% on the 20.4 MiB run and 45% before the request
+deadline (§4.7). The picker holds at fourteen times the size.
+
+**What the seeding windows did *not* show.** Upload flatlined at completion on
+both routers — i2pd sat at 95.0 MiB for the whole 890s window, Java climbed to
+54.0 MiB in the first 90s and then stopped — while attached peers decayed from
+7 toward 0–3 and `known_peers` stayed at 13–14. postman's interval is half an
+hour, so at most one announce falls inside a 15-minute window and no fresh
+peers arrive; that is the innocent reading and probably the right one. It is
+still worth settling before the multi-hour soak, because a soak against a swarm
+that drains in fifteen minutes measures nothing: check whether the seeding path
+re-dials from the known/PEX set as connections drop.
 
 **Two of three routers carry a full download, 2026-07-28.** Same magnet
 (`i2pupdate-2.13.0.su3`, 20.4 MiB, 82 pieces), same commit, back to back:
@@ -468,20 +596,33 @@ Fix it router-side (subscribe the address book) or sidestep it with a `b32`
 tracker URL; see the troubleshooting section above. Re-run before reading this
 row as anything about clove.
 
+*Updated 2026-07-28: an operator ran `make router-addressbook` before a sweep
+and hit the identical `KeyNotFound`, because the address book is only half of
+it.* The same sweep showed emissary 0.4.0 failing `NAMING LOOKUP` for its **own
+freshly created b32 destinations** — no address book involved, since a b32 is a
+hash resolved through the netDb — which `sam-stress` reported as *"neither b32
+resolves, including the dialer's own"*. Two independent naming failures, plus
+the same-router leaseSet failure of §2.8, none of them clove's. That is the
+evidence behind `DECISIONS.md` S1, which moves emissary out of the 0.1 gate
+until it reaches a stable release; its column stays, and stays recorded.
+
 **`bytes-served` is still empty on all three, and the evidence now points away
-from clove.** The Java run announced twice — `announces_ok 2`, so the
-`completed` announce of §5.6 did go out — and still served nothing across 900s
-of seeding. With the tracker correctly told there is a new seed, what remains
-is the swarm: an I2P router update is close to all-seeds, and seeds do not
-request from seeds. Peers decayed toward zero after completion on both routers,
-which is what a swarm of seeds does with a peer that has just said it wants
-nothing. **Test this row against a torrent with real leechers**; until then it
-is untested, not failing.
+from clove.** *(Superseded 2026-07-28 by the 286 MiB sweep above, which closed
+this row on both routers. Kept because the reasoning was the useful part and it
+turned out to be right.)* The Java run announced twice — `announces_ok 2`, so
+the `completed` announce of §5.6 did go out — and still served nothing across
+900s of seeding. With the tracker correctly told there is a new seed, what
+remains is the swarm: an I2P router update is close to all-seeds, and seeds do
+not request from seeds. Peers decayed toward zero after completion on both
+routers, which is what a swarm of seeds does with a peer that has just said it
+wants nothing. **Test this row against a torrent with real leechers**; until
+then it is untested, not failing.
 
 Also worth watching, not yet a finding: the second i2pd run saw no PEX and no
 inbound peer where the first saw 68 and 11. One run each is not a trend, the
 second was cut short at 603s, and both numbers depend on the swarm rather than
-on us — but if a third run is also empty, that is worth chasing.
+on us — but if a third run is also empty, that is worth chasing. *(Answered
+2026-07-28: the third run saw both. Swarm-dependent, not a trend.)*
 
 **First completed download from a live swarm — i2pd 2.61.0, 2026-07-28.**
 `i2pupdate-2.13.0.su3`, 20.4 MiB in 82 pieces, from postman's tracker:
@@ -529,11 +670,11 @@ loopback, either settles it — and `sam-stress` at 16/32/64. **M3** closes on
 the four swarm rows plus the announce quirks and the soak. `sam-stress`
 128/200 is R2's ceiling and informs tuning; it is not a release gate.
 
-A row that fails on one router and passes on the other two is a finding to
-file, not a reason to stop: record it, open the issue, and carry on with the
-other checks. A loopback row that fails while the swarm rows are green is a
-finding about the *router*, not about clove — §0 and `PROTOCOL.i2p-bt` §2.8
-are why.
+A row that fails on one router and passes on the others is a finding to file,
+not a reason to stop: record it, open the issue, and carry on with the other
+checks. A loopback row that fails while the swarm rows are green is a finding
+about the *router* — or about the test rig, if the router is containerized
+(§3.1) — not about clove. §0 and `PROTOCOL.i2p-bt` §2.8 are why.
 
 ### 6.4 Before spending 500 seconds on *tier 2*: `make router-ready`
 
@@ -588,6 +729,12 @@ for what sits above it and none of the earlier ones implies the later:
 A router that passes 1–3 and fails 4 is a perfectly good router for clove; it
 just cannot host the loopback test. A router that fails 3 is warming up,
 firewalled, or has no peers — and in none of those cases is clove the subject.
+
+**Gate 0, which is about the rig rather than the router:** can it reach a
+listener of ours at all? A containerized router cannot (§3.1), and it fails
+gate 4 for that reason alone — no matter how healthy it is. Check this first,
+because it is the one gate a better router will never pass. `ci/live-report.sh`
+checks it for you and skips gates 4 and up with the reason.
 
 ### 6.6 Do not test a firewalled router if you can avoid it
 
@@ -779,14 +926,20 @@ cold router N attempts run back-to-back at ~60s each. Confirm reachability with
 Bucket 1 has landed in full. What stands between here and the 0.1 interop
 sign-off, cheapest first:
 
-1. **emissary end to end** — `make router-addressbook`, then `make swarm
-   TORRENT=… ROUTER=emissary`. Its SAM layer has been fine since the first
-   run; only name resolution has ever blocked it (§7a).
+1. **A router that shares clove's network namespace** — a host-installed Java
+   I2P, or clove run inside a container's netns (§3.1). Nothing below this is
+   measurable without one, and it is configuration rather than code.
 2. **A router restart mid-transfer** (§6.1), which is the one M1 box no swarm
    run can tick for you.
 3. **`sam-stress` at 16/32/64/128/200** — R2's ceiling, and the only
-   instrument that answers it.
-4. **The multi-hour seed soak** (§6.2).
+   instrument that answers it. Needs item 1.
+4. **The multi-hour seed soak** (§6.2) — worth settling the post-completion
+   peer decay noted in §6.3 first, or the soak will measure an empty swarm.
+
+emissary is off this list (`DECISIONS.md` S1). It is welcome back when it
+reaches a stable release: `make router-addressbook`, then `make swarm
+TORRENT=… ROUTER=emissary`, and if it carries a download it returns to the
+gate.
 
 Findings from any of these go into `PROTOCOL.i2p-bt`, results into §6.3 with
 the router version.

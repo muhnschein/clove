@@ -13,9 +13,11 @@ Every defect that has mattered was found by running it against a real router
 and a real swarm; none was reachable from a router-free test, and the unit
 suite was green through all of them. They are recorded in
 [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt), each with the test that catches
-it now. Before 0.1: the interop sign-off across all three routers
-([`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) §6.3), where emissary's column
-is still open.
+it now. Before 0.1: the interop sign-off on i2pd and Java I2P
+([`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) §6.3). emissary is tracked in
+the same table but no longer gates the release, and
+[`docs/DECISIONS.md`](docs/DECISIONS.md) S1 says why and what would change it
+back.
 
 ## Documents
 

@@ -115,7 +115,8 @@ Exit (M4 demo): daily-drivable daemon+CLI against a local router.
   with real EXAMPLES. `PROTOCOL.i2p-bt` consolidated. `SECURITY.md`.
 - systemd unit (Layer 3) + network-namespace recipe; chaos suite in CI
   (SIGKILL during state write, disk-full); long seed soak; interop matrix
-  sign-off (i2pd/emissary/Java I2P × i2psnark/BiglyBT/XD).
+  sign-off (i2pd/Java I2P × i2psnark/BiglyBT/XD — emissary recorded but not
+  gating, `DECISIONS.md` S1).
 
 Exit: 0.1 release criteria per SCOPE §9 (signed tag, green interop matrix).
 
