@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 i2pnet = { path = "../i2pnet" }
 sha1 = "0.11"
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
 [lints]
 workspace = true

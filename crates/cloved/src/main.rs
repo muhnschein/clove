@@ -118,8 +118,22 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    // `0700`, not the umask's opinion. The token and the destination key live
+    // here and are `0600` themselves, but a traversable directory is one
+    // `chmod` accident away from mattering, and nothing else needs to look
+    // inside it. Applied on an existing directory too: an install that was
+    // created before this, or by a permissive umask, is the case worth fixing.
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|e| format!("creating data dir {}: {e}", config.data_dir.display()))?;
+    if let Err(e) = std::fs::set_permissions(
+        &config.data_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    ) {
+        eprintln!(
+            "cloved: could not restrict {} to 0700: {e}",
+            config.data_dir.display()
+        );
+    }
     if let Some(parent) = config.api_socket.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating socket dir {}: {e}", parent.display()))?;
@@ -250,7 +264,18 @@ impl Identity {
     /// truncated file rather than a stale session id.
     fn load(&self) -> Option<String> {
         let path = self.path.as_ref()?;
-        let text = std::fs::read_to_string(path).ok()?;
+        let text = match read_private_file(path) {
+            Ok(Some(text)) => text,
+            Ok(None) => return None,
+            Err(e) => {
+                eprintln!(
+                    "cloved: not using the destination key in {}: {e}; starting with \
+                     a new identity",
+                    path.display()
+                );
+                return None;
+            }
+        };
         let key = text.trim();
         if is_private_key_blob(key) {
             return Some(key.to_owned());
@@ -286,17 +311,36 @@ impl Identity {
     }
 }
 
+/// Smallest private key material that can follow a destination in a SAM
+/// key blob: a 256-byte private encryption key, then a private signing key,
+/// of which the shortest defined is DSA-SHA1's 20 bytes.
+///
+/// A lower bound rather than an exact size on purpose. The exact figure depends
+/// on the signing type named in the destination's certificate — 32 bytes for
+/// Ed25519, 20 for DSA, more for the ECDSA and `RedDSA` families — and a table of
+/// those is a thing to get out of date, which for a check like this means
+/// refusing a key that was perfectly good. The bound catches what actually goes
+/// wrong (truncation, and a destination stored where a key belongs) without
+/// pretending to know more than it does.
+const MIN_PRIVATE_KEY_BYTES: usize = 256 + 20;
+
 /// Whether `text` is a SAM private key blob: I2P base64 that decodes to a
 /// complete destination *plus* the private key material behind it.
 ///
-/// The length check is the one that matters. A destination alone is a perfectly
-/// well-formed thing to find in this file and completely useless as a
-/// `DESTINATION=` — it is the public half, and a router cannot sign with it.
+/// A destination alone is a perfectly well-formed thing to find in this file and
+/// completely useless as a `DESTINATION=` — it is the public half, and a router
+/// cannot sign with it. So was "a destination and one byte", which is what this
+/// used to accept: any trailing byte at all passed, and the resulting blob was
+/// handed to `SESSION CREATE` on every attempt, refused every time, and retried
+/// for the life of the process — §2.9's back-off-into-the-same-refusal, reached
+/// by a file that was checked and found wanting-but-acceptable.
 fn is_private_key_blob(text: &str) -> bool {
     let Some(bytes) = i2pnet::addr::i2p_base64_decode(text) else {
         return false;
     };
-    i2pnet::addr::destination_len(&bytes).is_some_and(|dest| bytes.len() > dest)
+    i2pnet::addr::destination_len(&bytes)
+        .and_then(|dest| bytes.len().checked_sub(dest))
+        .is_some_and(|private| private >= MIN_PRIVATE_KEY_BYTES)
 }
 
 /// Supervise the SAM session in the background: connect on the reconnect
@@ -492,8 +536,29 @@ pub(crate) struct FetchRound {
 }
 
 impl FetchRound {
+    /// Record a failure against something safe to name — a tracker hostname is
+    /// published in the torrent that carried it and is nobody's identity.
     fn fail(&mut self, stage: &str, what: &str, e: &dyn std::fmt::Display) {
         let text = format!("{stage} {what}: {e}");
+        eprintln!("cloved: metadata fetch: {text}");
+        self.last_error = Some(text);
+    }
+
+    /// Record a failure against a *peer*, without saying which one.
+    ///
+    /// The obvious thing to write here is the peer's b32, and it is what this
+    /// did. `SECURITY.md` puts a peer's destination reaching "logs, error
+    /// messages, or the local API" in the leak class, and this reached all
+    /// three: straight to stderr, and kept in `last_error`, which `clove list`
+    /// serves. A tracker chooses which peers we dial, so a tracker chooses
+    /// which destinations end up recorded next to our torrent.
+    ///
+    /// Truncating or hashing it would not help — a b32 *is* the hash of the
+    /// destination, and a stable tag stays linkable. So the peer is not named
+    /// at all. The stage and the error survive, which is the part that says
+    /// what to do next, and `peers_tried` already says how many there were.
+    fn fail_peer(&mut self, stage: &str, e: &dyn std::fmt::Display) {
+        let text = format!("{stage}: {e}");
         eprintln!("cloved: metadata fetch: {text}");
         self.last_error = Some(text);
     }
@@ -607,7 +672,7 @@ where
         let stream = match i2pnet::I2pDialer::dial(&ctx.dialer, peer, Duration::from_secs(120)) {
             Ok(stream) => stream,
             Err(e) => {
-                round.fail("dialing peer", &peer.to_b32(), &e);
+                round.fail_peer("dialing a peer", &e);
                 continue;
             }
         };
@@ -616,7 +681,7 @@ where
                 let bytes = clove_core::magnet::torrent_bytes(&meta.raw_info, &ctx.trackers);
                 return (Some(bytes), round);
             }
-            Err(e) => round.fail("fetching metadata from", &peer.to_b32(), &e),
+            Err(e) => round.fail_peer("fetching metadata from a peer", &e),
         }
     }
     (None, round)
@@ -987,9 +1052,11 @@ fn is_well_formed_token(token: &str) -> bool {
 /// because it was never a complete token, so replacing it costs nothing.
 fn load_or_create_token(data_dir: &Path) -> std::io::Result<String> {
     let path = data_dir.join("token");
-    match std::fs::read_to_string(&path) {
-        Ok(existing) if is_well_formed_token(existing.trim()) => Ok(existing.trim().to_owned()),
-        Ok(_) => {
+    match read_private_file(&path) {
+        Ok(Some(existing)) if is_well_formed_token(existing.trim()) => {
+            Ok(existing.trim().to_owned())
+        }
+        Ok(Some(_)) => {
             eprintln!(
                 "cloved: {} is not a well-formed API token (empty or truncated?); \
                  generating a new one",
@@ -997,8 +1064,16 @@ fn load_or_create_token(data_dir: &Path) -> std::io::Result<String> {
             );
             write_new_token(&path)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => write_new_token(&path),
-        Err(e) => Err(e),
+        Ok(None) => write_new_token(&path),
+        // Refused for being unsafe rather than malformed: replacing it silently
+        // would be the wrong move, because a token that has been world-readable
+        // must be assumed known and the operator needs to hear that they had
+        // one. Fatal, so the daemon does not come up serving an API whose token
+        // somebody else may hold.
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", path.display()),
+        )),
     }
 }
 
@@ -1011,6 +1086,77 @@ fn write_new_token(path: &Path) -> std::io::Result<String> {
     let token = registry::hex(&raw);
     write_private_file(path, token.as_bytes())?;
     Ok(token)
+}
+
+/// Read a secret file, refusing one that is not safe to treat as a secret.
+///
+/// `Ok(None)` means it is not there, which is how both callers say "first run".
+///
+/// New files are created `0600` by [`write_private_file`], so a clean first run
+/// is private and this checks nothing that was not already true. What it catches
+/// is a file that arrived some *other* way — restored from a backup that did not
+/// preserve modes, copied by hand, unpacked from an archive, or written by a
+/// migration — and reading such a file back without looking means the API token
+/// or the client's stable identity can sit at `0644` for anyone on the machine
+/// to take. `SECURITY.md` names both disclosures in scope.
+///
+/// The checks are: opened with `O_NOFOLLOW`, so a symlink here is refused rather
+/// than followed somewhere unexpected; and then `fstat` on the descriptor we
+/// actually hold — not a second look at the path, which could by then be a
+/// different file — requiring a regular file, owned by this process's effective
+/// user, with no group or other permission bits.
+///
+/// Refuses rather than repairs. A `0644` token has been readable for as long as
+/// it has existed and must be assumed known; quietly `chmod`-ing it to `0600`
+/// would hide that while changing nothing about who has already read it. The
+/// operator gets told, and can delete it to have a fresh one generated.
+///
+/// # Errors
+///
+/// A symlink, a non-regular file, the wrong owner, group/other permission bits,
+/// or any read error other than the file being absent.
+fn read_private_file(path: &Path) -> std::io::Result<Option<String>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let refused = |what: String| std::io::Error::new(std::io::ErrorKind::PermissionDenied, what);
+
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // `O_NOFOLLOW` on a symlink reports ELOOP, which has no stable
+        // `ErrorKind`; say what it means rather than passing the number on.
+        Err(e) if e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
+            return Err(refused("it is a symbolic link".to_owned()));
+        }
+        Err(e) => return Err(e),
+    };
+
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(refused("it is not a regular file".to_owned()));
+    }
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(refused(format!(
+            "it is owned by uid {}, not by this daemon",
+            meta.uid()
+        )));
+    }
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(refused(format!(
+            "its mode is {mode:04o}; a secret must not be readable by anyone else \
+             (delete it and a new one will be generated)"
+        )));
+    }
+
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(Some(text))
 }
 
 /// Write `contents` to `path` atomically and privately: a `0600` temp file,
@@ -1618,6 +1764,18 @@ mod tests {
         }
     }
 
+    /// Write a secret fixture the way the daemon writes one: `0600`.
+    ///
+    /// The default umask gives `0644`, which `read_private_file` now refuses —
+    /// correctly, and these fixtures stand in for files clove itself created.
+    /// A test that wrote them world-readable would be asserting against a state
+    /// the daemon never produces.
+    fn write_secret_fixture(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, contents).expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+
     #[test]
     fn a_malformed_token_file_is_replaced_not_trusted() {
         use std::os::unix::fs::PermissionsExt;
@@ -1632,7 +1790,7 @@ mod tests {
         ] {
             let dir = TempDir::new(&format!("bad-token-{what}"));
             let path = dir.0.join("token");
-            std::fs::write(&path, contents).expect("write");
+            write_secret_fixture(&path, contents);
             let token = load_or_create_token(&dir.0).expect("load");
             assert!(
                 is_well_formed_token(&token),
@@ -1661,7 +1819,7 @@ mod tests {
         // including a trailing newline, or every running CLI breaks.
         let dir = TempDir::new("good-token");
         let path = dir.0.join("token");
-        std::fs::write(&path, format!("{TOKEN}\n")).expect("write");
+        write_secret_fixture(&path, &format!("{TOKEN}\n"));
         assert_eq!(
             load_or_create_token(&dir.0).expect("load"),
             TOKEN,
@@ -1777,7 +1935,7 @@ mod tests {
             ),
         ] {
             let dir = TempDir::new(&format!("identity-bad-{}", what.replace(' ', "-")));
-            std::fs::write(dir.0.join("destination.key"), &contents).expect("write");
+            write_secret_fixture(&dir.0.join("destination.key"), &contents);
             assert_eq!(
                 Identity::new(&dir.0, false).load(),
                 None,
@@ -1787,8 +1945,92 @@ mod tests {
         // And the real thing still loads, or the check above is just refusing
         // everything.
         let dir = TempDir::new("identity-good");
-        std::fs::write(dir.0.join("destination.key"), &full).expect("write");
+        write_secret_fixture(&dir.0.join("destination.key"), &full);
         assert_eq!(Identity::new(&dir.0, false).load().as_deref(), Some(&*full));
+    }
+
+    /// A secret that is not private is refused, not read.
+    ///
+    /// A first run creates both files `0600`, so this is about one that arrived
+    /// another way — restored from a backup that dropped modes, copied by hand,
+    /// unpacked from an archive. Reading it anyway means the API token or the
+    /// client's stable identity has been readable by everyone on the machine and
+    /// clove never said so.
+    ///
+    /// The token case is fatal on purpose: silently rotating it would hide that
+    /// the old one had been exposed, and a daemon whose token somebody else may
+    /// hold should not come up serving the API.
+    #[test]
+    fn a_world_readable_secret_is_refused_rather_than_used() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for mode in [0o644, 0o640, 0o604, 0o666] {
+            let dir = TempDir::new(&format!("loose-token-{mode:o}"));
+            let path = dir.0.join("token");
+            std::fs::write(&path, TOKEN).expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            let err =
+                load_or_create_token(&dir.0).expect_err(&format!("a {mode:o} token was accepted"));
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("re-read").trim(),
+                TOKEN,
+                "the exposed token was replaced instead of reported"
+            );
+
+            // The identity is the same check, and declines to the transient
+            // path rather than being fatal: a daemon with no stored key still
+            // runs, it just comes back as somebody else.
+            let dir = TempDir::new(&format!("loose-key-{mode:o}"));
+            let key = dir.0.join("destination.key");
+            std::fs::write(&key, key_blob_b64()).expect("write");
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            assert_eq!(
+                Identity::new(&dir.0, false).load(),
+                None,
+                "a {mode:o} destination key was sent to the router"
+            );
+        }
+    }
+
+    /// A symlink where a secret belongs is refused rather than followed.
+    #[test]
+    fn a_symlinked_secret_is_refused() {
+        let dir = TempDir::new("linked-token");
+        let elsewhere = dir.0.join("elsewhere");
+        std::fs::write(&elsewhere, TOKEN).expect("write");
+        std::os::unix::fs::symlink(&elsewhere, dir.0.join("token")).expect("symlink");
+        let err = load_or_create_token(&dir.0).expect_err("a symlinked token was followed");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// A destination plus a stray byte is not a key, however well-formed the
+    /// destination is.
+    ///
+    /// The old check asked only that *something* followed the destination, so a
+    /// single trailing byte passed — and the result was handed to
+    /// `SESSION CREATE`, refused, and retried for the life of the process.
+    #[test]
+    fn a_destination_with_a_stray_byte_is_not_a_key() {
+        let full = key_blob_b64();
+        let bytes = i2pnet::addr::i2p_base64_decode(&full).expect("decode");
+        let dest = i2pnet::addr::destination_len(&bytes).expect("destination");
+
+        for extra in [1usize, 8, MIN_PRIVATE_KEY_BYTES - 1] {
+            let mut truncated = bytes[..dest].to_vec();
+            truncated.extend(std::iter::repeat_n(0x41, extra));
+            assert!(
+                !is_private_key_blob(&i2pnet::addr::i2p_base64_encode(&truncated)),
+                "a destination plus {extra} byte(s) was accepted as a key"
+            );
+        }
+        // The boundary, and the real thing, both pass.
+        let mut just_enough = bytes[..dest].to_vec();
+        just_enough.extend(std::iter::repeat_n(0x41, MIN_PRIVATE_KEY_BYTES));
+        assert!(is_private_key_blob(&i2pnet::addr::i2p_base64_encode(
+            &just_enough
+        )));
+        assert!(is_private_key_blob(&full));
     }
 
     #[test]

@@ -1021,12 +1021,9 @@ where
                 // component here would delete somebody else's file, which is
                 // the write-side escape pointed the other way and rather less
                 // recoverable.
-                match clove_core::storage::existing_path_beneath(&self.downloads_dir, &file.path) {
-                    Ok(Some(path)) => {
-                        let _ = fs::remove_file(&path); // deletion is best-effort
-                    }
-                    Ok(None) => {}
-                    Err(e) => eprintln!("cloved: not deleting {}: {e}", file.path.join("/")),
+                if let Err(e) = clove_core::storage::remove_beneath(&self.downloads_dir, &file.path)
+                {
+                    eprintln!("cloved: not deleting {}: {e}", file.path.join("/"));
                 }
             }
             // Best-effort: drop the torrent's now-empty top directory.
@@ -2011,6 +2008,83 @@ mod tests {
 
         fs::write(&resume_path, good.encode()).unwrap();
         assert_eq!(Registry::<MockDialer>::open(&data.0).unwrap().count(), 1);
+    }
+
+    /// A failure against a peer must not record *which* peer.
+    ///
+    /// A tracker chooses the peers we dial, so it chooses which destinations
+    /// end up written next to our torrent — and this text is not merely logged,
+    /// it is kept and served by `clove list`. `SECURITY.md` puts a peer's
+    /// destination reaching "logs, error messages, or the local API" in the
+    /// leak class, and this reached all three.
+    #[test]
+    fn a_peer_that_fails_is_not_named_in_the_recorded_error() {
+        let net = MockNet::new();
+        let (_content, bytes) = fixture("peer-name-demo");
+        let meta = MetaInfo::parse(&bytes).unwrap();
+        let info_hash = meta.info_hash.0;
+
+        // A tracker that hands back one peer nobody is listening for, so the
+        // dial fails and the round records why.
+        let dead_peer = DestHash([0x5A; 32]);
+        let tracker_ep = net.endpoint();
+        net.register_name("tracker.i2p", tracker_ep.dest());
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _from)) = tracker_ep.accept() {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).map(|n| n == 0).unwrap_or(true) {
+                        break;
+                    }
+                    head.push(byte[0]);
+                }
+                let mut body = b"d8:intervali60e5:peers32:".to_vec();
+                body.extend_from_slice(&dead_peer.0);
+                body.push(b'e');
+                let response = clove_core::http::Response::new(200, "text/plain", body);
+                let _ = std::io::Write::write_all(&mut stream, &response.encode());
+            }
+        });
+
+        let data = TempDir::new("peer-name");
+        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let ep = net.endpoint();
+        registry.attach_network(
+            ep.dialer(),
+            InboundDemux::new(8),
+            *b"-CV0001-magnetmagnet",
+            quick_swarm(),
+            "magnet-b64".to_owned(),
+        );
+        let uri = format!(
+            "magnet:?xt=urn:btih:{}&dn=nope&tr=http%3A%2F%2Ftracker.i2p%2Fannounce",
+            hex(&info_hash)
+        );
+        registry.add_magnet(&uri).unwrap();
+        let ctx = registry.fetch_context(&info_hash).unwrap().unwrap();
+        let (found, round) = crate::try_fetch_round(&ctx, info_hash, true);
+        assert!(found.is_none(), "there was nobody to fetch from");
+        assert_eq!(round.peers_tried, 1, "the peer was dialed");
+        registry.note_fetch_round(&info_hash, 1, &round);
+
+        let error = round
+            .last_error
+            .clone()
+            .expect("the round records a reason");
+        let b32 = dead_peer.to_b32();
+        let label = b32.trim_end_matches(".b32.i2p");
+        assert!(!error.contains(&b32), "the peer's address is in: {error}");
+        assert!(
+            !error.contains(label),
+            "the peer's b32 label is in: {error}"
+        );
+        // What it is *for* survives: the stage, and how many were tried.
+        assert!(error.contains("peer"), "the stage is missing from: {error}");
+
+        // And the same through the API, which is where it actually travels.
+        let listed = registry.list().encode();
+        assert!(!listed.contains(label), "a peer address reached the API");
     }
 
     /// A promotion that fails leaves the magnet exactly where it was.

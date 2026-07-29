@@ -339,7 +339,12 @@ dial through" — a distinction that cost us a debugging session once already.
 
 API tokens are redacted. I2P destinations are not, since they are what makes a
 dial traceable and the ones in a test run are transient; `--redact-dests`
-removes them if you would rather.
+removes them if you would rather — both the `.b32.i2p` form and the full base64
+destination an announce carries in `ip=`, which it used to leave behind.
+
+That distinction is the whole of it if you ever point this at a daemon holding
+your *real* persisted identity rather than a transient test one: prefer the flag
+over trusting the run to be throwaway.
 
 ### 5.4 `make test-live`
 

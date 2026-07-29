@@ -71,6 +71,30 @@ commit. Closure sizes are recorded when the dependency is actually added.
   the tree under `getrandom`, `landlock` and `seccompiler`, so this is a direct
   edge to an existing node, not a new crate. Not socket-capable in our use: we
   reference constants, and `unsafe_code = "forbid"` means we cannot call it.
+- **`rustix` 1.1** (features = `["fs", "std"]`, `default-features = false`,
+  `clove-core`) — entered 2026-07-29, closing the path-traversal finding
+  (M-01). Torrent file names are attacker-supplied, and validating them
+  lexically — no separators, no `..` — says nothing about what the filesystem
+  does with them: a symlink already sitting under the download directory turns
+  an ordinary join-and-open into a write outside it. The fix is to walk the
+  components as directory descriptors with `openat`/`mkdirat`/`unlinkat`
+  carrying `O_NOFOLLOW`, so the refusal is the kernel's and there is no window
+  between checking and acting. std has no `openat`, and `unsafe_code =
+  "forbid"` rules out calling it through `libc` ourselves — the same reasoning
+  that brought in `landlock`.
+
+  Chosen over `cap-std`, which offers the same guarantee through a much larger
+  surface (it replaces `std::fs` wholesale and pulls `rustix` in anyway).
+  Closure: `bitflags`, `linux-raw-sys` on Linux; `errno` and `windows-sys` are
+  target-gated and never compiled here. Six lockfile entries, three of them
+  built.
+
+  **Socket-capable behind a feature we do not enable.** `rustix::net` exists;
+  `default-features = false` with only `fs` and `std` leaves it out. Because
+  the capability is one word in a `Cargo.toml` away, `rustix` is listed in
+  *both* the deny and allow sets of `ci/check-net-deps.sh`, and that script now
+  also fails if any manifest turns the `net` feature on — the allowlist alone
+  would have said nothing.
 - **`getrandom` 0.2** (`cloved`) — entered Phase F. The API token and the
   peer-ID suffix are bytes straight from the OS RNG; `getrandom` is the
   maintained thin wrapper over `getrandom(2)`/`/dev/urandom`, exactly the
