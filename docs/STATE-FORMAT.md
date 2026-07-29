@@ -66,6 +66,25 @@ added the optional `sequential` flag.
 `have` and `verified` are stored separately on purpose: a crash between writing
 a piece and verifying it costs a re-verification, never false trust.
 
+Concretely, and this is what a reader is allowed to rely on:
+
+- `have` is what the engine believed in memory. A piece enters it when its
+  bytes pass SHA-1, which says nothing about whether the write reached the
+  disk.
+- `verified` is the weaker, truer claim: those pieces were hashed *and* the
+  files were `fsync`ed afterwards. It is a subset of `have` by construction,
+  and a file where it is not is refused on read.
+- `verified` advances on each persist tick (after the sync) and on a clean
+  stop, so it lags `have` by at most one tick while a torrent runs and catches
+  up when it stops. A scan sets both, because a scan hashes what it read back
+  off the disk.
+
+**On load, only `verified` is published.** Anything in `have` beyond it is
+re-verified before the torrent starts, which is what makes a crash cost a scan
+instead of a swarm being served pieces nobody checked. Writing `verified` as a
+copy of `have` — which clove did until 2026-07 — makes the field a lie and
+removes that protection entirely.
+
 The canonical encoder/decoder and its hostile-input tests live in
 `clove-core::resume`; this document tracks what that module guarantees.
 

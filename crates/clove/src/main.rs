@@ -694,8 +694,13 @@ fn request(
         headers: &[("X-Clove-Token", token)],
         body,
     };
+    // Unreachable with a well-formed token and a target we built ourselves,
+    // which is exactly why it is worth refusing rather than assuming.
+    let encoded = req.encode().ok_or_else(|| {
+        Fail::Failed("request contains a line break; refusing to send".to_owned())
+    })?;
     stream
-        .write_all(&req.encode())
+        .write_all(&encoded)
         .map_err(|e| Fail::Unreachable(format!("sending request: {e}")))?;
 
     let response = http::read_response(&mut stream, MAX_RESPONSE_BODY)

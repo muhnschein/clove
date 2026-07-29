@@ -169,6 +169,21 @@ fn run() -> Result<(), String> {
         spawn_metadata_fetch(&daemon, info_hash);
     }
 
+    // Torrents whose resume file claimed more than it could confirm — a crash,
+    // a truncated write, a bad sector, an edited state file. Each is already
+    // marked as scanning, so nothing starts it until its pass publishes. Same
+    // shape as the magnet loop above, and for the same reason: the job runs
+    // with the registry unlocked, and `run_scan` re-locks it to report.
+    let scans = lock(&daemon.registry).pending_scans();
+    for job in scans {
+        let daemon = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            if let Err(e) = run_scan(&daemon, &job) {
+                eprintln!("cloved: re-verifying after an unclean stop: {e}");
+            }
+        });
+    }
+
     spawn_sam_supervisor(
         &daemon,
         &config.sam_address,

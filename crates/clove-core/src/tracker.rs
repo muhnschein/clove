@@ -85,27 +85,6 @@ pub struct AnnounceParams<'a> {
     pub our_dest_b64: &'a str,
 }
 
-/// A tracker's announce URL, split into the pieces a request needs.
-struct AnnounceUrl<'a> {
-    host: &'a str,
-    path_and_query: &'a str,
-}
-
-/// Parse an `http://host.i2p/announce[?...]` URL.
-fn split_url(url: &str) -> Option<AnnounceUrl<'_>> {
-    let rest = url.strip_prefix("http://")?;
-    match rest.find('/') {
-        Some(i) => Some(AnnounceUrl {
-            host: &rest[..i],
-            path_and_query: &rest[i..],
-        }),
-        None => Some(AnnounceUrl {
-            host: rest,
-            path_and_query: "/",
-        }),
-    }
-}
-
 /// Build the announce request for `url`. Returns the host (for dialing) and
 /// the encoded HTTP request bytes.
 ///
@@ -113,14 +92,12 @@ fn split_url(url: &str) -> Option<AnnounceUrl<'_>> {
 ///
 /// The URL is not a parseable `http://…i2p/…` announce URL.
 pub fn build_announce(url: &str, params: &AnnounceParams) -> Result<(String, Vec<u8>), Error> {
-    // Second line of defence behind `metainfo`'s filter, and the reason the two
-    // agree exactly: a URL that reaches here from anywhere else (a resume file
-    // written by an older clove, an operator's edit) is refused rather than
-    // handed to a naming lookup.
-    if !crate::metainfo::is_i2p_tracker(url) {
-        return Err(Error::BadUrl);
-    }
-    let parsed = split_url(url).ok_or(Error::BadUrl)?;
+    // The same parse the filter uses, not a second one that agrees with it by
+    // inspection. A URL can reach here from somewhere `metainfo` never saw — a
+    // resume file written by an older clove, an operator's edit — so this is
+    // still the second line of defence it always was; it is just no longer a
+    // differently-shaped one.
+    let parsed = crate::metainfo::TrackerUrl::parse(url).ok_or(Error::BadUrl)?;
     // Preserve any query already in the announce path (e.g. postman's
     // /announce.php?...), then append ours with the right separator.
     let sep = if parsed.path_and_query.contains('?') {
@@ -128,7 +105,7 @@ pub fn build_announce(url: &str, params: &AnnounceParams) -> Result<(String, Vec
     } else {
         '?'
     };
-    let mut target = String::from(parsed.path_and_query);
+    let mut target = String::from(&parsed.path_and_query);
     target.push(sep);
     // Writing to a String is infallible; the result is intentionally ignored.
     let _ = write!(
@@ -153,11 +130,19 @@ pub fn build_announce(url: &str, params: &AnnounceParams) -> Result<(String, Vec
     let request = http::Request {
         method: "GET",
         target: &target,
-        host: parsed.host,
+        // The authority as written, port and all — that is what a `Host` header
+        // is. The *dial* uses the bare host: naming resolves a name, and a port
+        // in it makes a lookup that cannot succeed.
+        host: &parsed.authority,
         headers: &[("User-Agent", USER_AGENT)],
         body: &[],
     };
-    Ok((parsed.host.to_owned(), request.encode()))
+    // `encode` refuses a field that would break the message into more lines
+    // than we wrote. Nothing that got past `TrackerUrl::parse` can, so this is
+    // the second lock on the same door — and the one that stays shut if a
+    // future caller builds a `Request` from somewhere else.
+    let encoded = request.encode().ok_or(Error::BadUrl)?;
+    Ok((parsed.host, encoded))
 }
 
 /// The URL an encoded announce request actually asks for, reassembled from
@@ -213,6 +198,30 @@ fn redact_ip_param(target: &str) -> String {
     out
 }
 
+/// Longest tracker-supplied message clove will repeat back.
+const MAX_TRACKER_TEXT: usize = 512;
+
+/// Make tracker-supplied text safe to put in a log line or an API field.
+///
+/// The text is a stranger's, and it ends up in the daemon's stderr and in
+/// `clove list`. A newline in it forges a log line — an operator reading
+/// `cloved: …` has no way to tell which of those lines clove wrote — and a
+/// terminal escape can rewrite what the rest of the screen says. Replaced
+/// rather than stripped, so the message still reads as having had something
+/// there, and truncated because a tracker does not get to decide how much of a
+/// log it occupies.
+fn sanitise(text: &str) -> String {
+    let mut out: String = text
+        .chars()
+        .take(MAX_TRACKER_TEXT)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if text.chars().count() > MAX_TRACKER_TEXT {
+        out.push('…');
+    }
+    out
+}
+
 /// A tracker's decoded reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnnounceResponse {
@@ -247,7 +256,7 @@ pub fn parse_response(body: &[u8]) -> Result<AnnounceResponse, Error> {
         preview: preview(body),
     })?;
     if let Some(reason) = root.get(b"failure reason").and_then(Value::as_str) {
-        return Err(Error::TrackerFailure(reason.to_owned()));
+        return Err(Error::TrackerFailure(sanitise(reason)));
     }
     let interval = root
         .get(b"interval")
@@ -907,6 +916,27 @@ mod tests {
             "http://1.2.3.4:6969/announce",
             "http://evil@host.i2p/announce",
             "not a url",
+            // The shapes the two parsers used to read differently. Each was
+            // kept by the filter and then mangled by the builder: a query with
+            // no path became part of the hostname, as did a fragment, and a
+            // port reached naming lookup glued to the name.
+            "http://tracker.i2p#frag/announce",
+            "http://tracker.i2p/announce#frag",
+            "http://tracker.i2p:/announce",
+            "http://tracker.i2p:0/announce",
+            "http://tracker.i2p:99999/announce",
+            "http://tracker.i2p:80x/announce",
+            "http://.i2p/announce",
+            "http://a..i2p/announce",
+            // Control characters anywhere: the path is written into a request
+            // line verbatim and into a log line after that.
+            "http://tracker.i2p/announce\r\nX-Evil: 1",
+            "http://tracker.i2p/announce\nX-Evil: 1",
+            "http://track\rer.i2p/announce",
+            "http://tracker.i2p/ann ounce",
+            // A percent escape that is not one.
+            "http://tracker.i2p/announce?x=%zz",
+            "http://tracker.i2p/announce?x=%4",
         ] {
             assert!(!crate::metainfo::is_i2p_tracker(url), "{url}");
             assert!(
@@ -914,6 +944,119 @@ mod tests {
                 "{url} was built into an announce"
             );
         }
+    }
+
+    /// A query with no path is a query, not a hostname.
+    ///
+    /// `http://tracker.i2p?x=1` passed the filter (which cut the authority at
+    /// `?`) and was then read by the builder (which cut only at `/`) as a host
+    /// literally named `tracker.i2p?x=1` — a naming lookup that could never
+    /// resolve, failing on every announce for the life of the torrent.
+    #[test]
+    fn a_query_with_no_path_is_not_part_of_the_hostname() {
+        let (host, request) = build_announce("http://tracker.i2p?x=1", &params()).expect("built");
+        assert_eq!(host, "tracker.i2p");
+        let text = String::from_utf8(request).expect("ascii");
+        assert!(text.starts_with("GET /?x=1&info_hash="), "{text}");
+        assert!(text.contains("Host: tracker.i2p\r\n"), "{text}");
+    }
+
+    /// The dial gets the host; the `Host` header gets the authority.
+    ///
+    /// A port is meaningful to HTTP and meaningless to SAM naming, which
+    /// resolves a name to a destination. Handing it the port too — which the
+    /// old builder did, because it never separated one — is a lookup that
+    /// cannot succeed.
+    #[test]
+    fn a_port_reaches_the_host_header_but_never_the_naming_lookup() {
+        let (host, request) =
+            build_announce("http://opentracker.dg2.i2p:80/announce", &params()).expect("built");
+        assert_eq!(host, "opentracker.dg2.i2p", "the port must not be dialed");
+        let text = String::from_utf8(request).expect("ascii");
+        assert!(text.contains("Host: opentracker.dg2.i2p:80\r\n"), "{text}");
+    }
+
+    /// Nothing a `.torrent` can say puts an extra line in the request we send.
+    ///
+    /// Belt and braces, because the two halves fail independently: the URL is
+    /// refused at parse time, and the encoder refuses the request even if
+    /// something else built one.
+    #[test]
+    fn a_torrent_cannot_inject_a_header_into_our_announce() {
+        assert!(matches!(
+            build_announce("http://t.i2p/a\r\nX-Evil: 1", &params()),
+            Err(Error::BadUrl)
+        ));
+        assert!(
+            http::Request {
+                method: "GET",
+                target: "/a\r\nX-Evil: 1",
+                host: "t.i2p",
+                headers: &[],
+                body: &[],
+            }
+            .encode()
+            .is_none(),
+            "the encoder must refuse a target that breaks the message"
+        );
+        assert!(
+            http::Request {
+                method: "GET",
+                target: "/a",
+                host: "t.i2p\r\nX-Evil: 1",
+                headers: &[],
+                body: &[],
+            }
+            .encode()
+            .is_none(),
+            "…and a host that does"
+        );
+        assert!(
+            http::Request {
+                method: "GET",
+                target: "/a",
+                host: "t.i2p",
+                headers: &[("X", "1\r\nX-Evil: 1")],
+                body: &[],
+            }
+            .encode()
+            .is_none(),
+            "…and a header value that does"
+        );
+    }
+
+    /// A tracker does not get to write our log for us.
+    #[test]
+    fn a_tracker_failure_message_cannot_forge_a_log_line() {
+        let body = encode(&dict(vec![(
+            "failure reason",
+            Value::Bytes(b"nope\r\ncloved: everything is fine\x1b[2J".to_vec()),
+        )]));
+        let Err(Error::TrackerFailure(text)) = parse_response(&body) else {
+            panic!("a failure reason must surface as one");
+        };
+        assert!(
+            !text.contains('\n') && !text.contains('\r') && !text.contains('\x1b'),
+            "control characters survived: {text:?}"
+        );
+        assert!(
+            text.starts_with("nope"),
+            "the message is still readable: {text}"
+        );
+
+        // And a tracker cannot decide how much of the log it occupies.
+        let long = encode(&dict(vec![(
+            "failure reason",
+            Value::Bytes(vec![b'x'; 10_000]),
+        )]));
+        let Err(Error::TrackerFailure(text)) = parse_response(&long) else {
+            panic!("expected a failure reason");
+        };
+        assert!(
+            text.chars().count() <= MAX_TRACKER_TEXT + 1,
+            "{}",
+            text.len()
+        );
     }
 
     #[test]

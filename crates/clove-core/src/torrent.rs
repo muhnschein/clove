@@ -514,6 +514,27 @@ impl Torrent {
         lock(&self.shared.state).picker.bytes_left()
     }
 
+    /// Flush this torrent's files to disk, and report the piece set that is
+    /// durable once it returns.
+    ///
+    /// The pair is the point: a caller that fsyncs and then asks what was held
+    /// can race a piece completing in between and record it as durable when it
+    /// is not. Read after the sync, under no lock the writers need, so the
+    /// answer is a set the disk has certainly caught up with.
+    ///
+    /// # Errors
+    ///
+    /// Any filesystem error flushing the torrent's files.
+    pub fn sync_storage(&self) -> std::io::Result<Bitfield> {
+        // Snapshot first, sync second, and return the *earlier* set: anything
+        // that completed during the sync may or may not have been included, and
+        // under-claiming costs a re-verify while over-claiming costs the thing
+        // this whole mechanism exists to prevent.
+        let before = self.have();
+        self.shared.storage.sync_all()?;
+        Ok(before)
+    }
+
     /// How many pieces we want at all, held or not.
     #[must_use]
     pub fn wanted_pieces(&self) -> u32 {

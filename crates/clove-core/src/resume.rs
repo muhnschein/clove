@@ -191,6 +191,17 @@ impl Resume {
 
         let have = bitfield(&root, b"have", num_pieces)?;
         let verified = bitfield(&root, b"verified", num_pieces)?;
+        // `verified` is the subset of `have` we know passed SHA-1 against what
+        // is actually on disk (`docs/STATE-FORMAT.md`), so a bit set here and
+        // not there describes a piece that is verified but not held — which is
+        // not a state clove can be in. A file claiming it is either corrupt or
+        // written by something that did not understand the format, and either
+        // way believing it would mean trusting a piece we never fetched.
+        // Both are the same length and their spare bits are already required to
+        // be zero, so a bytewise test is the whole check.
+        if verified.iter().zip(&have).any(|(&v, &h)| v & !h != 0) {
+            return Err(Error::Invalid("verified claims a piece have does not"));
+        }
 
         let priorities = root
             .get(b"priorities")
