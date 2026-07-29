@@ -900,10 +900,17 @@ impl Write for ForwardedStream {
 impl I2pStream for ForwardedStream {
     type Reader = TcpStream;
     type Writer = TcpStream;
+    type Closer = TcpStream;
 
     fn split(self) -> io::Result<(TcpStream, TcpStream)> {
         let reader = self.inner.try_clone()?;
         Ok((reader, self.inner))
+    }
+
+    /// A duplicated descriptor onto the same loopback socket: `shutdown` on it
+    /// tears down the connection whichever half a thread is parked on.
+    fn closer(&self) -> io::Result<TcpStream> {
+        self.inner.try_clone()
     }
 
     /// Real timeouts: this is a loopback TCP socket from the router.

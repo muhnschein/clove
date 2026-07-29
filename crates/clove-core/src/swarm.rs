@@ -278,6 +278,10 @@ pub fn announce_stopped<D, N>(
             let Ok(mut stream) = dialer.dial(dest, dial_timeout) else {
                 continue;
             };
+            // Nothing joins this thread, so an unbounded exchange here is a
+            // leak nobody is even waiting to notice: one per pause, remove and
+            // shutdown, each parked on a tracker that need only stay silent.
+            let _ = stream.set_timeouts(Some(tracker::ANNOUNCE_IO_TIMEOUT));
             let _ = tracker::announce_over(&mut stream, &request);
         }
     });
@@ -433,6 +437,10 @@ where
     let mut stream = dialer
         .dial(dest, config.dial_timeout)
         .map_err(tracker::Error::Io)?;
+    // The dial timeout covered getting here; nothing covered what follows, so
+    // a tracker that accepted the stream and then went quiet held this thread
+    // — and with it this torrent's announces — for the life of the process.
+    let _ = stream.set_timeouts(Some(tracker::ANNOUNCE_IO_TIMEOUT));
     // Which destination the host resolved to, on every announce that then
     // goes wrong. A tracker answering 200 with somebody else's web page is
     // indistinguishable from a tracker that is broken, unless you can see
@@ -817,9 +825,14 @@ impl i2pnet::I2pClose for NoStream {
 impl I2pStream for NoStream {
     type Reader = NoStream;
     type Writer = NoStream;
+    type Closer = NoStream;
 
     fn split(self) -> io::Result<(NoStream, NoStream)> {
         match self {}
+    }
+
+    fn closer(&self) -> io::Result<NoStream> {
+        match *self {}
     }
 }
 

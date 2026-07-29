@@ -318,6 +318,15 @@ struct Peer {
     /// The peer's I2P destination, for peer exchange.
     dest: DestHash,
     out: SyncSender<Message>,
+    /// Ends the connection, from whichever thread drops the peer.
+    ///
+    /// Dropping `out` is not enough on its own: it wakes a writer *waiting* for
+    /// the next message, but not one already blocked inside a write to a peer
+    /// that has stopped reading — which is precisely the peer we most want
+    /// gone. Without this the table entry went away while the connection, its
+    /// two threads and its descriptor stayed, and the freed slot let the same
+    /// peer come straight back and do it again.
+    closer: Arc<dyn I2pClose + Send + Sync>,
     /// Their piece set.
     has: Bitfield,
     /// They are choking us.
@@ -772,12 +781,16 @@ impl Torrent {
         remote: DestHash,
         theirs: &Handshake,
     ) -> std::io::Result<()> {
+        // Before the split, while the whole stream is still in hand: the two
+        // halves are about to belong to threads that block on them, and
+        // `remove_peer` needs a way to end the connection that does not.
+        let closer = Arc::new(stream.closer()?);
         // Handshake done duplex; now split into independent halves so the
         // reader and writer run on separate threads (Q5 sync model).
         let (reader, writer) = stream.split()?;
         let (tx, rx) = sync_channel::<Message>(OUTGOING_QUEUE);
 
-        let id = self.shared.register_peer(tx.clone(), remote);
+        let id = self.shared.register_peer(tx.clone(), closer, remote);
 
         // Announce our piece set, then our extension handshake if the peer
         // speaks BEP 10.
@@ -846,7 +859,12 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
 }
 
 impl Shared {
-    fn register_peer(&self, out: SyncSender<Message>, dest: DestHash) -> u64 {
+    fn register_peer(
+        &self,
+        out: SyncSender<Message>,
+        closer: Arc<dyn I2pClose + Send + Sync>,
+        dest: DestHash,
+    ) -> u64 {
         let mut st = lock(&self.state);
         let id = st.next_id;
         st.next_id += 1;
@@ -855,6 +873,7 @@ impl Shared {
             id,
             dest,
             out,
+            closer,
             has: Bitfield::empty(self.num_pieces),
             peer_choking: true,
             we_choke: true,
@@ -887,15 +906,31 @@ impl Shared {
     }
 
     fn remove_peer(&self, id: u64) {
-        let mut st = lock(&self.state);
-        if let Some(pos) = st.peers.iter().position(|p| p.id == id) {
-            let peer = st.peers.swap_remove(pos);
-            st.picker.remove_bitfield(&peer.has);
-            for (piece, block) in peer.in_flight.into_keys() {
-                st.picker.block_failed(piece, block);
+        let mut closer = None;
+        {
+            let mut st = lock(&self.state);
+            if let Some(pos) = st.peers.iter().position(|p| p.id == id) {
+                let peer = st.peers.swap_remove(pos);
+                st.picker.remove_bitfield(&peer.has);
+                for (piece, block) in peer.in_flight.into_keys() {
+                    st.picker.block_failed(piece, block);
+                }
+                closer = Some(peer.closer);
             }
+            debug_check_state(&st);
         }
-        debug_check_state(&st);
+        // Outside the lock, because it wakes two threads that will want it:
+        // the writer to run its own close and end, the reader to fall out of
+        // `read_frame` and deregister. Idempotent, so the writer closing again
+        // on its way out costs nothing.
+        //
+        // Removing the entry is not what reclaims the connection — this is.
+        // The distinction cost two rounds of fixing the same leak: dropping
+        // `out` only reaches a writer that is idle, and the peer worth dropping
+        // is usually the one whose queue is full because it stopped reading.
+        if let Some(closer) = closer {
+            closer.close();
+        }
     }
 
     /// Handle one message: mutate state under the lock, collect outgoing
@@ -1433,7 +1468,27 @@ fn run_choker(st: &mut State, out: &mut Vec<Outgoing>) {
 const METADATA_FRAME: u32 = 16 * 1024 + 256; // METADATA_PIECE_LEN + overhead
 
 /// Longest a metadata fetch may take before the peer is treated as stalling.
+///
+/// Covers the exchange end to end — our handshake, theirs, and the assembly —
+/// not just the part after both handshakes. The half before them is the
+/// cheaper half to stall in, because it needs the peer to say nothing at all.
 const METADATA_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Per-read/write socket bound for a metadata stream.
+///
+/// [`METADATA_DEADLINE`] is only consulted between frames, so it cannot end a
+/// thread parked inside one. A peer that accepts the stream and then sends
+/// nothing — or stops half-way through a frame's length prefix — is stopped by
+/// this and nothing else.
+const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Frames a peer may spend before sending its extension handshake.
+///
+/// Generous, because a peer legitimately opens with a bitfield and a have or
+/// two; finite, because the loop that waits for the handshake ignores whatever
+/// else arrives, and a peer that never handshakes is otherwise free to keep
+/// sending it.
+const METADATA_GREETING_FRAMES: u32 = 64;
 
 /// Frames of slack per metadata piece, over the one useful reply each.
 ///
@@ -1446,6 +1501,41 @@ const METADATA_DEADLINE: Duration = Duration::from_secs(120);
 /// never trips a timeout at all.
 const METADATA_FRAME_SLACK: u32 = 8;
 
+/// Read frames until the peer's extension handshake arrives, and take the
+/// `ut_metadata` id and metadata size out of it.
+///
+/// Bounded like the assembly loop that follows it: "ignore anything else until
+/// the handshake arrives" is an invitation to send anything else forever, and a
+/// peer taking it up is indistinguishable from a merely chatty one until you
+/// count. The budget is frames *and* a deadline because those catch different
+/// peers — one that floods cheap frames, and one that sends a few very slowly.
+fn await_extension_handshake<S: std::io::Read>(
+    stream: &mut S,
+    deadline: std::time::Instant,
+) -> std::io::Result<(u8, usize)> {
+    let invalid = |m: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
+    let mut frames = METADATA_GREETING_FRAMES;
+    loop {
+        if frames == 0 {
+            return Err(invalid("peer sent frame after frame without handshaking"));
+        }
+        frames -= 1;
+        if std::time::Instant::now() >= deadline {
+            return Err(invalid("peer did not finish its handshake in time"));
+        }
+        let body = wire::read_frame(stream, METADATA_FRAME)?;
+        if let Ok(Message::Extended { id: 0, payload }) = Message::parse(&body) {
+            let hs =
+                extension::Handshake::parse(&payload).map_err(|_| invalid("bad ext handshake"))?;
+            return match (hs.id_for(UT_METADATA), hs.metadata_size) {
+                (Some(mid), Some(size)) => Ok((mid, size)),
+                _ => Err(invalid("peer does not serve metadata")),
+            };
+        }
+        // Ignore anything else (bitfield, etc.) until the handshake arrives.
+    }
+}
+
 /// Fetch and verify a torrent's `info` dictionary from one peer over BEP 9
 /// (`ut_metadata`) — the magnet bootstrap. Blocking and sequential, so it
 /// runs on the dialing thread against a duplex stream before the full peer
@@ -1454,16 +1544,28 @@ const METADATA_FRAME_SLACK: u32 = 8;
 /// The reassembled bytes are checked against `info_hash` inside the
 /// assembler, so a peer cannot serve a different torrent.
 ///
+/// Bounded end to end by [`METADATA_DEADLINE`], with [`METADATA_IO_TIMEOUT`]
+/// underneath it so a peer that says nothing at all is bounded too.
+///
 /// # Errors
 ///
 /// Handshake failure, a peer that does not offer metadata, a rejected
-/// piece, verification failure, or any I/O error.
+/// piece, verification failure, the deadline passing, or any I/O error.
 pub fn fetch_metadata<S: I2pStream>(
     mut stream: S,
     info_hash: [u8; 20],
     peer_id: [u8; 20],
 ) -> std::io::Result<MetaInfo> {
     let invalid = |m: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
+
+    // One clock for the whole exchange, started before the first byte rather
+    // than after the extension handshake. A peer that accepts the stream and
+    // then stops — before our handshake, between it and theirs, or part-way
+    // through a frame — used to park this thread for good, and because the
+    // fetch walks candidate peers one at a time, that peer alone was enough to
+    // stop a magnet ever resolving.
+    let deadline = std::time::Instant::now() + METADATA_DEADLINE;
+    let _ = stream.set_timeouts(Some(METADATA_IO_TIMEOUT));
 
     let ours = Handshake {
         info_hash,
@@ -1501,20 +1603,7 @@ pub fn fetch_metadata<S: I2pStream>(
         },
     )?;
 
-    // Wait for the peer's handshake, which carries its ut_metadata id and the
-    // total metadata size.
-    let (their_meta_id, total_size) = loop {
-        let body = wire::read_frame(&mut stream, METADATA_FRAME)?;
-        if let Ok(Message::Extended { id: 0, payload }) = Message::parse(&body) {
-            let hs =
-                extension::Handshake::parse(&payload).map_err(|_| invalid("bad ext handshake"))?;
-            match (hs.id_for(UT_METADATA), hs.metadata_size) {
-                (Some(mid), Some(size)) => break (mid, size),
-                _ => return Err(invalid("peer does not serve metadata")),
-            }
-        }
-        // Ignore anything else (bitfield, etc.) until the handshake arrives.
-    };
+    let (their_meta_id, total_size) = await_extension_handshake(&mut stream, deadline)?;
 
     let mut asm =
         metadata::MetadataAssembler::new(total_size).map_err(|_| invalid("bad metadata size"))?;
@@ -1528,7 +1617,6 @@ pub fn fetch_metadata<S: I2pStream>(
             },
         )?;
     }
-    let deadline = std::time::Instant::now() + METADATA_DEADLINE;
     let mut frames = asm
         .num_pieces()
         .saturating_mul(METADATA_FRAME_SLACK)
@@ -1826,6 +1914,69 @@ mod tests {
         let err = fetch_metadata(stream, info_hash, *b"-CV0001-clientclient")
             .expect_err("a peer that never finishes must not be waited on forever");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "took {:?} to give up",
+            started.elapsed()
+        );
+    }
+
+    /// The same refusal, one stage earlier: a peer that completes the
+    /// `BitTorrent` handshake and then never sends an *extension* handshake,
+    /// filling the wait with frames that are individually perfectly ordinary.
+    ///
+    /// The loop that waits for it ignores anything else by design, so a peer
+    /// need only keep talking. This is the half of the exchange the frame budget
+    /// and deadline did not originally cover — they began after the extension
+    /// handshake, which is to say after the point a peer has to reach to be
+    /// bounded at all.
+    #[test]
+    fn metadata_fetch_gives_up_on_a_peer_that_never_handshakes() {
+        let net = MockNet::new();
+        let info_hash = [0x55u8; 20];
+        let server_ep = net.endpoint();
+        let server_dest = server_ep.dest();
+
+        std::thread::spawn(move || {
+            let Ok((mut stream, _from)) = server_ep.accept() else {
+                return;
+            };
+            let mut buf = [0u8; wire::HANDSHAKE_LEN];
+            if stream.read_exact(&mut buf).is_err() {
+                return;
+            }
+            let ours = Handshake {
+                info_hash,
+                peer_id: *b"-XX0000-quietquietqu",
+                extensions: Extensions {
+                    extended: true,
+                    fast: false,
+                },
+            };
+            if stream.write_all(&ours.encode()).is_err() {
+                return;
+            }
+            // Never an extension handshake. Just `have`s, forever: valid
+            // messages, cheap to send, and nothing the waiting loop reacts to.
+            let mut piece = 0u32;
+            loop {
+                if wire::write_message(&mut stream, &Message::Have(piece)).is_err() {
+                    return;
+                }
+                piece = piece.wrapping_add(1);
+            }
+        });
+
+        let client_ep = net.endpoint();
+        let stream = client_ep.dial(server_dest, Duration::from_secs(5)).unwrap();
+        let started = std::time::Instant::now();
+        let err = fetch_metadata(stream, info_hash, *b"-CV0001-clientclient")
+            .expect_err("a peer that never handshakes must not be waited on forever");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("handshak"),
+            "the error should name the stage that gave up: {err}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "took {:?} to give up",

@@ -554,6 +554,10 @@ where
                 continue;
             }
         };
+        // A magnet's rounds are sequential, so one tracker that accepts the
+        // stream and then says nothing stops this magnet resolving at all —
+        // not just against that tracker.
+        let _ = i2pnet::I2pStream::set_timeouts(&stream, Some(tracker::ANNOUNCE_IO_TIMEOUT));
         match tracker::announce_over(&mut stream, &request) {
             Ok(response) => {
                 round.trackers_ok += 1;
