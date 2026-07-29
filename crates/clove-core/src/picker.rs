@@ -67,6 +67,15 @@ pub struct Picker {
     have: Bitfield,
     /// Block state for started-but-incomplete pieces, indexed by piece.
     progress: Vec<Option<Progress>>,
+    /// What each piece is worth to us: `0` skip, `1` normal, `2` high.
+    ///
+    /// Derived from the user's per-file priorities by
+    /// [`MetaInfo::piece_priorities`](crate::metainfo::MetaInfo::piece_priorities);
+    /// all `1` unless somebody says otherwise, which is the state every torrent
+    /// starts in. A `0` here means the piece is not ours to want: it is never
+    /// offered, never counted as outstanding, and does not stand between the
+    /// torrent and being finished.
+    priority: Vec<u8>,
 }
 
 impl Picker {
@@ -121,10 +130,24 @@ impl Picker {
         }
 
         assert_eq!(
+            self.priority.len(),
+            self.num_pieces as usize,
+            "priority table does not span the torrent"
+        );
+
+        assert_eq!(
             self.is_complete(),
-            self.have.count() == self.num_pieces,
+            (0..self.num_pieces).all(|i| !self.wants(i) || self.have.has(i)),
             "completion flag disagrees with the have field"
         );
+        // Holding every piece is completion under any priority set, which is
+        // the property that keeps a skip from being able to *delay* a finish.
+        if self.have.count() == self.num_pieces {
+            assert!(
+                self.is_complete(),
+                "every piece held, yet the torrent is not complete"
+            );
+        }
     }
 
     /// Total in-flight block requests the picker believes are outstanding.
@@ -159,7 +182,52 @@ impl Picker {
             availability: vec![0u32; num_pieces as usize],
             have: Bitfield::empty(num_pieces),
             progress: (0..num_pieces).map(|_| None).collect(),
+            priority: vec![1u8; num_pieces as usize],
         }
+    }
+
+    /// Set what each piece is worth (`0` skip, `1` normal, `2` high).
+    ///
+    /// Entries past the end of the torrent are ignored and a short slice
+    /// leaves the rest at normal, so a priority list that disagrees with the
+    /// torrent degrades to "download it all" rather than to a panic or a
+    /// torrent that can never finish.
+    ///
+    /// Takes effect from the next [`pick`](Picker::pick). Blocks already in
+    /// flight for a piece that just became unwanted are left alone: they are
+    /// already paid for, and cancelling them would need a message per peer to
+    /// avoid the blocks arriving anyway.
+    pub fn set_piece_priorities(&mut self, per_piece: &[u8]) {
+        for index in 0..self.num_pieces as usize {
+            self.priority[index] = per_piece.get(index).copied().unwrap_or(1);
+        }
+        self.debug_check();
+    }
+
+    /// Whether we want piece `index` at all.
+    #[must_use]
+    pub fn wants(&self, index: u32) -> bool {
+        self.priority.get(index as usize).is_some_and(|&p| p > 0)
+    }
+
+    /// How many pieces we want, held or not — the denominator for progress.
+    #[must_use]
+    pub fn wanted_count(&self) -> u32 {
+        u32::try_from(self.priority.iter().filter(|&&p| p > 0).count()).unwrap_or(self.num_pieces)
+    }
+
+    /// Bytes of the pieces we want that we do not yet hold.
+    ///
+    /// The `left` an announce reports. Counts the real length of each piece, so
+    /// a short final piece counts short, and ignores pieces we are not asking
+    /// for — reporting their bytes as outstanding would have us announce as a
+    /// leecher forever over files the user said to skip.
+    #[must_use]
+    pub fn bytes_left(&self) -> u64 {
+        (0..self.num_pieces)
+            .filter(|&i| self.wants(i) && !self.have.has(i))
+            .map(|i| u64::from(self.piece_len(i)))
+            .sum()
     }
 
     /// The piece-selection mode in force.
@@ -224,10 +292,15 @@ impl Picker {
         &self.have
     }
 
-    /// Whether every piece is verified.
+    /// Whether every piece we want is verified.
+    ///
+    /// Not "every piece": a torrent with files set to skip is finished when the
+    /// files it was told to fetch are, and holding it short of complete forever
+    /// would leave it announcing as a leecher and never reporting the snatch.
+    /// It still serves what it holds.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.have.count() == self.num_pieces
+        (0..self.num_pieces).all(|i| !self.wants(i) || self.have.has(i))
     }
 
     /// Record that a peer holds every piece in `field` (its bitfield, or a
@@ -377,7 +450,7 @@ impl Picker {
         }
         let mut remaining = 0u32;
         for index in 0..self.num_pieces {
-            if self.have.has(index) {
+            if self.have.has(index) || !self.wants(index) {
                 continue;
             }
             let received = match &self.progress[index as usize] {
@@ -392,21 +465,28 @@ impl Picker {
         true
     }
 
-    /// Pieces this peer can serve that we still need, ordered: started
-    /// pieces first (finish what we've begun), then unstarted, each group in
+    /// Pieces this peer can serve that we still want, ordered: started pieces
+    /// first (finish what we've begun), then high priority before normal, then
     /// the configured order (index, or rarest-first).
+    ///
+    /// Priority outranks rarity but not startedness. A piece we have blocks for
+    /// is nearly free to finish and its blocks are already spent; leaving it
+    /// half-done to chase a high-priority piece would strand them and cost the
+    /// bandwidth twice.
     fn candidate_order(&self, peer_has: &Bitfield) -> Vec<u32> {
         let mut candidates: Vec<u32> = (0..self.num_pieces)
-            .filter(|&i| peer_has.has(i) && !self.have.has(i))
+            .filter(|&i| peer_has.has(i) && !self.have.has(i) && self.wants(i))
             .collect();
         candidates.sort_by_key(|&i| {
             let started = self.progress[i as usize].is_some();
             let group = u8::from(!started); // started (0) before unstarted (1)
+            // Descending: 2 (high) sorts before 1 (normal).
+            let urgency = u8::MAX - self.priority[i as usize];
             let rarity = match self.mode {
                 Mode::RarestFirst => self.availability[i as usize],
                 Mode::Sequential => 0,
             };
-            (group, rarity, i)
+            (group, urgency, rarity, i)
         });
         candidates
     }
@@ -634,5 +714,113 @@ mod tests {
         // Never underflows.
         p.remove_bitfield(&f);
         assert_eq!(p.availability(0), 0);
+    }
+
+    /// `left` counts the bytes we are actually asking for: a short final piece
+    /// short (the case that used to under-report it), and a skipped piece not
+    /// at all.
+    #[test]
+    fn bytes_left_counts_a_short_last_piece_short_and_a_skipped_one_not_at_all() {
+        // Four pieces of 16 KiB over a torrent whose last piece is 100 bytes.
+        let piece = u64::from(BLOCK_LEN);
+        let total = 3 * piece + 100;
+        let fresh = || Picker::new(4, BLOCK_LEN, total, Mode::RarestFirst);
+
+        let mut p = fresh();
+        assert_eq!(p.bytes_left(), total, "nothing held yet");
+        p.set_have(0);
+        assert_eq!(p.bytes_left(), total - piece);
+        // The tail is 100 bytes, not a whole piece.
+        let mut p = fresh();
+        p.set_have(3);
+        assert_eq!(p.bytes_left(), 3 * piece);
+        // Holding the tail while missing a middle piece leaves that piece
+        // outstanding, not zero.
+        let mut p = fresh();
+        for i in [0, 1, 3] {
+            p.set_have(i);
+        }
+        assert_eq!(
+            p.bytes_left(),
+            piece,
+            "a missing whole piece went unreported"
+        );
+        let mut p = fresh();
+        for i in 0..4 {
+            p.set_have(i);
+        }
+        assert_eq!(p.bytes_left(), 0);
+        assert!(p.is_complete());
+
+        // Skipping the last two pieces drops their bytes from `left` — and the
+        // short one is the one whose length is easiest to get wrong.
+        let mut p = fresh();
+        p.set_piece_priorities(&[1, 1, 0, 0]);
+        assert_eq!(p.bytes_left(), 2 * piece);
+        assert_eq!(p.wanted_count(), 2);
+        p.set_have(0);
+        p.set_have(1);
+        assert_eq!(p.bytes_left(), 0);
+        assert!(p.is_complete(), "the wanted pieces are all held");
+        p.check_invariants();
+    }
+
+    /// A skipped piece is never offered, however much a peer has it and
+    /// however rare it is — and a high one goes first.
+    #[test]
+    fn priorities_decide_what_is_offered_and_in_what_order() {
+        let mut p = one_block_pieces(4);
+        let peer = field(4, &[0, 1, 2, 3]);
+        // Make piece 3 the rarest, so rarest-first would otherwise pick it.
+        p.add_bitfield(&field(4, &[0, 1, 2]));
+        p.set_piece_priorities(&[1, 0, 2, 1]);
+
+        let picked = p.pick(&peer, 4);
+        let indices: Vec<u32> = picked.iter().map(|b| b.index).collect();
+        assert!(
+            !indices.contains(&1),
+            "a skipped piece was offered: {indices:?}"
+        );
+        assert_eq!(
+            indices.first(),
+            Some(&2),
+            "the high-priority piece should lead: {indices:?}"
+        );
+        assert_eq!(indices.len(), 3, "the other wanted pieces still count");
+        p.check_invariants();
+    }
+
+    /// Skipping the last thing a torrent was waiting for finishes it, rather
+    /// than leaving it forever one piece short of a piece it will never ask
+    /// for.
+    #[test]
+    fn skipping_the_last_missing_piece_completes_the_torrent() {
+        let mut p = one_block_pieces(3);
+        p.set_have(0);
+        p.set_have(1);
+        assert!(!p.is_complete());
+        p.set_piece_priorities(&[1, 1, 0]);
+        assert!(p.is_complete(), "nothing wanted is missing");
+        assert_eq!(p.bytes_left(), 0);
+        p.check_invariants();
+
+        // And wanting it again reopens the torrent.
+        p.set_piece_priorities(&[1, 1, 1]);
+        assert!(!p.is_complete());
+        assert!(p.pick(&field(3, &[2]), 1).iter().any(|b| b.index == 2));
+        p.check_invariants();
+    }
+
+    /// A priority list that does not match the torrent must not be able to
+    /// wedge it: too short leaves the rest normal, too long ignores the extra.
+    #[test]
+    fn a_mismatched_priority_list_degrades_to_wanting_everything() {
+        let mut p = one_block_pieces(3);
+        p.set_piece_priorities(&[0]);
+        assert!(!p.wants(0));
+        assert!(p.wants(1) && p.wants(2), "unlisted pieces stay normal");
+        p.set_piece_priorities(&[1, 1, 1, 1, 1, 1]);
+        assert_eq!(p.wanted_count(), 3);
+        p.check_invariants();
     }
 }

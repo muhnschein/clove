@@ -98,6 +98,55 @@ impl From<bencode::Error> for Error {
 }
 
 impl MetaInfo {
+    /// Turn per-file priorities into per-piece ones: each piece takes the
+    /// highest priority among the files it overlaps.
+    ///
+    /// Files do not respect piece boundaries, so a piece can hold the tail of
+    /// one file and the head of the next. Taking the maximum is what makes
+    /// skipping safe: a piece shared between a skipped file and a wanted one
+    /// stays wanted, because the wanted file cannot be completed without it.
+    /// The cost is that the skipped file receives those bytes anyway — its
+    /// first and last piece's worth — which is the same bargain every client
+    /// making this offer strikes, and the alternative is a file that can never
+    /// finish.
+    ///
+    /// `per_file` shorter than the file list leaves the remaining files at
+    /// normal priority; longer, and the extra entries are ignored. The daemon
+    /// validates the length before it ever gets here, so this is deliberately
+    /// total for the one caller that cannot: a resume file written by another
+    /// version, which must not be able to make a torrent unloadable.
+    #[must_use]
+    pub fn piece_priorities(&self, per_file: &[u8]) -> Vec<u8> {
+        let piece_length = u64::from(self.piece_length);
+        let mut out = vec![0u8; self.pieces.len()];
+        if piece_length == 0 {
+            return out;
+        }
+        let mut offset = 0u64;
+        for (i, file) in self.files.iter().enumerate() {
+            let priority = per_file.get(i).copied().unwrap_or(1);
+            let start = offset;
+            offset = offset.saturating_add(file.length);
+            if priority == 0 || file.length == 0 {
+                continue;
+            }
+            // The half-open byte range [start, offset) maps to pieces
+            // [start / plen, (offset - 1) / plen].
+            let first = start / piece_length;
+            let last = (offset - 1) / piece_length;
+            for piece in first..=last {
+                let Ok(idx) = usize::try_from(piece) else {
+                    break;
+                };
+                let Some(slot) = out.get_mut(idx) else {
+                    break;
+                };
+                *slot = (*slot).max(priority);
+            }
+        }
+        out
+    }
+
     /// Build a [`MetaInfo`] from a bare `info` dictionary — the bytes fetched
     /// over BEP 9 for a magnet link, which have no surrounding torrent dict
     /// or trackers.
