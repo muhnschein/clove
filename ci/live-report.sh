@@ -19,7 +19,10 @@
 # API tokens are redacted. I2P destinations are NOT — they are what makes a
 # dial traceable, and the ones here belong to transient test identities that
 # live for the length of the run. If you would rather they did not leave your
-# machine, use --redact-dests.
+# machine, use --redact-dests: it removes b32 addresses *and* the full base64
+# destinations that a tracker announce carries in `ip=`. Point it at a daemon
+# holding your real persisted identity and that distinction is the whole
+# difference, so prefer it over trusting the run to be transient.
 set -eu
 
 usage() {
@@ -41,7 +44,8 @@ usage: ci/live-report.sh [options]
   --out FILE           report path (default: live-report-<timestamp>.txt)
   --lines N            per-command output cap, head+tail (default: 250)
   --skip-tier1         skip the router-free tests (build, unit, smoke, chaos)
-  --redact-dests       replace .b32.i2p addresses with a placeholder
+  --redact-dests       replace I2P destinations with a placeholder — both
+                       .b32.i2p addresses and full base64 destinations
   --help               this
 
 Typical first run:
@@ -147,7 +151,24 @@ sanitise() {
         -e 's/(x-clove-token:[[:space:]]*)[A-Za-z0-9]+/\1<redacted>/Ig' \
         -e 's/\b[0-9a-f]{64}\b/<64-hex-redacted>/g' \
     | if [ "$REDACT_DESTS" = yes ]; then
-          sed -E 's/[a-z2-7]{52}\.b32\.i2p/<dest>.b32.i2p/g'
+          # Both forms a destination takes, because removing only the first is
+          # worse than removing neither: it reads as "destinations are gone"
+          # while the more complete one is still in the file.
+          #
+          #   1. the b32 label — a hash of the destination, 52 base32 chars;
+          #   2. the destination itself — ~516 chars of I2P base64, which is
+          #      what a tracker announce carries in `ip=` and what a SAM
+          #      DESTINATION= line carries the private key behind.
+          #
+          # I2P's base64 alphabet is A-Za-z0-9 plus `-` and `~`, and every one
+          # of those is unreserved in a URL — so percent-encoding a destination
+          # leaves it byte-identical apart from `=` padding, and one pattern
+          # covers the raw and the URL-encoded form. 128 is far below the 516 a
+          # real destination runs to and far above any word, hash or path that
+          # belongs in a report.
+          sed -E \
+              -e 's/[a-z2-7]{52}\.b32\.i2p/<dest>.b32.i2p/g' \
+              -e 's/[A-Za-z0-9~-]{128,}(%3D|=)*/<i2p-dest-redacted>/g'
       else
           cat
       fi \

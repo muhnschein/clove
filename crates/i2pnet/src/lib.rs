@@ -55,6 +55,9 @@ pub trait I2pStream: Read + Write + Send + Sized {
     type Reader: Read + Send + 'static;
     /// The write half yielded by [`split`](Self::split).
     type Writer: Write + Send + I2pClose + 'static;
+    /// A handle that ends this connection from a thread that owns neither
+    /// half — see [`closer`](Self::closer).
+    type Closer: I2pClose + Send + Sync + 'static;
 
     /// Consume the stream, splitting it into independent read and write
     /// halves. Both must reference the same underlying connection; closing
@@ -63,6 +66,21 @@ pub trait I2pStream: Read + Write + Send + Sized {
     /// # Errors
     /// The underlying implementation cannot produce independent halves.
     fn split(self) -> io::Result<(Self::Reader, Self::Writer)>;
+
+    /// A third handle onto this connection, for closing it later.
+    ///
+    /// [`split`](Self::split) hands both halves to the threads that will block
+    /// on them, which leaves no way to end the connection from anywhere else:
+    /// the writer half closes on its way out, but a writer already blocked
+    /// *inside* a write never gets there, and dropping the channel it waits on
+    /// does not wake it. A peer that stops reading can hold both threads, a
+    /// descriptor and a router-side stream that way, after the engine has
+    /// already dropped it from the peer table — so take one of these before
+    /// splitting and keep it beside the peer.
+    ///
+    /// # Errors
+    /// The underlying implementation cannot duplicate the connection.
+    fn closer(&self) -> io::Result<Self::Closer>;
 
     /// Bound how long reads and writes on this stream may block, where the
     /// backend can do it. `None` restores blocking behaviour.

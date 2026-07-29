@@ -445,10 +445,15 @@ impl crate::I2pClose for MockStream {
 impl I2pStream for MockStream {
     type Reader = MockStream;
     type Writer = MockStream;
+    type Closer = MockStream;
 
     fn split(self) -> io::Result<(MockStream, MockStream)> {
         let reader = self.try_clone();
         Ok((reader, self))
+    }
+
+    fn closer(&self) -> io::Result<MockStream> {
+        Ok(self.try_clone())
     }
 
     fn set_timeouts(&self, timeout: Option<Duration>) -> io::Result<()> {

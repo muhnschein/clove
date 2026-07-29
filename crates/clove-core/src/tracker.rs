@@ -19,7 +19,8 @@
 //! until then.
 
 use std::fmt::Write as _;
-use std::time::Duration;
+use std::io::Write as _;
+use std::time::{Duration, Instant};
 
 use i2pnet::DestHash;
 
@@ -160,7 +161,7 @@ pub fn build_announce(url: &str, params: &AnnounceParams) -> Result<(String, Vec
 }
 
 /// The URL an encoded announce request actually asks for, reassembled from
-/// the bytes on the wire.
+/// the bytes on the wire — with our own destination taken back out.
 ///
 /// Taken from the request rather than rebuilt from the parameters, so what
 /// gets logged is what was sent — the point is to hand an operator something
@@ -168,6 +169,16 @@ pub fn build_announce(url: &str, params: &AnnounceParams) -> Result<(String, Vec
 /// deleting parameters. Three rounds of reasoning about which parameter a
 /// tracker dislikes were worth less than one round of removing them one at a
 /// time, and only the operator can run that test.
+///
+/// `ip` is the exception, and it is the one parameter an operator never needs
+/// to bisect: it is *our full public destination*, and this URL is logged on
+/// every failed announce — which any tracker can cause at will by accepting an
+/// announce and refusing it. `SECURITY.md` calls the client's destination
+/// reaching a log leak-class, the highest severity in the project, and that is
+/// the right call: stderr goes to journals, log shippers, backups and bug
+/// reports, and unlike the b32 in the line above it this is the complete
+/// base64 destination. Redacted rather than dropped, so what is left still
+/// says an `ip` was sent and where in the URL it sat.
 #[must_use]
 pub fn announced_url(host: &str, request: &[u8]) -> String {
     let line = request
@@ -178,7 +189,28 @@ pub fn announced_url(host: &str, request: &[u8]) -> String {
         .ok()
         .and_then(|l| l.split(' ').nth(1))
         .unwrap_or("/");
-    format!("http://{host}{target}")
+    format!("http://{host}{}", redact_ip_param(target))
+}
+
+/// Replace the value of the `ip` query parameter with a placeholder.
+///
+/// Splits on the separators a query is built from rather than searching for
+/// `ip=`, so a *different* parameter ending in those two letters keeps its
+/// value and an `ip` anywhere in the query loses its own.
+fn redact_ip_param(target: &str) -> String {
+    let Some((path, query)) = target.split_once('?') else {
+        return target.to_owned();
+    };
+    let mut out = String::with_capacity(target.len());
+    out.push_str(path);
+    for (i, field) in query.split('&').enumerate() {
+        out.push(if i == 0 { '?' } else { '&' });
+        match field.split_once('=') {
+            Some(("ip", _)) => out.push_str("ip=<redacted>"),
+            _ => out.push_str(field),
+        }
+    }
+    out
 }
 
 /// A tracker's decoded reply.
@@ -411,19 +443,94 @@ impl AnnounceState {
     }
 }
 
+/// How long a whole announce may take, first byte written to last byte read.
+///
+/// The socket timeout callers set ([`ANNOUNCE_IO_TIMEOUT`]) bounds any *single*
+/// read or write; this bounds their sum, which is the part a tracker can
+/// otherwise stretch without limit. One byte every few seconds resets a socket
+/// timeout forever and never finishes an announce — a stall indistinguishable
+/// from a slow tunnel, except that it never ends.
+pub const ANNOUNCE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// What callers should set as the per-read/write socket bound before handing a
+/// stream to [`announce_over`], so a single blocking call cannot outlast
+/// [`ANNOUNCE_DEADLINE`] by more than this much.
+pub const ANNOUNCE_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// An I/O stream that refuses to continue past an instant.
+///
+/// Every read and write checks the clock first, so a deadline set once covers
+/// a whole multi-call exchange — including the reads inside
+/// [`http::read_response`], which is where a tracker gets to decide how long
+/// we wait.
+struct Deadline<'a, S> {
+    inner: &'a mut S,
+    until: Instant,
+}
+
+impl<S> Deadline<'_, S> {
+    fn check(&self) -> std::io::Result<()> {
+        if Instant::now() >= self.until {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the tracker did not finish the exchange in time",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<S: std::io::Read> std::io::Read for Deadline<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.inner.read(buf)
+    }
+}
+
+impl<S: std::io::Write> std::io::Write for Deadline<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Perform one announce over an already-connected stream to the tracker:
 /// write the request, read and parse the response.
 ///
+/// Bounded by [`ANNOUNCE_DEADLINE`] end to end. Callers should also set
+/// [`ANNOUNCE_IO_TIMEOUT`] on the stream: this deadline is only consulted
+/// between reads, so without a socket timeout a tracker that accepts the
+/// connection and then says nothing at all still parks the thread on the
+/// first one.
+///
 /// # Errors
 ///
-/// I/O failure, an HTTP-level error, a non-200 status, or a tracker/parse
-/// error from [`parse_response`].
+/// I/O failure, the deadline passing, an HTTP-level error, a non-200 status,
+/// or a tracker/parse error from [`parse_response`].
 pub fn announce_over<S: std::io::Read + std::io::Write>(
     stream: &mut S,
     request: &[u8],
 ) -> Result<AnnounceResponse, Error> {
+    announce_over_until(stream, request, Instant::now() + ANNOUNCE_DEADLINE)
+}
+
+/// [`announce_over`] against a caller-chosen deadline, so a test can use one
+/// it can afford to wait for.
+fn announce_over_until<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    request: &[u8],
+    until: Instant,
+) -> Result<AnnounceResponse, Error> {
+    let mut stream = Deadline {
+        inner: stream,
+        until,
+    };
     stream.write_all(request).map_err(Error::Io)?;
-    let response = http::read_response(stream, MAX_RESPONSE_BYTES).map_err(Error::Http)?;
+    let response = http::read_response(&mut stream, MAX_RESPONSE_BYTES).map_err(Error::Http)?;
     if response.status != 200 {
         return Err(Error::HttpStatus(response.status));
     }
@@ -847,15 +954,26 @@ mod tests {
     /// announce came back "not bencode" with zero peers. The announce path —
     /// not just the HTTP reader — has to survive it.
     /// What gets logged when a tracker refuses an announce must be the URL
-    /// that was actually sent, byte for byte, because its only job is to be
-    /// pasted into a browser and bisected.
+    /// that was actually sent — every parameter an operator might bisect,
+    /// except the one that is our own identity.
     #[test]
     fn the_announced_url_is_reassembled_from_the_wire() {
         let (host, request) =
             build_announce("http://tracker2.postman.i2p/announce.php", &params()).unwrap();
         let url = announced_url(&host, &request);
         assert!(url.starts_with("http://tracker2.postman.i2p/announce.php?info_hash="));
-        assert!(url.contains("&ip=MYDESTb64"), "{url}");
+        assert!(
+            !url.contains("MYDESTb64"),
+            "our destination must not reach a log: {url}"
+        );
+        assert!(url.contains("&ip=<redacted>"), "{url}");
+        // Everything else survives, or the line stops being worth logging.
+        assert!(url.contains("&compact=1"), "{url}");
+        assert!(url.contains("&event=started"), "{url}");
+        assert!(
+            url.contains(&format!("info_hash={}", "%AB".repeat(20))),
+            "{url}"
+        );
         assert!(
             !url.contains("HTTP/1.1"),
             "the version is not part of it: {url}"
@@ -1060,5 +1178,97 @@ mod tests {
         let resp = announce_over(&mut stub, &request).unwrap();
         assert_eq!(resp.peers, vec![DestHash([0x77; 32])]);
         assert!(stub.written.starts_with(b"GET /announce?"));
+    }
+
+    /// A tracker that answers correctly and unendingly slowly: a valid head,
+    /// a length it means to honour, and then the body one byte at a time with
+    /// a pause between each.
+    ///
+    /// Nothing here is malformed, so no parser rejects it, and every read
+    /// succeeds, so a per-read socket timeout never fires — each byte resets
+    /// it. The byte caps do not help either: the body stays under
+    /// `MAX_RESPONSE_BYTES`, it just never arrives. Only a clock over the whole
+    /// exchange ends this, which is what the deadline is.
+    #[test]
+    fn a_tracker_that_drips_slowly_gives_up_on_a_deadline() {
+        /// A valid response head, then the body a byte per read, each after a
+        /// pause — the shape of a tracker on a very slow tunnel, and of one
+        /// stalling on purpose.
+        struct Drip {
+            head: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Read for Drip {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.head.read(buf)?;
+                if n > 0 {
+                    return Ok(n);
+                }
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                buf[0] = b'd';
+                Ok(1)
+            }
+        }
+        impl std::io::Write for Drip {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (_host, request) = build_announce("http://t.i2p/announce", &params()).unwrap();
+        // Well under MAX_RESPONSE_BYTES: the body is legal, it just never ends.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 40000\r\n\r\n".to_vec();
+        let mut drip = Drip {
+            head: std::io::Cursor::new(head),
+        };
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        let outcome = announce_over_until(&mut drip, &request, deadline);
+
+        assert!(
+            outcome.is_err(),
+            "the body never arrived; this is not a win"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a drip held the announce thread for {:?}",
+            started.elapsed()
+        );
+        // 40 000 bytes at 5 ms each is over three minutes, so finishing this
+        // fast can only be the deadline: the test would still pass on elapsed
+        // time alone if the body had simply been short.
+        let Err(Error::Http(http::Error::Io(e))) = outcome else {
+            panic!("expected the deadline to surface as an I/O error");
+        };
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+    }
+
+    /// The `ip` parameter carries our destination and must not survive into a
+    /// log line; everything an operator would bisect must.
+    #[test]
+    fn only_the_ip_parameter_is_redacted() {
+        assert_eq!(
+            redact_ip_param("/announce?info_hash=%AB&ip=SECRET&event=started"),
+            "/announce?info_hash=%AB&ip=<redacted>&event=started"
+        );
+        // First and last positions, not just the middle.
+        assert_eq!(redact_ip_param("/a?ip=SECRET"), "/a?ip=<redacted>");
+        assert_eq!(redact_ip_param("/a?ip=SECRET&x=1"), "/a?ip=<redacted>&x=1");
+        // A parameter that merely ends in those letters keeps its value, and a
+        // target with no query is untouched.
+        assert_eq!(redact_ip_param("/a?skip=1&zip=2"), "/a?skip=1&zip=2");
+        assert_eq!(redact_ip_param("/announce"), "/announce");
+        // An `ip` with `=` in its value (percent-encoding leaves padding) still
+        // loses all of it.
+        assert_eq!(
+            redact_ip_param("/a?ip=AA%3D%3D&x=1"),
+            "/a?ip=<redacted>&x=1"
+        );
     }
 }

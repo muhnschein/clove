@@ -32,6 +32,33 @@ This document is a dated record, not a live task list. Nothing here is
 outstanding; it is kept for the testing-regime analysis below, which is what
 made the difference, and because the repros are worth having.
 
+**Correction, 2026-07-29.** A later review of the same tree found three of the
+closures above to be partial, and one note in them to be wrong. Recorded here
+rather than edited into the findings, because what a fix missed is worth as much
+as the fix:
+
+- **Finding 2** ended the *stall* but not the *leak*. Dropping a peer's queue
+  wakes a writer waiting for its next message and not one already blocked inside
+  a write — which is the state of every peer worth dropping, since the queue
+  filled precisely because the peer stopped reading. The table entry went and
+  the connection stayed. Threads are now reclaimed by an explicit close handle
+  held beside each peer (`I2pStream::closer`), and the test asserts on
+  `live_threads` rather than on the peer table, which is what the original test
+  could not distinguish.
+- **Finding 6** bounded the metadata assembly loop but not the wait for the
+  extension handshake before it, where a peer need only keep sending ordinary
+  frames. Both halves are bounded now, by one deadline that starts before the
+  first byte.
+- **Finding 9's** closing note — that a read timeout is something "yosemite does
+  not offer" — is wrong, and was wrong when written. Outbound SAM streams are
+  built by `sam::dial_stream`, not by yosemite: they are loopback `TcpStream`s
+  with working `set_timeouts` and `try_clone`. Tracker and metadata exchanges
+  now set both, so nothing on those paths blocks forever.
+
+The common thread is the one item A2 below already names: an assertion that
+cannot see the failure. "The honest download still finishes" holds perfectly
+well while threads leak behind it.
+
 ---
 
 ## Critical

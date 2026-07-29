@@ -705,6 +705,83 @@ fn a_peer_that_stops_reading_cannot_stall_an_honest_one() {
     drop(flood);
 }
 
+/// The same peer, asked the harder question: dropping it from the table has to
+/// *reclaim* it, not merely forget it.
+///
+/// Removing a peer used to drop its outgoing channel and nothing else, which
+/// wakes a writer waiting for the next message but not one already blocked
+/// inside a write — and the peer worth removing is exactly the one whose queue
+/// filled because it stopped reading, so its writer is always in the second
+/// state. The entry went, the connection stayed: two threads, a descriptor and
+/// a router-side stream each. Then, because the table slot was free, the same
+/// peer could reconnect and take another set.
+///
+/// So this asserts on threads rather than on the peer table. Every hostile
+/// connection is held open to the end of the test: if reclamation only happens
+/// because the peer hung up, that is the peer's doing, not ours, and a real one
+/// will not oblige.
+#[test]
+fn a_peer_that_stops_reading_is_reclaimed_not_merely_dropped() {
+    const ROUNDS: usize = 4;
+
+    // Small buffers so "stopped reading" bites in a few messages, as above.
+    let net = MockNet::with_capacity(32 * 1024);
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("reclaim");
+    let server = seeding_torrent(&meta, &content, &dir);
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&server, ep);
+
+    // Held to the end of the test, never read from, never dropped.
+    let mut wedged: Vec<MockStream> = Vec::new();
+    for round in 0..ROUNDS {
+        let evil_ep = net.endpoint();
+        let mut evil = evil_ep
+            .dial(dest, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("evil dial {round}: {e}"));
+        handshake(&mut evil, info_hash).unwrap_or_else(|e| panic!("evil handshake {round}: {e}"));
+        wire::write_message(&mut evil, &Message::Interested)
+            .unwrap_or_else(|e| panic!("evil interest {round}: {e}"));
+        // Ask for far more than the outgoing queue can hold, and never read a
+        // byte of the answer. Writes start failing once the engine gives up on
+        // us, which is the point — it is not an error here.
+        for _ in 0..2000 {
+            let req = Message::Request(wire::BlockRequest {
+                index: 0,
+                begin: 0,
+                length: BLOCK_LEN,
+            });
+            if wire::write_message(&mut evil, &req).is_err() {
+                break;
+            }
+        }
+        wedged.push(evil);
+    }
+
+    // Every one of them must be gone from the table *and* off the thread list.
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let (peers, threads) = (server.connected_peers().len(), server.live_threads());
+        if peers == 0 && threads == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{ROUNDS} peers that stopped reading left {peers} in the table and \
+             {threads} live thread(s) behind; every connection is still open, so \
+             nothing but clove closing them can reclaim these"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Only now: the connections were open for all of that.
+    drop(wedged);
+}
+
 /// A peer that keeps re-announcing what it has. Availability is a global signal
 /// — rarest-first steers the whole torrent by it — so a peer that can inflate it
 /// permanently decides what everyone downloads first, and the inflation outlives
