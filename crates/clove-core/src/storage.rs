@@ -50,16 +50,29 @@ impl Storage {
         let mut regions = Vec::with_capacity(meta.files.len());
         let mut global = 0u64;
         for entry in &meta.files {
-            let path = join_under(root, &entry.path);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let file = OpenOptions::new()
+            // Creates the parent directories itself, one checked level at a
+            // time; `create_dir_all` would walk a symlinked component without
+            // comment.
+            let path = resolve_beneath(root, &entry.path)?;
+            // `create_new` first, because `O_CREAT | O_EXCL` refuses a symlink
+            // atomically — the one part of this that needs no check because the
+            // kernel will not do it. Falling back to a plain open only once we
+            // know something is there, and `resolve_beneath` has just confirmed
+            // that something is not a link.
+            let file = match OpenOptions::new()
                 .read(true)
                 .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)?;
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&path)?,
+                Err(e) => return Err(e),
+            };
             if preallocate && entry.length > 0 {
                 file.set_len(entry.length)?;
             }
@@ -230,15 +243,97 @@ impl Storage {
     }
 }
 
-/// Join validated path components under `root`. Components are already
-/// checked by `metainfo` (no separators, no `..`), so this cannot escape
-/// `root`.
-fn join_under(root: &Path, components: &[String]) -> PathBuf {
+/// Join validated path components under `root`, refusing to pass through a
+/// symbolic link at any level, and creating missing directories as we go.
+///
+/// `metainfo` guarantees the components are lexically harmless — no separators,
+/// no `..`, no NUL — and for a long time a comment here concluded from that
+/// that the result "cannot escape `root`". It can. Lexical validation says
+/// nothing about what the *filesystem* does with the names: if
+/// `downloads/demo/sub` already exists as a symlink to `/etc`, then joining and
+/// opening `downloads/demo/sub/passwd` writes to `/etc/passwd`, and every
+/// component of every path we open is joined exactly that way. The torrent
+/// cannot create the link — that is why this is not a critical finding — but a
+/// torrent is not the only thing that writes under a download directory, and
+/// the escape turns "can write in `downloads/`" into "can write wherever the
+/// daemon can".
+///
+/// So each component is checked before it is descended into, and directories we
+/// create are created one level at a time rather than by `create_dir_all`,
+/// which happily walks a link. Landlock stops the escape too where it is
+/// available, but `docs/SCOPE.md` §9 is explicit that no layer may assume
+/// another is present.
+///
+/// # Errors
+///
+/// A component that exists and is a symlink, or exists and is not a directory
+/// where one is needed, and any filesystem error creating an intermediate
+/// directory.
+fn resolve_beneath(root: &Path, components: &[String]) -> io::Result<PathBuf> {
+    let refused = |path: &Path, what: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: {what}", path.display()),
+        )
+    };
+
     let mut path = root.to_path_buf();
-    for c in components {
-        path.push(c);
+    let Some((last, parents)) = components.split_last() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a file entry with no path components",
+        ));
+    };
+    for component in parents {
+        path.push(component);
+        match std::fs::symlink_metadata(&path) {
+            // `symlink_metadata` does not follow the final component, so this
+            // is the link itself rather than whatever it points at.
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(refused(&path, "path component is a symbolic link"));
+            }
+            Ok(md) if md.is_dir() => {}
+            Ok(_) => return Err(refused(&path, "path component is not a directory")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir(&path)?,
+            Err(e) => return Err(e),
+        }
     }
-    path
+    path.push(last);
+    if std::fs::symlink_metadata(&path).is_ok_and(|md| md.file_type().is_symlink()) {
+        return Err(refused(&path, "torrent file is a symbolic link"));
+    }
+    Ok(path)
+}
+
+/// Resolve a torrent file's path beneath `root` without creating anything,
+/// refusing any symlinked component.
+///
+/// For callers that want to *remove* a file rather than write one — deleting
+/// through a link is the same escape in the other direction, and takes
+/// somebody else's file with it. `Ok(None)` means the path does not exist,
+/// which for a deletion is success.
+///
+/// # Errors
+///
+/// A component that exists and is a symbolic link, or a filesystem error other
+/// than the path being absent.
+pub fn existing_path_beneath(root: &Path, components: &[String]) -> io::Result<Option<PathBuf>> {
+    let mut path = root.to_path_buf();
+    for component in components {
+        path.push(component);
+        match std::fs::symlink_metadata(&path) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{}: path component is a symbolic link", path.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(path))
 }
 
 #[cfg(test)]
@@ -426,5 +521,130 @@ mod tests {
         let st = Storage::create(&meta, &dir.0, false).unwrap();
         let err = st.write_block(0, 8, &[1, 2, 3, 4]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// A symlinked directory component must not be written through.
+    ///
+    /// The components are lexically clean — no `..`, no separators — and that
+    /// was taken as proof the path could not escape. It is not: the escape is
+    /// the filesystem's doing, not the name's. `outside` here stands in for
+    /// anywhere the daemon can write, which is the point of the finding.
+    #[test]
+    fn a_symlinked_directory_component_is_refused() {
+        let dir = TempDir::new();
+        let root = dir.0.join("downloads");
+        let outside = dir.0.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("demo")).unwrap();
+
+        let content: Vec<u8> = vec![7; 10];
+        let meta = meta_for(
+            vec![FileEntry {
+                path: vec!["demo".into(), "escaped.bin".into()],
+                length: 10,
+            }],
+            16,
+            &content,
+        );
+
+        let Err(err) = Storage::create(&meta, &root, false) else {
+            panic!("a symlinked component must not be written through");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(
+            !outside.join("escaped.bin").exists(),
+            "a file was created outside the download root"
+        );
+    }
+
+    /// And a symlink where the *file* itself goes: the last component is the
+    /// one that gets the bytes.
+    #[test]
+    fn a_symlinked_file_is_refused_rather_than_written_through() {
+        let dir = TempDir::new();
+        let root = dir.0.join("downloads");
+        std::fs::create_dir_all(root.join("demo")).unwrap();
+        let victim = dir.0.join("victim.txt");
+        std::fs::write(&victim, b"original").unwrap();
+        std::os::unix::fs::symlink(&victim, root.join("demo").join("a.bin")).unwrap();
+
+        let content: Vec<u8> = vec![7; 10];
+        let meta = meta_for(
+            vec![FileEntry {
+                path: vec!["demo".into(), "a.bin".into()],
+                length: 10,
+            }],
+            16,
+            &content,
+        );
+
+        let Err(err) = Storage::create(&meta, &root, false) else {
+            panic!("a symlinked file must be refused");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"original",
+            "the linked-to file was written through"
+        );
+    }
+
+    /// The ordinary case still works, including creating nested directories
+    /// that do not exist yet — the fix must not cost the feature.
+    #[test]
+    fn nested_directories_are_still_created() {
+        let dir = TempDir::new();
+        let content: Vec<u8> = vec![3; 10];
+        let meta = meta_for(
+            vec![FileEntry {
+                path: vec![
+                    "demo".into(),
+                    "deep".into(),
+                    "deeper".into(),
+                    "a.bin".into(),
+                ],
+                length: 10,
+            }],
+            16,
+            &content,
+        );
+        let st = Storage::create(&meta, &dir.0, false).expect("nested layout");
+        st.write_block(0, 0, &content).unwrap();
+        assert!(dir.0.join("demo/deep/deeper/a.bin").is_file());
+        // Re-opening an existing layout is the common path and must not trip
+        // the new-file branch.
+        let again = Storage::create(&meta, &dir.0, false).expect("reopen");
+        assert!(again.verify_all().unwrap().has(0));
+    }
+
+    /// Resolution for deletion refuses the same links, and reports "not there"
+    /// rather than an error for a path that simply does not exist.
+    #[test]
+    fn existing_path_beneath_refuses_links_and_tolerates_absence() {
+        let dir = TempDir::new();
+        let root = dir.0.join("downloads");
+        std::fs::create_dir_all(root.join("demo")).unwrap();
+
+        assert_eq!(
+            existing_path_beneath(&root, &["demo".into(), "absent.bin".into()]).unwrap(),
+            None,
+            "an absent file is not an error for a deletion"
+        );
+
+        let real = root.join("demo").join("real.bin");
+        std::fs::write(&real, b"x").unwrap();
+        assert_eq!(
+            existing_path_beneath(&root, &["demo".into(), "real.bin".into()]).unwrap(),
+            Some(real)
+        );
+
+        let outside = dir.0.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+        let err = existing_path_beneath(&root, &["linked".into(), "keep.txt".into()])
+            .expect_err("deleting through a link must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
     }
 }

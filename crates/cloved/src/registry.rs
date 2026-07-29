@@ -608,10 +608,17 @@ where
             live: None,
         };
         let hex = hex(&info_hash);
-        atomic_write(&self.state_dir.join(format!("{hex}.torrent")), bytes)
-            .map_err(AddError::Io)?;
-        self.write_resume(&info_hash, &hosted)
-            .map_err(AddError::Io)?;
+        let torrent_path = self.state_dir.join(format!("{hex}.torrent"));
+        atomic_write(&torrent_path, bytes).map_err(AddError::Io)?;
+        if let Err(e) = self.write_resume(&info_hash, &hosted) {
+            // The pair is the unit: a `.torrent` with no resume file beside it
+            // is not a torrent this daemon can load, and leaving one behind
+            // turns a failed add into a file that looks like a half-added
+            // torrent for ever. Best-effort, because the disk that just refused
+            // a write may refuse this too — but then nothing was added either.
+            let _ = fs::remove_file(&torrent_path);
+            return Err(AddError::Io(e));
+        }
         self.torrents.insert(info_hash, hosted);
         Ok((
             info_hash,
@@ -728,21 +735,33 @@ where
         }))
     }
 
-    /// Promote a fetched magnet: drop the pending entry and its URI file,
-    /// then add the synthesized `.torrent` bytes through the normal path
-    /// (persist, go live).
+    /// Promote a fetched magnet: add the synthesized `.torrent` bytes through
+    /// the normal path (persist, go live), and only then drop the pending entry
+    /// and its URI file.
+    ///
+    /// That order is the whole of it. Dropping the magnet first — which this
+    /// did — means a promotion that then fails to persist has destroyed the
+    /// recoverable state and registered nothing in its place: the magnet is
+    /// gone from memory and from disk, the torrent does not exist, and a
+    /// restart finds neither. A full disk or a refused rename at the wrong
+    /// moment was enough. Now the magnet survives a failed promotion and the
+    /// fetch can be retried; the worst case is a `.magnet` file for a torrent
+    /// that is already registered, which the next start resolves in favour of
+    /// the torrent.
     ///
     /// # Errors
     ///
-    /// [`AddError`] from the underlying [`add_torrent`](Registry::add_torrent).
+    /// [`AddError`] from the underlying [`add_torrent`](Registry::add_torrent),
+    /// with the pending magnet left intact.
     pub(crate) fn complete_magnet(
         &mut self,
         info_hash: &[u8; 20],
         torrent_bytes: &[u8],
     ) -> Result<ScanJob, AddError> {
+        let (_, job) = self.add_torrent(torrent_bytes)?;
         self.pending.remove(info_hash);
         let _ = fs::remove_file(self.state_dir.join(format!("{}.magnet", hex(info_hash))));
-        self.add_torrent(torrent_bytes).map(|(_, job)| job)
+        Ok(job)
     }
 
     /// Pause or resume a torrent, persisting the change.
@@ -998,11 +1017,17 @@ where
         remove_file_ok(&self.state_dir.join(format!("{hex}.resume")))?;
         if delete_data {
             for file in &hosted.meta.files {
-                let mut path = self.downloads_dir.clone();
-                for component in &file.path {
-                    path.push(component);
+                // Resolved the same way it was written: following a symlinked
+                // component here would delete somebody else's file, which is
+                // the write-side escape pointed the other way and rather less
+                // recoverable.
+                match clove_core::storage::existing_path_beneath(&self.downloads_dir, &file.path) {
+                    Ok(Some(path)) => {
+                        let _ = fs::remove_file(&path); // deletion is best-effort
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("cloved: not deleting {}: {e}", file.path.join("/")),
                 }
-                let _ = fs::remove_file(&path); // data deletion is best-effort
             }
             // Best-effort: drop the torrent's now-empty top directory.
             let _ = fs::remove_dir(self.downloads_dir.join(&hosted.meta.name));
@@ -1060,20 +1085,31 @@ where
         let Ok(entries) = fs::read_dir(&self.state_dir) else {
             return;
         };
+        let mut torrents = Vec::new();
+        let mut magnets = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             match path.extension().and_then(|e| e.to_str()) {
-                Some("torrent") => {
-                    if let Err(e) = self.load_one(&path) {
-                        eprintln!("cloved: skipping {}: {e}", path.display());
-                    }
-                }
-                Some("magnet") => {
-                    if let Err(e) = self.load_magnet(&path) {
-                        eprintln!("cloved: skipping {}: {e}", path.display());
-                    }
-                }
+                Some("torrent") => torrents.push(path),
+                Some("magnet") => magnets.push(path),
                 _ => {}
+            }
+        }
+        // Torrents first, all of them, because `load_magnet` needs to know
+        // whether a magnet has already been promoted and `read_dir` order says
+        // nothing about which it hands over first. Promotion writes the torrent
+        // before dropping the magnet, so a crash in between leaves both on
+        // disk; without this ordering that came back as the same info-hash in
+        // the torrent list *and* the pending list, listed twice and fetched for
+        // no reason.
+        for path in torrents {
+            if let Err(e) = self.load_one(&path) {
+                eprintln!("cloved: skipping {}: {e}", path.display());
+            }
+        }
+        for path in magnets {
+            if let Err(e) = self.load_magnet(&path) {
+                eprintln!("cloved: skipping {}: {e}", path.display());
             }
         }
     }
@@ -1081,6 +1117,14 @@ where
     fn load_magnet(&mut self, path: &Path) -> Result<(), String> {
         let uri = fs::read_to_string(path).map_err(|e| e.to_string())?;
         let magnet = Magnet::parse(uri.trim()).map_err(|e| e.to_string())?;
+        // Already promoted: the torrent is the newer, better-founded record of
+        // the same thing, so the leftover magnet is stale rather than a second
+        // torrent. Removing it here is what keeps a crash mid-promotion from
+        // costing anything at all.
+        if self.torrents.contains_key(&magnet.info_hash) {
+            let _ = fs::remove_file(path);
+            return Ok(());
+        }
         self.pending.insert(
             magnet.info_hash,
             PendingMagnet {
@@ -1967,6 +2011,77 @@ mod tests {
 
         fs::write(&resume_path, good.encode()).unwrap();
         assert_eq!(Registry::<MockDialer>::open(&data.0).unwrap().count(), 1);
+    }
+
+    /// A promotion that fails leaves the magnet exactly where it was.
+    ///
+    /// The old order dropped the pending entry and deleted its `.magnet` file
+    /// *first*, so a failure after that point had destroyed the recoverable
+    /// state and registered nothing in its place: gone from memory, gone from
+    /// disk, no torrent, and a restart finding neither. The magnet is the only
+    /// record of what the user asked for, and it is not the promotion's to
+    /// spend before the replacement exists.
+    #[test]
+    fn a_failed_promotion_leaves_the_magnet_recoverable() {
+        let data = TempDir::new("promote-fail");
+        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let info_hash = registry
+            .add_magnet(&format!("magnet:?xt=urn:btih:{}", "ab".repeat(20)))
+            .expect("add magnet");
+        let magnet_path = data.0.join(format!("state/{}.magnet", hex(&info_hash)));
+        assert!(magnet_path.is_file(), "the magnet was persisted");
+
+        // Promote with bytes that are not a torrent: `add_torrent` fails, and
+        // everything about the magnet must survive it.
+        assert!(
+            registry
+                .complete_magnet(&info_hash, b"not a torrent")
+                .is_err(),
+            "rubbish must not promote"
+        );
+        assert_eq!(registry.pending_hashes(), vec![info_hash], "still pending");
+        assert!(magnet_path.is_file(), "the magnet file was deleted anyway");
+        assert_eq!(registry.count(), 0, "nothing was registered");
+
+        // And a restart still finds it, which is the part that matters after a
+        // crash rather than an error return.
+        let reopened = Registry::<MockDialer>::open(&data.0).unwrap();
+        assert_eq!(reopened.pending_hashes(), vec![info_hash]);
+    }
+
+    /// A crash between writing the torrent and dropping the magnet leaves both
+    /// on disk. The torrent wins, and the stale magnet is cleaned up.
+    ///
+    /// Without this the same info-hash came back in the torrent list *and* the
+    /// pending list — listed twice, and a metadata fetch spawned for something
+    /// already fully known.
+    #[test]
+    fn a_leftover_magnet_beside_its_torrent_is_dropped() {
+        let (_content, bytes) = fixture("leftover-demo");
+        let data = TempDir::new("leftover");
+        let info_hash = {
+            let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+            add_and_scan(&mut registry, &bytes)
+        };
+
+        // The state promotion passes through, if it stops half way.
+        let magnet_path = data.0.join(format!("state/{}.magnet", hex(&info_hash)));
+        fs::write(
+            &magnet_path,
+            format!("magnet:?xt=urn:btih:{}", hex(&info_hash)),
+        )
+        .unwrap();
+
+        let registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        assert_eq!(registry.count(), 1, "the torrent loads");
+        assert!(
+            registry.pending_hashes().is_empty(),
+            "the same torrent was also listed as a pending magnet"
+        );
+        assert!(
+            !magnet_path.exists(),
+            "the stale magnet file was left behind"
+        );
     }
 
     #[test]
