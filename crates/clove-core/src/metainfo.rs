@@ -250,31 +250,143 @@ impl MetaInfo {
     }
 }
 
+/// An announce URL that has been parsed and accepted: `http://` to a host
+/// ending in `.i2p`, with everything a request needs already separated out.
+///
+/// One parse for both questions clove asks of a tracker URL — "is this ours to
+/// talk to" and "what request does it mean" — because two parsers that
+/// disagree let a URL through the filter that the builder then reads
+/// differently. They did: the filter cut the authority at `/`, `?` or `#`
+/// while the builder cut only at `/`, so `http://tracker.i2p?x=1` was accepted
+/// as a tracker and then dialed as a *host* named `tracker.i2p?x=1`, and a
+/// port survived the filter only to be handed to naming lookup as part of the
+/// hostname. Neither could work, and both failed far from the URL that caused
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackerUrl {
+    /// The host alone, lowercased — what SAM naming resolves. Never carries a
+    /// port: the router has no use for one, and I2P destinations do not have
+    /// them.
+    pub host: String,
+    /// The authority as written, host plus any port, for the `Host` header.
+    pub authority: String,
+    /// Path and query, always beginning with `/`.
+    pub path_and_query: String,
+}
+
+impl TrackerUrl {
+    /// Parse an announce URL, or `None` if clove has no business dialing it.
+    ///
+    /// Accepts `http://` only. `https://` is refused deliberately: clove speaks
+    /// plain HTTP over an I2P stream (the tunnel is the encryption) and has no
+    /// TLS stack to speak anything else with, so a URL kept here that the
+    /// announcer could never dial would fail forever with nothing to show the
+    /// operator.
+    ///
+    /// Also refused, and each for a reason a `.torrent` from a stranger makes
+    /// concrete:
+    ///
+    /// - **Control characters and whitespace anywhere.** The path lands in a
+    ///   request line verbatim, so a `\r\n` in it appends headers of the
+    ///   sender's choosing to an announce we sign our name to — and the same
+    ///   URL is written to a log, where a newline forges a line.
+    /// - **Userinfo** (`user@host`): no business in an announce URL, and it
+    ///   hides the real host behind something that reads like one.
+    /// - **Fragments**: never sent to a server, so keeping one means the URL we
+    ///   dial is not the URL we were given.
+    /// - **Malformed percent escapes**, an empty host label, and a port that is
+    ///   not a number in range.
+    #[must_use]
+    pub fn parse(url: &str) -> Option<TrackerUrl> {
+        let rest = url.strip_prefix("http://")?;
+        if rest.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+            return None;
+        }
+        if rest.contains('#') {
+            return None;
+        }
+        let (authority, path_and_query) = match rest.find('/') {
+            Some(i) => (&rest[..i], rest[i..].to_owned()),
+            None => match rest.find('?') {
+                // A query with no path: the target is `/?…`, not a host called
+                // `tracker.i2p?x=1`. This is the split the two old parsers
+                // disagreed about.
+                Some(i) => (&rest[..i], format!("/{}", &rest[i..])),
+                None => (rest, "/".to_owned()),
+            },
+        };
+        if authority.contains('@') {
+            return None;
+        }
+        if !valid_percent_escapes(&path_and_query) {
+            return None;
+        }
+
+        // Split a trailing `:port`. Anything else after a colon is not an
+        // authority we understand, rather than a host to try anyway.
+        let host = match authority.rsplit_once(':') {
+            Some((host, port)) => {
+                if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                port.parse::<u16>().ok().filter(|&p| p > 0)?;
+                host
+            }
+            None => authority,
+        };
+        // By label rather than by suffix: `.i2p` has to be the last *label*,
+        // every label has to be non-empty, and there has to be one in front of
+        // it — so `i2p`, `.i2p` and `a..i2p` are all refused, and a host that
+        // merely ends in those characters is not mistaken for one.
+        let host = host.to_ascii_lowercase();
+        let mut labels = host.rsplit('.');
+        if labels.next() != Some("i2p") {
+            return None;
+        }
+        if labels.next().is_none_or(str::is_empty) {
+            return None;
+        }
+        if host.split('.').any(str::is_empty) {
+            return None;
+        }
+        Some(TrackerUrl {
+            host,
+            authority: authority.to_owned(),
+            path_and_query,
+        })
+    }
+}
+
+/// Whether every `%` in `s` begins a complete two-hex-digit escape.
+fn valid_percent_escapes(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let Some(pair) = bytes.get(i + 1..i + 3) else {
+                return false;
+            };
+            if !pair.iter().all(u8::is_ascii_hexdigit) {
+                return false;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
 /// True when `url` announces to an I2P destination: `http://` with a host
 /// ending in `.i2p` (which covers `.b32.i2p`). Anything else — IPs, clearnet
 /// hosts, other schemes — is not ours to talk to.
 ///
-/// `https://` is *not* accepted, deliberately. clove speaks plain HTTP over an
-/// I2P stream (the tunnel is the encryption) and has no TLS stack to speak
-/// anything else with; a URL kept here that the announcer cannot dial would
-/// fail forever with nothing to show the operator. Keeping the filter and
-/// [`crate::tracker::build_announce`] in exact agreement is the point — a
-/// tracker we cannot talk to is dropped at parse time and counted, like any
-/// other.
+/// Exactly [`TrackerUrl::parse`] succeeding, which is what keeps this and
+/// [`crate::tracker::build_announce`] in the agreement they claim: a tracker we
+/// cannot talk to is dropped at parse time and counted, like any other.
 #[must_use]
 pub fn is_i2p_tracker(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return false;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    if authority.contains('@') {
-        return false; // userinfo has no business in an announce URL
-    }
-    let host = match authority.rsplit_once(':') {
-        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
-        _ => authority,
-    };
-    host.to_ascii_lowercase().ends_with(".i2p")
+    TrackerUrl::parse(url).is_some()
 }
 
 fn parse_files(info: &Value, name: &str) -> Result<(Vec<FileEntry>, u64), Error> {

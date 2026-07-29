@@ -45,8 +45,27 @@ pub struct Request<'a> {
 impl Request<'_> {
     /// Serialize to on-wire bytes. `Host`, an accurate `Content-Length`, and
     /// `Connection: close` are always emitted, followed by the body.
+    ///
+    /// `None` if any field would break the message into lines this function did
+    /// not write: a CR, an LF, or a NUL in the target, host, or a header. The
+    /// target comes from a `.torrent`'s announce URL, which is a stranger's
+    /// text, and writing it into a request line verbatim is how that stranger
+    /// gets to append headers to an announce we send under our own name.
+    /// [`crate::metainfo::TrackerUrl`] already refuses those URLs; this refuses
+    /// the request whatever built it.
     #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        let clean = |s: &str| !s.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0));
+        if !clean(self.method) || !clean(self.target) || !clean(self.host) {
+            return None;
+        }
+        if self
+            .headers
+            .iter()
+            .any(|(name, value)| !clean(name) || !clean(value))
+        {
+            return None;
+        }
         let mut out = Vec::new();
         out.extend_from_slice(self.method.as_bytes());
         out.push(b' ');
@@ -71,7 +90,7 @@ impl Request<'_> {
         }
         out.extend_from_slice(b"Connection: close\r\n\r\n");
         out.extend_from_slice(self.body);
-        out
+        Some(out)
     }
 }
 
@@ -540,7 +559,7 @@ mod tests {
             headers: &[("User-Agent", "clove/0.1")],
             body: &[],
         };
-        let s = String::from_utf8(req.encode()).unwrap();
+        let s = String::from_utf8(req.encode().expect("clean fields")).unwrap();
         // No Content-Length: a bodyless GET does not carry one, because
         // almost nothing on the web sends `GET` with `Content-Length: 0` and
         // a tracker behind a picky webserver is a bad place to be unusual.
@@ -561,7 +580,7 @@ mod tests {
             headers: &[],
             body: b"d4:infod',",
         };
-        let s = String::from_utf8(post.encode()).unwrap();
+        let s = String::from_utf8(post.encode().expect("clean fields")).unwrap();
         assert!(s.contains("Content-Length: 10\r\n"), "{s}");
 
         let empty_post = Request {
@@ -571,7 +590,7 @@ mod tests {
             headers: &[],
             body: &[],
         };
-        let s = String::from_utf8(empty_post.encode()).unwrap();
+        let s = String::from_utf8(empty_post.encode().expect("clean fields")).unwrap();
         assert!(s.contains("Content-Length: 0\r\n"), "{s}");
     }
 

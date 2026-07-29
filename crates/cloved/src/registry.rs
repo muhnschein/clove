@@ -144,6 +144,16 @@ impl ScanJob {
 struct Hosted {
     meta: MetaInfo,
     have: Bitfield,
+    /// The subset of [`have`](Hosted::have) we have both hashed and made
+    /// durable — what a restart is allowed to believe without re-reading the
+    /// disk.
+    ///
+    /// Advanced only after a successful `sync_all`, so it lags `have` by at
+    /// most one persist tick while a torrent is running and catches up on a
+    /// clean stop. A crash therefore costs re-verifying that tick's worth,
+    /// which is the bargain `docs/STATE-FORMAT.md` describes and the reason
+    /// the two fields exist separately at all.
+    verified: Bitfield,
     priorities: Vec<u8>,
     uploaded: u64,
     downloaded: u64,
@@ -198,8 +208,14 @@ impl Hosted {
             info_hash,
             num_pieces: self.have.len(),
             have: self.have.as_bytes().to_vec(),
-            // We only mark a piece present once it verifies, so verified == have.
-            verified: self.have.as_bytes().to_vec(),
+            // Not a copy of `have`. A piece enters `have` when its bytes pass
+            // SHA-1 in memory, which says nothing about whether the write
+            // reached the platter; `verified` is the weaker, truer claim that
+            // we fsynced the files and the piece was good as of then
+            // (`docs/STATE-FORMAT.md`). Copying `have` here is what let a
+            // crash — or a bad sector afterwards — come back as a torrent
+            // serving pieces nobody had checked.
+            verified: self.verified.as_bytes().to_vec(),
             priorities: self.priorities.clone(),
             uploaded: self.uploaded,
             downloaded: self.downloaded,
@@ -419,6 +435,13 @@ where
         if let Some(network) = &self.network {
             network.demux.unregister(info_hash);
         }
+        // A clean stop is the one moment the two sets can legitimately meet:
+        // flush, then claim exactly what the flush covered. Without this every
+        // pause would leave up to a tick's worth to re-verify on resume.
+        match live.torrent.sync_storage() {
+            Ok(durable) => hosted.verified = durable,
+            Err(e) => eprintln!("cloved: syncing {}: {e}", hex(info_hash)),
+        }
         hosted.have = live.torrent.have();
         let (up, down) = live.torrent.stats();
         hosted.uploaded = live.stats_base.0.saturating_add(up);
@@ -498,10 +521,20 @@ where
     /// Called periodically by the daemon and around lifecycle transitions.
     pub(crate) fn persist_progress(&mut self) {
         self.refresh();
-        for (info_hash, hosted) in &self.torrents {
-            if hosted.live.is_some()
-                && let Err(e) =
-                    write_resume_file(&self.state_dir, info_hash, &hosted.resume(*info_hash))
+        for (info_hash, hosted) in &mut self.torrents {
+            let Some(live) = &hosted.live else {
+                continue;
+            };
+            // Make the data durable before recording that it is. A failure is
+            // not fatal — the resume file is still written, just with the older
+            // verified set, so the next start re-checks what this tick could
+            // not promise for.
+            match live.torrent.sync_storage() {
+                Ok(durable) => hosted.verified = durable,
+                Err(e) => eprintln!("cloved: syncing {}: {e}", hex(info_hash)),
+            }
+            if let Err(e) =
+                write_resume_file(&self.state_dir, info_hash, &hosted.resume(*info_hash))
             {
                 eprintln!("cloved: persisting {}: {e}", hex(info_hash));
             }
@@ -557,6 +590,8 @@ where
         let hosted = Hosted {
             meta: meta.clone(),
             have: Bitfield::empty(num_pieces),
+            // Nothing claimed and nothing confirmed; the scan below sets both.
+            verified: Bitfield::empty(num_pieces),
             priorities,
             uploaded: 0,
             downloaded: 0,
@@ -633,6 +668,26 @@ where
     /// Every pending magnet's info-hash (for spawning fetchers at startup).
     pub(crate) fn pending_hashes(&self) -> Vec<[u8; 20]> {
         self.pending.keys().copied().collect()
+    }
+
+    /// Scan jobs for torrents that came back from disk needing re-verification
+    /// — those whose resume file claimed pieces it could not confirm.
+    ///
+    /// They are already marked as scanning by [`load_one`](Registry::load_one),
+    /// so nothing can start them in the meantime; the caller runs each job
+    /// unlocked and reports through [`finish_scan`](Registry::finish_scan), as
+    /// with any other scan. Normally empty, because a clean run leaves the two
+    /// sets equal.
+    pub(crate) fn pending_scans(&self) -> Vec<ScanJob> {
+        self.torrents
+            .iter()
+            .filter(|(_, hosted)| hosted.scanning)
+            .map(|(info_hash, hosted)| ScanJob {
+                info_hash: *info_hash,
+                meta: hosted.meta.clone(),
+                downloads_dir: self.downloads_dir.clone(),
+            })
+            .collect()
     }
 
     /// Record what a metadata-fetch round managed, so `clove list` can show
@@ -885,6 +940,11 @@ where
         };
         hosted.scanning = false;
         let have = scanned.map_err(ActionError::Io)?;
+        // A scan is the strongest claim available: every bit in it came from
+        // hashing bytes that were read back off the disk a moment ago. This is
+        // the one place the two sets are equal by construction rather than by
+        // an fsync we have to trust.
+        hosted.verified = have.clone();
         hosted.have = have;
         let count = hosted.have.count();
         let resume = hosted.resume(info_hash);
@@ -1054,12 +1114,42 @@ where
                 meta.pieces.len()
             ));
         }
+        // Same reasoning as the piece count: a priorities vector measured
+        // against a different file list decides the wrong files are skipped,
+        // and does it silently.
+        if resume.priorities.len() != meta.files.len() {
+            return Err(format!(
+                "resume file has {} priorities, the .torrent has {} file(s)",
+                resume.priorities.len(),
+                meta.files.len()
+            ));
+        }
         let have = Bitfield::from_bytes(&resume.have, resume.num_pieces)
             .map_err(|_| "resume have-bitfield is inconsistent".to_owned())?;
+        let verified = Bitfield::from_bytes(&resume.verified, resume.num_pieces)
+            .map_err(|_| "resume verified-bitfield is inconsistent".to_owned())?;
+        // Only what `verified` covers is publishable. `have` is what we
+        // believed in memory; `verified` is what we last confirmed was on disk
+        // and correct, and the gap between them is exactly what a crash, a
+        // truncated write or a bad sector leaves behind. Publishing `have`
+        // unread — which is what this did — meant announcing, serving and
+        // counting as complete pieces nothing had looked at since.
+        //
+        // The difference is normally empty (the persist loop fsyncs and then
+        // records what it made durable), so this costs a scan only when
+        // something actually went wrong.
+        let rescan = have != verified;
+        if rescan {
+            eprintln!(
+                "cloved: {hex}: {} piece(s) were held but not confirmed on disk; verifying",
+                have.count().saturating_sub(verified.count())
+            );
+        }
         self.torrents.insert(
             info_hash,
             Hosted {
-                have,
+                have: verified.clone(),
+                verified,
                 priorities: resume.priorities,
                 uploaded: resume.uploaded,
                 downloaded: resume.downloaded,
@@ -1075,7 +1165,9 @@ where
                 last_announce_error: None,
                 paused: resume.paused,
                 sequential: resume.sequential,
-                scanning: false,
+                // Claimed here so nothing can start the torrent before the scan
+                // publishes; `pending_scans` hands out the job at startup.
+                scanning: rescan,
                 meta,
                 live: None,
             },
@@ -1761,6 +1853,118 @@ mod tests {
 
         // And the good one still loads, so the check is about the mismatch and
         // not about rejecting resume files in general.
+        fs::write(&resume_path, good.encode()).unwrap();
+        assert_eq!(Registry::<MockDialer>::open(&data.0).unwrap().count(), 1);
+    }
+
+    /// A resume file that claims pieces it cannot vouch for does not get to
+    /// hand them to the engine.
+    ///
+    /// `have` is what clove believed in memory; `verified` is what it last
+    /// confirmed was on disk. Loading published `have` and never read
+    /// `verified` at all, so a file edited to claim everything — or one written
+    /// before a crash, or one whose data rotted since — came back as a torrent
+    /// that announced those pieces, served them on request, and called itself
+    /// complete, without anything having hashed a byte.
+    #[test]
+    fn a_resume_file_cannot_claim_pieces_the_disk_does_not_back() {
+        let (_content, bytes) = fixture("forged-demo");
+        let data = TempDir::new("forged");
+        let info_hash = {
+            let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+            add_and_scan(&mut registry, &bytes)
+        };
+        let resume_path = data.0.join(format!("state/{}.resume", hex(&info_hash)));
+
+        // Nothing is on disk, so the honest state is "no pieces".
+        let honest = Resume::decode(&fs::read(&resume_path).unwrap()).unwrap();
+        assert_eq!(
+            honest.have.iter().copied().max(),
+            Some(0),
+            "fixture holds nothing"
+        );
+
+        // Forge `have` into "I hold everything", keeping `verified` honest —
+        // the shape of a crash, and of a hand-edited state file.
+        let mut forged = honest.clone();
+        let full = {
+            let mut bits = vec![0u8; clove_core::resume::bitfield_len(honest.num_pieces)];
+            for piece in 0..honest.num_pieces as usize {
+                bits[piece / 8] |= 0x80 >> (piece % 8);
+            }
+            bits
+        };
+        forged.have = full;
+        fs::write(&resume_path, forged.encode()).unwrap();
+
+        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        assert_eq!(registry.count(), 1, "the torrent still loads");
+        assert!(
+            first_progress(&mut registry).abs() < f64::EPSILON,
+            "unverified pieces were published to the engine"
+        );
+
+        // And it is claimed for a scan, so the pieces are recovered rather than
+        // simply forgotten — a torrent whose data really is there must not have
+        // to be re-added by hand.
+        assert_eq!(
+            registry.pending_scans().len(),
+            1,
+            "the gap between have and verified must schedule a re-verify"
+        );
+    }
+
+    /// Forging both halves is refused outright: `verified` is a subset of
+    /// `have` by construction, so a file where it is not was not written by
+    /// anything that understood the format.
+    #[test]
+    fn a_resume_file_whose_verified_exceeds_have_is_refused() {
+        let (_content, bytes) = fixture("subset-demo");
+        let data = TempDir::new("subset");
+        let info_hash = {
+            let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+            add_and_scan(&mut registry, &bytes)
+        };
+        let resume_path = data.0.join(format!("state/{}.resume", hex(&info_hash)));
+
+        let good = Resume::decode(&fs::read(&resume_path).unwrap()).unwrap();
+        let mut bad = good.clone();
+        bad.verified = vec![0u8; clove_core::resume::bitfield_len(good.num_pieces)];
+        bad.verified[0] = 0x80; // verified piece 0, which `have` does not hold
+        fs::write(&resume_path, bad.encode()).unwrap();
+        assert!(
+            Resume::decode(&fs::read(&resume_path).unwrap()).is_err(),
+            "verified must not be able to exceed have"
+        );
+        assert_eq!(
+            Registry::<MockDialer>::open(&data.0).unwrap().count(),
+            0,
+            "an impossible resume file was loaded anyway"
+        );
+    }
+
+    /// A priorities vector measured against a different file list decides the
+    /// wrong files are skipped — silently, now that priorities do something.
+    #[test]
+    fn a_resume_file_with_the_wrong_priority_count_is_skipped() {
+        let (_content, bytes) = fixture("prio-count-demo");
+        let data = TempDir::new("prio-count");
+        let info_hash = {
+            let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+            add_and_scan(&mut registry, &bytes)
+        };
+        let resume_path = data.0.join(format!("state/{}.resume", hex(&info_hash)));
+
+        let good = Resume::decode(&fs::read(&resume_path).unwrap()).unwrap();
+        let mut bad = good.clone();
+        bad.priorities = vec![1u8; good.priorities.len() + 1];
+        fs::write(&resume_path, bad.encode()).unwrap();
+        assert_eq!(
+            Registry::<MockDialer>::open(&data.0).unwrap().count(),
+            0,
+            "a priorities vector for a different file list was loaded anyway"
+        );
+
         fs::write(&resume_path, good.encode()).unwrap();
         assert_eq!(Registry::<MockDialer>::open(&data.0).unwrap().count(), 1);
     }
