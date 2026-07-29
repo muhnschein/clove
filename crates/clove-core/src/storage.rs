@@ -11,10 +11,10 @@
 //! Verification reads a whole piece and compares its SHA-1 to the metainfo
 //! expectation; a download is only trusted after it verifies.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use sha1::{Digest, Sha1};
 
@@ -50,29 +50,10 @@ impl Storage {
         let mut regions = Vec::with_capacity(meta.files.len());
         let mut global = 0u64;
         for entry in &meta.files {
-            // Creates the parent directories itself, one checked level at a
-            // time; `create_dir_all` would walk a symlinked component without
-            // comment.
-            let path = resolve_beneath(root, &entry.path)?;
-            // `create_new` first, because `O_CREAT | O_EXCL` refuses a symlink
-            // atomically — the one part of this that needs no check because the
-            // kernel will not do it. Falling back to a plain open only once we
-            // know something is there, and `resolve_beneath` has just confirmed
-            // that something is not a link.
-            let file = match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(file) => file,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(&path)?,
-                Err(e) => return Err(e),
-            };
+            // Walks and opens by directory descriptor with `O_NOFOLLOW`, so a
+            // symlinked component is refused by the kernel rather than by a
+            // check that could be stale by the time we act on it.
+            let file = open_beneath(root, &entry.path)?;
             if preallocate && entry.length > 0 {
                 file.set_len(entry.length)?;
             }
@@ -243,97 +224,142 @@ impl Storage {
     }
 }
 
-/// Join validated path components under `root`, refusing to pass through a
-/// symbolic link at any level, and creating missing directories as we go.
+/// Walk `components` beneath `root` as directory descriptors, refusing to
+/// traverse a symbolic link at any level, and creating missing directories.
+///
+/// Returns the descriptor of the directory holding the last component, and the
+/// last component itself.
 ///
 /// `metainfo` guarantees the components are lexically harmless — no separators,
-/// no `..`, no NUL — and for a long time a comment here concluded from that
-/// that the result "cannot escape `root`". It can. Lexical validation says
-/// nothing about what the *filesystem* does with the names: if
-/// `downloads/demo/sub` already exists as a symlink to `/etc`, then joining and
-/// opening `downloads/demo/sub/passwd` writes to `/etc/passwd`, and every
-/// component of every path we open is joined exactly that way. The torrent
-/// cannot create the link — that is why this is not a critical finding — but a
-/// torrent is not the only thing that writes under a download directory, and
-/// the escape turns "can write in `downloads/`" into "can write wherever the
-/// daemon can".
+/// no `..`, no NUL — and for a long time a comment in this module concluded from
+/// that that the joined path "cannot escape `root`". It cannot lexically; it can
+/// through the filesystem. If `downloads/demo` already exists as a symlink to
+/// somewhere else, then joining and opening `downloads/demo/a.bin` writes there,
+/// and `create_dir_all` walks the link without comment. A torrent cannot create
+/// that link, but a torrent is not the only thing that writes under a download
+/// directory, and the escape turns "can write in `downloads/`" into "can write
+/// wherever the daemon can".
 ///
-/// So each component is checked before it is descended into, and directories we
-/// create are created one level at a time rather than by `create_dir_all`,
-/// which happily walks a link. Landlock stops the escape too where it is
-/// available, but `docs/SCOPE.md` §9 is explicit that no layer may assume
-/// another is present.
+/// The refusal is the kernel's, not ours: every step is an `openat` on a single
+/// component carrying `O_NOFOLLOW | O_DIRECTORY`, so a symlink fails the syscall
+/// rather than failing a check we made a moment earlier. Checking with
+/// `symlink_metadata` and then opening by path — which is what this did first —
+/// leaves a window between the two in which the component can become a link, and
+/// closing that window is the whole reason `openat` exists.
+///
+/// Landlock stops the escape too where it is available, but `docs/SCOPE.md` §9 is
+/// explicit that no layer may assume another is present.
 ///
 /// # Errors
 ///
-/// A component that exists and is a symlink, or exists and is not a directory
-/// where one is needed, and any filesystem error creating an intermediate
-/// directory.
-fn resolve_beneath(root: &Path, components: &[String]) -> io::Result<PathBuf> {
-    let refused = |path: &Path, what: &str| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{}: {what}", path.display()),
-        )
-    };
+/// A component that is a symbolic link or is not a directory, and any
+/// filesystem error opening or creating one.
+fn walk_beneath<'a>(
+    root: &Path,
+    components: &'a [String],
+) -> io::Result<(rustix::fd::OwnedFd, &'a str)> {
+    use rustix::fs::{CWD, Mode, OFlags, mkdirat, openat};
 
-    let mut path = root.to_path_buf();
     let Some((last, parents)) = components.split_last() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "a file entry with no path components",
         ));
     };
+
+    // The root is the configured download directory, not anything a torrent
+    // named, so it is created the ordinary way. Everything below it is
+    // attacker-influenced and gets the careful treatment.
+    std::fs::create_dir_all(root)?;
+    let mut dir = openat(
+        CWD,
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+
     for component in parents {
-        path.push(component);
-        match std::fs::symlink_metadata(&path) {
-            // `symlink_metadata` does not follow the final component, so this
-            // is the link itself rather than whatever it points at.
-            Ok(md) if md.file_type().is_symlink() => {
-                return Err(refused(&path, "path component is a symbolic link"));
-            }
-            Ok(md) if md.is_dir() => {}
-            Ok(_) => return Err(refused(&path, "path component is not a directory")),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir(&path)?,
-            Err(e) => return Err(e),
+        match mkdirat(&dir, component.as_str(), Mode::from_bits_truncate(0o755)) {
+            // Already there is the ordinary case; whether it is usable is the
+            // next line's question, and it asks the kernel.
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(e) => return Err(refused(component, e)),
         }
+        dir = openat(
+            &dir,
+            component.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| refused(component, e))?;
     }
-    path.push(last);
-    if std::fs::symlink_metadata(&path).is_ok_and(|md| md.file_type().is_symlink()) {
-        return Err(refused(&path, "torrent file is a symbolic link"));
-    }
-    Ok(path)
+    Ok((dir, last.as_str()))
 }
 
-/// Resolve a torrent file's path beneath `root` without creating anything,
-/// refusing any symlinked component.
+/// Turn the errno a refused component produces into something an operator can
+/// act on.
 ///
-/// For callers that want to *remove* a file rather than write one — deleting
-/// through a link is the same escape in the other direction, and takes
-/// somebody else's file with it. `Ok(None)` means the path does not exist,
-/// which for a deletion is success.
+/// `ELOOP` from an `O_NOFOLLOW` open and `ENOTDIR` from a non-directory in the
+/// middle of a path both mean "this name is not what a torrent's path component
+/// may be", and both arrive here as bare numbers.
+fn refused(component: &str, e: rustix::io::Errno) -> io::Error {
+    let why = match e {
+        rustix::io::Errno::LOOP => "path component is a symbolic link",
+        rustix::io::Errno::NOTDIR => "path component is not a directory",
+        _ => return io::Error::from(e),
+    };
+    io::Error::new(io::ErrorKind::InvalidInput, format!("{component}: {why}"))
+}
+
+/// Open (creating if absent) the file `components` names beneath `root`.
 ///
 /// # Errors
 ///
-/// A component that exists and is a symbolic link, or a filesystem error other
-/// than the path being absent.
-pub fn existing_path_beneath(root: &Path, components: &[String]) -> io::Result<Option<PathBuf>> {
-    let mut path = root.to_path_buf();
-    for component in components {
-        path.push(component);
-        match std::fs::symlink_metadata(&path) {
-            Ok(md) if md.file_type().is_symlink() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{}: path component is a symbolic link", path.display()),
-                ));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        }
+/// Anything [`walk_beneath`] refuses, or a final component that is a symbolic
+/// link or cannot be opened.
+fn open_beneath(root: &Path, components: &[String]) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let (dir, last) = walk_beneath(root, components)?;
+    // `O_NOFOLLOW` here is what stops the *file* itself being a link to
+    // somewhere else — the last component is the one that gets the bytes.
+    let fd = openat(
+        &dir,
+        last,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_bits_truncate(0o644),
+    )
+    .map_err(|e| refused(last, e))?;
+    Ok(File::from(fd))
+}
+
+/// Delete the file `components` names beneath `root`, if it is there.
+///
+/// Deleting through a symbolic link is the same escape pointed the other way,
+/// and takes somebody else's file with it. Absent is success: there is nothing
+/// to delete.
+///
+/// # Errors
+///
+/// Anything [`walk_beneath`] refuses, or an unlink error other than the file
+/// already being gone.
+pub fn remove_beneath(root: &Path, components: &[String]) -> io::Result<()> {
+    use rustix::fs::{AtFlags, unlinkat};
+
+    let (dir, last) = match walk_beneath(root, components) {
+        Ok(pair) => pair,
+        // Nothing laid out beneath the root at all: nothing to remove.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    // `unlinkat` removes the link itself, never what it points at, so a
+    // symlinked *final* component costs the attacker their own link and nothing
+    // of ours. The parents are what needed care, and `walk_beneath` gave it.
+    match unlinkat(&dir, last, AtFlags::empty()) {
+        // Gone already is the outcome we wanted either way.
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(e) => Err(io::Error::from(e)),
     }
-    Ok(Some(path))
 }
 
 #[cfg(test)]
@@ -341,6 +367,7 @@ mod tests {
     use super::*;
     use crate::metainfo::{FileEntry, InfoHash, MetaInfo};
     use sha1::{Digest, Sha1};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A throwaway directory under the system temp dir; removed on drop.
@@ -618,33 +645,40 @@ mod tests {
         assert!(again.verify_all().unwrap().has(0));
     }
 
-    /// Resolution for deletion refuses the same links, and reports "not there"
-    /// rather than an error for a path that simply does not exist.
+    /// Deletion refuses the same links, and treats absence as success.
     #[test]
-    fn existing_path_beneath_refuses_links_and_tolerates_absence() {
+    fn remove_beneath_refuses_links_and_tolerates_absence() {
         let dir = TempDir::new();
         let root = dir.0.join("downloads");
         std::fs::create_dir_all(root.join("demo")).unwrap();
 
-        assert_eq!(
-            existing_path_beneath(&root, &["demo".into(), "absent.bin".into()]).unwrap(),
-            None,
-            "an absent file is not an error for a deletion"
-        );
+        remove_beneath(&root, &["demo".into(), "absent.bin".into()])
+            .expect("an absent file is not an error for a deletion");
 
         let real = root.join("demo").join("real.bin");
         std::fs::write(&real, b"x").unwrap();
-        assert_eq!(
-            existing_path_beneath(&root, &["demo".into(), "real.bin".into()]).unwrap(),
-            Some(real)
-        );
+        remove_beneath(&root, &["demo".into(), "real.bin".into()]).expect("remove a real file");
+        assert!(!real.exists(), "the file was not removed");
 
+        // A symlinked *parent* must not be walked: the file on the other side
+        // is not ours to delete.
         let outside = dir.0.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        let keep = outside.join("keep.txt");
+        std::fs::write(&keep, b"keep").unwrap();
         std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
-        let err = existing_path_beneath(&root, &["linked".into(), "keep.txt".into()])
+        let err = remove_beneath(&root, &["linked".into(), "keep.txt".into()])
             .expect_err("deleting through a link must be refused");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(keep.exists(), "a file outside the root was deleted");
+
+        // A symlinked *final* component costs the attacker their link and
+        // nothing of ours: `unlinkat` removes the link, never its target.
+        let target = dir.0.join("target.txt");
+        std::fs::write(&target, b"target").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("demo").join("link.bin")).unwrap();
+        remove_beneath(&root, &["demo".into(), "link.bin".into()]).expect("unlink the link itself");
+        assert!(target.exists(), "unlinkat followed the link");
+        assert!(!root.join("demo").join("link.bin").exists());
     }
 }

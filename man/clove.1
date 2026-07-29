@@ -217,9 +217,14 @@ $ clove resume 58e2fc46a8dc57c78191f079648750b0644d03a2
 .Ed
 .Pp
 Connect two instances directly, without a tracker.
-On the first host read its destination from
+The first host's destination is the one
+.Xr cloved 8
+prints when it connects to the router
+.Pq Dq we are ... .b32.i2p ;
+it is deliberately not served by
 .Cm status ,
-then on the second:
+so that reading a torrent listing never hands out an identity.
+On the second host:
 .Bd -literal -offset indent
 $ clove peer 58e2fc46a8dc57c78191f079648750b0644d03a2 \e
     asubu6d7wsbj7x7b7agamhimpmnlr3ezb7qu5zh2jllyalblxdpq.b32.i2p

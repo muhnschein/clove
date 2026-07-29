@@ -121,6 +121,15 @@ pub enum Problem {
     RemoteSam,
     /// A path value that is not absolute.
     RelativePath,
+    /// A `sam_address` this build cannot actually dial.
+    ///
+    /// Separate from [`BadSamAddress`](Problem::BadSamAddress), which is about
+    /// shape: these are well-formed addresses the runtime has no way to honour,
+    /// and accepting them meant `cloved -C` approving a configuration that then
+    /// did something else — a unix path left the daemon running with no router
+    /// at all, and a remote host was quietly redirected to the same port on
+    /// `127.0.0.1`.
+    UnsupportedSamTransport(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -150,6 +159,10 @@ impl fmt::Display for Problem {
                     "sam_address must be host:port or an absolute socket path"
                 )
             }
+            Problem::UnsupportedSamTransport(what) => write!(
+                f,
+                "sam_address: {what} (this build dials 127.0.0.1 only; see clove.conf(5))"
+            ),
             Problem::RemoteSam => write!(
                 f,
                 "sam_address is not loopback; if you really run SAM remotely, set i_know_sam_is_remote yes (dangerous: your traffic to the router is unprotected)"
@@ -217,6 +230,18 @@ impl Config {
                 problem: Problem::RemoteSam,
             });
         }
+        // Refuse here what the runtime cannot do, rather than accepting it and
+        // doing something else. `cloved -C` exists to tell an operator their
+        // configuration is good; it should not say so about an address that
+        // leaves the daemon with no router, or one it will silently swap for a
+        // different host. `docs/PROTOCOL.i2p-bt` §2.1 records why the backend
+        // is loopback-only.
+        if let Some(what) = unsupported_sam_transport(&sam_address) {
+            return Err(Error::Line {
+                line: sam_line,
+                problem: Problem::UnsupportedSamTransport(what),
+            });
+        }
 
         let data_dir = data_dir.map_or_else(|| defaults.data_home.join("clove"), |(_, v)| v);
         let api_socket = api_socket.map_or_else(
@@ -282,6 +307,28 @@ fn looks_like_sam_address(value: &str) -> bool {
             .is_ok_and(|p| p != 0 && !port.starts_with('+')),
         _ => false,
     }
+}
+
+/// Why this build cannot dial `value`, or `None` if it can.
+///
+/// The SAM backend builds its own loopback TCP connection and takes the port
+/// from here and nothing else (`crates/i2pnet/src/sam.rs`), so these two shapes
+/// parse and validate and then are not what happens. Both were accepted:
+///
+/// - a unix-socket path became `"unsupported-sam-address"` at startup and the
+///   daemon ran with no router, having been told its configuration was fine;
+/// - a remote `host:port` had its host discarded and the port dialed on
+///   `127.0.0.1`, which is a different router than the one asked for — and the
+///   one case where quietly doing something else is worse than failing, because
+///   the operator set a deliberately ugly flag to say they meant it.
+fn unsupported_sam_transport(value: &str) -> Option<&'static str> {
+    if value.starts_with('/') {
+        return Some("a unix-socket SAM address is not supported; use host:port");
+    }
+    if !is_loopback_sam(value) {
+        return Some("a remote SAM bridge is not supported");
+    }
+    None
 }
 
 /// Textual loopback check. Deliberately exact-match — `localhost` is the
@@ -404,16 +451,34 @@ ephemeral yes
             }
         );
 
-        let c = Config::parse("sam_address 10.0.0.2:7656\ni_know_sam_is_remote yes\n", &d).unwrap();
-        assert!(c.i_know_sam_is_remote);
+        // The ugly flag gets you past the loopback rule and straight into the
+        // truth: this build dials 127.0.0.1 and cannot do otherwise, so saying
+        // "I know" does not make a remote bridge work. It used to be accepted
+        // here and then quietly redirected to the local router — a different
+        // machine than the one the operator deliberately asked for.
+        assert_eq!(
+            Config::parse("sam_address 10.0.0.2:7656\ni_know_sam_is_remote yes\n", &d).unwrap_err(),
+            Error::Line {
+                line: 1,
+                problem: Problem::UnsupportedSamTransport("a remote SAM bridge is not supported")
+            }
+        );
 
-        // Loopback spellings that pass; unix socket too.
-        for addr in [
-            "127.0.0.1:7656",
-            "localhost:7656",
-            "[::1]:7656",
-            "/run/sam.sock",
-        ] {
+        // A unix socket is well-formed, was accepted, and left the daemon with
+        // no router at all — `cloved -C` said the configuration was good.
+        assert_eq!(
+            Config::parse("sam_address /run/sam.sock\n", &d).unwrap_err(),
+            Error::Line {
+                line: 1,
+                problem: Problem::UnsupportedSamTransport(
+                    "a unix-socket SAM address is not supported; use host:port"
+                )
+            }
+        );
+
+        // Loopback spellings still pass, or the check above is just refusing
+        // everything.
+        for addr in ["127.0.0.1:7656", "localhost:7656", "[::1]:7656"] {
             let text = format!("sam_address {addr}\n");
             assert!(Config::parse(&text, &d).is_ok(), "rejected {addr}");
         }

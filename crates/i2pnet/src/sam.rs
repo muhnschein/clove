@@ -387,8 +387,13 @@ impl SessionLife {
 
     /// Remember a line the router volunteered, in case it turns out to have
     /// been the session's last words.
+    ///
+    /// Scrubbed on the way in, not on the way out: this ends up in the
+    /// "router lost" line the daemon prints, and a control line can carry the
+    /// `DESTINATION=` blob. Storing it raw would mean the only thing between
+    /// the key and a log was remembering to scrub at every use.
     fn note(&self, line: &str) {
-        self.lock().last_line = Some(line.to_owned());
+        self.lock().last_line = Some(scrub_control_line(line));
     }
 
     /// Record the session as ended. The first reason wins: what killed it is
@@ -647,13 +652,86 @@ impl Drop for SamSession {
     }
 }
 
+/// Make a line the router sent safe to repeat in an error or a log.
+///
+/// A SAM control line is the one place clove handles text that may contain the
+/// *private* half of its identity: `SESSION STATUS RESULT=OK DESTINATION=…`
+/// carries the full key blob, and that line — or a malformed one meant to be
+/// it — used to be embedded verbatim in the error we then printed.
+/// `SECURITY.md` puts "the destination key, or any part of the SAM
+/// `DESTINATION=` blob behind it, reaching … a log" in scope, and rightly: a
+/// bridge that answers oddly is a bug to report, and a bug report is exactly
+/// where that line ends up.
+///
+/// A hostile bridge already holds the key — it generated it — so this is not
+/// defence against the bridge. It is defence against the key travelling
+/// further than the machine it was made on, which is what logs do.
+///
+/// Two rules, because the field name is not enough on its own:
+///
+/// 1. a field whose *name* says it carries key material loses its value; and
+/// 2. any long run of I2P base64 loses itself, whatever field it turned up in
+///    — a bridge that puts a key somewhere unexpected is exactly the bridge
+///    worth defending against, and by definition it is not going to label it.
+///
+/// `RESULT` and `MESSAGE` survive: they are the router explaining why a session
+/// died, which is the entire reason this text is kept, and neither is a place a
+/// key belongs. Control characters go regardless — this reaches a terminal.
+fn scrub_control_line(line: &str) -> String {
+    /// Field names whose values are, or may contain, private key material.
+    const SECRET_FIELDS: &[&str] = &["DESTINATION", "PRIVKEY", "PRIVATEKEY", "KEY"];
+    /// Shortest run of I2P base64 treated as a key rather than a word. A
+    /// destination is ~516 characters; no diagnostic English gets near this.
+    const BLOB: usize = 64;
+
+    let mut out = String::with_capacity(line.len());
+    for (i, field) in line.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        match field.split_once('=') {
+            Some((key, _)) if SECRET_FIELDS.contains(&key.to_ascii_uppercase().as_str()) => {
+                out.extend(key.chars().map(scrub_char));
+                out.push_str("=<redacted>");
+            }
+            _ if looks_like_key_material(field, BLOB) => out.push_str("<redacted>"),
+            _ => out.extend(field.chars().map(scrub_char)),
+        }
+    }
+    out
+}
+
+/// Whether `field` contains an unbroken run of at least `min` I2P base64
+/// characters — the shape of a destination or a key blob, in any field.
+fn looks_like_key_material(field: &str, min: usize) -> bool {
+    let mut run = 0usize;
+    for c in field.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '~' | '=') {
+            run += 1;
+            if run >= min {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+fn scrub_char(c: char) -> char {
+    if c.is_control() { '?' } else { c }
+}
+
 /// Pull the destination blob out of a `SESSION STATUS` reply, or say what the
 /// router said instead.
 fn parse_session_status(status: &str) -> io::Result<&str> {
     if !status.starts_with("SESSION STATUS") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("SAM bridge answered SESSION CREATE with {status:?}"),
+            format!(
+                "SAM bridge answered SESSION CREATE with {:?}",
+                scrub_control_line(status)
+            ),
         ));
     }
     let result = status
@@ -664,11 +742,16 @@ fn parse_session_status(status: &str) -> io::Result<&str> {
         // The router's own result word: DUPLICATED_ID, I2P_ERROR and friends
         // call for entirely different actions, and "session refused" calls for
         // none of them.
+        //
+        // `MESSAGE=` runs to the end of the line, so a router that puts
+        // anything after it — including a `DESTINATION=` — puts it in here too.
+        // Scrubbed as a whole line rather than trusted to be only a message.
         return Err(io::Error::other(format!(
-            "router refused the session: {result}{}",
+            "router refused the session: {}{}",
+            result.chars().map(scrub_char).collect::<String>(),
             status
                 .split_once("MESSAGE=")
-                .map(|(_, m)| format!(" ({})", m.trim_matches('"')))
+                .map(|(_, m)| format!(" ({})", scrub_control_line(m.trim_matches('"'))))
                 .unwrap_or_default()
         )));
     }
@@ -1665,6 +1748,53 @@ mod session_tests {
         assert!(
             err.to_string().contains("session clove-test exists"),
             "{err}"
+        );
+    }
+
+    /// A router's control line may carry the private half of our identity, and
+    /// what we do with a line we did not expect is print it.
+    ///
+    /// `SESSION STATUS RESULT=OK DESTINATION=…` is the ordinary shape of that:
+    /// the blob is the key. A bridge that answers oddly — malformed, or a
+    /// refusal with the key after `MESSAGE=` — used to have that line embedded
+    /// verbatim in an error, which the supervisor then wrote to stderr.
+    /// `SECURITY.md` puts any part of the `DESTINATION=` blob reaching a log in
+    /// scope, and a bug report is precisely where such a line goes.
+    #[test]
+    fn a_control_line_cannot_carry_key_material_into_a_log() {
+        let key = "A".repeat(516);
+
+        // Named field, whatever else is on the line.
+        let scrubbed = scrub_control_line(&format!(
+            "SESSION STATUS RESULT=OK DESTINATION={key} STYLE=STREAM"
+        ));
+        assert!(!scrubbed.contains(&key), "{scrubbed}");
+        assert!(scrubbed.contains("RESULT=OK"), "{scrubbed}");
+        assert!(scrubbed.contains("DESTINATION=<redacted>"), "{scrubbed}");
+        assert!(scrubbed.contains("STYLE=STREAM"), "the shape survives");
+
+        // Unnamed, or hidden behind a field we have never heard of: the run of
+        // base64 gives it away on its own.
+        for line in [
+            format!("SESSION STATUS RESULT=OK {key}"),
+            format!("SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"oops {key}\""),
+            format!("SESSION STATUS RESULT=OK SOMETHINGNEW={key}"),
+        ] {
+            let scrubbed = scrub_control_line(&line);
+            assert!(!scrubbed.contains(&key), "key survived in: {scrubbed}");
+        }
+
+        // What the field is *for* survives, or keeping the line is pointless.
+        let diagnostic =
+            scrub_control_line("SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"tunnel build failed\"");
+        assert!(diagnostic.contains("I2P_ERROR"), "{diagnostic}");
+        assert!(diagnostic.contains("tunnel build failed"), "{diagnostic}");
+
+        // And a router cannot forge a log line or repaint the terminal.
+        let nasty = scrub_control_line("SESSION STATUS RESULT=OK\r\ncloved: all is well\x1b[2J");
+        assert!(
+            !nasty.contains('\n') && !nasty.contains('\r') && !nasty.contains('\x1b'),
+            "{nasty:?}"
         );
     }
 

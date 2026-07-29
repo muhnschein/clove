@@ -38,24 +38,27 @@ A typo must fail startup loudly rather than be silently ignored; use
 to check a file before restarting a running daemon.
 .Sh KEYWORDS
 .Bl -tag -width Ds
-.It Ic sam_address Ar host:port | Ar path
+.It Ic sam_address Ar host:port
 Address of the router's SAMv3 bridge.
 Default:
 .Pa 127.0.0.1:7656 .
 .Pp
 The address must be loopback
-.Pq Pa 127.0.0.1 , Pa localhost , Pa [::1]
-or an absolute unix socket path, unless
-.Ic i_know_sam_is_remote
-is set.
+.Pq Pa 127.0.0.1 , Pa localhost , Pa [::1] .
+.Pp
+A unix-socket path is refused: clove speaks SAM over TCP only, and accepting
+a path it could not dial meant
+.Nm cloved Fl C
+approving a configuration that then left the daemon with no router.
 .Pa localhost
 is the only hostname clove accepts anywhere: there is no DNS resolution.
 Exotic loopback spellings such as
 .Pa 127.0.0.2
 are refused rather than given the benefit of the doubt.
 .It Ic i_know_sam_is_remote Ar yes | Ar no
-Permit a non-loopback
-.Ic sam_address .
+Acknowledge that a non-loopback
+.Ic sam_address
+is intended.
 Default:
 .Ar no .
 .Pp
@@ -63,7 +66,13 @@ This is dangerous and deliberately ugly to type.
 Traffic between clove and a remote SAM bridge is unprotected: anyone who can
 see that link sees which destinations you talk to, defeating the point of
 running over I2P.
-Do not set this unless the link is a trusted, otherwise-protected one.
+.Pp
+It is currently of no use: this build dials
+.Pa 127.0.0.1
+and nothing else, so a remote address is refused whether or not the flag is
+set, rather than being accepted and quietly redirected to the local router.
+The flag is kept so an existing configuration still parses, and so the
+refusal can say what was meant.
 .It Ic data_dir Ar path
 Absolute path of the state directory: destination keys, per-torrent resume
 data, the API token, and downloaded files.

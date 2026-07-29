@@ -63,12 +63,23 @@ for another week, is worth more than a tidy file.
 2. SAM and the routers — the session, dialing, and every live surprise
 ----------------------------------------------------------------------
 
-2.1 [decided] yosemite hardcodes the SAM host to 127.0.0.1; only the TCP
-    port is configurable. This happens to enforce Layer 1's loopback-only
-    rule for free. Consequence: the documented `--i-know-sam-is-remote`
-    escape hatch (SCOPE §5) is NOT expressible through the yosemite backend
-    as it stands — a remote SAM bridge would need a different backend or an
-    upstream change. Noted rather than worked around.
+2.1 [decided] The SAM host is 127.0.0.1; only the TCP port is configurable.
+    This happens to enforce Layer 1's loopback-only rule for free.
+    Consequence: the documented `--i-know-sam-is-remote` escape hatch
+    (SCOPE §5) is NOT expressible — a remote SAM bridge would need the
+    backend to dial elsewhere. Noted rather than worked around.
+
+    Originally this was yosemite's constraint. It is now clove's own:
+    `sam::dial_stream` builds the loopback connection itself, and yosemite
+    is down to `NAMING LOOKUP`, which also takes only a port. The
+    consequence is unchanged; the reason has moved.
+
+    Since 2026-07-29 the configuration says so rather than implying
+    otherwise. A remote address and a unix-socket path are both refused at
+    parse time, because accepting them meant `cloved -C` approving a
+    configuration the runtime then did not honour — a path left the daemon
+    with no router, and a remote host was redirected to the same port on
+    127.0.0.1, which is a different machine than the one asked for.
 
 2.2 [decided] yosemite's synchronous Stream exposes `split(self) ->
     (ReadHalf, WriteHalf)`, not a duplicating `try_clone`. clove's
