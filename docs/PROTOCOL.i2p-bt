@@ -236,6 +236,16 @@ for another week, is worth more than a tidy file.
       should not be read as a limit on peer concurrency: the same sweeps
       dialled 200 concurrent streams on a single session without losing one.
 
+      **Evidence for churn over uptime or load, same day, same router.** A
+      six-hour seed soak (LIVE-TESTING §6.3) held *one* identity for seven
+      hours across 8 announces, 19 inbound dials and 1.3 GiB served, with no
+      SAM trouble of any kind. Same i2pd 2.61.0 that dropped its bridge twice
+      under the sweeps. The variable that distinguishes them is destination
+      churn, not session age, throughput or peer count — which is the reading
+      that makes this a harness artifact rather than something a long-running
+      clove would ever provoke. Not conclusive without watching the router
+      while it happens; still the way to bet.
+
 
     2.6b [assumed] A freshly created transient destination is briefly
       unreachable: a dial to it returns STREAM STATUS RESULT=CANT_REACH_PEER

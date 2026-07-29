@@ -75,8 +75,12 @@ can reach. M1 and M3 are met on those two routers.
 session, twice over — the R2 question, answered in the negative and closed in
 `SCOPE.md` §7. The dial path does not degrade with concurrency (§2.6e).
 
-**Not proven:** the multi-hour seed soak, and a router restart mid-transfer.
-Those are what stands between here and the 0.1 interop sign-off.
+**Also proven, on i2pd:** a six-hour seed soak — 2.0 GiB downloaded, then 1.3
+GiB served back over the seeding window with peers steady and inbound dials
+climbing. No session starvation under peer load (§6.3).
+
+**Not proven:** a router restart mid-transfer, and the soak repeated on Java
+I2P. Those are what stands between here and the 0.1 interop sign-off.
 
 **Not reachable in this environment:** the inbound half against a containerized
 router (§3.1), and with it every tier that needs a listener of ours — the
@@ -516,13 +520,19 @@ in its table; tick them from the run rather than from impressions.
       → `peers-known` proves the announce was *accepted*; the exact value form
       still wants a read of the daemon log next to the tracker's reply, so this
       box is the one the script cannot tick for you.
-- [ ] Sustained seed to i2psnark peers over a multi-hour soak; no session
-      starvation under peer load (revisit Q1 only if it appears). *Serving
-      itself is confirmed* — 71 MiB and 69 MiB back on 2026-07-28, on a
-      torrent with real leechers — but not yet over hours.
-      → `make swarm … SWARM_ARGS='--seed-for 21600'` after a completed
-      download; `bytes-served` and `inbound-peer` are the signals that peers
-      are actually taking data from us rather than us merely being up.
+- [x] Sustained seed to i2psnark peers over a multi-hour soak; no session
+      starvation under peer load (revisit Q1 only if it appears).
+      **i2pd 2.61.0, 2026-07-28** — six hours of seeding after a 2.0 GiB
+      download, 1.3 GiB served in that window, peers steady at 20–44 and
+      inbound climbing 5 → 19. No starvation, so Q1 stands. Detail in §6.3.
+      → `make swarm … SWARM_ARGS='--deadline … --seed-for 21600 --keep'` after
+      a completed download; `bytes-served` and `inbound-peer` are the signals
+      that peers are actually taking data from us rather than us merely being
+      up. **Pick a torrent with real leechers** — a near-all-seeds swarm serves
+      nothing and reads as a clove defect (§6.3 cost a week to that once). Pass
+      `--keep`: the cleanup trap fires on `INT`, so a Ctrl-C otherwise takes
+      the data directory *and* the verify pass with it.
+      Still open on **Java I2P**, whose §6.3 cell is empty.
 - [ ] Wire identity `-CV0001-` re-checked against observed swarm peer IDs before
       the first announce (Q7 checkpoint — the wire-permanent moment).
 
@@ -544,7 +554,7 @@ client works", and because they no longer depend on the loopback rows passing.
 | **Bytes served to a swarm peer** (`bytes-served`) | **ok** — 2.61.0, 95.0 MiB | **ok** — 54.0 MiB, 2026-07-28 ‡ | |
 | **A remote peer dialed us** (`inbound-peer`, §2.5) | **ok** — 2.61.0, 11 and 2 peers | not reachable in this environment — §3.1 | |
 | Announce quirks confirmed (§5.1, §5.4) | | | |
-| Multi-hour seed soak | | | |
+| Multi-hour seed soak | **ok** — 2.61.0, 2026-07-28, 6 h seeding, 1.3 GiB served | | |
 | Survives router restart mid-transfer | | | |
 | Cross-router dial (`make cross`) | unfinished at 240s — 2026-07-28 | n/a as listener — §3.1 | n/a as listener — §3.1 |
 | Two-instance loopback download, both directions | | n/a — §3.1 | n/a — §3.1 |
@@ -566,6 +576,36 @@ inbound half, and every containerized router in this environment is
 structurally unable to provide it. They become runnable against a
 host-installed router, or clove inside the router's namespace.
 
+**Six-hour seed soak — i2pd 2.61.0, 2026-07-28.** 2.0 GiB in 1025 pieces from
+a swarm with real leechers; downloaded in 4194s (~500 KiB/s, the fastest
+observed by some margin), then seeded for the full 21600s:
+
+```
+download-complete  4194s   uploaded 188.5 MiB at that point
+                  25794s   uploaded 1.5 GiB      (6 h later)
+verified 1025 piece(s) · announces_ok 8 · announces_failed 0
+```
+
+Over the seeding window: **1.3 GiB served**, attached peers held at **20–44**
+and never approached zero, `known_peers` grew 69 → 93, `pex_peers` 40 → 48,
+and `inbound_peers` climbed **5 → 19**. Every milestone ticked, `bytes-served`
+at 196s and `inbound-peer` at 302s.
+
+**This settles the post-completion peer decay noted below: it was the swarm,
+not clove.** The earlier runs flatlined at completion against a near-all-seeds
+torrent; against one with real leechers, upload climbs continuously for six
+hours and peers do not drain. The tentative reading below — postman's ~30
+minute interval leaving one announce inside a 15-minute window — is consistent
+with this run's 8 announces over 7 hours, but it was never the whole story:
+the swarm's composition was. **No re-dial defect exists in the seeding path**,
+and the check suggested below is no longer needed.
+
+It also bears on §2.6f, for free. This run held **one identity for seven
+hours** across 8 announces and 19 inbound dials with no SAM trouble at all,
+where a stress sweep asking i2pd for ~36 fresh destinations inside an hour
+took the bridge down twice. That is evidence for destination *churn* rather
+than uptime or load, and churn is not a pattern clove produces (Q4).
+
 **A 286 MiB torrent, three routers, one sweep — 2026-07-28.** Same magnet
 (286.1 MiB, 1145 pieces, a swarm with active leechers), same commit, all three started
 within 80 seconds of each other:
@@ -586,7 +626,7 @@ needs a run that is not competing with itself.
 
 **`bytes-served` closed, and the swarm was the culprit all along.** That row
 was empty on all three routers, and the note below argued the cause was the
-torrent — an I2P router update is close to all-seeds, and seeds do not request
+torrent — that swarm was close to all-seeds, and seeds do not request
 from seeds — recording it as *untested, not failing* and asking for a re-run
 against real leechers. This is that re-run: bytes moved at **105s on i2pd and
 46s on Java**, both long before completion, i.e. ordinary reciprocation while
@@ -658,7 +698,7 @@ this row on both routers. Kept because the reasoning was the useful part and it
 turned out to be right.)* The Java run announced twice — `announces_ok 2`, so
 the `completed` announce of §5.6 did go out — and still served nothing across
 900s of seeding. With the tracker correctly told there is a new seed, what
-remains is the swarm: an I2P router update is close to all-seeds, and seeds do
+remains is the swarm: that torrent was close to all-seeds, and seeds do
 not request from seeds. Peers decayed toward zero after completion on both
 routers, which is what a swarm of seeds does with a peer that has just said it
 wants nothing. **Test this row against a torrent with real leechers**; until
@@ -696,7 +736,7 @@ one is ours:
     and postman's interval is half an hour. The tracker therefore spent the
     entire seeding window handing our destination to peers as a leecher, and
     no peer had a reason to ask us for anything. See §5.6.
-  - **the swarm's**, and not a defect: an I2P router update is close to
+  - **the swarm's**, and not a defect: that torrent was close to
     all-seeds, and seeds do not request from seeds. Peers fell from 38 to 7
     shortly after completion, which is what a swarm of seeds correctly does
     with a peer that has just told them it wants nothing.
@@ -977,15 +1017,17 @@ sign-off, cheapest first:
    I2P, or clove run inside a container's netns (§3.1). Nothing below this is
    measurable without one, and it is configuration rather than code.
 2. **A router restart mid-transfer** (§6.1), which is the one M1 box no swarm
-   run can tick for you.
-3. **The multi-hour seed soak** (§6.2) — worth settling the post-completion
-   peer decay noted in §6.3 first, or the soak will measure an empty swarm.
+   run can tick for you — and now the only box left that needs a live run
+   rather than a reading.
+3. **The seed soak on Java I2P** (§6.2). Done on i2pd; the §6.3 cell for the
+   other gating router is empty. Lower stakes than it was, since the question
+   the soak existed to answer is answered — this fills a matrix cell.
 4. **§2.6f, if it recurs**: i2pd's SAM bridge stopped answering at the top of
    both stress ladders. Watch `systemctl --user status i2pd` across the next
    sweep — whether the router exited or only its bridge stopped decides
    between an upstream bug report and a local limit. Not a release gate, and
-   not something a torrent client's usage pattern provokes (§2.6f), but it is
-   the one open question the sweeps raised.
+   the six-hour soak has since made destination *churn* the leading suspect
+   (§6.3), which is not a pattern clove produces.
 
 *`sam-stress` at 16/32/64/128/200 has left this list: R2 is answered (§2.6e),
 and the ladder is a regression instrument now rather than an open question.*
