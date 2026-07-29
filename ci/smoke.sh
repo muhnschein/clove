@@ -172,6 +172,15 @@ run verify "$info_hash" >/dev/null || fail "verify failed"
 echo "smoke: priorities"
 run priorities "$info_hash" 2 >/dev/null || fail "priorities failed"
 expect_contains "$(run show "$info_hash")" "high" "priority in show"
+# Displayed and persisted is where this used to stop: the engine was never
+# told, so a file set to skip downloaded in full. Progress is the cheapest
+# observable proof it arrives — nothing wanted is nothing outstanding, and
+# this torrent holds none of its one piece.
+expect_contains "$(run show "$info_hash" --json)" '"progress":0.0' "progress before skipping"
+run priorities "$info_hash" 0 >/dev/null || fail "priorities skip failed"
+expect_contains "$(run show "$info_hash" --json)" '"progress":1.0' "skipping the only file leaves nothing outstanding"
+run priorities "$info_hash" 1 >/dev/null || fail "priorities normal failed"
+expect_contains "$(run show "$info_hash" --json)" '"progress":0.0' "wanting it again reopens the torrent"
 
 echo "smoke: sequential mode persists across a restart"
 run sequential "$info_hash" on >/dev/null || fail "sequential on failed"

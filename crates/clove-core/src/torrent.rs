@@ -493,6 +493,33 @@ impl Torrent {
         lock(&self.shared.state).request_timeout = timeout;
     }
 
+    /// Set what each piece is worth (`0` skip, `1` normal, `2` high), as
+    /// derived from the user's per-file choice by
+    /// [`MetaInfo::piece_priorities`](crate::metainfo::MetaInfo::piece_priorities).
+    ///
+    /// Takes effect on the next pick, and re-checks completion: dropping the
+    /// only pieces a torrent was still missing finishes it, and a torrent that
+    /// has quietly become complete needs to say so rather than wait for a block
+    /// that is no longer coming.
+    pub fn set_piece_priorities(&self, per_piece: &[u8]) {
+        lock(&self.shared.state)
+            .picker
+            .set_piece_priorities(per_piece);
+        self.shared.check_done();
+    }
+
+    /// Bytes of the pieces we want and do not hold — an announce's `left`.
+    #[must_use]
+    pub fn bytes_left(&self) -> u64 {
+        lock(&self.shared.state).picker.bytes_left()
+    }
+
+    /// How many pieces we want at all, held or not.
+    #[must_use]
+    pub fn wanted_pieces(&self) -> u32 {
+        lock(&self.shared.state).picker.wanted_count()
+    }
+
     /// Start the periodic work this torrent needs: keep-alives to peers we have
     /// nothing else to say to, dropping peers that have gone silent, and choke
     /// rounds.
@@ -1724,6 +1751,165 @@ mod tests {
         let mut root = BTreeMap::new();
         root.insert(b"info".to_vec(), Value::Dict(info));
         MetaInfo::parse(&encode(&Value::Dict(root))).unwrap()
+    }
+
+    /// A three-file torrent, one piece per file, so a file maps to exactly one
+    /// piece and "which file was skipped" is readable off the wire.
+    fn three_file_meta(content: &[u8]) -> MetaInfo {
+        let each = u64::from(BLOCK_LEN);
+        let files = ["a.bin", "b.bin", "c.bin"]
+            .iter()
+            .map(|name| FileEntry {
+                path: vec!["demo".into(), (*name).into()],
+                length: each,
+            })
+            .collect();
+        meta_for(files, BLOCK_LEN, content)
+    }
+
+    /// Attach a raw peer that claims everything and unchokes, then collect
+    /// every piece index the engine asks it for within `window`.
+    fn indices_requested(
+        net: &MockNet,
+        torrent: &Arc<Torrent>,
+        dest: DestHash,
+        num_pieces: u32,
+        window: Duration,
+    ) -> Vec<u32> {
+        let ep = net.endpoint();
+        let mut peer = ep.dial(dest, Duration::from_secs(5)).unwrap();
+        let ours = Handshake {
+            info_hash: torrent.info_hash(),
+            peer_id: *b"-XX0000-priopriopr00",
+            extensions: Extensions {
+                extended: false,
+                fast: false,
+            },
+        };
+        peer.write_all(&ours.encode()).unwrap();
+        let mut buf = [0u8; wire::HANDSHAKE_LEN];
+        peer.read_exact(&mut buf).unwrap();
+
+        let mut full = vec![0u8; (num_pieces as usize).div_ceil(8)];
+        for p in 0..num_pieces as usize {
+            full[p / 8] |= 0x80 >> (p % 8);
+        }
+        wire::write_message(&mut peer, &Message::Bitfield(full)).unwrap();
+        wire::write_message(&mut peer, &Message::Unchoke).unwrap();
+
+        // Bounded, so a piece that is never requested ends the read instead of
+        // hanging it — the absence is exactly what this asserts on.
+        peer.set_timeouts(Some(Duration::from_millis(200)));
+        let deadline = std::time::Instant::now() + window;
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let Ok(body) = wire::read_frame(&mut peer, 1 << 20) else {
+                continue;
+            };
+            if let Ok(Message::Request(req)) = Message::parse(&body)
+                && !seen.contains(&req.index)
+            {
+                seen.push(req.index);
+            }
+        }
+        seen
+    }
+
+    /// The engine must never ask for a piece the user set to skip, and must ask
+    /// for a high-priority one first.
+    ///
+    /// Asserted on the wire, because everything upstream of it was already
+    /// right: `clove priority` validated the vector, stored it, persisted it and
+    /// reported success, `clove list` displayed it, and the manual documented
+    /// `0 = skip`. The one thing nothing did was tell the engine, so a skipped
+    /// file downloaded in full.
+    #[test]
+    fn priorities_decide_what_the_engine_asks_for() {
+        let net = MockNet::new();
+        let content: Vec<u8> = (0..(3 * BLOCK_LEN))
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let meta = three_file_meta(&content);
+
+        let dir = TempDir::new("prio-skip");
+        let torrent = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(3),
+            Mode::Sequential,
+            *b"-CV0001-prioprioprio",
+        );
+        // Skip the middle file, raise the last: with sequential selection the
+        // untouched order would be 0, 1, 2, so both effects are visible.
+        torrent.set_piece_priorities(&meta.piece_priorities(&[1, 0, 2]));
+
+        let ep = net.endpoint();
+        let dest = ep.dest();
+        let torrent_for_accept = Arc::clone(&torrent);
+        let accept = std::thread::spawn(move || {
+            if let Ok((stream, from)) = ep.accept() {
+                let mut buf = [0u8; wire::HANDSHAKE_LEN];
+                let mut stream = stream;
+                if stream.read_exact(&mut buf).is_ok()
+                    && let Ok(hs) = Handshake::parse(&buf)
+                {
+                    let _ = torrent_for_accept.attach_accepted(stream, from, &hs);
+                }
+            }
+        });
+
+        let asked = indices_requested(&net, &torrent, dest, 3, Duration::from_secs(2));
+        accept.join().unwrap();
+
+        assert!(
+            !asked.contains(&1),
+            "the skipped file's piece was requested anyway: {asked:?}"
+        );
+        assert_eq!(
+            asked.first(),
+            Some(&2),
+            "the high-priority file should be asked for first: {asked:?}"
+        );
+        assert!(
+            asked.contains(&0),
+            "the normal file must still be downloaded: {asked:?}"
+        );
+        // And the torrent is finished once the two wanted pieces land, rather
+        // than waiting for a piece it will never ask for.
+        assert_eq!(torrent.wanted_pieces(), 2);
+        assert_eq!(torrent.bytes_left(), 2 * u64::from(BLOCK_LEN));
+    }
+
+    /// Changing priorities on a running torrent takes effect on that torrent,
+    /// not merely on the next start.
+    #[test]
+    fn a_live_torrent_picks_up_a_priority_change() {
+        let content: Vec<u8> = (0..(3 * BLOCK_LEN))
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let meta = three_file_meta(&content);
+        let dir = TempDir::new("prio-live");
+        let torrent = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(3),
+            Mode::Sequential,
+            *b"-CV0001-priolivepri0",
+        );
+
+        assert_eq!(torrent.wanted_pieces(), 3);
+        assert_eq!(torrent.bytes_left(), 3 * u64::from(BLOCK_LEN));
+        assert!(!torrent.is_complete());
+
+        torrent.set_piece_priorities(&meta.piece_priorities(&[0, 0, 1]));
+        assert_eq!(torrent.wanted_pieces(), 1);
+        assert_eq!(torrent.bytes_left(), u64::from(BLOCK_LEN));
+
+        // Skipping everything finishes it: there is nothing left to wait for.
+        torrent.set_piece_priorities(&meta.piece_priorities(&[0, 0, 0]));
+        assert_eq!(torrent.wanted_pieces(), 0);
+        assert_eq!(torrent.bytes_left(), 0);
+        assert!(torrent.is_complete());
     }
 
     /// Two instances negotiate BEP 10 and one learns a third peer via

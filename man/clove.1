@@ -132,6 +132,14 @@ skip,
 normal,
 .Sy 2
 high.
+A running torrent changes course immediately; blocks already requested are
+not cancelled.
+.Pp
+Files do not begin and end on piece boundaries, so a skipped file still
+receives whatever shares a piece with a neighbour it is keeping: at most
+one piece at each end of it.
+A torrent counts as finished, and starts seeding, once every file it was
+told to fetch is present; the skipped ones are not waited for.
 .It Cm announce Ar info-hash
 Announce to every one of the torrent's trackers immediately, ignoring the
 intervals they last asked for.

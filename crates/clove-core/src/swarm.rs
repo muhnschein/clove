@@ -376,25 +376,6 @@ fn announce_loop<D, N>(
     }
 }
 
-/// Bytes of the torrent we actually hold.
-///
-/// Not `pieces * piece_length`: the last piece is usually short, so counting it
-/// as a whole one over-reports what we have and under-reports `left` — by up to
-/// a piece, on every announce, for any torrent holding its tail but not its
-/// middle.
-fn bytes_present(have: &crate::bitfield::Bitfield, piece_length: u64, total_length: u64) -> u64 {
-    if piece_length == 0 {
-        return 0;
-    }
-    have.iter_present()
-        .map(|index| {
-            let start = u64::from(index).saturating_mul(piece_length);
-            let remaining = total_length.saturating_sub(start);
-            remaining.min(piece_length)
-        })
-        .sum()
-}
-
 /// One announce to one tracker: build, resolve, dial, exchange, feed peers.
 ///
 /// Returns the interval the tracker asked for and the event that went out, so
@@ -412,14 +393,12 @@ where
     D: I2pDialer,
     N: I2pNamingLookup,
 {
-    let have = torrent.have();
-    let complete = have.count() == have.len();
-    let left = if complete {
-        0
-    } else {
-        let done = bytes_present(&have, target.piece_length, target.total_length);
-        target.total_length.saturating_sub(done)
-    };
+    // Both from the engine, which is the only thing that knows which pieces
+    // this torrent is actually asking for. Counting every piece instead would
+    // have a torrent with skipped files announce as a leecher for ever and
+    // never report the snatch it did make.
+    let complete = torrent.is_complete();
+    let left = torrent.bytes_left();
     let (uploaded, downloaded) = torrent.stats();
     let event = state.next_event(complete);
     let params = tracker::AnnounceParams {
@@ -1431,32 +1410,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         done()
-    }
-
-    #[test]
-    fn bytes_present_counts_a_short_last_piece_as_short() {
-        use crate::bitfield::Bitfield;
-        // Four pieces of 16 KiB over a torrent whose last piece is 100 bytes.
-        let piece = u64::from(BLOCK_LEN);
-        let total = 3 * piece + 100;
-        let field = |present: &[u32]| {
-            let mut bf = Bitfield::empty(4);
-            for &p in present {
-                bf.set(p);
-            }
-            bf
-        };
-        assert_eq!(bytes_present(&field(&[]), piece, total), 0);
-        assert_eq!(bytes_present(&field(&[0]), piece, total), piece);
-        // The tail is 100 bytes, not a whole piece — the case that used to
-        // over-count and report `left` as smaller than it was.
-        assert_eq!(bytes_present(&field(&[3]), piece, total), 100);
-        assert_eq!(bytes_present(&field(&[0, 3]), piece, total), piece + 100);
-        assert_eq!(bytes_present(&field(&[0, 1, 2, 3]), piece, total), total);
-        // Holding the tail while missing a middle piece must leave that piece
-        // outstanding, not zero.
-        let done = bytes_present(&field(&[0, 1, 3]), piece, total);
-        assert_eq!(total - done, piece, "a missing whole piece went unreported");
     }
 
     /// A dialer that records how many dials were in flight at once, and how

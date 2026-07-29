@@ -364,6 +364,10 @@ where
             hosted.mode(),
             network.peer_id,
         );
+        // Before anything is dialed, so the first pick already knows what the
+        // user asked for. Persisted priorities that never reached the engine
+        // were a `clove priority` that reported success and changed nothing.
+        torrent.set_piece_priorities(&hosted.meta.piece_priorities(&hosted.priorities));
         network.demux.register(&torrent);
         let swarm = Swarm::dial_only(
             Arc::clone(&torrent),
@@ -744,6 +748,13 @@ where
         }
         let count = priorities.len();
         hosted.priorities = priorities;
+        // The engine first, then the disk. A live torrent that kept picking
+        // pieces the user just told it to skip is the whole of this bug, and
+        // it is not fixed by persisting the choice for next time.
+        if let Some(live) = &hosted.live {
+            live.torrent
+                .set_piece_priorities(&hosted.meta.piece_priorities(&hosted.priorities));
+        }
         let resume = hosted.resume(*info_hash);
         write_resume_file(&self.state_dir, info_hash, &resume).map_err(ActionError::Io)?;
         Ok(count)
@@ -1084,8 +1095,31 @@ impl Hosted {
     }
 
     /// The state string shown in listings.
+    /// Pieces this torrent is asking for, and how many of those it holds.
+    ///
+    /// Everything user-facing counts against this rather than against the whole
+    /// torrent: a download with files set to skip is finished when the files it
+    /// was told to fetch are, and reporting it at 60% for ever — never
+    /// "seeding", never done — would be describing a job it was told not to do.
+    fn wanted_and_held(&self) -> (u32, u32) {
+        let priorities = self.meta.piece_priorities(&self.priorities);
+        let mut wanted = 0;
+        let mut held = 0;
+        for index in 0..self.have.len() {
+            if priorities.get(index as usize).copied().unwrap_or(1) == 0 {
+                continue;
+            }
+            wanted += 1;
+            if self.have.has(index) {
+                held += 1;
+            }
+        }
+        (wanted, held)
+    }
+
     fn state(&self) -> &'static str {
-        let complete = self.have.count() == self.have.len();
+        let (wanted, held) = self.wanted_and_held();
+        let complete = held == wanted;
         if self.scanning {
             "verifying"
         } else if self.paused {
@@ -1101,10 +1135,14 @@ impl Hosted {
     }
 
     fn progress(&self) -> f64 {
-        if self.have.is_empty() {
-            0.0
+        let (wanted, held) = self.wanted_and_held();
+        if wanted == 0 {
+            // Nothing asked for is nothing outstanding. Reporting 0% for a
+            // torrent with every file skipped would be the one number that
+            // never moves however long it runs.
+            1.0
         } else {
-            f64::from(self.have.count()) / f64::from(self.have.len())
+            f64::from(held) / f64::from(wanted)
         }
     }
 
