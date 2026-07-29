@@ -295,6 +295,34 @@ SECS ?= 60
 fuzz:
 	cargo +nightly fuzz run $(TARGET) -- -max_total_time=$(SECS)
 
+## Every target, per-target budgets, one report file you can send to someone.
+## A crash lands in the report with its input and a reproducer, so it can be
+## diagnosed away from the machine that found it.
+##   make fuzz-all              # ~50 min
+##   make fuzz-all SCALE=4      # a long hunt
+##   make fuzz-all QUICK=1      # ~5 min, "does it still build and run"
+SCALE ?= 1
+fuzz-all:
+	@./ci/fuzz.sh $(if $(QUICK),--quick,--scale $(SCALE))
+
+## Shrink the local corpus to the smallest set of inputs reaching the same
+## coverage, then repack it as the committed seed. Run after a long sweep.
+##
+## The seed ships as one tarball rather than thousands of loose files: the
+## content is ~1 MiB either way, but as files it is thousands of git objects in
+## every clone, for inputs nobody can review individually anyway.
+fuzz-seed:
+	@for t in $$(cargo +nightly fuzz list); do \
+		printf 'cmin: %-12s' "$$t"; \
+		before=$$(ls fuzz/corpus/$$t 2>/dev/null | wc -l); \
+		cargo +nightly fuzz cmin "$$t" >/dev/null 2>&1 && \
+			printf '%5s -> %5s\n' "$$before" "$$(ls fuzz/corpus/$$t | wc -l)" || \
+			printf 'skipped\n'; \
+	done; \
+	tar czf fuzz/seed-corpus.tar.gz -C fuzz corpus; \
+	echo "seed: $$(find fuzz/corpus -type f | wc -l) file(s) packed into \
+fuzz/seed-corpus.tar.gz ($$(du -h fuzz/seed-corpus.tar.gz | cut -f1))"
+
 ## Check the manuals parse and follow mdoc conventions. Unresolved cross-page
 ## references are expected until the pages are installed, so they are filtered.
 man-lint:

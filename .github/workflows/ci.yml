@@ -53,12 +53,40 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [bencode, metainfo, resume, json, http, wire, tracker, extensions, magnet]
+        # Budgets are per-target because the targets are not alike. Measured
+        # 2026-07-29: `wire` reached all 168 of its edges within seconds and
+        # spent the rest of a 300s run re-proving them, while `extensions` and
+        # `metainfo` were still finding new coverage when the clock ran out.
+        # `ci/fuzz.sh` carries the same table for local runs.
+        include:
+          - {target: wire, secs: 120}
+          - {target: bencode, secs: 300}
+          - {target: resume, secs: 300}
+          - {target: http, secs: 300}
+          - {target: magnet, secs: 300}
+          - {target: json, secs: 420}
+          - {target: tracker, secs: 420}
+          - {target: metainfo, secs: 600}
+          - {target: extensions, secs: 600}
     steps:
       - uses: actions/checkout@v4
+      # The committed seed corpus starts each run warm; this carries what the
+      # run *discovers* to the next one. Without it every scheduled run spends
+      # much of its budget rediscovering that input has to be bencode at all,
+      # which is the difference between fuzzing the parser and fuzzing the
+      # question of whether the input is a torrent.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
       - run: rustup toolchain install nightly
       - run: cargo install cargo-fuzz --locked
-      - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
+      # Committed seeds on top of whatever the cache restored: the cache can be
+      # evicted or cold, and a run that starts from nothing is a slower run.
+      - run: tar xzf fuzz/seed-corpus.tar.gz -C fuzz -k || true
+      - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=${{ matrix.secs }}
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
