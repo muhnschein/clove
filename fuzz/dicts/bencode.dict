@@ -1,0 +1,54 @@
+# Bencode grammar. Five shapes, and every one of them is a prefix the mutator
+# would otherwise have to stumble on: an input that is not `d`, `l`, `i`, or a
+# digit is rejected on the first byte and tells the fuzzer nothing about the
+# parser underneath.
+"d"
+"e"
+"l"
+"i"
+"de"
+"le"
+"dee"
+"lle"
+"d1:ai0ee"
+"l0:e"
+
+# Integers: the syntactic edges (leading zero, minus zero, empty) and the
+# numeric ones (i64/u64 boundaries, overflow past them).
+"i0e"
+"i-0e"
+"i-1e"
+"i00e"
+"i01e"
+"ie"
+"i9223372036854775807e"
+"i-9223372036854775808e"
+"i18446744073709551615e"
+"i18446744073709551616e"
+"i99999999999999999999e"
+
+# Byte strings: the length prefix is the interesting part, not the payload.
+"0:"
+"1:a"
+"2:ab"
+"-1:"
+"00:"
+"4294967296:"
+"18446744073709551616:"
+":"
+
+# The keys that actually appear in the documents this codec carries, so a
+# round-trip case can be built by insertion rather than by luck.
+"4:info"
+"8:announce"
+"13:announce-list"
+"12:piece length"
+"6:pieces"
+"6:length"
+"5:files"
+"4:path"
+"4:name"
+"7:private"
+"8:interval"
+"5:peers"
+"14:failure reason"

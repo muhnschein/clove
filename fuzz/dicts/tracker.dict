@@ -1,0 +1,42 @@
+# Announce responses. parse_response takes bencode directly — the HTTP framing
+# around it belongs to the `http` target, not this one.
+"d"
+"e"
+"l"
+"8:interval"
+"12:min interval"
+"5:peers"
+"14:failure reason"
+"2:ip"
+
+# A response skeleton: interval is the field whose hostile values this target
+# asserts against (a tracker must not be able to push us inside the local
+# announce floor), so make it cheap to reach.
+"d8:intervali0ee"
+"d8:intervali1800ee"
+"8:intervali"
+
+# Interval values worth reaching: zero, negative, the signed/unsigned edges,
+# and past them.
+"i0e"
+"i-1e"
+"i1e"
+"i-2147483648e"
+"i2147483647e"
+"i9223372036854775807e"
+"i18446744073709551615e"
+"i18446744073709551616e"
+
+# Peers arrive either as a list of dicts keyed by "ip" or as a compact string
+# of concatenated 32-byte I2P destination hashes — the length check on the
+# latter (a multiple of 32) is worth hitting from both sides.
+"5:peersl"
+"5:peers0:"
+"5:peers32:"
+"5:peers64:"
+"5:peers31:"
+"5:peers33:"
+"d2:ip"
+"2:ip0:"
+"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+".i2p"

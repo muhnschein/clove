@@ -1,0 +1,58 @@
+# Peer wire messages: a 4-byte big-endian length, then a one-byte id, then a
+# payload. Both parts are structure the mutator would otherwise guess at.
+#
+# This target reached all 168 of its edges within seconds of a cold start on
+# both 2026-07-29 and 2026-07-30 and added no corpus units in 59M executions,
+# so the dictionary is not expected to move it — it is here so that a change
+# to the codec has the vocabulary waiting rather than needing it written.
+
+# Length prefixes: keep-alive, the fixed-size messages, and the bound.
+"\x00\x00\x00\x00"
+"\x00\x00\x00\x01"
+"\x00\x00\x00\x03"
+"\x00\x00\x00\x05"
+"\x00\x00\x00\x09"
+"\x00\x00\x00\x0d"
+"\x00\x10\x00\x00"
+"\x00\x10\x00\x01"
+"\xff\xff\xff\xff"
+"\x7f\xff\xff\xff"
+
+# Message ids, as they appear after a one-byte length.
+"\x00\x00\x00\x01\x00"
+"\x00\x00\x00\x01\x01"
+"\x00\x00\x00\x01\x02"
+"\x00\x00\x00\x01\x03"
+"\x00\x00\x00\x05\x04"
+"\x00\x00\x00\x01\x05"
+"\x00\x00\x00\x0d\x06"
+"\x00\x00\x00\x09\x07"
+"\x00\x00\x00\x0d\x08"
+"\x00\x00\x00\x05\x0d"
+"\x00\x00\x00\x01\x0e"
+"\x00\x00\x00\x01\x0f"
+"\x00\x00\x00\x0d\x10"
+"\x00\x00\x00\x05\x11"
+"\x00\x00\x00\x02\x14"
+
+# Unassigned ids, which must be rejected rather than mis-dispatched.
+"\x09"
+"\x0a"
+"\x0b"
+"\x0c"
+"\x12"
+"\x13"
+"\x15"
+"\xff"
+
+# Block geometry: the 16 KiB block length and the boundaries either side.
+"\x00\x00\x40\x00"
+"\x00\x00\x40\x01"
+"\x00\x00\x3f\xff"
+
+# Handshake: pstrlen, the protocol string, and a wrong-length variant.
+"\x13BitTorrent protocol"
+"BitTorrent protocol"
+"\x14BitTorrent protocol"
+"\x00\x00\x00\x00\x00\x00\x00\x00"
+"\x00\x00\x00\x00\x00\x10\x00\x00"
