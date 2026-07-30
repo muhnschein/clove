@@ -470,7 +470,16 @@ fn sweep<D>(
     D::Stream: 'static,
 {
     let connected: Vec<DestHash> = torrent.connected_peers();
-    let budget = config.max_peers.saturating_sub(connected.len());
+    // Two ceilings, and the wave is sized by the tighter one: this torrent's
+    // own `max_peers`, and what is left of the client-wide budget every other
+    // torrent is drawing on too (`docs/PHASE-H.md` §3). The second read is
+    // advisory — another torrent may claim the slot before this wave attaches
+    // — but its job is only to stop us spending a `dial_timeout` reaching for
+    // room that is not there. `Torrent::attach` makes the binding claim.
+    let budget = config
+        .max_peers
+        .saturating_sub(connected.len())
+        .min(torrent.budget().available());
     if budget == 0 {
         return;
     }
@@ -540,11 +549,14 @@ where
     loop {
         match listener.accept() {
             Ok(Some((stream, from))) => {
-                if torrent.connected_peers().len() >= max_peers {
+                if torrent.connected_peers().len() >= max_peers || torrent.budget().available() == 0
+                {
                     drop(stream);
                     continue;
                 }
                 // A failed handshake just closes this peer; the loop lives on.
+                // So does a lost race for the last budget slot — `attach`
+                // refuses it, which is the same outcome as any other refusal.
                 let _ = torrent.attach(stream, from);
             }
             // One unusable connection, not the end of the listener.
@@ -689,9 +701,11 @@ impl InboundDemux {
         let Some(torrent) = torrent else {
             return; // unknown info-hash: drop, nothing to say
         };
-        if torrent.connected_peers().len() >= self.max_peers {
+        if torrent.connected_peers().len() >= self.max_peers || torrent.budget().available() == 0 {
             return;
         }
+        // Still only advisory: `attach_accepted` claims the slot, and refuses
+        // with `WouldBlock` if the client filled up between here and there.
         let _ = torrent.attach_accepted(stream, from, &theirs);
     }
 }
@@ -833,6 +847,7 @@ impl I2pListener for NoListener {
 mod tests {
     use super::*;
     use crate::bitfield::Bitfield;
+    use crate::budget::PeerBudget;
     use crate::metainfo::{FileEntry, InfoHash, MetaInfo};
     use crate::picker::Mode;
     use crate::storage::Storage;
@@ -929,6 +944,67 @@ mod tests {
             *b"-CV0001-leechleechle",
         );
         (seeder, leecher, seed_dir, leech_dir)
+    }
+
+    /// The metainfo and content of one distinct test torrent, without the
+    /// seeder/leecher pair [`seed_and_leech_tagged`] builds — for tests that
+    /// need many seeders of the same torrent rather than one.
+    fn fixture_meta(tag: u8) -> (MetaInfo, Vec<u8>) {
+        let content: Vec<u8> = (0..(3 * BLOCK_LEN + 100))
+            .map(|i| u8::try_from((i + u32::from(tag)) % 251).unwrap_or(0))
+            .collect();
+        let pieces: Vec<[u8; 20]> = content
+            .chunks(BLOCK_LEN as usize)
+            .map(|c| Sha1::digest(c).into())
+            .collect();
+        let meta = MetaInfo {
+            info_hash: InfoHash([tag; 20]),
+            name: format!("budget-demo-{tag}"),
+            piece_length: BLOCK_LEN,
+            pieces,
+            files: vec![FileEntry {
+                path: vec!["budget-demo".into()],
+                length: content.len() as u64,
+            }],
+            total_length: content.len() as u64,
+            private: true,
+            trackers: vec![],
+            skipped_trackers: 0,
+            raw_info: Vec::new(),
+        };
+        (meta, content)
+    }
+
+    /// A complete seeder for `meta`, listening on its own endpoint.
+    ///
+    /// Its own budget is unlimited: the ceiling under test is the *leechers'*,
+    /// and a seeder that refused connections would be indistinguishable from
+    /// the budget working.
+    fn spawn_budget_seeder(net: &MockNet, meta: &MetaInfo, content: &[u8]) -> (DestHash, TempDir) {
+        let dir = TempDir::new("budget-seed");
+        let storage = Arc::new(Storage::create(meta, &dir.0, false).unwrap());
+        for p in 0..storage.num_pieces() {
+            let start = p as usize * BLOCK_LEN as usize;
+            let end = (start + storage.piece_len(p) as usize).min(content.len());
+            storage.write_block(p, 0, &content[start..end]).unwrap();
+        }
+        let have = storage.verify_all().unwrap();
+        assert!(have.is_full());
+        let seeder = Torrent::new(
+            meta,
+            storage,
+            &have,
+            Mode::RarestFirst,
+            *b"-CV0001-seedseedseed",
+        );
+        let ep = net.endpoint();
+        let dest = ep.dest();
+        let demux = InboundDemux::new(64);
+        demux.register(&seeder);
+        let _accept = demux.run(ep);
+        // Held for the test's duration; the process ends before this matters.
+        std::mem::forget(seeder);
+        (dest, dir)
     }
 
     #[test]
@@ -1500,6 +1576,105 @@ mod tests {
             8,
             "failed dials must be scheduled for retry, not forgotten"
         );
+    }
+
+    /// Several torrents sharing one client's budget must not add up past it,
+    /// however generous each one's own `max_peers` is.
+    ///
+    /// This is the whole point of `docs/PHASE-H.md` §3: the per-torrent cap
+    /// bounds one torrent, and nothing used to bound the sum, so hosting *n*
+    /// torrents cost *n* times a number chosen for one — against a single SAM
+    /// session measured only to 200 concurrent streams.
+    #[test]
+    fn torrents_sharing_a_budget_cannot_add_up_past_it() {
+        const LIMIT: usize = 5;
+        let net = MockNet::new();
+        let budget = PeerBudget::new(LIMIT);
+
+        // Four torrents, each allowed 4 peers of its own — 16 in total if
+        // nothing shared a ceiling — and eight seeders apiece to attach to.
+        let mut leechers = Vec::new();
+        let mut dirs = Vec::new();
+        for tag in 0..4u8 {
+            let (meta, content) = fixture_meta(tag);
+            let leech_dir = TempDir::new("budget-leech");
+            let storage = Arc::new(Storage::create(&meta, &leech_dir.0, false).unwrap());
+            let leecher = Torrent::with_budget(
+                &meta,
+                storage,
+                &Bitfield::empty(meta.pieces.len().try_into().unwrap()),
+                Mode::RarestFirst,
+                *b"-CV0001-leechleechle",
+                Arc::clone(&budget),
+            );
+            let mut seed_dests = Vec::new();
+            for _ in 0..8 {
+                let (dest, dir) = spawn_budget_seeder(&net, &meta, &content);
+                seed_dests.push(dest);
+                dirs.push(dir);
+            }
+            leecher.add_peers(&seed_dests);
+            leechers.push(leecher);
+            dirs.push(leech_dir);
+        }
+
+        let config = SwarmConfig {
+            max_peers: 4,
+            dial_concurrency: 4,
+            ..quick_config()
+        };
+        // Every torrent sweeps at once, which is how the daemon runs them:
+        // each has its own thread and its own timer, so the interleaving here
+        // is the real one and the race for the last slot is genuine.
+        std::thread::scope(|scope| {
+            for leecher in &leechers {
+                let dialer = net.endpoint().dialer();
+                scope.spawn(move || {
+                    let stop = StopFlag::default();
+                    let mut retry_after = HashMap::new();
+                    for _ in 0..3 {
+                        sweep(leecher, &dialer, &stop, &config, &mut retry_after);
+                    }
+                });
+            }
+        });
+
+        let attached: usize = leechers.iter().map(|t| t.connected_peers().len()).sum();
+        assert!(
+            attached <= LIMIT,
+            "{attached} peers attached across four torrents, budget was {LIMIT}"
+        );
+        assert_eq!(
+            budget.in_use(),
+            attached,
+            "the budget's count and the peer tables disagree"
+        );
+        // Saturated, not merely under: four torrents allowed four peers each
+        // have 32 seeders between them and three sweeps to reach them, so
+        // without the shared ceiling this lands on 16. A run that attached
+        // nothing would satisfy "at most 5" while proving nothing at all.
+        assert_eq!(
+            attached, LIMIT,
+            "the budget should be the binding constraint here, not the supply of peers"
+        );
+
+        // And the slots come back when the *connections* do. Dropping the
+        // `Arc<Torrent>` handles is deliberately not what does it: the reader
+        // and writer threads hold their own references, the streams are still
+        // open, and a slot is a claim on a live connection rather than on a
+        // handle. `disconnect_all` is what pause and session teardown both
+        // call, and it empties the table the slots live in.
+        for leecher in &leechers {
+            leecher.disconnect_all();
+        }
+        assert_eq!(
+            budget.in_use(),
+            0,
+            "slots outlived the connections that claimed them"
+        );
+        // Room for a fresh sweep, which is the operational point: a paused
+        // torrent's peers must stop costing the ones still running.
+        assert_eq!(budget.available(), LIMIT);
     }
 
     /// A sweep must not start dials after a stop is requested — otherwise a

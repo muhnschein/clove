@@ -90,7 +90,27 @@ pub struct Config {
     /// Grow each file to its full length when a torrent is added, rather than
     /// letting it become sparse as pieces land (SCOPE §4).
     pub preallocate: bool,
+    /// Ceiling on peer connections across *every* torrent at once
+    /// (`docs/PHASE-H.md` §3).
+    pub peer_limit: usize,
+    /// Ceiling on peer connections for any one torrent, applied under
+    /// [`peer_limit`](Config::peer_limit).
+    pub torrent_peer_limit: usize,
 }
+
+/// Client-wide peer ceiling when the config does not say otherwise.
+///
+/// The concurrency `SCOPE.md` R2 actually measured — 200 concurrent streams on
+/// one i2pd SAM session, uncorrelated with connect latency across 30 runs
+/// (`PROTOCOL.i2p-bt` §2.6e) — rather than a round number. Above it we would be
+/// guessing, and the thing being guessed with is the session every torrent
+/// shares.
+pub const DEFAULT_PEER_LIMIT: usize = 200;
+
+/// Per-torrent peer ceiling when the config does not say otherwise. The
+/// long-standing `SwarmConfig::max_peers` default, now a sub-cap rather than
+/// the only cap.
+pub const DEFAULT_TORRENT_PEER_LIMIT: usize = 50;
 
 /// Why configuration was rejected. Messages are written for the operator:
 /// they name the line, the key, and what to do about it.
@@ -118,6 +138,8 @@ pub enum Problem {
     DuplicateKey,
     /// Boolean value other than `yes` or `no`.
     BadBool,
+    /// A count that is not a positive number, or is absurdly large.
+    BadCount,
     /// SAM address is neither `host:port` nor an absolute socket path.
     BadSamAddress,
     /// SAM address is not loopback and `i_know_sam_is_remote` is not set.
@@ -156,6 +178,7 @@ impl fmt::Display for Problem {
             Problem::MissingValue => write!(f, "key has no value"),
             Problem::DuplicateKey => write!(f, "key already set earlier in the file"),
             Problem::BadBool => write!(f, "expected \"yes\" or \"no\""),
+            Problem::BadCount => write!(f, "expected a number from 1 to {MAX_PEER_LIMIT}"),
             Problem::BadSamAddress => {
                 write!(
                     f,
@@ -193,6 +216,8 @@ impl Config {
         let mut api_socket: Option<(usize, PathBuf)> = None;
         let mut ephemeral: Option<(usize, bool)> = None;
         let mut preallocate: Option<(usize, bool)> = None;
+        let mut peer_limit: Option<(usize, usize)> = None;
+        let mut torrent_peer_limit: Option<(usize, usize)> = None;
 
         for (index, raw) in text.lines().enumerate() {
             let line = index + 1;
@@ -225,6 +250,14 @@ impl Config {
                 "preallocate" => {
                     let flag = parse_bool(value).ok_or_else(|| at(Problem::BadBool))?;
                     set(&mut preallocate, line, flag)?;
+                }
+                "peer_limit" => {
+                    let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
+                    set(&mut peer_limit, line, count)?;
+                }
+                "torrent_peer_limit" => {
+                    let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
+                    set(&mut torrent_peer_limit, line, count)?;
                 }
                 other => return Err(at(Problem::UnknownKey(other.to_owned()))),
             }
@@ -269,8 +302,31 @@ impl Config {
             api_socket,
             ephemeral: ephemeral.is_some_and(|(_, v)| v),
             preallocate: preallocate.is_some_and(|(_, v)| v),
+            peer_limit: peer_limit.map_or(DEFAULT_PEER_LIMIT, |(_, v)| v),
+            torrent_peer_limit: torrent_peer_limit.map_or(DEFAULT_TORRENT_PEER_LIMIT, |(_, v)| v),
         })
     }
+}
+
+/// Largest accepted value for either peer ceiling.
+///
+/// Not a considered engineering limit so much as a refusal to accept a typo:
+/// the numbers that make sense here are in the hundreds, and a `peer_limit` of
+/// 100000 is a slipped keystroke that would be discovered as a wedged SAM
+/// session hours later rather than as a failed start.
+pub const MAX_PEER_LIMIT: usize = 10_000;
+
+/// Parse a peer-count value: a plain decimal, at least 1, at most
+/// [`MAX_PEER_LIMIT`].
+///
+/// Zero is refused rather than read as "unlimited". A client configured to
+/// hold no peers at all is never what was meant, and the spelling for
+/// "as many as you like" is a large number, not an ambiguous one.
+fn parse_count(value: &str) -> Option<usize> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (1..=MAX_PEER_LIMIT).contains(n))
 }
 
 fn set<T>(slot: &mut Option<(usize, T)>, line: usize, value: T) -> Result<(), Error> {
@@ -375,6 +431,8 @@ mod tests {
         // Sparse by default: preallocation costs the full size at add time,
         // which is a deviation an operator opts into, not basic function.
         assert!(!c.preallocate);
+        assert_eq!(c.peer_limit, DEFAULT_PEER_LIMIT);
+        assert_eq!(c.torrent_peer_limit, DEFAULT_TORRENT_PEER_LIMIT);
         assert_eq!(c.data_dir, PathBuf::from("/home/u/.local/share/clove"));
         assert_eq!(c.api_socket, PathBuf::from("/run/user/1000/clove.sock"));
     }
@@ -417,6 +475,41 @@ preallocate yes
         assert_eq!(c.api_socket, PathBuf::from("/run/clove.sock"));
         assert!(c.ephemeral);
         assert!(c.preallocate);
+    }
+
+    #[test]
+    fn peer_ceilings_are_counts_with_a_refused_zero() {
+        let d = defaults();
+        let c = Config::parse("peer_limit 120\ntorrent_peer_limit 30\n", &d).unwrap();
+        assert_eq!(c.peer_limit, 120);
+        assert_eq!(c.torrent_peer_limit, 30);
+        assert_eq!(Config::parse("peer_limit 1\n", &d).unwrap().peer_limit, 1);
+        assert_eq!(
+            Config::parse(&format!("peer_limit {MAX_PEER_LIMIT}\n"), &d)
+                .unwrap()
+                .peer_limit,
+            MAX_PEER_LIMIT
+        );
+
+        // Zero is not "unlimited" — a client that may hold no peers is never
+        // what was meant — and a slipped keystroke fails the start rather
+        // than being discovered later as a wedged session.
+        for bad in [
+            "peer_limit 0",
+            "peer_limit -1",
+            "peer_limit 1.5",
+            "peer_limit lots",
+            "peer_limit 10001",
+            "torrent_peer_limit 0",
+            "torrent_peer_limit 99999999999999999999",
+        ] {
+            match Config::parse(bad, &d) {
+                Err(Error::Line { problem, .. }) => {
+                    assert_eq!(problem, Problem::BadCount, "{bad}");
+                }
+                other => panic!("{bad}: expected BadCount, got {other:?}"),
+            }
+        }
     }
 
     #[test]

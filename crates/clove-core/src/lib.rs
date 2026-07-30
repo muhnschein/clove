@@ -4,6 +4,7 @@
 
 pub mod bencode;
 pub mod bitfield;
+pub mod budget;
 pub mod choker;
 pub mod config;
 pub mod extension;

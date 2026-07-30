@@ -103,7 +103,7 @@ screen.
 
 ---
 
-## 3. H1 — One budget, shared
+## 3. H1 — One budget, shared — **landed**
 
 A `PeerBudget`: an atomic count of attached peers across the whole daemon, and
 a slot guard that releases on drop. The dial sweep takes slots before it dials;
@@ -119,16 +119,22 @@ refuses past its cap.
 - **`torrent_peer_limit`** (config, default 50) — the existing `max_peers`,
   now explicitly a sub-cap. A single torrent still cannot take the whole
   budget.
-- **Fairness.** The registry sweeps its torrents in rotation rather than in
-  `BTreeMap` order, so a torrent whose info-hash sorts first cannot
-  monopolise the budget forever. Rotation is one index in the registry, not a
-  scheduler.
+- **Fairness — corrected on contact with the code.** This section originally
+  called for sweeping the registry's torrents in rotation, so a torrent whose
+  info-hash sorts first could not monopolise the budget. There is no such
+  sweep to rotate: each live torrent owns its *own* `Swarm` thread and its own
+  `sweep_interval` timer, started whenever that torrent went live, so the
+  order they reach the budget in is already arbitrary and carries no bias
+  toward a low info-hash. What actually bounds one torrent is
+  `torrent_peer_limit`, which is why it stays. *Trigger for revisiting:* at
+  the defaults, four torrents can hold the whole 200 while a fifth gets
+  nothing until peers churn. If a live run shows a new add starved for more
+  than an announce interval, the fix is a fair share — `peer_limit` divided
+  by the live-torrent count as a floor — not a rotation.
 - **No preemption.** A torrent that holds slots keeps them until its peers
   drop on their own (idle timeout, choke churn, completion). Preemption means
   deciding *which* healthy connection to sever, which needs a policy we have
-  no evidence for. Deferred with a trigger: revisit if a live run shows a
-  finished-and-seeding torrent starving a fresh add for more than one
-  announce interval.
+  no evidence for. Same trigger as above.
 
 Both keys are tunables in the R5 sense — the defaults are the numbers we can
 defend today, and live measurement is expected to move them.
@@ -137,6 +143,23 @@ defend today, and live measurement is expected to move them.
 config keys. No new dependency. Mock-provable: N torrents, a budget of K,
 assert the attached total never exceeds K and that every torrent eventually
 gets slots.
+
+**As built.** `clove-core::budget` — a `PeerBudget` whose `claim()` is one
+compare-exchange returning a `PeerSlot` guard. The slot is held *by the peer's
+own entry in its torrent's table*, so it returns on every path that removes a
+peer — idle timeout, protocol violation, pause, session teardown, or a reader
+thread that panicked — without any of those paths knowing the budget exists.
+
+The claim sits in `Torrent`'s attach path and is the only authoritative check.
+The dial sweep and the inbound demux read `available()` first, but purely to
+avoid spending a `dial_timeout` reaching for room that is not there: that read
+is advisory and documented as such, because two torrents can reach the claim
+believing the same slot is free and exactly one of them can be right.
+
+A `Torrent` built the old way gets `PeerBudget::unlimited()`, so every existing
+test and any standalone use behaves as before; the daemon uses
+`Torrent::with_budget` and one budget owned by the registry — which outlives
+any single session, since a router restart returns every slot on its own.
 
 ---
 

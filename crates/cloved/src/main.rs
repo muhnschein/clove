@@ -140,7 +140,7 @@ fn run() -> Result<(), String> {
     }
     let token = load_or_create_token(&config.data_dir).map_err(|e| e.to_string())?;
 
-    let registry = Registry::open(&config.data_dir, config.preallocate)
+    let registry = Registry::open(&config.data_dir, registry::Limits::from(&config))
         .map_err(|e| format!("opening registry in {}: {e}", config.data_dir.display()))?;
     eprintln!("cloved: {} torrent(s) loaded", registry.count());
 
@@ -172,6 +172,7 @@ fn run() -> Result<(), String> {
         token,
         peer_id: build_peer_id().map_err(|e| e.to_string())?,
         registry: Mutex::new(registry),
+        torrent_peer_limit: config.torrent_peer_limit,
         router: Mutex::new("connecting"),
     });
 
@@ -215,6 +216,10 @@ struct Daemon {
     /// Our wire identity for this run, decided before anything can need it.
     peer_id: [u8; 20],
     registry: Mutex<Registry<Arc<SamSession>>>,
+    /// Per-torrent peer ceiling (`torrent_peer_limit`), applied to the dial
+    /// sweep and the inbound demux when a session comes up. The client-wide
+    /// ceiling is the registry's, since it outlives any one session.
+    torrent_peer_limit: usize,
     /// Router connection state shown in `/v1/status`.
     router: Mutex<&'static str>,
 }
@@ -385,13 +390,21 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str, identity: Ident
             // Only now, with the router having accepted it: a key that failed
             // SESSION CREATE is not one worth keeping.
             identity.remember(session.private_key_b64());
-            let demux = InboundDemux::new(SwarmConfig::default().max_peers);
+            // The per-torrent ceiling reaches the engine by these two paths and
+            // no other — the dial sweep's and the inbound demux's. Both come
+            // from the same configured number, so raising it in clove.conf
+            // raises it for dialling and accepting alike.
+            let swarm_config = SwarmConfig {
+                max_peers: daemon.torrent_peer_limit,
+                ..SwarmConfig::default()
+            };
+            let demux = InboundDemux::new(swarm_config.max_peers);
             let _accept = demux.run(listener);
             lock(&daemon.registry).attach_network(
                 Arc::clone(&session),
                 Arc::clone(&demux),
                 daemon.peer_id,
-                SwarmConfig::default(),
+                swarm_config,
                 session.local_dest_b64().to_owned(),
             );
             *lock(&daemon.router) = "connected";
@@ -1316,7 +1329,10 @@ mod tests {
             sam_address: "127.0.0.1:7656".to_owned(),
             token: TOKEN.to_owned(),
             peer_id: *b"-CV0001-testtesttes\0",
-            registry: Mutex::new(Registry::open(&dir.0, false).expect("registry")),
+            registry: Mutex::new(
+                Registry::open(&dir.0, registry::Limits::default()).expect("registry"),
+            ),
+            torrent_peer_limit: clove_core::config::DEFAULT_TORRENT_PEER_LIMIT,
             router: Mutex::new("connecting"),
         })
     }
@@ -1822,7 +1838,10 @@ mod tests {
             sam_address: "127.0.0.1:7656".to_owned(),
             token: String::new(),
             peer_id: *b"-CV0001-testtesttes\0",
-            registry: Mutex::new(Registry::open(&dir.0, false).expect("registry")),
+            registry: Mutex::new(
+                Registry::open(&dir.0, registry::Limits::default()).expect("registry"),
+            ),
+            torrent_peer_limit: clove_core::config::DEFAULT_TORRENT_PEER_LIMIT,
             router: Mutex::new("connecting"),
         });
         for header in [Some(""), Some(" "), None, Some(TOKEN)] {

@@ -1,4 +1,4 @@
-.Dd July 25, 2026
+.Dd July 30, 2026
 .Dt CLOVE.CONF 5
 .Os
 .Sh NAME
@@ -112,6 +112,44 @@ it downloads.
 Leave it off on a filesystem where sparse files are cheap and free space is
 tight, and on one that does not support sparse files it changes nothing —
 the space is taken either way.
+.It Ic peer_limit Ar count
+The greatest number of peer connections
+.Xr cloved 8
+will hold across
+.Em every
+torrent at once.
+Default:
+.Ar 200 .
+.Pp
+Every peer is an I2P stream on the one SAM session the whole client shares, so
+this is a ceiling on that session as much as on peers.
+The default is the concurrency that has actually been measured — 200 streams
+on one i2pd session, with connect latency independent of how many were open —
+rather than a round number, because above it we would be guessing with the
+session every torrent depends on.
+A session that wedges takes all of them down, not the torrent that overspent.
+.Pp
+Raise it if you have measured your router happily doing more; lower it on a
+small or busy router, or when clove is sharing one with other applications.
+.It Ic torrent_peer_limit Ar count
+The greatest number of peer connections any single torrent will hold.
+Default:
+.Ar 50 .
+.Pp
+Applied underneath
+.Ic peer_limit ,
+which the sum is still bound by: this one stops a single busy torrent taking
+the whole allowance, and is what an operator running many torrents at once
+should lower.
+Both keys take a number from 1 to 10000.
+.Pp
+There is deliberately no fair share between torrents.
+With the defaults, four saturated torrents can hold the entire
+.Ic peer_limit
+and a fifth waits for peers to churn; if that is your situation, lower
+.Ic torrent_peer_limit
+rather than raising
+.Ic peer_limit .
 .El
 .Sh EXAMPLES
 The recommended configuration is no file at all.
@@ -126,6 +164,13 @@ data_dir /srv/clove
 A throwaway identity for a one-off download:
 .Bd -literal -offset indent
 ephemeral yes
+.Ed
+.Pp
+Many torrents on a modest router: hold fewer streams overall, and stop any one
+torrent from taking most of them.
+.Bd -literal -offset indent
+peer_limit 80
+torrent_peer_limit 12
 .Ed
 .Pp
 A system-wide instance with a fixed socket path, so a service manager and its

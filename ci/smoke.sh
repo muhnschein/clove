@@ -138,6 +138,23 @@ PY
 echo "smoke: config check"
 timeout 20 "$cloved" -C >/dev/null || fail "cloved -C failed"
 
+# The peer ceilings are numbers, and a typo in one has to fail the start
+# rather than be discovered later as a wedged session.
+cat >"$work/limits.conf" <<EOF
+data_dir $work/limits-data
+peer_limit 80
+torrent_peer_limit 12
+EOF
+timeout 20 "$cloved" -C -c "$work/limits.conf" >/dev/null || fail "valid peer limits rejected"
+for bad in "peer_limit 0" "peer_limit lots" "torrent_peer_limit 0"; do
+    printf 'data_dir %s\n%s\n' "$work/limits-data" "$bad" >"$work/bad.conf"
+    set +e
+    timeout 20 "$cloved" -C -c "$work/bad.conf" >/dev/null 2>&1
+    code=$?
+    set -e
+    [ "$code" -ne 0 ] || fail "cloved -C accepted \"$bad\""
+done
+
 echo "smoke: daemon starts and answers"
 start_daemon
 run status >/dev/null || fail "clove status failed"
