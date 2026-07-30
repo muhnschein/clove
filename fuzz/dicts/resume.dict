@@ -1,0 +1,42 @@
+# On-disk resume state, possibly tampered with. Length-prefixed keys, as they
+# appear on the wire to the parser.
+"d"
+"e"
+"l"
+"i0e"
+"7:version"
+"9:info_hash"
+"10:num_pieces"
+"4:have"
+"10:priorities"
+"8:trackers"
+"6:paused"
+"10:sequential"
+"10:downloaded"
+"8:uploaded"
+"8:verified"
+
+# A skeleton that gets past the first few required-field checks, so mutation
+# can reach the cross-field invariants (bitfield length against piece count,
+# priorities in range) rather than dying at "missing version".
+"d7:versioni1e"
+"9:info_hash20:"
+"10:num_piecesi8e"
+
+# The invariants this target asserts, driven from both sides: an info_hash
+# that is not 20 bytes, a bitfield that disagrees with num_pieces, a priority
+# outside the accepted range.
+"20:"
+"19:"
+"21:"
+"0:"
+"i-1e"
+"i255e"
+"i4294967296e"
+"i18446744073709551615e"
+
+# Tracker lists are nested one level deeper than they look.
+"ll"
+"ee"
+"http://t.i2p/a"
+".i2p"

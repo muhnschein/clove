@@ -53,21 +53,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Budgets are per-target because the targets are not alike. Measured
-        # 2026-07-29: `wire` reached all 168 of its edges within seconds and
-        # spent the rest of a 300s run re-proving them, while `extensions` and
-        # `metainfo` were still finding new coverage when the clock ran out.
-        # `ci/fuzz.sh` carries the same table for local runs.
-        include:
-          - {target: wire, secs: 120}
-          - {target: bencode, secs: 300}
-          - {target: resume, secs: 300}
-          - {target: http, secs: 300}
-          - {target: magnet, secs: 300}
-          - {target: json, secs: 420}
-          - {target: tracker, secs: 420}
-          - {target: metainfo, secs: 600}
-          - {target: extensions, secs: 600}
+        # Budgets are per-target because the targets are not alike, and they
+        # live in exactly one place: `budget_for` in ci/fuzz.sh, which the run
+        # step below asks. This list used to carry its own copy with a comment
+        # saying the two must agree — a rule somebody had to remember, on a
+        # file nobody edits often, where forgetting means this job silently
+        # running the wrong budgets for months.
+        target:
+          - wire
+          - bencode
+          - json
+          - metainfo
+          - extensions
+          - http
+          - tracker
+          - resume
+          - magnet
     steps:
       - uses: actions/checkout@v4
       # The committed seed corpus starts each run warm; this carries what the
@@ -86,7 +87,29 @@ jobs:
       # Committed seeds on top of whatever the cache restored: the cache can be
       # evicted or cold, and a run that starts from nothing is a slower run.
       - run: tar xzf fuzz/seed-corpus.tar.gz -C fuzz -k || true
-      - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=${{ matrix.secs }}
+      - run: |
+          secs=$(./ci/fuzz.sh --budget ${{ matrix.target }})
+          echo "budget: ${{ matrix.target }} ${secs}s"
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -dict=fuzz/dicts/${{ matrix.target }}.dict \
+            -max_total_time="$secs"
+      # Minimise before the cache is written, not after it is read. libFuzzer
+      # keeps an input for reaching a new execution-count bucket, not a new
+      # edge, so a cache that is only ever added to grows without the coverage
+      # growing with it — and a bloated corpus makes the *next* run slower and
+      # shallower, because startup replays all of it and mutation energy is
+      # split across all of it. Left alone this compounds every night.
+      - if: success()
+        run: cargo +nightly fuzz cmin ${{ matrix.target }}
+      # `fuzz/corpus/` is git-ignored and the cache expires, so without this a
+      # month of scheduled runs leaves nothing behind. The artifact is what
+      # somebody folds into the committed seed with `make fuzz-seed`.
+      - if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+          retention-days: 30
       - if: failure()
         uses: actions/upload-artifact@v4
         with:

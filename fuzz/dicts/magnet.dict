@@ -1,0 +1,41 @@
+# magnet: URIs. Every input that is not "magnet:?…" is rejected by the first
+# line of Magnet::parse, so without these tokens the mutator spends its budget
+# rediscovering an eight-byte literal instead of exercising the parser behind
+# it. The 2026-07-30 sweep is the evidence: magnet was the only target still
+# gaining coverage at 300s (308 -> 402 edges), and its corpus grew to 5107
+# files to do it.
+"magnet:?"
+"xt=urn:btih:"
+"magnet:?xt=urn:btih:"
+"&dn="
+"&tr="
+"&xt="
+"&xl="
+"&ws="
+"&kt="
+
+# btih in both accepted encodings: 40 hex (v1) and 32 base32 of the same hash.
+"0123456789abcdef0123456789abcdef01234567"
+"0123456789ABCDEF0123456789ABCDEF01234567"
+"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+"MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43U"
+
+# Tracker values: the filter that keeps clearnet announces out is the property
+# this target asserts, so give the mutator both sides of it.
+"http://"
+".i2p"
+"http%3A%2F%2F"
+"http://tracker.i2p/announce"
+"http://tracker.i2p:6969/announce"
+"http://1.2.3.4:6969/announce"
+".I2P"
+".i2p."
+"..i2p"
+
+# percent-decoding, reached through both dn= and tr=
+"%00"
+"%2F"
+"%25"
+"%FF"
+"%zz"
+"%"

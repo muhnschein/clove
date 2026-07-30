@@ -1,0 +1,71 @@
+# Hand-rolled HTTP/1.1, both directions: tracker replies read off an I2P
+# stream, and API requests arriving on the control socket. The framing is the
+# parser — a mutator that has to find a bare CRLF by chance never reaches a body.
+#
+# CR and LF are written \x0d and \x0a throughout, not \r and \n: libFuzzer's
+# dictionary parser understands exactly three escapes — \\ , \" and \xNN — and
+# rejects the whole file on anything else, naming only the first bad line.
+
+"\x0d\x0a"
+"\x0d\x0a\x0d\x0a"
+"\x0a"
+"\x0a\x0a"
+"\x0d"
+": "
+
+# Response line
+"HTTP/1.1 200 OK\x0d\x0a"
+"HTTP/1.1 "
+"HTTP/1.0 "
+"HTTP/1."
+"200 OK"
+"204 No Content"
+"400 Bad Request"
+"401 Unauthorized"
+"403 Forbidden"
+"404 Not Found"
+"405 Method Not Allowed"
+"409 Conflict"
+"500 Internal Server Error"
+
+# Request line
+"GET "
+"POST "
+"PUT "
+"DELETE "
+" HTTP/1.1\x0d\x0a"
+"/v1/torrents"
+"/v1/torrents/x/pause"
+
+# Headers that change how the body is framed, which is where the interesting
+# disagreements live.
+"Content-Length: "
+"Content-Length: 0\x0d\x0a"
+"Content-Length: -1\x0d\x0a"
+"Content-Length: 18446744073709551616\x0d\x0a"
+"Transfer-Encoding: chunked\x0d\x0a"
+"CONTENT-LENGTH: "
+"content-type"
+"Content-Type: application/json\x0d\x0a"
+"Host: "
+"User-Agent: clove/0.1\x0d\x0a"
+"Connection: close\x0d\x0a"
+
+# Chunked bodies: the size line is hex, and the terminator is easy to get
+# wrong in a way that only shows up under a fuzzer.
+"0\x0d\x0a\x0d\x0a"
+"1a4\x0d\x0a"
+"ffffffff\x0d\x0a"
+"-1\x0d\x0a"
+"\x0d\x0a0\x0d\x0a"
+
+# percent_decode is driven with the same bytes, so give it something to chew.
+"%00"
+"%20"
+"%2F"
+"%FF"
+"%25"
+"%zz"
+"%0"
+"%"
+"+"

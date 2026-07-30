@@ -1,0 +1,39 @@
+# BEP 10 extension payloads: the handshake, ut_metadata, and i2p_pex. All
+# three are bencode dictionaries a peer sends us unprompted.
+"d"
+"e"
+"l"
+"i0e"
+
+# Extension handshake
+"1:m"
+"1:v"
+"7:i2p_pex"
+"11:ut_metadata"
+"13:metadata_size"
+"d1:md"
+"d1:md7:i2p_pexi1e11:ut_metadatai2eee"
+
+# ut_metadata: msg_type selects the branch, piece indexes it, total_size is
+# the field a hostile peer would use to make us allocate.
+"8:msg_type"
+"5:piece"
+"10:total_size"
+"d8:msg_typei0e5:piecei0ee"
+"d8:msg_typei1e5:piecei0e10:total_sizei0ee"
+"i2e"
+"i3e"
+"i-1e"
+"i16384e"
+"i4294967296e"
+"i18446744073709551615e"
+
+# i2p_pex: the peer cap is the property this target asserts, so the mutator
+# needs the keys and a length prefix long enough to argue about.
+"5:added"
+"7:dropped"
+"d5:added0:7:dropped0:e"
+"5:added32:"
+"5:added64:"
+"7:dropped32:"
+"5:added0:"

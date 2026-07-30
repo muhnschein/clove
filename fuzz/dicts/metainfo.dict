@@ -1,0 +1,43 @@
+# .torrent files. The keys are length-prefixed because that is how they appear
+# in the byte stream — "info" on its own is not something the parser can ever
+# see, but "4:info" is.
+"d"
+"e"
+"l"
+"i0e"
+"4:info"
+"8:announce"
+"13:announce-list"
+"12:piece length"
+"6:pieces"
+"6:length"
+"5:files"
+"4:path"
+"4:name"
+"7:private"
+
+# A well-formed skeleton, so the mutator can start from a torrent rather than
+# from the question of whether this is one.
+"d4:infod"
+"d8:announce"
+"12:piece lengthi16384e"
+
+# Path traversal and NUL in file paths is one of the properties this target
+# asserts, not merely a crash it hopes for. Hand the mutator the components.
+".."
+"../"
+"..\x2f"
+"/"
+"//"
+"\x00"
+"1:."
+"2:.."
+"1:/"
+"4:....//"
+
+# Tracker URLs: the surviving-trackers-are-I2P property, from both sides.
+"http://"
+".i2p"
+"http://tracker.i2p/announce"
+"http://1.2.3.4:6969/announce"
+"udp://"
