@@ -337,14 +337,17 @@ i2pd's netDb/tunnel counts, and the container log for any router that failed.
 Those are what separate "clove cannot dial" from "this router knows nobody to
 dial through" — a distinction that cost us a debugging session once already.
 
-API tokens are redacted. I2P destinations are not, since they are what makes a
-dial traceable and the ones in a test run are transient; `--redact-dests`
-removes them if you would rather — both the `.b32.i2p` form and the full base64
-destination an announce carries in `ip=`, which it used to leave behind.
+API tokens and I2P destinations are both redacted — the `.b32.i2p` form and the
+full base64 destination an announce carries in `ip=`. `--keep-dests` turns that
+off for a run where a traceable dial is the thing being debugged.
 
-That distinction is the whole of it if you ever point this at a daemon holding
-your *real* persisted identity rather than a transient test one: prefer the flag
-over trusting the run to be throwaway.
+Destinations used to be kept unless you asked otherwise, on the reasoning that
+they are what makes a dial traceable and that the identities in a test run are
+transient. The first half is why `--keep-dests` exists. The second was the
+script assuming how it was being used — about a file whose whole purpose is to
+be handed to somebody else, and wrong the first time anyone points it at a
+daemon holding their real persisted identity, which is precisely when it costs
+most. The default is now the one that is safe when the assumption fails.
 
 ### 5.4 `make test-live`
 
