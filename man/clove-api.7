@@ -187,6 +187,18 @@ Pausing disconnects its peers and persists across restarts.
 A resumed torrent returns to its place in the queue, which may be
 .Sy queued
 rather than running.
+.It Sy PUT Pa /v1/torrents/ Ns Ar info-hash Ns Pa /seed-ratio
+Set this torrent's seeding ratio.
+The body is a ratio written as a decimal
+.Pq Sy 2 , Sy 1.75 ,
+to at most three places, or
+.Sy 0
+to follow the daemon's
+.Ic seed_ratio .
+Reported as
+.Sy seed_ratio
+in thousandths, beside the torrent's current
+.Sy ratio .
 .It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /start
 Resume the torrent and move it to the head of the queue.
 At most one torrent is at the head; the position is not persisted.

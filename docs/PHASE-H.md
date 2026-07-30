@@ -1,6 +1,6 @@
 # Phase H — Daily-drivable: many torrents, and a view worth watching
 
-**Status:** In progress — **H0, H4, H1 and H5 landed**; H2, H3, H6 and the TUI as designed below.
+**Status:** In progress — **H0, H4, H1, H5, H2 and H3 landed**; H6 and the TUI as designed below.
 This pinned the design before the wiring, the way `PHASE-F.md` did, so the
 architecture was argued on paper where arguing is cheap. Maps to no new milestone: this is what M4's *"a CLI pleasant
 enough for daily use"* (`SCOPE.md` §1) turns out to mean once you run more than
@@ -219,7 +219,7 @@ newer ones. `clove start` exists for when the order is not what you want.
 
 ---
 
-## 5. H3 — Knowing when to stop
+## 5. H3 — Knowing when to stop — **landed**
 
 Without this, "daily drivable" means manually pausing finished torrents
 forever, and an unattended `cloved` seeds everything it has ever seen until the
@@ -243,7 +243,29 @@ rtorrent/Transmission feature that is genuinely better served by the thing
 already on the operator's machine — `systemd` timers against `clove pause
 --all` / `clove resume --all`, which H4 makes a one-liner.
 
-**Cost:** ~120 lines, two config keys, one subcommand.
+**Cost:** ~120 lines, two config keys, one subcommand, and resume **v5** for
+the per-torrent override and the stop reason.
+
+**As built.** The reason is carried *by* the stopped state rather than beside
+it — `Wanted::Paused(Why)`, where `Why` is `Operator`, `SeedRatio` or
+`SeedIdle` — so a stopped torrent cannot exist without an answer to the
+question its operator will ask. It is persisted, because that question is
+usually asked days later, and surfaces as `paused_because` in `clove show`.
+
+Ratios are stored and parsed in **thousandths**, never as floats. The config
+format is exact `key value` text and the resume file is bencode, which has
+integers and no floats at all; a ratio that round-trips through an `f64` can
+come back as 1.499 where the operator wrote 1.5. One hand-rolled parser serves
+both `clove.conf` and the API, so `seed_ratio 1.5` and a `1.5` over the socket
+are the same number.
+
+Two rules that keep it from firing when it should not: a torrent that
+downloaded nothing has no ratio and is never stopped by one (it was added
+complete), and the idle clock runs only while a torrent is *complete and has
+nobody attached*, resetting the moment a peer arrives — so an incomplete
+download in a slow swarm is never stopped for being quiet. Raising a limit on a
+torrent the daemon stopped starts it again; an operator's own pause is not
+undone by it.
 
 ---
 

@@ -24,7 +24,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clove_core::bitfield::Bitfield;
 use clove_core::budget::PeerBudget;
@@ -64,6 +64,10 @@ pub(crate) struct Limits {
     pub(crate) max_active_downloads: usize,
     /// How many complete torrents may seed at once.
     pub(crate) max_active_seeds: usize,
+    /// Stop seeding at this ratio, in thousandths; `0` seeds without limit.
+    pub(crate) seed_ratio_milli: u64,
+    /// Stop seeding after this long with no peer; `0` never stops.
+    pub(crate) seed_idle_minutes: u64,
 }
 
 impl Default for Limits {
@@ -73,6 +77,10 @@ impl Default for Limits {
             peer_limit: config::DEFAULT_PEER_LIMIT,
             max_active_downloads: config::DEFAULT_MAX_ACTIVE_DOWNLOADS,
             max_active_seeds: config::DEFAULT_MAX_ACTIVE_SEEDS,
+            // Seeding without limit: stopping is a deviation an operator opts
+            // into, not something a fresh install does behind their back.
+            seed_ratio_milli: 0,
+            seed_idle_minutes: 0,
         }
     }
 }
@@ -84,6 +92,8 @@ impl From<&config::Config> for Limits {
             peer_limit: config.peer_limit,
             max_active_downloads: config.max_active_downloads,
             max_active_seeds: config.max_active_seeds,
+            seed_ratio_milli: config.seed_ratio_milli,
+            seed_idle_minutes: config.seed_idle_minutes,
         }
     }
 }
@@ -227,9 +237,58 @@ enum Wanted {
     Running,
     /// Wanted and startable, but past the active limit (`docs/PHASE-H.md` §4).
     Queued,
-    /// The operator stopped it. Survives restarts; nothing but the operator
-    /// takes a torrent out of this state.
-    Paused,
+    /// Stopped, and why. Survives restarts; nothing but the operator takes a
+    /// torrent out of this state, whichever reason put it there.
+    Paused(Why),
+}
+
+/// Why a torrent is stopped.
+///
+/// Carried by [`Wanted::Paused`] rather than kept alongside it, so a stopped
+/// torrent cannot exist without an answer to the question its operator will
+/// ask. A torrent that stops for a reason nobody can read is a bug report
+/// about a torrent that "stopped working".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    /// `clove pause`, or a torrent loaded from a resume file that predates
+    /// this distinction.
+    Operator,
+    /// It reached its seed ratio (`seed_ratio`, `docs/PHASE-H.md` §5).
+    SeedRatio,
+    /// It seeded with no peer for `seed_idle_minutes`.
+    SeedIdle,
+}
+
+impl Why {
+    /// The wire/on-disk tag. Explicit rather than derived from the variant
+    /// order, because these numbers are in a file format.
+    fn code(self) -> i64 {
+        match self {
+            Why::Operator => 0,
+            Why::SeedRatio => 1,
+            Why::SeedIdle => 2,
+        }
+    }
+
+    /// Read a tag back. An unknown code reads as [`Why::Operator`]: a paused
+    /// torrent is paused whatever the reason field says, and refusing to load
+    /// one over a label would be the wrong trade entirely.
+    fn from_code(code: i64) -> Why {
+        match code {
+            1 => Why::SeedRatio,
+            2 => Why::SeedIdle,
+            _ => Why::Operator,
+        }
+    }
+
+    /// What `clove show` says about it.
+    fn describe(self) -> &'static str {
+        match self {
+            Why::Operator => "paused by the operator",
+            Why::SeedRatio => "stopped: seed ratio reached",
+            Why::SeedIdle => "stopped: no peers for the idle limit",
+        }
+    }
 }
 
 /// One hosted torrent's in-memory summary.
@@ -286,6 +345,15 @@ struct Hosted {
     /// The counters and the moment [`Registry::refresh`] last read them, which
     /// is what the rates above are a difference of.
     rate_mark: Option<(Instant, u64, u64)>,
+    /// This torrent's own seed ratio in thousandths, or `0` to follow the
+    /// daemon's. Persisted (resume v5).
+    seed_ratio_milli: u64,
+    /// Since when this torrent has been seeding with nobody attached, for the
+    /// idle limit. `None` while it has a peer, or is not seeding at all.
+    ///
+    /// In memory only: a restart starts the clock again, which is the
+    /// forgiving direction — it costs a torrent nothing but time.
+    idle_since: Option<Instant>,
     /// Jump the queue at the next rebalance (`clove start`).
     ///
     /// Deliberately not persisted: forcing is a statement about right now, and
@@ -372,7 +440,12 @@ impl Hosted {
             uploaded: self.uploaded,
             downloaded: self.downloaded,
             trackers: self.meta.trackers.clone(),
-            paused: self.wanted == Wanted::Paused,
+            paused: matches!(self.wanted, Wanted::Paused(_)),
+            pause_reason: match self.wanted {
+                Wanted::Paused(why) => why.code(),
+                _ => 0,
+            },
+            seed_ratio_milli: self.seed_ratio_milli,
             sequential: self.sequential,
             added: self.added,
         }
@@ -585,7 +658,7 @@ where
             };
             // A paused torrent is the operator's decision and a scanning one
             // has no publishable have-set yet; neither is in the queue at all.
-            if hosted.wanted == Wanted::Paused || hosted.scanning {
+            if matches!(hosted.wanted, Wanted::Paused(_)) || hosted.scanning {
                 stop.push((info_hash, false));
                 continue;
             }
@@ -618,6 +691,104 @@ where
                 eprintln!("cloved: starting {}: {e}", hex(&info_hash));
             }
         }
+    }
+
+    /// Stop any torrent that has met its seeding limits.
+    ///
+    /// Run from the periodic tick, before the rebalance, so a torrent that
+    /// stops here frees its slot in the same pass rather than a tick later.
+    ///
+    /// Only *seeding* torrents are candidates: a ratio is meaningless while a
+    /// torrent is still fetching, and stopping an incomplete download because
+    /// it had no peers for an hour would turn a quiet swarm into a torrent
+    /// that never finishes.
+    fn enforce_seed_limits(&mut self) {
+        let idle_limit = (self.seed_idle_minutes() > 0)
+            .then(|| Duration::from_secs(self.seed_idle_minutes().saturating_mul(60)));
+        let default_ratio = self.limits.seed_ratio_milli;
+        let now = Instant::now();
+        let mut stop: Vec<([u8; 20], Why)> = Vec::new();
+
+        for (info_hash, hosted) in &mut self.torrents {
+            if hosted.live.is_none() || !hosted.is_complete() {
+                hosted.idle_since = None;
+                continue;
+            }
+            let ratio = hosted.effective_seed_ratio(default_ratio);
+            if ratio > 0 && hosted.ratio_milli() >= ratio {
+                stop.push((*info_hash, Why::SeedRatio));
+                continue;
+            }
+            // The idle clock runs only while seeding with nobody attached, and
+            // resets the moment a peer arrives — so "idle" means genuinely
+            // nobody wants this, not "quiet for a while".
+            if hosted.peers > 0 {
+                hosted.idle_since = None;
+                continue;
+            }
+            let since = *hosted.idle_since.get_or_insert(now);
+            if let Some(limit) = idle_limit
+                && now.duration_since(since) >= limit
+            {
+                stop.push((*info_hash, Why::SeedIdle));
+            }
+        }
+
+        for (info_hash, why) in stop {
+            let Some(hosted) = self.torrents.get_mut(&info_hash) else {
+                continue;
+            };
+            hosted.wanted = Wanted::Paused(why);
+            hosted.forced = false;
+            hosted.idle_since = None;
+            eprintln!("cloved: {}: {}", hex(&info_hash), why.describe());
+            self.stop_live(&info_hash);
+            if let Some(hosted) = self.torrents.get(&info_hash) {
+                let resume = hosted.resume(info_hash);
+                if let Err(e) = write_resume_file(&self.state_dir, &info_hash, &resume) {
+                    eprintln!("cloved: persisting {}: {e}", hex(&info_hash));
+                }
+            }
+        }
+    }
+
+    /// The configured idle limit in minutes.
+    fn seed_idle_minutes(&self) -> u64 {
+        self.limits.seed_idle_minutes
+    }
+
+    /// Set one torrent's seed ratio, in thousandths; `0` follows the daemon's.
+    ///
+    /// A torrent stopped *because* of its ratio is un-stopped by raising it —
+    /// otherwise the operator raises the limit, nothing happens, and the
+    /// reason is invisible.
+    ///
+    /// # Errors
+    ///
+    /// [`ActionError::NotFound`], or a filesystem error persisting it.
+    pub(crate) fn set_seed_ratio(
+        &mut self,
+        info_hash: &[u8; 20],
+        milli: u64,
+    ) -> Result<(), ActionError> {
+        {
+            let default_ratio = self.limits.seed_ratio_milli;
+            let hosted = self
+                .torrents
+                .get_mut(info_hash)
+                .ok_or(ActionError::NotFound)?;
+            hosted.seed_ratio_milli = milli;
+            if hosted.wanted == Wanted::Paused(Why::SeedRatio) {
+                let ratio = hosted.effective_seed_ratio(default_ratio);
+                if ratio == 0 || hosted.ratio_milli() < ratio {
+                    hosted.wanted = Wanted::Running;
+                }
+            }
+        }
+        self.rebalance();
+        let hosted = self.torrents.get(info_hash).ok_or(ActionError::NotFound)?;
+        write_resume_file(&self.state_dir, info_hash, &hosted.resume(*info_hash))
+            .map_err(ActionError::Io)
     }
 
     /// Put a torrent at the head of the queue and unpause it (`clove start`).
@@ -840,6 +1011,9 @@ where
     /// Called periodically by the daemon and around lifecycle transitions.
     pub(crate) fn persist_progress(&mut self) {
         self.refresh();
+        // Seeding limits first, so a torrent that stops here frees its slot
+        // in the same pass rather than a tick later.
+        self.enforce_seed_limits();
         // A torrent that finished since the last tick has moved from the
         // download allowance to the seed one, which frees a slot for the next
         // queued download. Nothing else notices a completion — it happens in
@@ -936,6 +1110,9 @@ where
             rate_mark: None,
             // Recomputed by the rebalance that follows the initial scan.
             forced: false,
+            // No per-torrent override until one is set; the daemon's applies.
+            seed_ratio_milli: 0,
+            idle_since: None,
             scanning: true,
             live: None,
         };
@@ -1119,7 +1296,7 @@ where
                 ));
             }
             hosted.wanted = if paused {
-                Wanted::Paused
+                Wanted::Paused(Why::Operator)
             } else {
                 Wanted::Running
             };
@@ -1220,7 +1397,7 @@ where
             .torrents
             .get_mut(info_hash)
             .ok_or(ActionError::NotFound)?;
-        if hosted.wanted == Wanted::Paused {
+        if matches!(hosted.wanted, Wanted::Paused(_)) {
             return Err(ActionError::BadInput("torrent is paused"));
         }
         let Some(live) = &mut hosted.live else {
@@ -1564,7 +1741,7 @@ where
                 announces_failed: 0,
                 last_announce_error: None,
                 wanted: if resume.paused {
-                    Wanted::Paused
+                    Wanted::Paused(Why::from_code(resume.pause_reason))
                 } else {
                     Wanted::Running
                 },
@@ -1577,6 +1754,8 @@ where
                 rate_mark: None,
                 // Not persisted: forcing is a statement about right now.
                 forced: false,
+                seed_ratio_milli: resume.seed_ratio_milli,
+                idle_since: None,
                 // Claimed here so nothing can start the torrent before the scan
                 // publishes; `pending_scans` hands out the job at startup.
                 scanning: rescan,
@@ -1605,6 +1784,32 @@ impl Hosted {
     /// torrent: a download with files set to skip is finished when the files it
     /// was told to fetch are, and reporting it at 60% for ever — never
     /// "seeding", never done — would be describing a job it was told not to do.
+    /// The ratio this torrent is held to: its own if set, else the daemon's.
+    fn effective_seed_ratio(&self, default_milli: u64) -> u64 {
+        if self.seed_ratio_milli > 0 {
+            self.seed_ratio_milli
+        } else {
+            default_milli
+        }
+    }
+
+    /// Uploaded over downloaded, in thousandths.
+    ///
+    /// A torrent that downloaded nothing — added complete, or every file
+    /// skipped — has no ratio to speak of, and dividing by zero to get one
+    /// would stop it the instant it served a byte. It reports `0`, so only an
+    /// explicit ratio of 0 (meaning "no limit") applies to it, which is to say
+    /// it seeds until the operator says otherwise.
+    fn ratio_milli(&self) -> u64 {
+        if self.downloaded == 0 {
+            return 0;
+        }
+        self.uploaded
+            .saturating_mul(1000)
+            .checked_div(self.downloaded)
+            .unwrap_or(0)
+    }
+
     /// Whether every piece this torrent was told to fetch is present — which
     /// is to say, whether it draws on the seed allowance or the download one.
     fn is_complete(&self) -> bool {
@@ -1632,7 +1837,7 @@ impl Hosted {
         let complete = self.is_complete();
         if self.scanning {
             "verifying"
-        } else if self.wanted == Wanted::Paused {
+        } else if matches!(self.wanted, Wanted::Paused(_)) {
             "paused"
         } else if self.live.is_some() {
             if complete { "seeding" } else { "downloading" }
@@ -1740,6 +1945,8 @@ impl Hosted {
                 "known_peers".to_owned(),
                 Value::UInt(u64::try_from(self.known_peers).unwrap_or(u64::MAX)),
             ),
+            ("ratio".to_owned(), Value::UInt(self.ratio_milli())),
+            ("seed_ratio".to_owned(), Value::UInt(self.seed_ratio_milli)),
             ("pex_peers".to_owned(), Value::UInt(self.pex_peers)),
             ("inbound_peers".to_owned(), Value::UInt(self.inbound_peers)),
             (
@@ -1758,6 +1965,11 @@ impl Hosted {
         ];
         // Only present when there is one: an absent key reads as "nothing has
         // gone wrong", which an empty string does not.
+        // Why a stopped torrent stopped, which is the question its operator
+        // will ask — and the reason `Wanted::Paused` carries one at all.
+        if let Wanted::Paused(why) = self.wanted {
+            fields.push(("paused_because".to_owned(), Value::from(why.describe())));
+        }
         if let Some(why) = &self.last_announce_error {
             fields.push(("last_announce_error".to_owned(), Value::from(why.clone())));
         }
@@ -2984,6 +3196,116 @@ mod tests {
                 .all(|s| s == "waiting-for-router" || s == "paused"),
             "{:?}",
             states(&mut registry)
+        );
+    }
+
+    #[test]
+    fn a_seeding_torrent_stops_at_its_ratio_and_says_why() {
+        let data = TempDir::new("ratio");
+        let limits = Limits {
+            // 2.0, as thousandths.
+            seed_ratio_milli: 2000,
+            ..Limits::default()
+        };
+        let mut registry = Registry::<MockDialer>::open(&data.0, limits).unwrap();
+        let (_, bytes) = fixture("seeded");
+        let info_hash = add_and_scan(&mut registry, &bytes);
+
+        // A torrent with no engine is not seeding, so nothing applies to it
+        // however lopsided its counters are.
+        {
+            let hosted = registry.torrents.get_mut(&info_hash).expect("hosted");
+            hosted.downloaded = 1000;
+            hosted.uploaded = 5000;
+        }
+        registry.enforce_seed_limits();
+        assert!(
+            !matches!(
+                registry.torrents[&info_hash].wanted,
+                Wanted::Paused(Why::SeedRatio)
+            ),
+            "an offline torrent must not be stopped for its ratio"
+        );
+
+        // The ratio arithmetic itself, in thousandths and exact.
+        {
+            let hosted = &registry.torrents[&info_hash];
+            assert_eq!(hosted.ratio_milli(), 5000);
+            assert_eq!(hosted.effective_seed_ratio(2000), 2000);
+        }
+
+        // A torrent that downloaded nothing has no ratio to exceed — it was
+        // added complete — and reports 0 rather than dividing by zero.
+        {
+            let hosted = registry.torrents.get_mut(&info_hash).expect("hosted");
+            hosted.downloaded = 0;
+            assert_eq!(hosted.ratio_milli(), 0);
+        }
+
+        // A per-torrent ratio wins over the daemon's, and 0 means "follow it".
+        {
+            let hosted = registry.torrents.get_mut(&info_hash).expect("hosted");
+            hosted.seed_ratio_milli = 500;
+            assert_eq!(hosted.effective_seed_ratio(2000), 500);
+            hosted.seed_ratio_milli = 0;
+            assert_eq!(hosted.effective_seed_ratio(2000), 2000);
+        }
+
+        // Raising the limit on a torrent stopped for its ratio restarts it —
+        // otherwise the operator raises it, nothing happens, and why is
+        // invisible.
+        {
+            let hosted = registry.torrents.get_mut(&info_hash).expect("hosted");
+            hosted.downloaded = 1000;
+            hosted.uploaded = 5000;
+            hosted.wanted = Wanted::Paused(Why::SeedRatio);
+        }
+        registry.set_seed_ratio(&info_hash, 9000).expect("raise");
+        assert_eq!(registry.torrents[&info_hash].wanted, Wanted::Running);
+
+        // But an operator's pause is not undone by it: only the daemon's own
+        // stop is reversible this way.
+        {
+            let hosted = registry.torrents.get_mut(&info_hash).expect("hosted");
+            hosted.wanted = Wanted::Paused(Why::Operator);
+        }
+        registry.set_seed_ratio(&info_hash, 0).expect("clear");
+        assert_eq!(
+            registry.torrents[&info_hash].wanted,
+            Wanted::Paused(Why::Operator)
+        );
+
+        // The reason reaches the operator, which is the whole point of
+        // carrying it on the state rather than beside it.
+        {
+            let hosted = registry.torrents.get_mut(&info_hash).expect("hosted");
+            hosted.wanted = Wanted::Paused(Why::SeedIdle);
+        }
+        let detail = registry.detail(&info_hash).expect("detail");
+        assert_eq!(
+            detail
+                .get("paused_because")
+                .and_then(clove_core::json::Value::as_str),
+            Some("stopped: no peers for the idle limit")
+        );
+
+        // And it survives a restart, which is when the question actually gets
+        // asked. Written the way `enforce_seed_limits` writes it — the
+        // periodic `persist_progress` would skip this torrent, since it has no
+        // engine, which is exactly why the stop path persists for itself
+        // rather than leaving it to the next tick.
+        let hosted = &registry.torrents[&info_hash];
+        registry
+            .write_resume(&info_hash, hosted)
+            .expect("persist the stop");
+        let mut reopened =
+            Registry::<MockDialer>::open(&data.0, Limits::default()).expect("reopen");
+        let detail = reopened.detail(&info_hash).expect("detail after reopen");
+        assert_eq!(
+            detail
+                .get("paused_because")
+                .and_then(clove_core::json::Value::as_str),
+            Some("stopped: no peers for the idle limit")
         );
     }
 

@@ -915,6 +915,13 @@ fn torrent_action(
             action_result(lock(&daemon.registry).set_paused(&info_hash, false))
         }
         ("POST", Some("start")) => action_result(lock(&daemon.registry).force_start(&info_hash)),
+        ("PUT", Some("seed-ratio")) => match parse_ratio_body(&request.body) {
+            Some(milli) => action_result(lock(&daemon.registry).set_seed_ratio(&info_hash, milli)),
+            None => error(
+                400,
+                "body must be a ratio like 2 or 1.75, or 0 to follow the daemon's seed_ratio",
+            ),
+        },
         ("POST", Some("peers")) => {
             let text = String::from_utf8_lossy(&request.body);
             let Some(peer) = DestHash::from_b32(&text) else {
@@ -1041,6 +1048,14 @@ fn parse_priorities(body: &[u8]) -> Option<Vec<u8>> {
         out.push(value);
     }
     Some(out)
+}
+
+/// Parse a seed-ratio body (`2`, `1.75`, `0`) into thousandths.
+///
+/// The same grammar `clove.conf` accepts, so a ratio means one thing whether
+/// it is typed into a file or handed to the API.
+fn parse_ratio_body(body: &[u8]) -> Option<u64> {
+    clove_core::config::parse_seed_ratio(std::str::from_utf8(body).ok()?.trim())
 }
 
 /// Parse a boolean request body. Deliberately strict — only `true` and

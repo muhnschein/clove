@@ -101,6 +101,12 @@ pub struct Config {
     pub max_active_downloads: usize,
     /// How many complete torrents may seed at once.
     pub max_active_seeds: usize,
+    /// Stop seeding at this uploaded/downloaded ratio, in **thousandths**;
+    /// `0` seeds without limit. Per-torrent overrides sit under it.
+    pub seed_ratio_milli: u64,
+    /// Stop seeding after this many minutes with no peer attached; `0` never
+    /// stops.
+    pub seed_idle_minutes: u64,
 }
 
 /// Client-wide peer ceiling when the config does not say otherwise.
@@ -131,6 +137,16 @@ pub const DEFAULT_MAX_ACTIVE_DOWNLOADS: usize = 3;
 /// is most of what an I2P client is for.
 pub const DEFAULT_MAX_ACTIVE_SEEDS: usize = 5;
 
+/// Largest accepted seed ratio, in thousandths (1000 = 1.0).
+///
+/// A thousand-to-one is already far past any tracker's requirement; past this
+/// the value is a typo, and the same reasoning applies as to
+/// [`MAX_PEER_LIMIT`].
+pub const MAX_SEED_RATIO_MILLI: u64 = 1_000_000;
+
+/// Longest accepted seed idle limit, in minutes — a little over two months.
+pub const MAX_SEED_IDLE_MINUTES: u64 = 100_000;
+
 /// Why configuration was rejected. Messages are written for the operator:
 /// they name the line, the key, and what to do about it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,6 +175,8 @@ pub enum Problem {
     BadBool,
     /// A count that is not a positive number, or is absurdly large.
     BadCount,
+    /// A ratio that is not a non-negative decimal, or is absurdly large.
+    BadRatio,
     /// SAM address is neither `host:port` nor an absolute socket path.
     BadSamAddress,
     /// SAM address is not loopback and `i_know_sam_is_remote` is not set.
@@ -198,6 +216,11 @@ impl fmt::Display for Problem {
             Problem::DuplicateKey => write!(f, "key already set earlier in the file"),
             Problem::BadBool => write!(f, "expected \"yes\" or \"no\""),
             Problem::BadCount => write!(f, "expected a number from 1 to {MAX_PEER_LIMIT}"),
+            Problem::BadRatio => write!(
+                f,
+                "expected a ratio like 2 or 1.75, from 0 (unlimited) to {}",
+                MAX_SEED_RATIO_MILLI / 1000
+            ),
             Problem::BadSamAddress => {
                 write!(
                     f,
@@ -219,6 +242,88 @@ impl fmt::Display for Problem {
 
 impl std::error::Error for Error {}
 
+/// The keys as read so far, each with the line it came from, before defaults
+/// are applied.
+///
+/// A struct rather than a dozen locals in [`Config::parse`], so the per-key
+/// dispatch can live in its own function: the loop that reads lines and the
+/// table that interprets keys are separate jobs, and keeping them in one body
+/// is what pushed it past the length clippy will accept.
+#[derive(Default)]
+struct Draft {
+    sam_address: Option<(usize, String)>,
+    i_know_sam_is_remote: Option<(usize, bool)>,
+    data_dir: Option<(usize, PathBuf)>,
+    api_socket: Option<(usize, PathBuf)>,
+    ephemeral: Option<(usize, bool)>,
+    preallocate: Option<(usize, bool)>,
+    peer_limit: Option<(usize, usize)>,
+    torrent_peer_limit: Option<(usize, usize)>,
+    max_active_downloads: Option<(usize, usize)>,
+    max_active_seeds: Option<(usize, usize)>,
+    seed_ratio_milli: Option<(usize, u64)>,
+    seed_idle_minutes: Option<(usize, u64)>,
+}
+
+impl Draft {
+    /// Record one `key value` line, or say what is wrong with it.
+    fn accept(&mut self, line: usize, key: &str, value: &str) -> Result<(), Error> {
+        let at = |problem| Error::Line { line, problem };
+        match key {
+            "sam_address" => {
+                if !looks_like_sam_address(value) {
+                    return Err(at(Problem::BadSamAddress));
+                }
+                set(&mut self.sam_address, line, value.to_owned())?;
+            }
+            "i_know_sam_is_remote" => {
+                let flag = parse_bool(value).ok_or_else(|| at(Problem::BadBool))?;
+                set(&mut self.i_know_sam_is_remote, line, flag)?;
+            }
+            "data_dir" => set(&mut self.data_dir, line, absolute(value, line)?)?,
+            "api_socket" => set(&mut self.api_socket, line, absolute(value, line)?)?,
+            "ephemeral" => {
+                let flag = parse_bool(value).ok_or_else(|| at(Problem::BadBool))?;
+                set(&mut self.ephemeral, line, flag)?;
+            }
+            "preallocate" => {
+                let flag = parse_bool(value).ok_or_else(|| at(Problem::BadBool))?;
+                set(&mut self.preallocate, line, flag)?;
+            }
+            "peer_limit" => {
+                let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
+                set(&mut self.peer_limit, line, count)?;
+            }
+            "torrent_peer_limit" => {
+                let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
+                set(&mut self.torrent_peer_limit, line, count)?;
+            }
+            "max_active_downloads" => {
+                let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
+                set(&mut self.max_active_downloads, line, count)?;
+            }
+            "max_active_seeds" => {
+                let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
+                set(&mut self.max_active_seeds, line, count)?;
+            }
+            "seed_ratio" => {
+                let milli = parse_seed_ratio(value).ok_or_else(|| at(Problem::BadRatio))?;
+                set(&mut self.seed_ratio_milli, line, milli)?;
+            }
+            "seed_idle_minutes" => {
+                let minutes = value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|n| *n <= MAX_SEED_IDLE_MINUTES)
+                    .ok_or_else(|| at(Problem::BadCount))?;
+                set(&mut self.seed_idle_minutes, line, minutes)?;
+            }
+            other => return Err(at(Problem::UnknownKey(other.to_owned()))),
+        }
+        Ok(())
+    }
+}
+
 impl Config {
     /// Parse configuration text against environment-derived defaults.
     /// Empty text yields the fully working default configuration.
@@ -229,68 +334,40 @@ impl Config {
     /// missing values, bad booleans, relative paths, or a non-loopback SAM
     /// address without the explicit override.
     pub fn parse(text: &str, defaults: &Defaults) -> Result<Self, Error> {
-        let mut sam_address: Option<(usize, String)> = None;
-        let mut i_know_sam_is_remote: Option<(usize, bool)> = None;
-        let mut data_dir: Option<(usize, PathBuf)> = None;
-        let mut api_socket: Option<(usize, PathBuf)> = None;
-        let mut ephemeral: Option<(usize, bool)> = None;
-        let mut preallocate: Option<(usize, bool)> = None;
-        let mut peer_limit: Option<(usize, usize)> = None;
-        let mut torrent_peer_limit: Option<(usize, usize)> = None;
-        let mut max_active_downloads: Option<(usize, usize)> = None;
-        let mut max_active_seeds: Option<(usize, usize)> = None;
+        let mut draft = Draft::default();
 
         for (index, raw) in text.lines().enumerate() {
             let line = index + 1;
-            let at = |problem| Error::Line { line, problem };
             let trimmed = raw.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
             let (key, value) = match trimmed.split_once(char::is_whitespace) {
                 Some((k, v)) if !v.trim().is_empty() => (k, v.trim()),
-                _ => return Err(at(Problem::MissingValue)),
+                _ => {
+                    return Err(Error::Line {
+                        line,
+                        problem: Problem::MissingValue,
+                    });
+                }
             };
-            match key {
-                "sam_address" => {
-                    if !looks_like_sam_address(value) {
-                        return Err(at(Problem::BadSamAddress));
-                    }
-                    set(&mut sam_address, line, value.to_owned())?;
-                }
-                "i_know_sam_is_remote" => {
-                    let flag = parse_bool(value).ok_or_else(|| at(Problem::BadBool))?;
-                    set(&mut i_know_sam_is_remote, line, flag)?;
-                }
-                "data_dir" => set(&mut data_dir, line, absolute(value, line)?)?,
-                "api_socket" => set(&mut api_socket, line, absolute(value, line)?)?,
-                "ephemeral" => {
-                    let flag = parse_bool(value).ok_or_else(|| at(Problem::BadBool))?;
-                    set(&mut ephemeral, line, flag)?;
-                }
-                "preallocate" => {
-                    let flag = parse_bool(value).ok_or_else(|| at(Problem::BadBool))?;
-                    set(&mut preallocate, line, flag)?;
-                }
-                "peer_limit" => {
-                    let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
-                    set(&mut peer_limit, line, count)?;
-                }
-                "torrent_peer_limit" => {
-                    let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
-                    set(&mut torrent_peer_limit, line, count)?;
-                }
-                "max_active_downloads" => {
-                    let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
-                    set(&mut max_active_downloads, line, count)?;
-                }
-                "max_active_seeds" => {
-                    let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
-                    set(&mut max_active_seeds, line, count)?;
-                }
-                other => return Err(at(Problem::UnknownKey(other.to_owned()))),
-            }
+            draft.accept(line, key, value)?;
         }
+
+        let Draft {
+            sam_address,
+            i_know_sam_is_remote,
+            data_dir,
+            api_socket,
+            ephemeral,
+            preallocate,
+            peer_limit,
+            torrent_peer_limit,
+            max_active_downloads,
+            max_active_seeds,
+            seed_ratio_milli,
+            seed_idle_minutes,
+        } = draft;
 
         let i_know_sam_is_remote = i_know_sam_is_remote.is_some_and(|(_, v)| v);
         let (sam_line, sam_address) = sam_address.unwrap_or((0, DEFAULT_SAM_ADDRESS.to_owned()));
@@ -336,6 +413,8 @@ impl Config {
             max_active_downloads: max_active_downloads
                 .map_or(DEFAULT_MAX_ACTIVE_DOWNLOADS, |(_, v)| v),
             max_active_seeds: max_active_seeds.map_or(DEFAULT_MAX_ACTIVE_SEEDS, |(_, v)| v),
+            seed_ratio_milli: seed_ratio_milli.map_or(0, |(_, v)| v),
+            seed_idle_minutes: seed_idle_minutes.map_or(0, |(_, v)| v),
         })
     }
 }
@@ -354,6 +433,48 @@ pub const MAX_PEER_LIMIT: usize = 10_000;
 /// Zero is refused rather than read as "unlimited". A client configured to
 /// hold no peers at all is never what was meant, and the spelling for
 /// "as many as you like" is a large number, not an ambiguous one.
+/// Parse a ratio written the way a human writes one — `2`, `1.5`, `0.25` —
+/// into thousandths.
+///
+/// Hand-rolled rather than by `f64`: the config format is exact `key value`
+/// text, and a ratio that round-trips through a float can persist as
+/// `1499` where the operator wrote `1.5`. At most three decimal places, which
+/// is more precision than a seeding ratio has ever needed.
+///
+/// Public because the API takes ratios too, and one grammar for both is the
+/// point: `seed_ratio 1.5` in a config and `1.5` over the socket must mean the
+/// same number.
+///
+/// Returns `None` for anything that is not a ratio, or is past
+/// [`MAX_SEED_RATIO_MILLI`].
+#[must_use]
+pub fn parse_seed_ratio(value: &str) -> Option<u64> {
+    let (whole, frac) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty() && frac.is_empty() {
+        return None;
+    }
+    if !whole.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if frac.len() > 3 {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    // Right-pad to exactly three digits: "5" is 500 thousandths, not 5.
+    let mut milli = 0u64;
+    let mut digits = frac.bytes();
+    for _ in 0..3 {
+        let d = digits.next().map_or(0, |b| u64::from(b - b'0'));
+        milli = milli * 10 + d;
+    }
+    let total = whole.checked_mul(1000)?.checked_add(milli)?;
+    (total <= MAX_SEED_RATIO_MILLI).then_some(total)
+}
+
 fn parse_count(value: &str) -> Option<usize> {
     value
         .parse::<usize>()
@@ -467,6 +588,10 @@ mod tests {
         assert_eq!(c.torrent_peer_limit, DEFAULT_TORRENT_PEER_LIMIT);
         assert_eq!(c.max_active_downloads, DEFAULT_MAX_ACTIVE_DOWNLOADS);
         assert_eq!(c.max_active_seeds, DEFAULT_MAX_ACTIVE_SEEDS);
+        // Seeding without limit is the default: stopping is a deviation an
+        // operator opts into.
+        assert_eq!(c.seed_ratio_milli, 0);
+        assert_eq!(c.seed_idle_minutes, 0);
         assert_eq!(c.data_dir, PathBuf::from("/home/u/.local/share/clove"));
         assert_eq!(c.api_socket, PathBuf::from("/run/user/1000/clove.sock"));
     }
@@ -544,6 +669,49 @@ preallocate yes
                 other => panic!("{bad}: expected BadCount, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_ratio_is_read_exactly_as_written() {
+        let d = defaults();
+        let ratio = |text: &str| Config::parse(text, &d).map(|c| c.seed_ratio_milli);
+        assert_eq!(ratio("seed_ratio 2\n").unwrap(), 2000);
+        assert_eq!(ratio("seed_ratio 1.5\n").unwrap(), 1500);
+        assert_eq!(ratio("seed_ratio 0.25\n").unwrap(), 250);
+        assert_eq!(ratio("seed_ratio 0.001\n").unwrap(), 1);
+        // A bare fraction, and a trailing dot, both mean what they look like.
+        assert_eq!(ratio("seed_ratio .5\n").unwrap(), 500);
+        assert_eq!(ratio("seed_ratio 3.\n").unwrap(), 3000);
+        // Zero is "seed without limit", the default, and is spelled the same
+        // way the config omits the key.
+        assert_eq!(ratio("seed_ratio 0\n").unwrap(), 0);
+        // The fraction is padded, not parsed as an integer: `1.5` is 1500
+        // thousandths and not 1005.
+        assert_ne!(ratio("seed_ratio 1.5\n").unwrap(), 1005);
+
+        for bad in [
+            "seed_ratio -1",
+            "seed_ratio 1.2345",
+            "seed_ratio two",
+            "seed_ratio 1.5.2",
+            "seed_ratio .",
+            "seed_ratio 1e3",
+            "seed_ratio 1000001",
+        ] {
+            match Config::parse(bad, &d) {
+                Err(Error::Line { problem, .. }) => {
+                    assert_eq!(problem, Problem::BadRatio, "{bad}");
+                }
+                other => panic!("{bad}: expected BadRatio, got {other:?}"),
+            }
+        }
+
+        let idle = |text: &str| Config::parse(text, &d).map(|c| c.seed_idle_minutes);
+        assert_eq!(idle("seed_idle_minutes 30\n").unwrap(), 30);
+        // Zero means never, so unlike a peer limit it is accepted.
+        assert_eq!(idle("seed_idle_minutes 0\n").unwrap(), 0);
+        assert!(idle("seed_idle_minutes -5\n").is_err());
+        assert!(idle("seed_idle_minutes soon\n").is_err());
     }
 
     #[test]

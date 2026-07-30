@@ -123,8 +123,14 @@ never put into raw mode, so
 .Ic Ctrl-C
 leaves it exactly as it was.
 .It Cm show Ar torrent Op Fl -json
-One torrent in detail: sizes, progress, state, peer counts, bytes moved, the
-file table with per-file priorities, and the announce URLs.
+One torrent in detail: sizes, progress, state, peer counts, bytes moved, its
+share ratio and the limit it is held to, the file table with per-file
+priorities, and the announce URLs.
+.Pp
+.Sy paused_because
+appears whenever the torrent is stopped, and says whether that was the
+operator, its seed ratio or the idle limit — so a torrent that stopped on its
+own is never just "paused".
 .Pp
 The peer counts answer different questions.
 .Sy peers
@@ -232,6 +238,18 @@ you would otherwise have fetched early may leave before you ask for them.
 The change takes effect immediately and survives a restart.
 Blocks already requested are left alone, so the switch costs nothing already
 in flight.
+.It Cm seed-ratio Ar torrent Ar ratio
+Stop seeding this torrent once it has uploaded
+.Ar ratio
+times what it downloaded, overriding
+.Ic seed_ratio
+in
+.Xr clove.conf 5 .
+.Ar 0
+follows the configured value again.
+.Pp
+Raising it on a torrent that has already stopped for its ratio starts it back
+up, so the effect of the change is visible rather than waiting for a restart.
 .It Cm completions Ar bash | Ar zsh | Ar fish
 Print a shell completion script on standard output.
 .El

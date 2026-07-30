@@ -102,6 +102,7 @@ fn run() -> Result<(), Fail> {
         Some("priorities") => cmd_priorities(&where_, &operands),
         Some("announce") => cmd_action(&where_, &operands, "announce", "announcing"),
         Some("sequential") => cmd_sequential(&where_, &operands),
+        Some("seed-ratio") => cmd_seed_ratio(&where_, &operands),
         Some("completions") => cmd_completions(&operands),
         Some(other) => Err(Fail::Usage(format!(
             "unknown command {other:?} (try --help)"
@@ -137,6 +138,7 @@ fn print_help() {
     println!("  priorities <torrent> <spec>    set per-file priorities (e.g. 1,0,2)");
     println!("  announce <torrent…>            re-announce to every tracker now");
     println!("  sequential <torrent> on|off    pick pieces in order instead of rarest-first");
+    println!("  seed-ratio <torrent> <ratio>   stop seeding it at this ratio (0 = follow config)");
     println!("  completions <bash|zsh|fish>    print a shell completion script");
     println!();
     println!("<torrent> is an info-hash, a unique prefix of one, or a # from");
@@ -612,6 +614,32 @@ fn cmd_sequential(where_: &Where, operands: &[String]) -> Result<(), Fail> {
     Ok(())
 }
 
+fn cmd_seed_ratio(where_: &Where, operands: &[String]) -> Result<(), Fail> {
+    let [info_hash, ratio] = operands else {
+        return Err(Fail::Usage(
+            "seed-ratio needs <torrent> and a ratio like 2 or 1.75".to_owned(),
+        ));
+    };
+    let (socket, token) = resolve(where_)?;
+    let info_hash = one_target(&socket, &token, info_hash)?;
+    request(
+        &socket,
+        &token,
+        "PUT",
+        &format!("/v1/torrents/{info_hash}/seed-ratio"),
+        ratio.as_bytes(),
+    )?;
+    if ratio == "0" {
+        println!(
+            "{} now follows the daemon's seed_ratio",
+            display(&info_hash)
+        );
+    } else {
+        println!("{} will stop seeding at {ratio}", display(&info_hash));
+    }
+    Ok(())
+}
+
 /// Print a shell completion script (no daemon needed).
 fn cmd_completions(operands: &[String]) -> Result<(), Fail> {
     let shell = operands
@@ -653,10 +681,14 @@ fn render_detail(value: &Value) -> String {
         "uploaded",
         "down_rate",
         "up_rate",
+        "ratio",
+        "seed_ratio",
         "announces_ok",
         "announces_failed",
-        // Last, and unwrapped: it is a sentence, not a field, and it is the
-        // one line worth reading when a torrent has no peers.
+        // Last, and unwrapped: each is a sentence rather than a field, and
+        // between them they answer the two questions a stopped or peerless
+        // torrent raises.
+        "paused_because",
         "last_announce_error",
     ] {
         let Some(field) = value.get(key) else {
@@ -667,6 +699,21 @@ fn render_detail(value: &Value) -> String {
                 field.as_u64().map_or_else(|| cell(field), human_size)
             }
             "down_rate" | "up_rate" => human_rate(field.as_u64()),
+            // Thousandths on the wire, because bencode and JSON integers are
+            // exact and a ratio round-tripped through a float is not.
+            "ratio" | "seed_ratio" => field.as_u64().map_or_else(
+                || cell(field),
+                |milli| {
+                    if milli == 0 && key == "seed_ratio" {
+                        "unlimited (follows the daemon)".to_owned()
+                    } else {
+                        // Integer division, not a float: thousandths are on
+                        // the wire precisely so a ratio never round-trips
+                        // through something that can render 1.5 as 1.499.
+                        format!("{}.{:03}", milli / 1000, milli % 1000)
+                    }
+                },
+            ),
             "progress" => field
                 .as_f64()
                 .map_or_else(|| cell(field), |p| format!("{:.0}%", p * 100.0)),
