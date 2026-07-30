@@ -10,6 +10,7 @@
 mod registry;
 mod sandbox;
 
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -205,7 +206,81 @@ fn run() -> Result<(), String> {
         Identity::new(&config.data_dir, config.ephemeral),
     );
     spawn_persist_loop(&daemon);
+    if let Some(dir) = config.watch_dir.clone() {
+        spawn_watch_dir(&daemon, dir);
+    }
     serve(&listener, &daemon)
+}
+
+/// How often the watch directory is looked at.
+///
+/// Polling, not `inotify`: a directory listing on a timer is a `read_dir` and
+/// no new dependency, against a watch API that would be one. Nobody notices
+/// five seconds on a torrent that is about to spend minutes building tunnels.
+const WATCH_DIR_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Watch a directory for `.torrent` files and add each one it finds.
+///
+/// The file is renamed to `<name>.added` once it has been taken, which is what
+/// stops the same torrent being offered every five seconds forever. A file
+/// that fails to parse becomes `<name>.rejected` for the same reason — it is
+/// not going to start parsing, and retrying it every tick would fill the log
+/// with one complaint.
+///
+/// This is how external tooling drives clove without an API of its own, and it
+/// is deliberately the dumbest thing that works.
+fn spawn_watch_dir(daemon: &Arc<Daemon>, dir: PathBuf) {
+    let daemon = Arc::clone(daemon);
+    std::thread::spawn(move || {
+        loop {
+            scan_watch_dir(&daemon, &dir);
+            std::thread::sleep(WATCH_DIR_INTERVAL);
+        }
+    });
+}
+
+/// One pass over the watch directory.
+fn scan_watch_dir(daemon: &Arc<Daemon>, dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        // Not readable, or not there yet. Said once per tick would be noise;
+        // an operator who set the key and mistyped it sees nothing added,
+        // which is the same information.
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("torrent") {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let added = lock(&daemon.registry).add_torrent(&bytes, registry::AddOptions::default());
+        let suffix = match added {
+            Ok((info_hash, job)) => {
+                // Same as the API path: the initial hash of whatever is
+                // already on disk runs with the registry unlocked.
+                let _ = run_scan(daemon, &job);
+                eprintln!(
+                    "cloved: added {} from {}",
+                    registry::hex(&info_hash),
+                    path.display()
+                );
+                "added"
+            }
+            // A duplicate is not a failure: the operator dropped in something
+            // already hosted, and the file has still been dealt with.
+            Err(AddError::Duplicate) => "added",
+            Err(e) => {
+                eprintln!("cloved: not adding {}: {e}", path.display());
+                "rejected"
+            }
+        };
+        let taken = path.with_extension(format!("torrent.{suffix}"));
+        if let Err(e) = fs::rename(&path, &taken) {
+            eprintln!("cloved: leaving {} where it is: {e}", path.display());
+        }
+    }
 }
 
 /// Daemon state shared across connection threads.
@@ -806,6 +881,14 @@ fn route(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response {
 }
 
 fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response {
+    // `?paused` and `?sequential` are what an operator wanted *of this add*,
+    // rather than a second command issued after the torrent already started
+    // doing the other thing.
+    let query = request.query().unwrap_or("");
+    let options = registry::AddOptions {
+        paused: query_flag(query, "paused"),
+        sequential: query_flag(query, "sequential"),
+    };
     if request.body.starts_with(b"magnet:") {
         let uri = String::from_utf8_lossy(&request.body).into_owned();
         // Bind first: a `match lock(..)` would hold the registry guard across
@@ -830,7 +913,7 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response 
             Err(e) => error(500, &format!("adding magnet: {e}")),
         };
     }
-    let added = lock(&daemon.registry).add_torrent(&request.body);
+    let added = lock(&daemon.registry).add_torrent(&request.body, options);
     match added {
         Ok((info_hash, job)) => {
             // The initial pass over whatever is already on disk runs with the
@@ -1067,6 +1150,15 @@ fn parse_bool_body(body: &[u8]) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
+}
+
+/// Whether a query string carries `name` as a truthy flag — bare, or set to
+/// `1`, `true` or `yes`.
+fn query_flag(query: &str, name: &str) -> bool {
+    query.split('&').any(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, "1"));
+        key == name && matches!(value, "1" | "true" | "yes")
+    })
 }
 
 /// Whether a query string carries a truthy `data` flag (`data`, `data=1`,
@@ -1719,7 +1811,9 @@ mod tests {
         let bytes = bencode::encode(&Ben::Dict(root));
 
         // Add it, and write the data so the scan has something to hash.
-        let (info_hash, job) = lock(&d.registry).add_torrent(&bytes).expect("add");
+        let (info_hash, job) = lock(&d.registry)
+            .add_torrent(&bytes, registry::AddOptions::default())
+            .expect("add");
         let downloads = dir.0.join("downloads/scan-lock");
         std::fs::write(&downloads, &content).expect("write the data");
         let published = run_scan(&d, &job).expect("first scan");

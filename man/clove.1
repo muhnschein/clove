@@ -155,12 +155,29 @@ answer the first question a torrent with no peers raises: whether its trackers
 are replying at all.
 .Sy last_announce_error
 appears only when an announce has failed, and carries the tracker's own words.
-.It Cm add Ar file | Ar magnet
+.It Cm stats Op Fl -json
+What the whole client is doing: how many torrents there are and in which
+states, the current rates, peers against the
+.Ic peer_limit
+they come from, lifetime bytes moved, and how long the daemon has been up.
+.Pp
+.Cm status
+answers whether the daemon and its router are alright;
+this answers what your client is doing.
+They are read at different moments.
+.It Cm add Ar file | Ar magnet Op Fl -paused Op Fl -sequential
 Add a torrent from a
 .Pa .torrent
 file or a
 .Ar magnet:\&
 URI.
+.Pp
+.Fl -paused
+adds it stopped, and
+.Fl -sequential
+picks pieces in file order from the outset — both settings a torrent would
+otherwise need a second command to change, after it had already started doing
+the other thing.
 A magnet is stored immediately and listed as
 .Sy fetching-metadata
 while the daemon fetches its info dictionary from peers; it becomes an

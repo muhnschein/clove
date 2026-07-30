@@ -89,6 +89,7 @@ fn run() -> Result<(), Fail> {
     };
     match command.as_deref() {
         Some("status") => cmd_status(&where_, json),
+        Some("stats") => cmd_stats(&where_, json),
         Some("list") => cmd_list(&where_, json),
         Some("watch") => cmd_watch(&where_, &operands),
         Some("add") => cmd_add(&where_, &operands),
@@ -125,10 +126,12 @@ fn print_help() {
     println!("  -c, --config <path>            read this configuration instead of the default");
     println!("commands:");
     println!("  status [--json]                daemon and router status");
+    println!("  stats [--json]                 totals across every torrent");
     println!("  list [--json]                  hosted torrents");
     println!("  watch [--interval <secs>]      live view, repainted (Ctrl-C to quit)");
     println!("  show <torrent> [--json]        one torrent in detail");
     println!("  add <file.torrent|magnet:…>    add a torrent");
+    println!("      [--paused] [--sequential]  ...stopped, or in file order");
     println!("  remove <torrent…> [--data]     remove torrents (--data also deletes files)");
     println!("  pause <torrent…>               pause torrents");
     println!("  resume <torrent…>              resume torrents");
@@ -350,6 +353,52 @@ fn cmd_list(where_: &Where, json: bool) -> Result<(), Fail> {
     Ok(())
 }
 
+/// Client-wide totals: what every torrent adds up to right now.
+///
+/// Deliberately a separate command from `status`, which answers "is the daemon
+/// and its router alright". This one answers "what is my client doing", and
+/// they are read at different moments.
+fn cmd_stats(where_: &Where, json: bool) -> Result<(), Fail> {
+    let (socket, token) = resolve(where_)?;
+    let body = request(&socket, &token, "GET", "/v1/status", &[])?;
+    if json {
+        println!("{}", String::from_utf8_lossy(&body).trim_end());
+        return Ok(());
+    }
+    let status = parse_body(&body)?;
+    let torrents = parse_body(&request(&socket, &token, "GET", "/v1/torrents", &[])?)?;
+    let empty: Vec<Value> = Vec::new();
+    let items: &[Value] = torrents.as_array().unwrap_or(&empty);
+
+    let mut by_state: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let (mut up, mut down) = (0u64, 0u64);
+    for item in items {
+        *by_state.entry(field_str(item, "state")).or_default() += 1;
+        up += item.get("uploaded").and_then(Value::as_u64).unwrap_or(0);
+        down += item.get("downloaded").and_then(Value::as_u64).unwrap_or(0);
+    }
+
+    let mut out = String::new();
+    let num = |key: &str| status.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let _ = writeln!(out, "torrents      {}", items.len());
+    for (state, count) in &by_state {
+        let _ = writeln!(out, "  {state:<12}{count}");
+    }
+    let _ = writeln!(out, "down rate     {}", human_rate(Some(num("down_rate"))));
+    let _ = writeln!(out, "up rate       {}", human_rate(Some(num("up_rate"))));
+    let _ = writeln!(
+        out,
+        "peers         {} of {}",
+        num("peers"),
+        num("peer_limit")
+    );
+    let _ = writeln!(out, "downloaded    {}", human_size(down));
+    let _ = writeln!(out, "uploaded      {}", human_size(up));
+    let _ = writeln!(out, "session       {}", human_duration(num("uptime_secs")));
+    print!("{out}");
+    Ok(())
+}
+
 /// Default repaint interval for `clove watch`.
 const WATCH_DEFAULT_SECS: u64 = 2;
 
@@ -440,16 +489,33 @@ fn human_duration(secs: u64) -> String {
 }
 
 fn cmd_add(where_: &Where, operands: &[String]) -> Result<(), Fail> {
-    let target = operands
-        .first()
-        .ok_or_else(|| Fail::Usage("add needs a .torrent file or magnet link".to_owned()))?;
+    let mut target: Option<&String> = None;
+    let mut flags: Vec<&str> = Vec::new();
+    for op in operands {
+        match op.as_str() {
+            "--paused" => flags.push("paused=1"),
+            "--sequential" => flags.push("sequential=1"),
+            other if other.starts_with("--") => {
+                return Err(Fail::Usage(format!("unexpected option {other:?}")));
+            }
+            _ if target.is_none() => target = Some(op),
+            other => return Err(Fail::Usage(format!("unexpected argument {other:?}"))),
+        }
+    }
+    let target =
+        target.ok_or_else(|| Fail::Usage("add needs a .torrent file or magnet link".to_owned()))?;
     let (socket, token) = resolve(where_)?;
     let body = if target.starts_with("magnet:") {
         target.clone().into_bytes()
     } else {
         std::fs::read(target).map_err(|e| Fail::Failed(format!("reading {target}: {e}")))?
     };
-    let reply = request(&socket, &token, "POST", "/v1/torrents", &body)?;
+    let path = if flags.is_empty() {
+        "/v1/torrents".to_owned()
+    } else {
+        format!("/v1/torrents?{}", flags.join("&"))
+    };
+    let reply = request(&socket, &token, "POST", &path, &body)?;
     let value = parse_body(&reply)?;
     match value.get("info_hash").and_then(Value::as_str) {
         Some(info_hash) => println!("added {info_hash}"),

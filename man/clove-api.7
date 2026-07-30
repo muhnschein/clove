@@ -135,8 +135,14 @@ is one of
 or
 .Sy fetching-metadata
 .Pq a magnet whose info dictionary has not arrived yet .
-.It Sy POST Pa /v1/torrents
+.It Sy POST Pa /v1/torrents Ns Op ?paused=1&sequential=1
 Add a torrent.
+.Sy paused=1
+adds it stopped;
+.Sy sequential=1
+picks pieces in file order from the outset.
+Both are ignored for a magnet, whose settings are applied when its metadata
+arrives and it becomes an ordinary torrent.
 The body is either the raw bytes of a
 .Pa .torrent
 file or a

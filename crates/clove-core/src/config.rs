@@ -107,6 +107,9 @@ pub struct Config {
     /// Stop seeding after this many minutes with no peer attached; `0` never
     /// stops.
     pub seed_idle_minutes: u64,
+    /// A directory to watch for `.torrent` files to add, or `None` to watch
+    /// none — the default.
+    pub watch_dir: Option<PathBuf>,
 }
 
 /// Client-wide peer ceiling when the config does not say otherwise.
@@ -263,6 +266,7 @@ struct Draft {
     max_active_seeds: Option<(usize, usize)>,
     seed_ratio_milli: Option<(usize, u64)>,
     seed_idle_minutes: Option<(usize, u64)>,
+    watch_dir: Option<(usize, PathBuf)>,
 }
 
 impl Draft {
@@ -310,6 +314,7 @@ impl Draft {
                 let milli = parse_seed_ratio(value).ok_or_else(|| at(Problem::BadRatio))?;
                 set(&mut self.seed_ratio_milli, line, milli)?;
             }
+            "watch_dir" => set(&mut self.watch_dir, line, absolute(value, line)?)?,
             "seed_idle_minutes" => {
                 let minutes = value
                     .parse::<u64>()
@@ -367,6 +372,7 @@ impl Config {
             max_active_seeds,
             seed_ratio_milli,
             seed_idle_minutes,
+            watch_dir,
         } = draft;
 
         let i_know_sam_is_remote = i_know_sam_is_remote.is_some_and(|(_, v)| v);
@@ -415,6 +421,7 @@ impl Config {
             max_active_seeds: max_active_seeds.map_or(DEFAULT_MAX_ACTIVE_SEEDS, |(_, v)| v),
             seed_ratio_milli: seed_ratio_milli.map_or(0, |(_, v)| v),
             seed_idle_minutes: seed_idle_minutes.map_or(0, |(_, v)| v),
+            watch_dir: watch_dir.map(|(_, v)| v),
         })
     }
 }
@@ -592,6 +599,7 @@ mod tests {
         // operator opts into.
         assert_eq!(c.seed_ratio_milli, 0);
         assert_eq!(c.seed_idle_minutes, 0);
+        assert_eq!(c.watch_dir, None);
         assert_eq!(c.data_dir, PathBuf::from("/home/u/.local/share/clove"));
         assert_eq!(c.api_socket, PathBuf::from("/run/user/1000/clove.sock"));
     }

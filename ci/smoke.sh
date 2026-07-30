@@ -346,6 +346,49 @@ expect_contains "$(qrun list)" "waiting-for-router" "still waiting on the router
 kill "$queue_pid" 2>/dev/null
 wait "$queue_pid" 2>/dev/null || true
 
+echo "smoke: stats totals the client"
+expect_contains "$(run stats)" "torrents" "stats reports a torrent count"
+expect_contains "$(run stats)" "peers" "stats reports peers against the budget"
+
+echo "smoke: a watch directory picks up what is dropped in it"
+wdir="$work/watched"
+mkdir -p "$wdir" "$work/watch-data" "$work/watch-run"
+cat >"$work/watch.conf" <<EOF
+data_dir $work/watch-data
+api_socket $work/watch-run/clove.sock
+watch_dir $wdir
+EOF
+timeout 60 "$cloved" -c "$work/watch.conf" >"$work/daemon-watch.log" 2>&1 &
+watch_pid=$!
+i=0
+until timeout 5 "$clove" -c "$work/watch.conf" status >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -gt 200 ] && fail "watch daemon never answered (log: $(cat "$work/daemon-watch.log"))"
+    sleep 0.05
+done
+cp "$work/demo.torrent" "$wdir/dropped.torrent"
+printf 'not a torrent at all' >"$wdir/junk.torrent"
+i=0
+until [ -f "$wdir/dropped.torrent.added" ] && [ -f "$wdir/junk.torrent.rejected" ]; do
+    i=$((i + 1))
+    [ "$i" -gt 300 ] && fail "watch_dir did not take the files (log: $(cat "$work/daemon-watch.log"))"
+    sleep 0.1
+done
+expect_contains "$(timeout 5 "$clove" -c "$work/watch.conf" list)" "smoke.txt" \
+    "the dropped torrent was added"
+# Renamed, so it is offered once rather than every few seconds forever.
+[ ! -f "$wdir/dropped.torrent" ] || fail "the taken file was left in place"
+
+echo "smoke: add --paused and --sequential apply at add time"
+flagged=$(run add --paused --sequential "$work/second.torrent") || fail "add with flags failed"
+flagged_hash=$(printf '%s' "$flagged" | awk '{print $2}')
+[ -n "$flagged_hash" ] || fail "flagged add printed no info-hash: $flagged"
+expect_contains "$(run show "$flagged_hash" --json)" '"state":"paused"' "added paused"
+expect_contains "$(run show "$flagged_hash" --json)" '"sequential":true' "added sequential"
+run remove "$flagged_hash" >/dev/null || fail "removing the flagged torrent"
+kill "$watch_pid" 2>/dev/null
+wait "$watch_pid" 2>/dev/null || true
+
 echo "smoke: resume, then remove both torrents"
 run resume "$info_hash" >/dev/null || fail "resume failed"
 run remove "$info_hash" --data >/dev/null || fail "remove failed"

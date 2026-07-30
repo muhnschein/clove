@@ -214,6 +214,29 @@ resets the moment a peer arrives — so this means "nobody wants this" rather
 than "quiet for a while".
 Incomplete torrents are never stopped by it: a download in a slow swarm is
 still a download.
+.It Ic watch_dir Ar path
+Absolute path of a directory to watch for
+.Pa .torrent
+files.
+Default: none, and nothing is watched.
+.Pp
+Every few seconds each
+.Pa .torrent
+in it is added and the file renamed to
+.Pa .torrent.added ,
+which is what stops the same torrent being offered forever.
+One that does not parse becomes
+.Pa .torrent.rejected ,
+for the same reason: it is not going to start parsing, and retrying it every
+few seconds would fill the log with one complaint.
+A torrent that is already hosted counts as added.
+.Pp
+Polled rather than watched through the kernel: a directory listing on a timer
+needs nothing that is not already here, and nobody notices five seconds on a
+torrent about to spend minutes building tunnels.
+.Pp
+This is how other tooling drives clove without an API of its own.
+The daemon needs write access to the directory, since it renames what it takes.
 .El
 .Sh EXAMPLES
 The recommended configuration is no file at all.
@@ -225,9 +248,10 @@ sam_address 127.0.0.1:7000
 data_dir /srv/clove
 .Ed
 .Pp
-Unattended: stop seeding at twice what was downloaded, or after a day with
-nobody asking.
+Driven by other tooling: pick up torrents dropped in a directory, and stop
+seeding at twice what was downloaded or after a day with nobody asking.
 .Bd -literal -offset indent
+watch_dir /srv/torrents/inbox
 seed_ratio 2
 seed_idle_minutes 1440
 .Ed

@@ -515,6 +515,20 @@ impl fmt::Display for ActionError {
     }
 }
 
+/// What an operator asked for at add time.
+///
+/// Both settings are ones a torrent would otherwise need a second command to
+/// change, after it had already started doing the wrong thing — beginning a
+/// download you meant to queue for later, or picking pieces rarest-first when
+/// you added it to watch.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AddOptions {
+    /// Add it stopped rather than letting it start.
+    pub(crate) paused: bool,
+    /// Pick pieces in file order from the outset.
+    pub(crate) sequential: bool,
+}
+
 /// Why adding a torrent failed (mapped to an HTTP status by the caller).
 #[derive(Debug)]
 pub(crate) enum AddError {
@@ -1073,7 +1087,11 @@ where
     ///
     /// [`AddError`] if the bytes do not parse, the torrent is already hosted,
     /// or persistence fails.
-    pub(crate) fn add_torrent(&mut self, bytes: &[u8]) -> Result<([u8; 20], ScanJob), AddError> {
+    pub(crate) fn add_torrent(
+        &mut self,
+        bytes: &[u8],
+        options: AddOptions,
+    ) -> Result<([u8; 20], ScanJob), AddError> {
         let meta = MetaInfo::parse(bytes).map_err(AddError::Parse)?;
         let info_hash = meta.info_hash.0;
         if self.torrents.contains_key(&info_hash) {
@@ -1101,8 +1119,12 @@ where
             announces_ok: 0,
             announces_failed: 0,
             last_announce_error: None,
-            wanted: Wanted::Running,
-            sequential: false,
+            wanted: if options.paused {
+                Wanted::Paused(Why::Operator)
+            } else {
+                Wanted::Running
+            },
+            sequential: options.sequential,
             // The listing's order is add order, and this is the add.
             added: now_unix_millis(),
             up_rate: 0.0,
@@ -1269,7 +1291,7 @@ where
         info_hash: &[u8; 20],
         torrent_bytes: &[u8],
     ) -> Result<ScanJob, AddError> {
-        let (_, job) = self.add_torrent(torrent_bytes)?;
+        let (_, job) = self.add_torrent(torrent_bytes, AddOptions::default())?;
         self.pending.remove(info_hash);
         let _ = fs::remove_file(self.state_dir.join(format!("{}.magnet", hex(info_hash))));
         Ok(job)
@@ -2303,7 +2325,9 @@ mod tests {
     /// and must not happen under the lock; a test that only called the first
     /// half would leave the torrent stuck in "verifying" and never started.
     fn add_and_scan(registry: &mut Registry<MockDialer>, bytes: &[u8]) -> [u8; 20] {
-        let (info_hash, job) = registry.add_torrent(bytes).expect("add");
+        let (info_hash, job) = registry
+            .add_torrent(bytes, AddOptions::default())
+            .expect("add");
         let scanned = job.run();
         registry
             .finish_scan(&job, scanned)

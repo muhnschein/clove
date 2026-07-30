@@ -1,6 +1,6 @@
 # Phase H — Daily-drivable: many torrents, and a view worth watching
 
-**Status:** In progress — **H0, H4, H1, H5, H2 and H3 landed**; H6 and the TUI as designed below.
+**Status:** In progress — **H0, H4, H1, H5, H2, H3 and H6 landed** (less `--to`, §8); the TUI as designed below.
 This pinned the design before the wiring, the way `PHASE-F.md` did, so the
 architecture was argued on paper where arguing is cheap. Maps to no new milestone: this is what M4's *"a CLI pleasant
 enough for daily use"* (`SCOPE.md` §1) turns out to mean once you run more than
@@ -361,7 +361,7 @@ all-digit info-hash — `0000…0000` is legal — was read as position zero.
 
 ---
 
-## 8. H6 — Adding torrents the way people actually add them
+## 8. H6 — Adding torrents the way people actually add them — **landed, less `--to`**
 
 - **`add --paused`**, **`add --sequential`**, **`add --to <subdir>`.** The
   first two are trivially small and remove a two-step dance. The third has a
@@ -387,6 +387,21 @@ all-digit info-hash — `0000…0000` is legal — was read as position zero.
   current draw.
 
 **Cost:** ~180 lines total, one config key.
+
+**`--to` is deferred, and this is the reason.** Everything else here landed;
+the per-torrent destination did not. It needs a resume field (a third format
+bump in one phase), and more importantly it needs every storage path to be
+resolved beneath a *configurable* root rather than the one root there is now.
+That is the same surface the M-01 path-traversal finding lives on — the one
+`rustix` and `openat` entered the tree for — and adding a second root at the
+end of a long phase, beside a TUI, is how the bug that work exists to prevent
+gets introduced. It wants its own change with its own review, not a corner of
+this one.
+
+*Trigger:* it is wanted as soon as somebody keeps media and archives on
+different disks, which is most operators. The design above stands — a
+subdirectory of the downloads root, because Landlock will refuse anything else
+— and nothing that landed forecloses it.
 
 ---
 
