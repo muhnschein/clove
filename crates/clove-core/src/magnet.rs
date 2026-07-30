@@ -6,7 +6,7 @@
 //!
 //! The btih value is accepted as 40 hex characters (v1) or 32 base32
 //! characters (both encode the same 20-byte hash). I2P's own `maggot://`
-//! links are a separate, underspecified format left [open] in
+//! links are a separate, underspecified format left open in
 //! `docs/PROTOCOL.i2p-bt` until confirmed against real examples — we do not
 //! guess at a grammar we cannot verify.
 

@@ -140,7 +140,7 @@ fn run() -> Result<(), String> {
     }
     let token = load_or_create_token(&config.data_dir).map_err(|e| e.to_string())?;
 
-    let registry = Registry::open(&config.data_dir)
+    let registry = Registry::open(&config.data_dir, config.preallocate)
         .map_err(|e| format!("opening registry in {}: {e}", config.data_dir.display()))?;
     eprintln!("cloved: {} torrent(s) loaded", registry.count());
 
@@ -1259,7 +1259,7 @@ mod tests {
             sam_address: "127.0.0.1:7656".to_owned(),
             token: TOKEN.to_owned(),
             peer_id: *b"-CV0001-testtesttes\0",
-            registry: Mutex::new(Registry::open(&dir.0).expect("registry")),
+            registry: Mutex::new(Registry::open(&dir.0, false).expect("registry")),
             router: Mutex::new("connecting"),
         })
     }
@@ -1752,7 +1752,7 @@ mod tests {
             sam_address: "127.0.0.1:7656".to_owned(),
             token: String::new(),
             peer_id: *b"-CV0001-testtesttes\0",
-            registry: Mutex::new(Registry::open(&dir.0).expect("registry")),
+            registry: Mutex::new(Registry::open(&dir.0, false).expect("registry")),
             router: Mutex::new("connecting"),
         });
         for header in [Some(""), Some(" "), None, Some(TOKEN)] {

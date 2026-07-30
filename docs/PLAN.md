@@ -130,5 +130,6 @@ Exit: 0.1 release criteria per SCOPE §9 (signed tag, green interop matrix).
 | E | none |
 | F | `getrandom` (API token randomness) |
 | G | `landlock`, `seccompiler`, `libc` (constants for the seccomp filter) |
+| — | `rustix` (`openat`-family path walking; entered 2026-07-29 with the path-traversal fix, not on a phase boundary) |
 
-Total: 7 of the ≤15 budget (`DEPENDENCIES.md` is authoritative).
+Total: 8 of the ≤15 budget (`DEPENDENCIES.md` is authoritative).

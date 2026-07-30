@@ -587,7 +587,7 @@ pub enum Error {
         content_type: Option<String>,
         /// Full body length, which the preview may not show all of.
         len: usize,
-        /// Printable prefix, bounded by [`PREVIEW_LEN`].
+        /// Printable prefix, bounded by `PREVIEW_LEN` (512 bytes).
         preview: String,
     },
 }

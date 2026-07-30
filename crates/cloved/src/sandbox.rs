@@ -18,7 +18,7 @@
 //!   ABI 4 also covers outbound TCP, which is how the SAM port becomes the only
 //!   address this process may connect to.
 //! - **seccomp** installs a *deny* filter over the syscalls listed in
-//!   [`DENIED`], plus `socket(2)` for any address family outside
+//!   `DENIED`, plus `socket(2)` for any address family outside
 //!   `AF_UNIX`/`AF_INET`/`AF_INET6`. A deny filter, not an allowlist: an
 //!   allowlist over a threaded Rust process with an allocator underneath is a
 //!   list that breaks in the field on a kernel or libc we did not test, and

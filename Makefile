@@ -328,6 +328,13 @@ man-lint:
 	done; \
 	[ $$fail -eq 0 ] && echo "man-lint: ok"
 
+## The rustdoc counterpart to man-lint: broken and private intra-doc links are
+## errors, not warnings. SCOPE §9 asks for rustdoc on every public item, which
+## `missing_docs = "deny"` enforces for presence — this is the half that keeps
+## what is there from pointing at items that were renamed or made private.
+doc-lint:
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
 ## Install the binaries and manuals. Release build; strip nothing, so a
 ## crash report from a user still carries symbols.
 install:

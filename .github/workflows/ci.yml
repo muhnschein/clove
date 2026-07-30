@@ -125,6 +125,9 @@ jobs:
       # The manuals are the primary user documentation (SCOPE §9); keep them
       # parsing and conventional so they cannot rot unnoticed.
       - run: make man-lint
+      # Same rule one level down: rustdoc links that point at renamed or
+      # newly-private items are a build failure, not a warning nobody reads.
+      - run: make doc-lint
 
   deny:
     runs-on: ubuntu-latest

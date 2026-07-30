@@ -147,7 +147,8 @@ impl Swarm {
 }
 
 /// Announcer timing. Tunable (R5); the state machine's own scheduling
-/// ([`AnnounceState`]) governs per-tracker cadence — this is just the poll
+/// ([`crate::tracker::AnnounceState`]) governs per-tracker cadence — this is
+/// just the poll
 /// tick and transport limits.
 #[derive(Clone, Debug)]
 pub struct AnnouncerConfig {
@@ -173,7 +174,8 @@ impl Default for AnnouncerConfig {
 /// host (SAM naming), dials the tracker over I2P, performs the HTTP announce
 /// (`tracker::announce_over`), and feeds returned peers into
 /// [`Torrent::add_peers`] for the swarm's dial sweep. Scheduling and backoff
-/// per URL follow [`AnnounceState`] (interval floor, exponential failure
+/// per URL follow [`crate::tracker::AnnounceState`] (interval floor,
+/// exponential failure
 /// backoff — `PROTOCOL.i2p-bt` §5.3).
 ///
 /// Each URL is currently tracked independently rather than with strict BEP 12

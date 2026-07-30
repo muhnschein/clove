@@ -1,8 +1,9 @@
 //! Per-torrent resume data — versioned bencode (Q2, `docs/DECISIONS.md`).
 //!
-//! This module is only the format; atomic write-temp-rename persistence
-//! arrives with storage (Phase C), and the written spec (`STATE-FORMAT.md`)
-//! ships at M4. The format is an API (`SQLite` doctrine): any semantic
+//! This module is only the format. The atomic write-temp-rename that puts it
+//! on disk belongs to whoever owns the data directory — `cloved`'s registry —
+//! and the written spec is `docs/STATE-FORMAT.md`. The format is an API
+//! (`SQLite` doctrine): any semantic
 //! change bumps [`VERSION`]. Newer clove always reads older files; older
 //! clove refuses newer files cleanly — a clear error, no write, no
 //! corruption. Unknown keys are likewise refused: resume files are

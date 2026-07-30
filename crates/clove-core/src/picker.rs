@@ -85,7 +85,7 @@ impl Picker {
     /// (SCOPE §9's paranoid-debug-builds rule), so a bug in the piece
     /// accounting is caught the moment it is introduced rather than surfacing
     /// later as a stalled or corrupt download. Called after every mutating
-    /// operation via [`debug_check`](Picker::debug_check).
+    /// operation via the private `debug_check` helper.
     ///
     /// # Panics
     ///
@@ -314,7 +314,7 @@ impl Picker {
         self.debug_check();
     }
 
-    /// Undo [`add_bitfield`] when a peer disconnects.
+    /// Undo [`Picker::add_bitfield`] when a peer disconnects.
     pub fn remove_bitfield(&mut self, field: &Bitfield) {
         for index in 0..self.num_pieces {
             if field.has(index) {
