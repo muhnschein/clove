@@ -87,6 +87,9 @@ pub struct Config {
     pub api_socket: PathBuf,
     /// Transient identity: never persist destination keys (Q4).
     pub ephemeral: bool,
+    /// Grow each file to its full length when a torrent is added, rather than
+    /// letting it become sparse as pieces land (SCOPE §4).
+    pub preallocate: bool,
 }
 
 /// Why configuration was rejected. Messages are written for the operator:
@@ -189,6 +192,7 @@ impl Config {
         let mut data_dir: Option<(usize, PathBuf)> = None;
         let mut api_socket: Option<(usize, PathBuf)> = None;
         let mut ephemeral: Option<(usize, bool)> = None;
+        let mut preallocate: Option<(usize, bool)> = None;
 
         for (index, raw) in text.lines().enumerate() {
             let line = index + 1;
@@ -217,6 +221,10 @@ impl Config {
                 "ephemeral" => {
                     let flag = parse_bool(value).ok_or_else(|| at(Problem::BadBool))?;
                     set(&mut ephemeral, line, flag)?;
+                }
+                "preallocate" => {
+                    let flag = parse_bool(value).ok_or_else(|| at(Problem::BadBool))?;
+                    set(&mut preallocate, line, flag)?;
                 }
                 other => return Err(at(Problem::UnknownKey(other.to_owned()))),
             }
@@ -260,6 +268,7 @@ impl Config {
             data_dir,
             api_socket,
             ephemeral: ephemeral.is_some_and(|(_, v)| v),
+            preallocate: preallocate.is_some_and(|(_, v)| v),
         })
     }
 }
@@ -363,6 +372,9 @@ mod tests {
         assert_eq!(c.sam_address, DEFAULT_SAM_ADDRESS);
         assert!(!c.i_know_sam_is_remote);
         assert!(!c.ephemeral);
+        // Sparse by default: preallocation costs the full size at add time,
+        // which is a deviation an operator opts into, not basic function.
+        assert!(!c.preallocate);
         assert_eq!(c.data_dir, PathBuf::from("/home/u/.local/share/clove"));
         assert_eq!(c.api_socket, PathBuf::from("/run/user/1000/clove.sock"));
     }
@@ -397,12 +409,21 @@ sam_address\t127.0.0.1:7657
 data_dir /srv/clove
 api_socket /run/clove.sock
 ephemeral yes
+preallocate yes
 ";
         let c = Config::parse(text, &defaults()).unwrap();
         assert_eq!(c.sam_address, "127.0.0.1:7657");
         assert_eq!(c.data_dir, PathBuf::from("/srv/clove"));
         assert_eq!(c.api_socket, PathBuf::from("/run/clove.sock"));
         assert!(c.ephemeral);
+        assert!(c.preallocate);
+    }
+
+    #[test]
+    fn preallocate_is_a_bool_like_every_other_flag() {
+        let d = defaults();
+        assert!(Config::parse("preallocate yes\n", &d).unwrap().preallocate);
+        assert!(!Config::parse("preallocate no\n", &d).unwrap().preallocate);
     }
 
     #[test]
@@ -430,6 +451,9 @@ ephemeral yes
             ("sam_address 127.0.0.1:99999", Problem::BadSamAddress),
             ("sam_address :7656", Problem::BadSamAddress),
             ("ephemeral yes\nephemeral yes", Problem::DuplicateKey),
+            ("preallocate", Problem::MissingValue),
+            ("preallocate sometimes", Problem::BadBool),
+            ("preallocate yes\npreallocate no", Problem::DuplicateKey),
         ];
         for (text, problem) in cases {
             match Config::parse(text, &d) {

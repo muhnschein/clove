@@ -341,7 +341,8 @@ fn open_beneath(root: &Path, components: &[String]) -> io::Result<File> {
 ///
 /// # Errors
 ///
-/// Anything [`walk_beneath`] refuses, or an unlink error other than the file
+/// Anything the private `walk_beneath` walk refuses, or an unlink error
+/// other than the file
 /// already being gone.
 pub fn remove_beneath(root: &Path, components: &[String]) -> io::Result<()> {
     use rustix::fs::{AtFlags, unlinkat};

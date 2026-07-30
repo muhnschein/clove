@@ -13,7 +13,6 @@ live swarms on i2pd and Java I2P.
 
 - [`docs/SCOPE.md`](docs/SCOPE.md) — what clove is and is not (the spec)
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — resolved design questions Q1–Q7
-- [`docs/PLAN.md`](docs/PLAN.md) — implementation phases and milestones
 - [`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) — running against real routers, and the interop matrix
 - [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt) — the I2P-BitTorrent dialect, and every live finding
 - [`docs/PHASE-F.md`](docs/PHASE-F.md) — daemon/CLI/API design, and the TUI decision

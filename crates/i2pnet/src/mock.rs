@@ -1,6 +1,6 @@
-//! In-memory implementation of the `i2pnet` traits (Phase B,
-//! `docs/PLAN.md`): a process-local "network" where endpoints connect to
-//! each other over piped in-memory streams. This is the substrate for all
+//! In-memory implementation of the `i2pnet` traits: a process-local
+//! "network" where endpoints connect to each other over piped in-memory
+//! streams. This is the substrate for all
 //! engine tests and chaos tests — no router required.
 //!
 //! Fault injection mirrors what the real network does to us:

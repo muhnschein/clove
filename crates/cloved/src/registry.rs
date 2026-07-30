@@ -48,6 +48,9 @@ where
 {
     state_dir: PathBuf,
     downloads_dir: PathBuf,
+    /// Lay files out at full length on creation rather than letting them go
+    /// sparse (`preallocate` in clove.conf(5)).
+    preallocate: bool,
     torrents: BTreeMap<[u8; 20], Hosted>,
     /// Magnet adds still fetching their metadata (BEP 9). Promoted into
     /// `torrents` by [`complete_magnet`](Registry::complete_magnet).
@@ -124,6 +127,7 @@ pub(crate) struct ScanJob {
     info_hash: [u8; 20],
     meta: MetaInfo,
     downloads_dir: PathBuf,
+    preallocate: bool,
 }
 
 impl ScanJob {
@@ -135,7 +139,7 @@ impl ScanJob {
     ///
     /// Any filesystem error opening or reading the torrent's files.
     pub(crate) fn run(&self) -> io::Result<Bitfield> {
-        let storage = Storage::create(&self.meta, &self.downloads_dir, false)?;
+        let storage = Storage::create(&self.meta, &self.downloads_dir, self.preallocate)?;
         storage.verify_all()
     }
 }
@@ -300,7 +304,7 @@ where
     /// # Errors
     ///
     /// The state or downloads directory cannot be created.
-    pub(crate) fn open(data_dir: &Path) -> io::Result<Registry<D>> {
+    pub(crate) fn open(data_dir: &Path, preallocate: bool) -> io::Result<Registry<D>> {
         let state_dir = data_dir.join("state");
         let downloads_dir = data_dir.join("downloads");
         fs::create_dir_all(&state_dir)?;
@@ -308,6 +312,7 @@ where
         let mut registry = Registry {
             state_dir,
             downloads_dir,
+            preallocate,
             torrents: BTreeMap::new(),
             pending: BTreeMap::new(),
             network: None,
@@ -372,7 +377,11 @@ where
         if hosted.paused || hosted.live.is_some() || hosted.scanning {
             return Ok(());
         }
-        let storage = Arc::new(Storage::create(&hosted.meta, &self.downloads_dir, false)?);
+        let storage = Arc::new(Storage::create(
+            &hosted.meta,
+            &self.downloads_dir,
+            self.preallocate,
+        )?);
         let torrent = Torrent::new(
             &hosted.meta,
             storage,
@@ -626,6 +635,7 @@ where
                 info_hash,
                 meta,
                 downloads_dir: self.downloads_dir.clone(),
+                preallocate: self.preallocate,
             },
         ))
     }
@@ -693,6 +703,7 @@ where
                 info_hash: *info_hash,
                 meta: hosted.meta.clone(),
                 downloads_dir: self.downloads_dir.clone(),
+                preallocate: self.preallocate,
             })
             .collect()
     }
@@ -863,7 +874,7 @@ where
     /// re-announce), bypassing the intervals trackers gave us.
     ///
     /// Rate-limited to one forced announce per
-    /// [`MIN_ANNOUNCE_INTERVAL`](clove_core::tracker::MIN_ANNOUNCE_INTERVAL):
+    /// [`clove_core::tracker::MIN_ANNOUNCE_INTERVAL`]:
     /// the command exists for an operator who suspects a stale peer set, not
     /// as something to put in a loop.
     ///
@@ -914,6 +925,7 @@ where
     /// running or already being scanned.
     pub(crate) fn begin_verify(&mut self, info_hash: &[u8; 20]) -> Result<ScanJob, ActionError> {
         let downloads_dir = self.downloads_dir.clone();
+        let preallocate = self.preallocate;
         let hosted = self
             .torrents
             .get_mut(info_hash)
@@ -933,6 +945,7 @@ where
             info_hash: *info_hash,
             meta: hosted.meta.clone(),
             downloads_dir,
+            preallocate,
         })
     }
 
@@ -1567,7 +1580,7 @@ mod tests {
         let (seed_dest, _seed_dir) = spawn_seeder(&net, &content, &bytes);
 
         let data = TempDir::new("data");
-        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
         let leech_ep = net.endpoint();
         registry.attach_network(
             leech_ep.dialer(),
@@ -1591,7 +1604,7 @@ mod tests {
 
         // A fresh registry (daemon restart) sees the completed state from
         // the persisted resume file alone.
-        let mut reopened = Registry::<MockDialer>::open(&data.0).unwrap();
+        let mut reopened = Registry::<MockDialer>::open(&data.0, false).unwrap();
         assert_eq!(reopened.count(), 1);
         assert!((first_progress(&mut reopened) - 1.0).abs() < f64::EPSILON);
     }
@@ -1602,7 +1615,7 @@ mod tests {
         let (_content, bytes) = fixture("pause-demo");
 
         let data = TempDir::new("data");
-        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
         let ep = net.endpoint();
         registry.attach_network(
             ep.dialer(),
@@ -1630,7 +1643,7 @@ mod tests {
     fn without_a_network_torrents_wait_for_the_router() {
         let (_content, bytes) = fixture("waiting-demo");
         let data = TempDir::new("data");
-        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
         let info_hash = add_and_scan(&mut registry, &bytes);
         let state = registry
             .list()
@@ -1646,7 +1659,7 @@ mod tests {
         let (_content, bytes) = fixture("sequential-demo");
         let data = TempDir::new("data");
         let info_hash = {
-            let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+            let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
             let info_hash = add_and_scan(&mut registry, &bytes);
             // Rarest-first is the default; nothing is claimed until asked.
             assert_eq!(sequential_flag(&mut registry, &info_hash), Some(false));
@@ -1656,7 +1669,7 @@ mod tests {
         };
         // A fresh registry over the same data dir reads the flag back out of
         // the resume file — the point of putting it in the format at all.
-        let mut reopened = Registry::<MockDialer>::open(&data.0).unwrap();
+        let mut reopened = Registry::<MockDialer>::open(&data.0, false).unwrap();
         assert_eq!(sequential_flag(&mut reopened, &info_hash), Some(true));
         reopened.set_sequential(&info_hash, false).unwrap();
         assert_eq!(sequential_flag(&mut reopened, &info_hash), Some(false));
@@ -1666,7 +1679,7 @@ mod tests {
     fn announce_now_refuses_a_torrent_that_is_not_running() {
         let (_content, bytes) = fixture("announce-demo");
         let data = TempDir::new("data");
-        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
         let info_hash = add_and_scan(&mut registry, &bytes);
         // No router yet: the error names that, rather than pretending to
         // announce into a void.
@@ -1708,7 +1721,7 @@ mod tests {
         let info_hash = meta.info_hash.0;
 
         let data = TempDir::new("magnet-unresolvable");
-        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
         let ep = net.endpoint();
         registry.attach_network(
             ep.dialer(),
@@ -1794,7 +1807,7 @@ mod tests {
         });
 
         let data = TempDir::new("magnet-data");
-        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
         let ep = net.endpoint();
         registry.attach_network(
             ep.dialer(),
@@ -1869,13 +1882,18 @@ mod tests {
         let (_content, bytes) = fixture("mismatch-demo");
         let data = TempDir::new("mismatch");
         let info_hash = {
-            let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+            let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
             add_and_scan(&mut registry, &bytes)
         };
         let resume_path = data.0.join(format!("state/{}.resume", hex(&info_hash)));
 
         // Reopening as-is finds it.
-        assert_eq!(Registry::<MockDialer>::open(&data.0).unwrap().count(), 1);
+        assert_eq!(
+            Registry::<MockDialer>::open(&data.0, false)
+                .unwrap()
+                .count(),
+            1
+        );
 
         // Now claim a different piece count. Every bitfield in the file is
         // sized against that number, so the entry has to be refused rather
@@ -1887,7 +1905,9 @@ mod tests {
         bad.verified = bad.have.clone();
         fs::write(&resume_path, bad.encode()).unwrap();
         assert_eq!(
-            Registry::<MockDialer>::open(&data.0).unwrap().count(),
+            Registry::<MockDialer>::open(&data.0, false)
+                .unwrap()
+                .count(),
             0,
             "a resume file describing a different torrent was loaded anyway"
         );
@@ -1895,7 +1915,12 @@ mod tests {
         // And the good one still loads, so the check is about the mismatch and
         // not about rejecting resume files in general.
         fs::write(&resume_path, good.encode()).unwrap();
-        assert_eq!(Registry::<MockDialer>::open(&data.0).unwrap().count(), 1);
+        assert_eq!(
+            Registry::<MockDialer>::open(&data.0, false)
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     /// A resume file that claims pieces it cannot vouch for does not get to
@@ -1912,7 +1937,7 @@ mod tests {
         let (_content, bytes) = fixture("forged-demo");
         let data = TempDir::new("forged");
         let info_hash = {
-            let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+            let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
             add_and_scan(&mut registry, &bytes)
         };
         let resume_path = data.0.join(format!("state/{}.resume", hex(&info_hash)));
@@ -1938,7 +1963,7 @@ mod tests {
         forged.have = full;
         fs::write(&resume_path, forged.encode()).unwrap();
 
-        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
         assert_eq!(registry.count(), 1, "the torrent still loads");
         assert!(
             first_progress(&mut registry).abs() < f64::EPSILON,
@@ -1963,7 +1988,7 @@ mod tests {
         let (_content, bytes) = fixture("subset-demo");
         let data = TempDir::new("subset");
         let info_hash = {
-            let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+            let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
             add_and_scan(&mut registry, &bytes)
         };
         let resume_path = data.0.join(format!("state/{}.resume", hex(&info_hash)));
@@ -1978,7 +2003,9 @@ mod tests {
             "verified must not be able to exceed have"
         );
         assert_eq!(
-            Registry::<MockDialer>::open(&data.0).unwrap().count(),
+            Registry::<MockDialer>::open(&data.0, false)
+                .unwrap()
+                .count(),
             0,
             "an impossible resume file was loaded anyway"
         );
@@ -1991,7 +2018,7 @@ mod tests {
         let (_content, bytes) = fixture("prio-count-demo");
         let data = TempDir::new("prio-count");
         let info_hash = {
-            let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+            let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
             add_and_scan(&mut registry, &bytes)
         };
         let resume_path = data.0.join(format!("state/{}.resume", hex(&info_hash)));
@@ -2001,13 +2028,20 @@ mod tests {
         bad.priorities = vec![1u8; good.priorities.len() + 1];
         fs::write(&resume_path, bad.encode()).unwrap();
         assert_eq!(
-            Registry::<MockDialer>::open(&data.0).unwrap().count(),
+            Registry::<MockDialer>::open(&data.0, false)
+                .unwrap()
+                .count(),
             0,
             "a priorities vector for a different file list was loaded anyway"
         );
 
         fs::write(&resume_path, good.encode()).unwrap();
-        assert_eq!(Registry::<MockDialer>::open(&data.0).unwrap().count(), 1);
+        assert_eq!(
+            Registry::<MockDialer>::open(&data.0, false)
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     /// A failure against a peer must not record *which* peer.
@@ -2048,7 +2082,7 @@ mod tests {
         });
 
         let data = TempDir::new("peer-name");
-        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
         let ep = net.endpoint();
         registry.attach_network(
             ep.dialer(),
@@ -2098,7 +2132,7 @@ mod tests {
     #[test]
     fn a_failed_promotion_leaves_the_magnet_recoverable() {
         let data = TempDir::new("promote-fail");
-        let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
         let info_hash = registry
             .add_magnet(&format!("magnet:?xt=urn:btih:{}", "ab".repeat(20)))
             .expect("add magnet");
@@ -2119,7 +2153,7 @@ mod tests {
 
         // And a restart still finds it, which is the part that matters after a
         // crash rather than an error return.
-        let reopened = Registry::<MockDialer>::open(&data.0).unwrap();
+        let reopened = Registry::<MockDialer>::open(&data.0, false).unwrap();
         assert_eq!(reopened.pending_hashes(), vec![info_hash]);
     }
 
@@ -2134,7 +2168,7 @@ mod tests {
         let (_content, bytes) = fixture("leftover-demo");
         let data = TempDir::new("leftover");
         let info_hash = {
-            let mut registry = Registry::<MockDialer>::open(&data.0).unwrap();
+            let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
             add_and_scan(&mut registry, &bytes)
         };
 
@@ -2146,7 +2180,7 @@ mod tests {
         )
         .unwrap();
 
-        let registry = Registry::<MockDialer>::open(&data.0).unwrap();
+        let registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
         assert_eq!(registry.count(), 1, "the torrent loads");
         assert!(
             registry.pending_hashes().is_empty(),

@@ -108,8 +108,22 @@ commit. Closure sizes are recorded when the dependency is actually added.
 
 Checked against crates.io on 2026-07-25. `yosemite` 0.7.0 is current;
 `sha1`/`sha2` were moved 0.10 → 0.11 together; `getrandom` is held at 0.2 on
-purpose (above). Total transitive closure: **46 crates**, the bulk of it
+purpose (above). Total transitive closure: **48 crates**, the bulk of it
 yosemite's (`rand`, `thiserror`, `nom`, `tracing` and the proc-macro trio).
+
+Counted as `Cargo.lock` entries less the four workspace members:
+
+```
+grep -c '^name = ' Cargo.lock   # 52, less the 4 workspace crates
+```
+
+It counts the duplicated crates below twice and includes the target-gated
+`rustix` entries (`errno`, `windows-sys`, `windows-link`) that are never
+compiled on Linux. **Recounted 2026-07-30**, and restated against that command
+rather than left as a bare figure: it read 46 when written, which was the whole
+lockfile *including* the workspace members, and `rustix` then added its
+documented six entries. Two different countings of one number is how it drifted
+in the first place — the command above is now the definition.
 
 `cargo tree -d` should report no duplicates; if it does, that is a review
 topic, not a shrug. It currently reports one, arriving with Phase G:

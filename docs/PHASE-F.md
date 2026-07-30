@@ -2,7 +2,7 @@
 
 **Status:** Complete (build order §7 all landed). This pins the API surface, the daemon/CLI shape, the
 persistence plan, and the TUI decision before the daemon wiring is written, so
-the architecture is agreed up front. Maps to `PLAN.md` Phase F and milestone M4
+the architecture is agreed up front. Maps to milestone M4 (`SCOPE.md` §8)
 (daily-drivable daemon + CLI). Nothing here relaxes `SCOPE.md` §9 — in
 particular the ≤15-dependency budget and the hand-roll list (HTTP/1.1 both
 ends, JSON, arg parsing) stand.

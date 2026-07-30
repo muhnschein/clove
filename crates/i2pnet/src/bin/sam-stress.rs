@@ -19,7 +19,7 @@
 //! `CLOVE_STRESS_DEADLINE` when testing a slow router.
 //!
 //! Usage:
-//!   sam-stress [N]                  # N concurrent streams (default 32)
+//!   sam-stress \[N\]                  # N concurrent streams (default 32)
 //!   `CLOVE_SAM_PORT=7656` ...       # SAM port the listener uses (default 7656)
 //!   `CLOVE_SAM_PORT_DIAL=7666` ...  # SAM port the dialer uses (default: same)
 //!   `CLOVE_STRESS_DEADLINE=360` ... # seconds for the whole run (default 360)
@@ -519,7 +519,7 @@ struct Run {
     arrived: u64,
 }
 
-/// `attempts` is a shared counter rather than a field of [`Sample`], because
+/// `attempts` is a shared counter rather than a field of `Sample`, because
 /// the runs worth diagnosing are the ones that never produce a `Sample`. When
 /// it was per-sample and summed on the success arm only, a run where every
 /// dial was still retrying at the deadline reported `dial tries: 0` — which

@@ -1,4 +1,4 @@
-//! `SAMv3` backend (Phase D, `docs/PLAN.md`).
+//! `SAMv3` backend — the M1 half of `SCOPE.md` §8.
 //!
 //! This is the *only* code here that talks to a real router. Its runtime
 //! behavior against a live router is verified out-of-CI
@@ -10,12 +10,13 @@
 //!   its control connection: `HELLO VERSION` and `SESSION CREATE` are spoken
 //!   on a socket clove opens, with real deadlines on both (`PROTOCOL.i2p-bt`
 //!   §2.7, §2.13). Dialing likewise speaks SAM on a socket opened per stream
-//!   (see [`dial_stream`]), so a stream is a [`ForwardedStream`] — a plain TCP
+//!   (see the private `dial_stream`), so a stream is a [`ForwardedStream`] — a plain TCP
 //!   socket to the bridge, with real timeouts, a real `split`, and
 //!   close-on-drop. yosemite is left with `NAMING LOOKUP` alone, which is a
 //!   one-shot on a socket of its own.
 //! - The control connection is **read continuously** by a watchdog thread for
-//!   as long as the session lives ([`watch_control`]). That is not a nicety:
+//!   as long as the session lives (the private `watch_control` thread). That
+//!   is not a nicety:
 //!   `SAMv3.2` lets the router ping the client and Java I2P drops the session
 //!   when nobody answers, so a control connection that is only written to is a
 //!   session with a timer on it. It is also the only place the router's
@@ -1005,7 +1006,7 @@ impl I2pStream for ForwardedStream {
 impl I2pDialer for SamSession {
     type Stream = ForwardedStream;
 
-    /// Dial `peer` on a socket of our own (see [`dial_stream`]).
+    /// Dial `peer` on a socket of our own (see the private `dial_stream`).
     ///
     /// No session mutex is taken and no library state is touched, so dials
     /// are genuinely concurrent — `PROTOCOL.i2p-bt` §2.6a's serialization

@@ -97,6 +97,21 @@ Default:
 .Pp
 A transient identity is unlinkable across restarts, at the cost of losing
 your standing in swarms and having to re-announce as a new peer each time.
+.It Ic preallocate Ar yes | Ar no
+Grow each of a torrent's files to its full length when the torrent is added,
+instead of letting the file stay sparse and fill in as pieces arrive.
+Default:
+.Ar no .
+.Pp
+Preallocation trades disk up front for two things: a download that cannot
+fail part-way through with
+.Er ENOSPC
+because the space was already claimed, and files that are laid out more
+contiguously, which matters on rotational disks and for playing media while
+it downloads.
+Leave it off on a filesystem where sparse files are cheap and free space is
+tight, and on one that does not support sparse files it changes nothing —
+the space is taken either way.
 .El
 .Sh EXAMPLES
 The recommended configuration is no file at all.

@@ -114,7 +114,7 @@ stop_daemon() {
     daemon_pid=""
 }
 
-# A real single-file .torrent: 72 bytes of content, one 16 KiB piece.
+# A real single-file .torrent: 75 bytes of content, one 16 KiB piece.
 python3 - "$work/demo.torrent" <<'PY'
 import hashlib, sys
 
@@ -256,6 +256,42 @@ expect_contains "$(timeout 5 "$clove" -c "$conf_dir/clove.conf" list)" \
 expect_router_state "waiting-for-router"
 kill "$conf_pid" 2>/dev/null
 wait "$conf_pid" 2>/dev/null || true
+
+# `preallocate` is the one config key with a visible effect on disk, so it is
+# the one that can be checked rather than merely parsed. Without it a fresh
+# torrent's files are created empty and grow as blocks land; with it they are
+# at full length from the moment the torrent is added, before any peer exists.
+echo "smoke: preallocate lays files out at full length"
+pre_dir="$work/prealloc"
+mkdir -p "$pre_dir/data" "$pre_dir/run"
+cat >"$pre_dir/clove.conf" <<EOF
+data_dir $pre_dir/data
+api_socket $pre_dir/run/clove.sock
+preallocate yes
+EOF
+timeout 20 "$cloved" -C -c "$pre_dir/clove.conf" >/dev/null \
+    || fail "cloved -C rejected a config with preallocate"
+timeout 60 "$cloved" -c "$pre_dir/clove.conf" >"$work/daemon-prealloc.log" 2>&1 &
+pre_pid=$!
+i=0
+until timeout 5 "$clove" -c "$pre_dir/clove.conf" status >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -gt 200 ] && fail "preallocating daemon never answered (log: $(cat "$work/daemon-prealloc.log"))"
+    sleep 0.05
+done
+timeout 5 "$clove" -c "$pre_dir/clove.conf" add "$work/demo.torrent" >/dev/null \
+    || fail "add against the preallocating daemon failed"
+laid_out="$pre_dir/data/downloads/smoke.txt"
+i=0
+until [ -f "$laid_out" ]; do
+    i=$((i + 1))
+    [ "$i" -gt 200 ] && fail "preallocate never created $laid_out"
+    sleep 0.05
+done
+size=$(stat -c '%s' "$laid_out")
+[ "$size" = "75" ] || fail "preallocated file is $size bytes, expected the full 75"
+kill "$pre_pid" 2>/dev/null
+wait "$pre_pid" 2>/dev/null || true
 
 echo "smoke: token file is 0600"
 mode=$(stat -c '%a' "$XDG_DATA_HOME/clove/token")

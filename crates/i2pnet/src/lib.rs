@@ -2,8 +2,8 @@
 //! open sockets (Layer 1 no-clearnet enforcement, `docs/SCOPE.md` §5).
 //!
 //! Everything network-shaped in clove goes through the traits defined here.
-//! The production implementation (Phase D, `docs/PLAN.md`) wraps the
-//! `yosemite` `SAMv3` library with its `sync` feature; [`mock`] provides an
+//! The production implementation ([`sam`]) wraps the `yosemite` `SAMv3`
+//! library with its `sync` feature; [`mock`] provides an
 //! in-memory implementation so the engine is testable without a router.
 //!
 //! Invariants this crate owns:

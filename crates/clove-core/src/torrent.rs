@@ -2,7 +2,8 @@
 //! and storage — the Q5 sync thread-per-peer model in practice.
 //!
 //! Each connection runs two threads over one `i2pnet` stream (hence
-//! [`i2pnet::I2pStream::try_clone`]): a reader that blocks on incoming
+//! [`I2pStream::split`], which hands back independent read and write halves
+//! of the same connection): a reader that blocks on incoming
 //! messages and a writer that drains a bounded outgoing queue. Shared
 //! torrent state (picker, choker, the peer table) lives behind one mutex;
 //! handlers compute their outgoing messages while holding it, then release
@@ -26,9 +27,15 @@
 //!     its availability withdrawn, its in-flight blocks released)
 //! ```
 //!
-//! This is the engine core for the M2 lab demo (download between two
-//! instances). The real router backend (Phase D) and swarm features
-//! (trackers, PEX, magnets — Phase E) attach at the same seams.
+//! The four choke/interest booleans on a peer are the sub-state of `Active`
+//! above, not a state machine smeared across flags: BEP 3 defines them as
+//! four independent bits and all sixteen combinations are reachable, so
+//! modelling them as anything else would obscure the protocol rather than
+//! clarify it. See the waiver on `Peer` below.
+//!
+//! This module is generic over the `i2pnet` traits, so the same code runs
+//! against the mock network in CI and a real router in production; peer
+//! acquisition (dialling, accepting) belongs to [`crate::swarm`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -1592,8 +1599,9 @@ fn await_extension_handshake<S: std::io::Read>(
 /// The reassembled bytes are checked against `info_hash` inside the
 /// assembler, so a peer cannot serve a different torrent.
 ///
-/// Bounded end to end by [`METADATA_DEADLINE`], with [`METADATA_IO_TIMEOUT`]
-/// underneath it so a peer that says nothing at all is bounded too.
+/// Bounded end to end by `METADATA_DEADLINE` (120s), with
+/// `METADATA_IO_TIMEOUT` (30s) underneath it so a peer that says nothing at
+/// all is bounded too.
 ///
 /// # Errors
 ///

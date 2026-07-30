@@ -20,7 +20,3 @@ pub mod swarm;
 pub mod torrent;
 pub mod tracker;
 pub mod wire;
-
-// i2pnet is not consumed yet (that starts with `wire`/`supervisor`), but
-// the dependency edge pins the direction: engine -> i2pnet, never reverse.
-use i2pnet as _;

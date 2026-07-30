@@ -227,7 +227,8 @@ impl std::error::Error for ParseError {}
 ///
 /// A [`ParseError`] with a byte offset on malformed input: bad tokens,
 /// unterminated or badly escaped strings, numbers that do not parse, nesting
-/// past [`MAX_DEPTH`], or trailing bytes after the value.
+/// past the nesting limit (`MAX_DEPTH`, 128), or trailing bytes after the
+/// value.
 pub fn parse(input: &str) -> Result<Value, ParseError> {
     let mut parser = Parser {
         bytes: input.as_bytes(),
