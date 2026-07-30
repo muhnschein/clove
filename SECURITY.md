@@ -2,40 +2,16 @@
 
 clove exists to move data over I2P and nothing else. A bug that puts traffic,
 or a user's identity, anywhere but I2P is the most serious class of defect this
-project has. This file says how to report one and what to expect back. It is
-published before the first release, deliberately, so it is never retrofitted
-after the first report.
+project has. This file says how to report one.
 
 ## Reporting a vulnerability
 
-**Use GitHub's private vulnerability reporting on this repository** — the
-*Security* tab, *Report a vulnerability*. That is the only reporting channel,
-deliberately: one channel that is authenticated, private by construction, and
-cannot be misdelivered beats a published address nobody watches and a PGP key
-nobody can verify. Do not open a public issue for a suspected vulnerability.
-
-If you cannot use GitHub at all, open a public issue containing **no details** —
-just that you have something to report — and you will be given somewhere private
-to send it.
+**Use GitHub's private vulnerability reporting on this repository**. That is the only reporting channel. Do not open a public issue for a suspected vulnerability.
 
 Please include the clove version or commit, the router and version
 (i2pd / Java I2P / emissary), what you observed, and a reproduction if you have
 one. A vague report of a real problem is still worth sending; we would rather
 chase a hunch than miss a leak.
-
-## What to expect
-
-- **Acknowledgement within 7 days.** GitHub notifies the maintainer directly, so
-  silence past that means something went wrong — nudge the advisory thread.
-- An assessment — whether we agree it is a vulnerability, and its severity —
-  within 14 days.
-- We aim to fix and release within 90 days of the report. Leak-class bugs
-  (below) are treated as drop-everything work.
-- Credit in the release notes unless you ask otherwise. We will not name you
-  without your consent.
-- Coordinated disclosure: we ask that you hold public details until a fix is
-  released or 90 days have passed, whichever comes first. If a fix is taking
-  longer than that, we will tell you why rather than go quiet.
 
 ## What counts as a vulnerability
 
@@ -94,12 +70,3 @@ These are enforced in the codebase and checked in CI, not merely intended:
 
 If you find a way to violate one of these, that is a vulnerability by
 definition, even without a demonstrated exploit.
-
-## Releases
-
-Release tags are signed. The signing key's fingerprint is published with the
-first signed release and does not change without an announcement; verify the tag
-before building anything you intend to run.
-
-Security fixes ship as a normal release with the issue described plainly in
-the release notes. We do not quietly slip fixes into unrelated commits.

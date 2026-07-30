@@ -1,18 +1,8 @@
 # clove
 
-An I2P-only BitTorrent client. Daemon (`cloved`) + CLI (`clove`), speaking
-SAMv3 to an external I2P router (i2pd, Java I2P, or emissary). It aspires to be
-leak-proof by construction: the engine has no IP vocabulary, and only the
-`i2pnet` crate may touch a socket — enforced by lint and CI, not convention.
-
-*Aspires*, because that is the honest word for it. The architectural half holds
-up: an external review of the whole tree found no code path to clearnet and no
-DNS resolution, and the boundary is checked on every push. What it also found
-was the client's own destination reaching places it had no business being — a
-log line on every failed announce, a peer's address kept in an API field — none
-of which the socket boundary has anything to say about. Those are fixed and
-tested against, but "leak-proof" is a claim about a whole program, and the way
-to earn it is to keep failing to find leaks rather than to assert it.
+clove is an I2P-only BitTorrent client. Daemon (`cloved`) + CLI (`clove`),
+speaking SAMv3 to an external I2P router. Aspires to be leak-proof by 
+construction.
 
 **Status: pre-alpha.** Feature-complete against its v1 scope — daemon, CLI,
 engine, tracker, PEX, magnets, persistence — and it downloads from and seeds to
@@ -66,9 +56,6 @@ Three independent layers (`docs/SCOPE.md` §5), none assuming another is present
 Java I2P and emissary — which run side by side for the interop matrix.
 
 ## Building and testing
-
-Stable Rust, seven direct dependencies (three of them Linux-only sandboxing),
-no async runtime.
 
 ```
 cargo build                 # or: make install PREFIX=/usr DESTDIR=pkg
