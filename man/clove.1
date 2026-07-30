@@ -1,4 +1,4 @@
-.Dd July 25, 2026
+.Dd July 30, 2026
 .Dt CLOVE 1
 .Os
 .Sh NAME
@@ -28,6 +28,25 @@ The token is read from
 which the daemon creates mode 0600 on first start; running
 .Nm
 therefore requires the same user as the daemon, or read access to that file.
+.Pp
+A command names a torrent by its info-hash, or by any prefix of that hash
+long enough to be unique among the hosted torrents — four characters at the
+least.
+A prefix that matches more than one torrent is an error listing the ones it
+matched; it is never resolved by choosing.
+A full 40-character hash is matched exactly and is never treated as a prefix,
+so a script that names torrents in full is unaffected by what else gets added.
+.Pp
+The commands marked
+.Ar torrent ...
+take any number of torrents, or
+.Fl -all
+for every hosted one.
+Each is acted on separately, and one failure does not abandon the rest: the
+failures are reported per torrent and the command exits 1 if any of them
+failed.
+The exception is a daemon that cannot be reached, which stops the command
+where it stands.
 .Pp
 Text that came out of a torrent
 .Pq its name, its file paths, its tracker URLs
@@ -82,7 +101,7 @@ This is a plain redraw loop, not a full-screen program: the terminal is
 never put into raw mode, so
 .Ic Ctrl-C
 leaves it exactly as it was.
-.It Cm show Ar info-hash Op Fl -json
+.It Cm show Ar torrent Op Fl -json
 One torrent in detail: sizes, progress, state, peer counts, bytes moved, the
 file table with per-file priorities, and the announce URLs.
 .Pp
@@ -119,29 +138,34 @@ A magnet is stored immediately and listed as
 .Sy fetching-metadata
 while the daemon fetches its info dictionary from peers; it becomes an
 ordinary torrent once that succeeds.
-.It Cm remove Ar info-hash Op Fl -data
-Remove a torrent.
+.It Cm remove Ar torrent ... | Fl -all Op Fl -data
+Remove torrents.
 With
 .Fl -data
-its downloaded files are deleted as well.
-.It Cm pause Ar info-hash
-Stop peer acquisition and disconnect this torrent's peers.
+their downloaded files are deleted as well.
+.Pp
+.Fl -all Fl -data
+deletes the data of every hosted torrent and cannot be undone.
+Both flags are required to spell it, which is the only guard there is: a
+control program that stopped to ask would be one that cannot be scripted.
+.It Cm pause Ar torrent ... | Fl -all
+Stop peer acquisition and disconnect these torrents' peers.
 The paused state persists across daemon restarts.
-.It Cm resume Ar info-hash
-Bring a paused torrent back online.
-.It Cm verify Ar info-hash
-Re-read the torrent's data from disk and re-check every piece against the
+.It Cm resume Ar torrent ... | Fl -all
+Bring paused torrents back online.
+.It Cm verify Ar torrent ... | Fl -all
+Re-read each torrent's data from disk and re-check every piece against the
 metainfo hashes.
-The torrent must be paused first, since a running one is writing to the same
+A torrent must be paused first, since a running one is writing to the same
 files.
-.It Cm peer Ar info-hash Ar b32-address
+.It Cm peer Ar torrent Ar b32-address
 Hand a running torrent a peer to dial, as a
 .Ar 52-character
 b32 address with or without the
 .Pa .b32.i2p
 suffix.
 Useful for private swarms and for lab testing between two known instances.
-.It Cm priorities Ar info-hash Ar spec
+.It Cm priorities Ar torrent Ar spec
 Set per-file priorities from a comma-separated list, one value per file in
 the torrent's own order:
 .Sy 0
@@ -158,13 +182,13 @@ receives whatever shares a piece with a neighbour it is keeping: at most
 one piece at each end of it.
 A torrent counts as finished, and starts seeding, once every file it was
 told to fetch is present; the skipped ones are not waited for.
-.It Cm announce Ar info-hash
-Announce to every one of the torrent's trackers immediately, ignoring the
+.It Cm announce Ar torrent ... | Fl -all
+Announce to every one of each torrent's trackers immediately, ignoring the
 intervals they last asked for.
 For an operator who suspects a stale peer set; it is not something to put in
 a loop, and the daemon refuses a second forced announce within a minute.
 The torrent must be running and have at least one I2P tracker.
-.It Cm sequential Ar info-hash Cm on | Cm off
+.It Cm sequential Ar torrent Cm on | Cm off
 Pick pieces in file order rather than rarest-first.
 Useful for media you want to start watching before the download finishes; it
 is worse for the swarm and slightly worse for you, because the rare pieces
@@ -209,29 +233,46 @@ List torrents, then look at one in detail:
 $ clove list
 PROGRESS  STATE        SIZE     NAME          INFO-HASH
  42%      downloading  1.4 GiB  release.iso   58e2fc46a8dc
-$ clove show 58e2fc46a8dc57c78191f079648750b0644d03a2
+$ clove show 58e2
+.Ed
+.Pp
+The listing prints the leading characters of each info-hash because that is
+all a command needs.
+Should a prefix be ambiguous, the daemon says which torrents it hit rather
+than picking one:
+.Bd -literal -offset indent
+$ clove pause 58
+clove: that prefix matches 2 torrents; use more characters
 .Ed
 .Pp
 Download only the second of three files:
 .Bd -literal -offset indent
-$ clove priorities 58e2fc46a8dc57c78191f079648750b0644d03a2 0,1,0
+$ clove priorities 58e2 0,1,0
 .Ed
 .Pp
 Start watching a film before it has finished downloading, then ask the
 trackers for more peers:
 .Bd -literal -offset indent
-$ clove sequential 58e2fc46a8dc57c78191f079648750b0644d03a2 on
-58e2fc46a8dc57c78191f079648750b0644d03a2 now picks pieces in order
-$ clove announce 58e2fc46a8dc57c78191f079648750b0644d03a2
-announcing 58e2fc46a8dc57c78191f079648750b0644d03a2
+$ clove sequential 58e2 on
+58e2 now picks pieces in order
+$ clove announce 58e2
+announcing 58e2
+.Ed
+.Pp
+Act on several torrents at once, or on all of them:
+.Bd -literal -offset indent
+$ clove pause 58e2 9b1c
+paused 58e2
+paused 9b1c
+$ clove resume --all
 .Ed
 .Pp
 Re-check a torrent's data on disk:
 .Bd -literal -offset indent
-$ clove pause 58e2fc46a8dc57c78191f079648750b0644d03a2
-$ clove verify 58e2fc46a8dc57c78191f079648750b0644d03a2
-verified 5721 piece(s) for 58e2fc46a8dc57c78191f079648750b0644d03a2
-$ clove resume 58e2fc46a8dc57c78191f079648750b0644d03a2
+$ clove pause 58e2
+$ clove verify 58e2
+verified 5721 piece(s) for 58e2
+$ clove resume 58e2
 .Ed
 .Pp
 Connect two instances directly, without a tracker.

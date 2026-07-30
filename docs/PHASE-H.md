@@ -1,8 +1,8 @@
 # Phase H — Daily-drivable: many torrents, and a view worth watching
 
-**Status:** Proposed. Nothing here is built. This pins the design before the
-wiring, the way `PHASE-F.md` did, so the architecture is argued on paper where
-arguing is cheap. Maps to no new milestone: this is what M4's *"a CLI pleasant
+**Status:** In progress — **H0 and H4 landed**, the rest as designed below.
+This pinned the design before the wiring, the way `PHASE-F.md` did, so the
+architecture was argued on paper where arguing is cheap. Maps to no new milestone: this is what M4's *"a CLI pleasant
 enough for daily use"* (`SCOPE.md` §1) turns out to mean once you run more than
 one torrent at a time.
 
@@ -67,7 +67,7 @@ is the view.
 
 ---
 
-## 2. H0 — A torrent name is not a control sequence *(prerequisite, and a live defect)*
+## 2. H0 — A torrent name is not a control sequence — **landed**
 
 `metainfo::check_component` rejects the empty string, `.`, `..`, `/`, `\` and
 NUL. It does not reject `ESC`. A torrent whose `info.name` is
@@ -200,7 +200,7 @@ already on the operator's machine — `systemd` timers against `clove pause
 
 ---
 
-## 6. H4 — Naming a torrent without typing forty characters
+## 6. H4 — Naming a torrent without typing forty characters — **landed**
 
 This is the cheapest item here and the one that most changes how the client
 feels. Every per-torrent command today takes a full 40-character lowercase hex
@@ -233,6 +233,21 @@ of queueing or budgeting fixes that.
 
 **Cost:** ~80 lines split between `registry.rs` (the resolver) and
 `clove/src/main.rs` (operand loops). No new dependency.
+
+**What landing it turned up.** `--all` expands against the listing, and the
+listing includes magnets still fetching their metadata — which have no engine,
+so `clove resume --all` failed for the whole run because one entry was never
+resumable. Two fixes, both narrower than they first looked:
+
+- Those operations answered **`404 no such torrent`** about an entry
+  `clove list` was showing at that moment. That is simply false, and it sends
+  an operator hunting for a torrent they can see. They now answer `400` naming
+  the actual state. Removing one still works, because removing is the one
+  thing a half-added magnet can do.
+- `--all` means *every torrent that has become one*: the CLI filters on the
+  `fetching-metadata` state, which is the existing marker for "this is an add
+  in progress, not yet a torrent". One rule in one place, rather than a list of
+  which commands tolerate which states.
 
 ---
 

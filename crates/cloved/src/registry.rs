@@ -1406,6 +1406,126 @@ fn write_resume_file(state_dir: &Path, info_hash: &[u8; 20], resume: &Resume) ->
     )
 }
 
+/// Shortest prefix that may stand in for an info-hash.
+///
+/// Four hex characters is 16 bits. That is short enough to type from a listing
+/// and long enough that a collision across the tens of torrents a client hosts
+/// is something you have to go looking for — and when it happens the answer is
+/// [`ResolveError::Ambiguous`], not a guess.
+pub(crate) const MIN_PREFIX: usize = 4;
+
+/// A torrent that a prefix could have meant.
+#[derive(Debug)]
+pub(crate) struct Candidate {
+    /// Full hex info-hash.
+    pub(crate) info_hash: String,
+    /// Its display name, for telling two candidates apart.
+    pub(crate) name: String,
+}
+
+/// Why a torrent reference did not name exactly one torrent.
+#[derive(Debug)]
+pub(crate) enum ResolveError {
+    /// Not hex, too short, or longer than an info-hash (400).
+    Malformed,
+    /// Well-formed, but no hosted torrent starts with it (404).
+    NotFound,
+    /// More than one does (409). Never resolved by picking one.
+    Ambiguous(Vec<Candidate>),
+}
+
+impl<D: I2pDialer + I2pNamingLookup + Clone + Send + Sync + 'static> Registry<D>
+where
+    D::Stream: 'static,
+{
+    /// Resolve an operator's torrent reference — a full info-hash, or a unique
+    /// hex prefix of one — to exactly one info-hash.
+    ///
+    /// Prefixes are git's affordance, and they exist here for the same reason:
+    /// every per-torrent command used to require all forty characters, which is
+    /// fine for the one torrent you just added and unusable for the twentieth.
+    ///
+    /// Two rules make this safe to hand a script. A **full 40-character hash
+    /// keeps its exact-match path** and never consults the table, so anything
+    /// that works today keeps working and cannot start meaning a different
+    /// torrent because of what else got added. And an **ambiguous prefix is an
+    /// error carrying the candidates**, never a choice — the failure mode this
+    /// must not have is `clove remove --data` quietly picking one of two.
+    ///
+    /// Resolution happens here rather than in `clove(1)` because the CLI is a
+    /// one-request client: resolving there means a listing fetch before every
+    /// action, two round trips, and a window in which the answer changes
+    /// between the fetch and the act.
+    ///
+    /// # Errors
+    ///
+    /// [`ResolveError`] — malformed, unmatched, or matching more than one.
+    pub(crate) fn resolve(&self, text: &str) -> Result<[u8; 20], ResolveError> {
+        if let Some(exact) = parse_info_hash(text) {
+            return Ok(exact);
+        }
+        if text.len() < MIN_PREFIX
+            || text.len() > 40
+            || !text.bytes().all(|b| hex_digit(b).is_some())
+        {
+            return Err(ResolveError::Malformed);
+        }
+        // Linear over a map of tens. A `BTreeMap` range would be asymptotically
+        // nicer and is not worth it: the bound is the number of torrents one
+        // person hosts, and an odd-length prefix makes the byte range fiddly
+        // enough to get subtly wrong.
+        //
+        // Magnets still fetching their metadata are listed and can be removed,
+        // so they answer to a prefix too.
+        let found: Vec<[u8; 20]> = self
+            .torrents
+            .keys()
+            .chain(self.pending.keys())
+            .filter(|info_hash| hex(*info_hash).starts_with(text))
+            .copied()
+            .collect();
+        match found.as_slice() {
+            [] => Err(ResolveError::NotFound),
+            [one] => Ok(*one),
+            // Names are looked up only here: the answer an operator needs from
+            // an ambiguous prefix is which torrents it hit, and the resolving
+            // path that succeeds should not pay to build that.
+            many => Err(ResolveError::Ambiguous(
+                many.iter().map(|ih| self.candidate(ih)).collect(),
+            )),
+        }
+    }
+
+    /// Whether this info-hash is a magnet still waiting for its metadata.
+    ///
+    /// Such an entry is listed, resolvable and removable, but has no engine and
+    /// no file list, so every other operation has nothing to act on. The
+    /// distinction exists so those can say *why* rather than claiming the
+    /// torrent does not exist — which, for something `clove list` is showing,
+    /// is just untrue.
+    pub(crate) fn is_pending(&self, info_hash: &[u8; 20]) -> bool {
+        self.pending.contains_key(info_hash)
+    }
+
+    /// One resolution candidate: its hash, and the name that tells it apart.
+    fn candidate(&self, info_hash: &[u8; 20]) -> Candidate {
+        let full = hex(info_hash);
+        let name = self.torrents.get(info_hash).map_or_else(
+            || {
+                self.pending
+                    .get(info_hash)
+                    .and_then(|p| p.magnet.display_name.clone())
+                    .unwrap_or_else(|| full.clone())
+            },
+            |hosted| hosted.meta.name.clone(),
+        );
+        Candidate {
+            info_hash: full,
+            name,
+        }
+    }
+}
+
 /// Parse a 40-char lowercase-hex info-hash into 20 bytes.
 pub(crate) fn parse_info_hash(text: &str) -> Option<[u8; 20]> {
     if text.len() != 40 {
@@ -2205,5 +2325,116 @@ mod tests {
         assert!(parse_info_hash("short").is_none());
         assert!(parse_info_hash(&"g".repeat(40)).is_none());
         assert!(parse_info_hash(&"A".repeat(40)).is_none()); // uppercase not accepted
+    }
+
+    /// Magnets are how a test picks the info-hash it wants: a `.torrent`'s is
+    /// SHA-1 of its info dict and cannot be chosen, but `xt=urn:btih:` is
+    /// whatever we write. That is what makes the ambiguous case testable at
+    /// all.
+    fn add_magnet_named(registry: &mut Registry<MockDialer>, hash_hex: &str, name: &str) {
+        registry
+            .add_magnet(&format!("magnet:?xt=urn:btih:{hash_hex}&dn={name}"))
+            .expect("add magnet");
+    }
+
+    #[test]
+    fn a_prefix_names_a_torrent_and_an_ambiguous_one_never_guesses() {
+        let data = TempDir::new("resolve");
+        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+
+        let a = format!("aaaa{}", "1".repeat(36));
+        let b = format!("aaaa{}", "2".repeat(36));
+        let c = format!("bbbb{}", "3".repeat(36));
+        add_magnet_named(&mut registry, &a, "first");
+        add_magnet_named(&mut registry, &b, "second");
+        add_magnet_named(&mut registry, &c, "third");
+
+        // A full hash resolves to itself, and is the one form that never
+        // consults the table — so it cannot start meaning a different torrent
+        // because of what else got added.
+        assert_eq!(hex(&registry.resolve(&a).expect("exact")), a);
+
+        // A prefix that names exactly one torrent resolves to it, at the
+        // shortest accepted length and beyond.
+        assert_eq!(hex(&registry.resolve("bbbb").expect("unique")), c);
+        assert_eq!(hex(&registry.resolve("bbbb3333").expect("longer")), c);
+        assert_eq!(
+            hex(&registry.resolve("aaaa1").expect("one past the fork")),
+            a
+        );
+
+        // The failure this must never have: two candidates and a choice made.
+        match registry.resolve("aaaa") {
+            Err(ResolveError::Ambiguous(candidates)) => {
+                assert_eq!(candidates.len(), 2);
+                let mut names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+                names.sort_unstable();
+                assert_eq!(names, ["first", "second"]);
+                // The candidates carry full hashes, so the operator can retype
+                // one of them without going back to `clove list`.
+                for candidate in &candidates {
+                    assert_eq!(candidate.info_hash.len(), 40);
+                }
+            }
+            _ => panic!("an ambiguous prefix must not resolve"),
+        }
+
+        // Well-formed but matching nothing.
+        assert!(matches!(
+            registry.resolve("cccc"),
+            Err(ResolveError::NotFound)
+        ));
+        // A *full* hash that names nothing still resolves: the exact path
+        // answers "what hash is this", and whether a torrent by that name
+        // exists is the action's question, answered with the same 404. Keeping
+        // the two separate is what lets a full hash skip the table entirely.
+        let unknown = "9".repeat(40);
+        assert_eq!(hex(&registry.resolve(&unknown).expect("exact")), unknown);
+
+        // Malformed: too short to be worth guessing from, not hex, longer than
+        // an info-hash, or the uppercase `parse_info_hash` already refuses.
+        for bad in [
+            "",
+            "a",
+            "aaa",
+            "zzzz",
+            "aaaa!",
+            &"a".repeat(41),
+            &"A".repeat(40),
+        ] {
+            assert!(
+                matches!(registry.resolve(bad), Err(ResolveError::Malformed)),
+                "{bad:?} should be malformed"
+            );
+        }
+        // The boundary itself is accepted rather than refused.
+        assert_eq!(MIN_PREFIX, 4);
+        assert!(!matches!(
+            registry.resolve("aaaa"),
+            Err(ResolveError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn a_prefix_reaches_a_hosted_torrent_too() {
+        // The pending map is only half the picture: the resolver has to see
+        // fully added torrents, which is where every command but `remove`
+        // actually operates.
+        let data = TempDir::new("resolve-hosted");
+        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let (_, bytes) = fixture("resolvable");
+        let info_hash = add_and_scan(&mut registry, &bytes);
+        let full = hex(&info_hash);
+
+        assert_eq!(registry.resolve(&full).expect("exact"), info_hash);
+        let prefix = &full[..6];
+        assert_eq!(registry.resolve(prefix).expect("prefix"), info_hash);
+
+        // And it stops resolving once the torrent is gone.
+        registry.remove(&info_hash, false).expect("remove");
+        assert!(matches!(
+            registry.resolve(prefix),
+            Err(ResolveError::NotFound)
+        ));
     }
 }

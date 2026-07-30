@@ -125,26 +125,125 @@ fn print_help() {
     println!("  status [--json]                daemon and router status");
     println!("  list [--json]                  hosted torrents");
     println!("  watch [--interval <secs>]      live view, repainted (Ctrl-C to quit)");
-    println!("  show <info-hash> [--json]      one torrent in detail");
+    println!("  show <torrent> [--json]        one torrent in detail");
     println!("  add <file.torrent|magnet:…>    add a torrent");
-    println!("  remove <info-hash> [--data]    remove a torrent (--data also deletes files)");
-    println!("  pause <info-hash>              pause a torrent");
-    println!("  resume <info-hash>             resume a torrent");
-    println!("  verify <info-hash>             re-check data on disk");
-    println!("  peer <info-hash> <b32-addr>    hand a running torrent a peer to dial");
-    println!("  priorities <info-hash> <spec>  set per-file priorities (e.g. 1,0,2)");
-    println!("  announce <info-hash>           re-announce to every tracker now");
-    println!("  sequential <info-hash> on|off  pick pieces in order instead of rarest-first");
+    println!("  remove <torrent…> [--data]     remove torrents (--data also deletes files)");
+    println!("  pause <torrent…>               pause torrents");
+    println!("  resume <torrent…>              resume torrents");
+    println!("  verify <torrent…>              re-check data on disk");
+    println!("  peer <torrent> <b32-addr>      hand a running torrent a peer to dial");
+    println!("  priorities <torrent> <spec>    set per-file priorities (e.g. 1,0,2)");
+    println!("  announce <torrent…>            re-announce to every tracker now");
+    println!("  sequential <torrent> on|off    pick pieces in order instead of rarest-first");
     println!("  completions <bash|zsh|fish>    print a shell completion script");
+    println!();
+    println!("<torrent> is an info-hash or a unique prefix of one; commands taking");
+    println!("<torrent…> accept several, or --all for every hosted torrent.");
 }
 
-/// Extract the single required info-hash operand.
+/// What a command calls the torrent it wants: a full info-hash or a unique
+/// prefix of one. Resolved by the daemon, not here.
+const REF_HELP: &str = "an info-hash or a unique prefix of one";
+
+/// Extract the single required torrent reference.
 fn one_info_hash(operands: &[String]) -> Result<&str, Fail> {
     match operands {
         [ih] => Ok(ih),
-        [] => Err(Fail::Usage("this command needs an info-hash".to_owned())),
+        [] => Err(Fail::Usage(format!(
+            "this command needs a torrent ({REF_HELP})"
+        ))),
         _ => Err(Fail::Usage("too many arguments".to_owned())),
     }
+}
+
+/// Split a command's operands into torrent references and the `--all` flag.
+fn parse_refs(operands: &[String]) -> Result<(Vec<String>, bool), Fail> {
+    let mut refs = Vec::new();
+    let mut all = false;
+    for op in operands {
+        match op.as_str() {
+            "--all" => all = true,
+            other if other.starts_with('-') => {
+                return Err(Fail::Usage(format!("unexpected option {other:?}")));
+            }
+            other => refs.push(other.to_owned()),
+        }
+    }
+    Ok((refs, all))
+}
+
+/// The torrents a command will act on.
+///
+/// `--all` is the one case that needs a listing, and it is the CLI's job
+/// rather than a daemon-side `/v1/torrents/all` endpoint: expanding here keeps
+/// the bulk case made of the same single-torrent requests, so there is one
+/// code path on the daemon and nothing new to authorise.
+fn expand(socket: &Path, token: &str, refs: &[String], all: bool) -> Result<Vec<String>, Fail> {
+    if !all {
+        if refs.is_empty() {
+            return Err(Fail::Usage(format!(
+                "this command needs a torrent ({REF_HELP}), or --all"
+            )));
+        }
+        return Ok(refs.to_vec());
+    }
+    if !refs.is_empty() {
+        return Err(Fail::Usage(
+            "--all takes no torrent references of its own".to_owned(),
+        ));
+    }
+    let listed = parse_body(&request(socket, token, "GET", "/v1/torrents", &[])?)?;
+    let items = listed
+        .as_array()
+        .ok_or_else(|| Fail::Failed("daemon did not return a torrent list".to_owned()))?;
+    Ok(items
+        .iter()
+        // A magnet still fetching its metadata is an add in progress, not yet
+        // a torrent: it has no engine to pause, verify or announce, and
+        // including it would make `resume --all` fail for the whole run
+        // because one entry was never resumable. `state` is the one marker
+        // that says so, and using it keeps this rule out of every command.
+        .filter(|item| item.get("state").and_then(Value::as_str) != Some("fetching-metadata"))
+        .filter_map(|item| item.get("info_hash").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Apply `op` to every target, and report the worst thing that happened.
+///
+/// One target behaves exactly as it did before there were several — the error
+/// is the command's own, printed once by `main` — so nothing scripted against
+/// the single-torrent form changes shape.
+///
+/// Past that, each failure is printed against the torrent it belongs to and
+/// the command keeps going, because the alternative is a bulk pause that stops
+/// on the first paused torrent. An unreachable daemon is the exception: it is
+/// not a per-torrent failure, and every remaining attempt would rediscover it.
+fn for_each<F>(targets: &[String], mut op: F) -> Result<(), Fail>
+where
+    F: FnMut(&str) -> Result<(), Fail>,
+{
+    if let [only] = targets {
+        return op(only);
+    }
+    let mut failed = 0usize;
+    for target in targets {
+        match op(target) {
+            Ok(()) => {}
+            Err(e @ Fail::Unreachable(_)) => return Err(e),
+            Err(Fail::Usage(m) | Fail::Failed(m)) => {
+                eprintln!("clove: {}: {m}", display(target));
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        return Err(Fail::Failed(format!(
+            "{failed} of {} failed",
+            targets.len()
+        )));
+    }
+    Ok(())
 }
 
 fn cmd_status(where_: &Where, json: bool) -> Result<(), Fail> {
@@ -278,25 +377,29 @@ fn cmd_add(where_: &Where, operands: &[String]) -> Result<(), Fail> {
 }
 
 fn cmd_remove(where_: &Where, operands: &[String]) -> Result<(), Fail> {
-    let mut info_hash: Option<&str> = None;
     let mut delete_data = false;
-    for op in operands {
-        match op.as_str() {
-            "--data" => delete_data = true,
-            other if info_hash.is_none() => info_hash = Some(other),
-            other => return Err(Fail::Usage(format!("unexpected argument {other:?}"))),
-        }
-    }
-    let info_hash = info_hash.ok_or_else(|| Fail::Usage("remove needs an info-hash".to_owned()))?;
+    let rest: Vec<String> = operands
+        .iter()
+        .filter(|op| {
+            let is_data = op.as_str() == "--data";
+            delete_data |= is_data;
+            !is_data
+        })
+        .cloned()
+        .collect();
+    let (refs, all) = parse_refs(&rest)?;
     let (socket, token) = resolve(where_)?;
-    let target = if delete_data {
-        format!("/v1/torrents/{info_hash}?data=1")
-    } else {
-        format!("/v1/torrents/{info_hash}")
-    };
-    request(&socket, &token, "DELETE", &target, &[])?;
-    println!("removed {info_hash}");
-    Ok(())
+    let targets = expand(&socket, &token, &refs, all)?;
+    for_each(&targets, |target| {
+        let path = if delete_data {
+            format!("/v1/torrents/{target}?data=1")
+        } else {
+            format!("/v1/torrents/{target}")
+        };
+        request(&socket, &token, "DELETE", &path, &[])?;
+        println!("removed {}", display(target));
+        Ok(())
+    })
 }
 
 fn cmd_show(where_: &Where, json: bool, operands: &[String]) -> Result<(), Fail> {
@@ -317,37 +420,44 @@ fn cmd_show(where_: &Where, json: bool, operands: &[String]) -> Result<(), Fail>
     Ok(())
 }
 
-/// A `POST /v1/torrents/{ih}/{action}` with no body; prints `<done> <ih>`.
+/// A `POST /v1/torrents/{ref}/{action}` with no body, for each target;
+/// prints `<done> <ref>`.
 fn cmd_action(where_: &Where, operands: &[String], action: &str, done: &str) -> Result<(), Fail> {
-    let info_hash = one_info_hash(operands)?;
+    let (refs, all) = parse_refs(operands)?;
     let (socket, token) = resolve(where_)?;
-    request(
-        &socket,
-        &token,
-        "POST",
-        &format!("/v1/torrents/{info_hash}/{action}"),
-        &[],
-    )?;
-    println!("{done} {info_hash}");
-    Ok(())
+    let targets = expand(&socket, &token, &refs, all)?;
+    for_each(&targets, |target| {
+        request(
+            &socket,
+            &token,
+            "POST",
+            &format!("/v1/torrents/{target}/{action}"),
+            &[],
+        )?;
+        println!("{done} {}", display(target));
+        Ok(())
+    })
 }
 
 fn cmd_verify(where_: &Where, operands: &[String]) -> Result<(), Fail> {
-    let info_hash = one_info_hash(operands)?;
+    let (refs, all) = parse_refs(operands)?;
     let (socket, token) = resolve(where_)?;
-    let reply = request(
-        &socket,
-        &token,
-        "POST",
-        &format!("/v1/torrents/{info_hash}/verify"),
-        &[],
-    )?;
-    let verified = parse_body(&reply)?
-        .get("verified")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    println!("verified {verified} piece(s) for {info_hash}");
-    Ok(())
+    let targets = expand(&socket, &token, &refs, all)?;
+    for_each(&targets, |target| {
+        let reply = request(
+            &socket,
+            &token,
+            "POST",
+            &format!("/v1/torrents/{target}/verify"),
+            &[],
+        )?;
+        let verified = parse_body(&reply)?
+            .get("verified")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        println!("verified {verified} piece(s) for {}", display(target));
+        Ok(())
+    })
 }
 
 fn cmd_peer(where_: &Where, operands: &[String]) -> Result<(), Fail> {
@@ -1046,6 +1156,89 @@ mod tests {
             one_info_hash(&["a".to_owned(), "b".to_owned()]),
             Err(Fail::Usage(_))
         ));
+    }
+
+    #[test]
+    fn bulk_commands_separate_references_from_flags() {
+        let refs = |v: &[&str]| {
+            parse_refs(&v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+                .map(|(refs, all)| (refs.join(","), all))
+        };
+        assert_eq!(refs(&["3f2a"]).expect("one"), ("3f2a".to_owned(), false));
+        assert_eq!(
+            refs(&["3f2a", "9b1c"]).expect("several"),
+            ("3f2a,9b1c".to_owned(), false)
+        );
+        assert_eq!(refs(&["--all"]).expect("all"), (String::new(), true));
+        // A flag is never mistaken for a torrent, whichever side it lands on;
+        // `expand` is what then rejects the combination.
+        assert_eq!(
+            refs(&["--all", "3f2a"]).expect("flag first"),
+            refs(&["3f2a", "--all"]).expect("flag last")
+        );
+        // An unknown option is a usage error rather than a torrent named
+        // "--dat" that the daemon would then fail to resolve.
+        assert!(matches!(refs(&["--dat"]), Err(Fail::Usage(_))));
+        assert!(matches!(refs(&["3f2a", "-x"]), Err(Fail::Usage(_))));
+    }
+
+    #[test]
+    fn a_bulk_command_reports_the_worst_outcome() {
+        // One target keeps the single-torrent contract exactly: the error is
+        // the command's own, so anything scripted against it is unchanged.
+        let solo = vec!["a".to_owned()];
+        let err = for_each(&solo, |_| Err(Fail::Failed("no such torrent".to_owned())));
+        assert!(matches!(err, Err(Fail::Failed(m)) if m == "no such torrent"));
+        assert!(for_each(&solo, |_| Ok(())).is_ok());
+
+        let many: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_owned()).collect();
+        // All good is good.
+        assert!(for_each(&many, |_| Ok(())).is_ok());
+
+        // A failure part-way does not stop the rest — the point of a bulk
+        // pause is that one already-paused torrent does not abandon the others.
+        let mut seen = Vec::new();
+        let out = for_each(&many, |t| {
+            seen.push(t.to_owned());
+            if t == "b" {
+                Err(Fail::Failed("already paused".to_owned()))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(seen, ["a", "b", "c"], "every target was attempted");
+        assert!(matches!(out, Err(Fail::Failed(m)) if m == "1 of 3 failed"));
+
+        // An unreachable daemon stops immediately: it is not a per-torrent
+        // failure and the remaining attempts would each rediscover it.
+        let mut tried = 0;
+        let out = for_each(&many, |_| {
+            tried += 1;
+            Err(Fail::Unreachable("no socket".to_owned()))
+        });
+        assert_eq!(tried, 1, "gave up after the first");
+        assert!(matches!(out, Err(Fail::Unreachable(_))));
+    }
+
+    #[test]
+    fn expand_refuses_the_ambiguous_invocations() {
+        let socket = Path::new("/nonexistent/clove.sock");
+        // No torrents and no --all is a usage error, named so the operator
+        // learns that a prefix would have done.
+        let err = expand(socket, "t", &[], false).expect_err("nothing to act on");
+        assert!(
+            matches!(&err, Fail::Usage(m) if m.contains("prefix")),
+            "{err:?}"
+        );
+        // Mixing them is a usage error rather than a silent preference for one.
+        let both = expand(socket, "t", &["3f2a".to_owned()], true);
+        assert!(matches!(both, Err(Fail::Usage(_))));
+        // Plain references never touch the socket, which is why this passes a
+        // path that does not exist.
+        assert_eq!(
+            expand(socket, "t", &["3f2a".to_owned(), "9b1c".to_owned()], false).expect("refs"),
+            vec!["3f2a".to_owned(), "9b1c".to_owned()]
+        );
     }
 
     #[test]

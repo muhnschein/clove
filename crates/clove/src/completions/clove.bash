@@ -12,6 +12,11 @@ _clove() {
         add) COMPREPLY=( $(compgen -f -- "${cur}") ) ;;
         completions) COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") ) ;;
         sequential) [ "${COMP_CWORD}" -eq 3 ] && COMPREPLY=( $(compgen -W "on off" -- "${cur}") ) ;;
+        # Torrents are named by info-hash or a unique prefix, which nothing
+        # here can enumerate without talking to the daemon; the flags are what
+        # completion can usefully offer.
+        remove) COMPREPLY=( $(compgen -W "--all --data" -- "${cur}") ) ;;
+        pause|resume|verify|announce) COMPREPLY=( $(compgen -W "--all" -- "${cur}") ) ;;
     esac
     return 0
 }

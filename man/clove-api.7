@@ -1,4 +1,4 @@
-.Dd July 25, 2026
+.Dd July 30, 2026
 .Dt CLOVE-API 7
 .Os
 .Sh NAME
@@ -33,12 +33,23 @@ A missing or wrong token is answered with
 .Sy 401 ,
 compared in constant time.
 .Pp
-An error reply is a JSON object with a single
+Wherever a path takes an
+.Ar info-hash ,
+it also takes any prefix of one that is unique among the hosted torrents, of
+at least four hex characters.
+A full 40-character hash is matched exactly and never treated as a prefix, so
+it resolves without consulting the torrent table and cannot come to mean a
+different torrent as others are added.
+An ambiguous prefix is a
+.Sy 409
+and is never resolved by choosing one.
+.Pp
+An error reply is a JSON object with an
 .Sy error
 key and a status that says what went wrong:
 .Bl -tag -width "409" -compact -offset indent
 .It Sy 400
-Malformed request, bad info-hash, or invalid body.
+Malformed request, an unusable torrent reference, or an invalid body.
 A
 .Sy Content-Length
 above 2 MiB is refused here, on the header, before the body is read.
@@ -52,7 +63,18 @@ No such resource or torrent.
 .It Sy 405
 Method not allowed for that path.
 .It Sy 409
-The torrent is already added.
+The torrent is already added, or the given prefix matched more than one
+torrent.
+The second case carries a
+.Sy candidates
+array beside the
+.Sy error
+key, each entry an
+.Sy info_hash
+and a
+.Sy name ,
+so a client can say which torrents were meant without asking for the listing
+again.
 .It Sy 500
 The daemon failed the operation; the message says how.
 .El

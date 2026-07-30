@@ -114,21 +114,25 @@ stop_daemon() {
     daemon_pid=""
 }
 
-# A real single-file .torrent: 75 bytes of content, one 16 KiB piece.
-python3 - "$work/demo.torrent" <<'PY'
+# Real single-file .torrents: 75 bytes of content, one 16 KiB piece. Two of
+# them, because a client that hosts one torrent is not the one being tested —
+# the bulk commands need a second real torrent to act on.
+python3 - "$work/demo.torrent" "$work/second.torrent" <<'PY'
 import hashlib, sys
 
-content = b"clove smoke test content\n" * 3
-name = b"smoke.txt"
-piece_length = 16384
-info = (
-    b"d6:lengthi" + str(len(content)).encode() + b"e"
-    b"4:name" + str(len(name)).encode() + b":" + name +
-    b"12:piece lengthi" + str(piece_length).encode() + b"e"
-    b"6:pieces20:" + hashlib.sha1(content).digest() + b"e"
-)
-with open(sys.argv[1], "wb") as handle:
-    handle.write(b"d4:info" + info + b"e")
+def build(path, name, content):
+    piece_length = 16384
+    info = (
+        b"d6:lengthi" + str(len(content)).encode() + b"e"
+        b"4:name" + str(len(name)).encode() + b":" + name +
+        b"12:piece lengthi" + str(piece_length).encode() + b"e"
+        b"6:pieces20:" + hashlib.sha1(content).digest() + b"e"
+    )
+    with open(path, "wb") as handle:
+        handle.write(b"d4:info" + info + b"e")
+
+build(sys.argv[1], b"smoke.txt", b"clove smoke test content\n" * 3)
+build(sys.argv[2], b"second.txt", b"clove smoke second torrent\n" * 3)
 PY
 
 echo "smoke: config check"
@@ -157,6 +161,16 @@ echo "smoke: magnet add stays pending without a router"
 magnet_hash=$(printf 'ab%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20)
 run add "magnet:?xt=urn:btih:$magnet_hash&dn=smoke-magnet" >/dev/null || fail "magnet add failed"
 expect_contains "$(run list)" "fetching-metadata" "magnet listing"
+
+# A magnet without its metadata has no engine to act on, but it is right
+# there in the listing — so the refusal has to say that rather than claim the
+# torrent does not exist.
+set +e
+out=$(run pause "$magnet_hash" 2>&1)
+code=$?
+set -e
+expect_status "$code" 1 "pausing a magnet that has no metadata yet"
+expect_contains "$out" "still fetching its metadata" "the refusal names the real state"
 
 echo "smoke: pause persists across a restart"
 run pause "$info_hash" >/dev/null || fail "pause failed"
@@ -203,6 +217,66 @@ run announce "$info_hash" >/dev/null 2>&1
 code=$?
 set -e
 expect_status "$code" 1 "announce without a running engine"
+
+echo "smoke: a torrent answers to a unique prefix of its hash"
+# The whole point of prefixes is not having to paste forty characters, so the
+# proof has to run a real command against a short one.
+prefix=$(printf '%s' "$info_hash" | cut -c1-6)
+run pause "$prefix" >/dev/null || fail "pause by prefix failed"
+expect_contains "$(run list)" "paused" "pause by prefix took effect"
+run resume "$prefix" >/dev/null || fail "resume by prefix failed"
+expect_contains "$(run show "$prefix")" "$info_hash" "show by prefix"
+
+# Too short to be worth guessing from is a usage-class refusal (400 -> exit 1),
+# and a well-formed prefix matching nothing is "no such torrent".
+for bad in abc zzzz; do
+    set +e
+    run pause "$bad" >/dev/null 2>&1
+    code=$?
+    set -e
+    expect_status "$code" 1 "pause with an unusable reference ($bad)"
+done
+
+# Both torrents share no prefix by construction (one is ab-repeated), so an
+# ambiguous case needs a second magnet that does. This is the failure the
+# feature must never have: two candidates and a choice made.
+amb_a="abcd$(printf '1%.0s' $(seq 36))"
+amb_b="abcd$(printf '2%.0s' $(seq 36))"
+run add "magnet:?xt=urn:btih:$amb_a&dn=amb-a" >/dev/null || fail "ambiguous magnet a"
+run add "magnet:?xt=urn:btih:$amb_b&dn=amb-b" >/dev/null || fail "ambiguous magnet b"
+set +e
+out=$(run pause abcd 2>&1)
+code=$?
+set -e
+expect_status "$code" 1 "an ambiguous prefix is refused"
+expect_contains "$out" "matches 2 torrents" "the refusal says how many it hit"
+run remove "$amb_a" >/dev/null || fail "removing ambiguous magnet a"
+run remove "$amb_b" >/dev/null || fail "removing ambiguous magnet b"
+
+echo "smoke: several torrents in one command, and --all"
+second=$(run add "$work/second.torrent") || fail "adding the second torrent failed"
+second_hash=$(printf '%s' "$second" | awk '{print $2}')
+[ -n "$second_hash" ] || fail "second add printed no info-hash: $second"
+
+run pause "$info_hash" "$second_hash" >/dev/null || fail "pause of two torrents failed"
+expect_contains "$(run show "$info_hash" --json)" '"state":"paused"' "first paused"
+expect_contains "$(run show "$second_hash" --json)" '"state":"paused"' "second paused"
+run resume "$info_hash" "$second_hash" >/dev/null || fail "resume of two torrents failed"
+
+# One failure does not abandon the rest: the unknown hash fails, the real
+# torrent is still acted on, and the command exits 1.
+set +e
+out=$(run pause "$info_hash" 0000000000000000000000000000000000000000 2>&1)
+code=$?
+set -e
+expect_status "$code" 1 "a partial failure exits 1"
+expect_contains "$out" "paused $info_hash" "the reachable torrent was still paused"
+expect_contains "$out" "1 of 2 failed" "the summary counts the failure"
+
+# --all reaches every torrent it can act on, whatever state they are in.
+run resume --all >/dev/null || fail "resume --all failed"
+expect_contains "$(run show "$info_hash" --json)" '"state":"waiting-for-router"' "resumed by --all"
+run remove "$second_hash" >/dev/null || fail "removing the second torrent failed"
 
 echo "smoke: resume, then remove both torrents"
 run resume "$info_hash" >/dev/null || fail "resume failed"

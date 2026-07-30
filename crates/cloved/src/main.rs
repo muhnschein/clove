@@ -860,13 +860,27 @@ fn torrent_action(
     daemon: &Daemon,
     rest: &str,
 ) -> Response {
-    let (hex, action) = match rest.split_once('/') {
-        Some((hex, action)) => (hex, Some(action)),
+    let (reference, action) = match rest.split_once('/') {
+        Some((reference, action)) => (reference, Some(action)),
         None => (rest, None),
     };
-    let Some(info_hash) = registry::parse_info_hash(hex) else {
-        return error(400, "info-hash must be 40 lowercase-hex characters");
+    let info_hash = match lock(&daemon.registry).resolve(reference) {
+        Ok(info_hash) => info_hash,
+        Err(e) => return resolve_error(&e),
     };
+
+    // A magnet whose metadata has not arrived is listed and can be removed,
+    // but it has no engine, no files and no trackers of its own to act on.
+    // Every such operation used to answer "no such torrent", which is false
+    // about something `clove list` is showing at that moment — and sends the
+    // operator looking for a torrent they can see.
+    if lock(&daemon.registry).is_pending(&info_hash) && !(method == "DELETE" && action.is_none()) {
+        return error(
+            400,
+            "this magnet is still fetching its metadata; until it arrives there is \
+             nothing to act on but removing it",
+        );
+    }
 
     match (method, action) {
         ("GET", None) => match lock(&daemon.registry).detail(&info_hash) {
@@ -947,6 +961,49 @@ fn action_result(result: Result<(), ActionError>) -> Response {
     match result {
         Ok(()) => ok_json(),
         Err(e) => action_error(&e),
+    }
+}
+
+/// Turn a failed torrent-reference resolution into a response.
+///
+/// The ambiguous case carries the candidates rather than a bare refusal: an
+/// operator who typed too short a prefix wants to see which torrents they hit,
+/// and re-running `clove list` to find out is a step the daemon can save them.
+fn resolve_error(e: &registry::ResolveError) -> Response {
+    match e {
+        registry::ResolveError::Malformed => error(
+            400,
+            &format!(
+                "torrent reference must be a full 40-character lowercase-hex info-hash, \
+                 or a prefix of at least {} of its characters",
+                registry::MIN_PREFIX
+            ),
+        ),
+        registry::ResolveError::NotFound => error(404, "no such torrent"),
+        registry::ResolveError::Ambiguous(candidates) => {
+            let listed: Vec<Value> = candidates
+                .iter()
+                .map(|c| {
+                    Value::Object(vec![
+                        ("info_hash".to_owned(), Value::from(c.info_hash.clone())),
+                        ("name".to_owned(), Value::from(c.name.clone())),
+                    ])
+                })
+                .collect();
+            let body = Value::Object(vec![
+                (
+                    "error".to_owned(),
+                    Value::from(format!(
+                        "that prefix matches {} torrents; use more characters",
+                        candidates.len()
+                    )),
+                ),
+                ("candidates".to_owned(), Value::Array(listed)),
+            ])
+            .encode()
+            .into_bytes();
+            Response::new(409, "application/json", body)
+        }
     }
 }
 
@@ -1390,16 +1447,29 @@ mod tests {
         // Malformed is 400 and absent is 404; the two are different answers
         // on purpose, so a typo in a script reads as a typo.
         for bad in [
-            "/v1/torrents/zzzz",
-            "/v1/torrents/0123456789abcdef0123456789abcdef012345", // 38 chars
+            "/v1/torrents/zzz",                                        // under MIN_PREFIX
+            "/v1/torrents/zzzz",                                       // not hex
             "/v1/torrents/0123456789abcdef0123456789abcdef0123456789", // 42 chars
-            "/v1/torrents/0123456789ABCDEF0123456789ABCDEF01234567", // uppercase
-            "/v1/torrents/0123456789abcdef0123456789abcdef0123456 ", // trailing space
+            "/v1/torrents/0123456789ABCDEF0123456789ABCDEF01234567",   // uppercase
+            "/v1/torrents/0123456789abcdef0123456789abcdef0123456 ",   // trailing space
         ] {
             assert_eq!(status_of(&speak(&d, &get(bad, Some(TOKEN)))), 400, "{bad}");
         }
-        let absent = "/v1/torrents/0123456789abcdef0123456789abcdef01234567";
-        assert_eq!(status_of(&speak(&d, &get(absent, Some(TOKEN)))), 404);
+        // Absent is 404 whether it was named in full or by a prefix. The
+        // 38-character case used to be here as a malformed hash and is now a
+        // well-formed prefix that happens to match nothing — the same answer a
+        // full hash gets, which is the point of accepting prefixes at all.
+        for absent in [
+            "/v1/torrents/0123456789abcdef0123456789abcdef01234567", // full, unknown
+            "/v1/torrents/0123456789abcdef0123456789abcdef012345",   // 38-char prefix
+            "/v1/torrents/0123",                                     // shortest prefix
+        ] {
+            assert_eq!(
+                status_of(&speak(&d, &get(absent, Some(TOKEN)))),
+                404,
+                "{absent}"
+            );
+        }
     }
 
     // ----------------------------------------------------- hostile HTTP

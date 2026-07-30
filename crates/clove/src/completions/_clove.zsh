@@ -12,6 +12,11 @@ _clove() {
                 add) _files ;;
                 completions) _values 'shell' bash zsh fish ;;
                 sequential) [[ $CURRENT -eq 3 ]] && _values 'setting' on off ;;
+                # Torrents are named by info-hash or a unique prefix, which
+                # nothing here can enumerate without talking to the daemon;
+                # the flags are what completion can usefully offer.
+                remove) _values 'flag' --all --data ;;
+                pause|resume|verify|announce) _values 'flag' --all ;;
             esac
             ;;
     esac
