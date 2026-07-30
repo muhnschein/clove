@@ -16,13 +16,18 @@
 # minutes of your time.
 #
 # What ends up in the file: command output, router versions, container logs.
-# API tokens are redacted. I2P destinations are NOT — they are what makes a
-# dial traceable, and the ones here belong to transient test identities that
-# live for the length of the run. If you would rather they did not leave your
-# machine, use --redact-dests: it removes b32 addresses *and* the full base64
-# destinations that a tracker announce carries in `ip=`. Point it at a daemon
-# holding your real persisted identity and that distinction is the whole
-# difference, so prefer it over trusting the run to be transient.
+# API tokens and I2P destinations are both redacted — b32 addresses and the full
+# base64 destinations a tracker announce carries in `ip=`.
+#
+# Destinations used to be kept by default, on the reasoning that they are what
+# makes a dial traceable and that the identities in a test run are transient.
+# The first half is true and is why --keep-dests exists. The second is an
+# assumption about how the script is being used, made by the script, about a
+# file whose entire purpose is to be sent to somebody else — and it is wrong the
+# first time anyone points this at a daemon holding their real persisted
+# identity, which is exactly when it costs the most. A default that is safe when
+# the assumption fails is the better default; the reverse asks every user to
+# re-derive the reasoning above before their first run.
 set -eu
 
 usage() {
@@ -44,8 +49,11 @@ usage: ci/live-report.sh [options]
   --out FILE           report path (default: live-report-<timestamp>.txt)
   --lines N            per-command output cap, head+tail (default: 250)
   --skip-tier1         skip the router-free tests (build, unit, smoke, chaos)
-  --redact-dests       replace I2P destinations with a placeholder — both
-                       .b32.i2p addresses and full base64 destinations
+  --keep-dests         leave I2P destinations in the report. They are removed
+                       by default — both .b32.i2p addresses and full base64
+                       destinations. Use this only when the run is a throwaway
+                       identity and a traceable dial is what you are debugging
+  --redact-dests       accepted and does nothing; redaction is the default
   --help               this
 
 Typical first run:
@@ -87,7 +95,7 @@ OUT=""
 LINES=250
 BRING_UP=no
 SKIP_TIER1=no
-REDACT_DESTS=no
+REDACT_DESTS=yes
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -101,7 +109,10 @@ while [ $# -gt 0 ]; do
         --out) OUT="${2:?--out needs a value}"; shift ;;
         --lines) LINES="${2:?--lines needs a value}"; shift ;;
         --skip-tier1) SKIP_TIER1=yes ;;
+        # Accepted and a no-op: it is the default now, and a flag somebody
+        # has in their shell history should not become an error.
         --redact-dests) REDACT_DESTS=yes ;;
+        --keep-dests) REDACT_DESTS=no ;;
         --help|-h) usage; exit 0 ;;
         *) echo "unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
