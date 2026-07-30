@@ -121,11 +121,3 @@ are both worse than the duplicate: pinning `landlock` back to a 0.4.x on
 Layer 2, and dropping `landlock` means hand-written `landlock_*` syscalls in a
 workspace that forbids `unsafe_code`. The real fix is upstream — recheck when
 `yosemite` moves to `thiserror` 2.
-
-## Approved, enters at the scheduled phase (docs/PLAN.md)
-
-Nothing outstanding: the last two scheduled entries, `landlock` and
-`seccompiler`, landed in Phase G and are listed above.
-
-Everything else in SCOPE §9's hand-roll list (bencode, config, arg parsing,
-HTTP/1.1 both ends) is written in-tree, deliberately.

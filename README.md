@@ -1,22 +1,13 @@
 # clove
 
-clove is an I2P-only BitTorrent client. Daemon (`cloved`) + CLI (`clove`),
-speaking SAMv3 to an external I2P router. Aspires to be leak-proof by 
-construction.
+clove is an I2P-only BitTorrent client. Split into daemon (`cloved`) and CLI (`clove`),
+speaking SAMv3 to an external I2P router.
 
-**Status: pre-alpha.** Feature-complete against its v1 scope — daemon, CLI,
+## Status
+
+**Pre-alpha.** Feature-complete against its v1 scope — daemon, CLI,
 engine, tracker, PEX, magnets, persistence — and it downloads from and seeds to
-live i2psnark swarms on i2pd and Java I2P.
-
-Every defect that has mattered was found by running it against a real router
-and a real swarm; none was reachable from a router-free test, and the unit
-suite was green through all of them. They are recorded in
-[`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt), each with the test that catches
-it now. Before 0.1: the interop sign-off on i2pd and Java I2P
-([`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) §6.3). emissary is tracked in
-the same table but no longer gates the release, and
-[`docs/DECISIONS.md`](docs/DECISIONS.md) S1 says why and what would change it
-back.
+live swarms on i2pd and Java I2P.
 
 ## Documents
 
@@ -27,7 +18,6 @@ back.
 - [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt) — the I2P-BitTorrent dialect, and every live finding
 - [`docs/PHASE-F.md`](docs/PHASE-F.md) — daemon/CLI/API design, and the TUI decision
 - [`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md) — the data directory and the resume file
-- [`docs/CODE-REVIEW-2026-07.md`](docs/CODE-REVIEW-2026-07.md) — a whole-tree audit, closed
 - [`DEPENDENCIES.md`](DEPENDENCIES.md) — the dependency allowlist
 - [`SECURITY.md`](SECURITY.md) — how to report a vulnerability, and what counts as one
 
@@ -38,7 +28,7 @@ stays short on purpose.
 
 ## Confinement
 
-Three independent layers (`docs/SCOPE.md` §5), none assuming another is present:
+Aspires to be leak-proof by construction. Three independent layers (`docs/SCOPE.md` §5), none assuming another is present:
 
 1. **By construction** — the engine has no IP vocabulary and cannot open a
    socket; only `i2pnet` can, and only to a loopback SAM bridge. Enforced by
@@ -54,6 +44,21 @@ Three independent layers (`docs/SCOPE.md` §5), none assuming another is present
 
 `contrib/podman/` has quadlets for all three I2P routers clove targets — i2pd,
 Java I2P and emissary — which run side by side for the interop matrix.
+
+## Development
+
+**This is entirely vibe-coded. Here be dragons.**
+
+Every defect that has mattered was found by running it against a real router
+and a real swarm; none was reachable from a router-free test, and the unit
+suite was green through all of them. They are recorded in
+[`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt), each with the test that catches
+it now. Before 0.1: the interop sign-off on i2pd and Java I2P
+([`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) §6.3). emissary is tracked in
+the same table but no longer gates the release, and
+[`docs/DECISIONS.md`](docs/DECISIONS.md) S1 says why and what would change it
+back.
+
 
 ## Building and testing
 

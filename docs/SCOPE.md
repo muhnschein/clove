@@ -1,12 +1,11 @@
 # Scope Document — clove: an I2P-Only BitTorrent Client
 
-**Status:** Accepted (rev 1). Two `[rev]` edits against the draft: the §4
-diagram no longer names tokio (contradicted Q5's lean, since decided — see
-`DECISIONS.md`), and sections are renumbered to close the draft's §8→§10 gap.
-Open questions Q1–Q7 are resolved in `DECISIONS.md` as reversible defaults.
 **Name:** clove (daemon: `cloved`, control CLI: `clove`) — pending final trademark/crates.io/distro-package sweep
-**Language:** Rust (stable toolchain; concurrency model per Q5)
+
+**Language:** Rust (stable toolchain) 
+
 **SAM library:** yosemite (eepnet/yosemite)
+
 **Engineering ethos:** see §9 — OpenBSD/OpenSSH/doas/opentracker/SQLite as the quality reference class
 
 ---
@@ -53,9 +52,10 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 - Per-torrent resume data: bitfield, verified-piece state, file priorities, stats (up/down totals), tracker state. Format: bencoded per Q2 decision; forward-versioned.
 - Client destination keys persisted (stable identity across restarts) with an ephemeral-keys option per client or per torrent profile ("transient identity" mode).
 - Atomic writes (write-temp-rename) for all state files. Crash at any point must never corrupt resume state — worst case is re-verification.
-- **The file format is an API (SQLite doctrine):** the resume/state format gets a written specification and a version field from day one. Policy: newer clove always reads older state; older clove refuses newer state cleanly (clear error, no write, no corruption). Format changes are release-notes headline items.
+- **The file format is an API:** the resume/state format gets a written specification and a version field from day one. Policy: newer clove always reads older state; older clove refuses newer state cleanly (clear error, no write, no corruption). Format changes are release-notes headline items.
 
-### Configuration (doas/sshd discipline)
+### Configuration
+- Aspire to a doas/sshd-level of discipline.
 - One config file, one format: flat `key value` lines, hand-parsed, comments with `#`. No TOML/YAML dependency, no nesting.
 - **Unknown keys are a fatal error.** A typo'd option must fail startup loudly, never be silently ignored.
 - `cloved -C` (or `--check`): parse and validate config, report, exit — for testing before restart.
@@ -126,9 +126,9 @@ No layer assumes another is present.
 
 | Router | Priority | Notes |
 |---|---|---|
-| i2pd | P0 | Your deployment target; SAM quirks differ from Java |
-| Java I2P | P0 | Sanity/reference; also what most *remote* peers run behind. When routers disagree, this one is presumed right |
-| emissary | P2 | Tracked, **not a 0.1 gate** — experimental upstream, and 0.4.0 cannot resolve names in either direction. Revisit at its first stable release; see `DECISIONS.md` S1 |
+| Java I2P | P0 | Sanity/reference; what most peers run behind. When routers disagree, this one is presumed right |
+| i2pd | P0 | Also popular; SAM quirks differ from Java |
+| emissary | P2 | Tracked, but not a hard requirement, as it is still considered experimental by I2P. Revisit at its first stable release; see `DECISIONS.md` S1 |
 
 Priority is where to spend attention first, not what to skip: **0.1 requires
 the live sign-off on i2pd and Java I2P** — the deployment target and the
@@ -167,8 +167,6 @@ Q1–Q7 from the draft are resolved as reversible defaults — see `DECISIONS.md
 
 ## 8. Milestones
 
-See `PLAN.md` for the phase-level roadmap (Phases A–G) these map onto.
-
 - **M0 — Bootstrap (this repo state):** workspace, lint/CI no-clearnet gates, decision memos Q1–Q7, dependency allowlist. The concurrency spike is dropped (yosemite `sync` verified); the R2 stress harness moves to Phase D where its findings land.
 - **M1 — SAM foundation:** `i2pnet` module complete with supervision/reconnect, naming cache, mock impl; chaos-tested against router restarts.
 - **M2 — Engine core:** wire protocol, piece picker, storage, verification; downloads a torrent from a single known peer (lab, two instances).
@@ -182,13 +180,13 @@ Status is not tracked here — it lives in `LIVE-TESTING.md` §6.3, per router a
 
 ## 9. Engineering Standards
 
-Reference class: OpenBSD base, OpenSSH (non-portable), doas, opentracker, SQLite. Interpreted as concrete, checkable commitments — not vibes:
+Reference class: OpenBSD base, OpenSSH (non-portable), doas, opentracker, SQLite. This may be slop, but let's at least make it high quality slop.
 
 ### Smallness
 - **Dependency allowlist, committed in-repo.** Every direct dependency is named in `DEPENDENCIES.md` with a one-paragraph justification and the size of its transitive closure. Target: **≤ ~15 direct dependencies**, transitive closure small enough that `cargo vendor` output is human-reviewable. Additions require the same scrutiny as adding code — because they are adding code.
 - Prefer writing 300 focused lines over importing 30,000 general ones: arg parsing, the HTTP/1.1 server for the local API, bencode, and config parsing are all candidates for hand-rolled implementations (bencode especially — it is ~200 lines done carefully, and we need hostile-input control over it anyway).
 - No proc-macro-heavy frameworks. serde only if the resume-format decision (Q2) genuinely warrants it; otherwise hand-written encoders (bencode makes this natural). Q2 resolved to bencode, so no serde.
-- **LOC as a watched metric.** Not a hard cap, but reported per milestone; unexplained growth is a review topic. opentracker-style pride in what *isn't* there.
+- **LOC as a watched metric.** Not a hard cap, but unexplained growth is considered a review topic. Take pride in what *isn't* there.
 
 ### Code quality
 - `#![forbid(unsafe_code)]` in every crate except (if ever needed) a single documented exception with rationale — expected count: zero.
@@ -198,21 +196,20 @@ Reference class: OpenBSD base, OpenSSH (non-portable), doas, opentracker, SQLite
 - Panics are bugs. `unwrap`/`expect` forbidden by lint outside tests; every `expect` in test-support code states its invariant.
 
 ### Documentation
-- **Man pages are the primary user documentation**, written and shipped from M4: `cloved(8)`, `clove(1)`, `clove.conf(5)`, and the HTTP API documented in a `clove-api(7)`-style page. Every page has a real EXAMPLES section (OpenBSD standard). README stays short and defers to them.
-- **`PROTOCOL.i2p-bt`**: an OpenSSH-`PROTOCOL`-style file recording our precise interpretation of the I2P BitTorrent dialect — every place the upstream spec is vague (R4: i2p_pex flags, magnet conventions, tracker edge cases) gets our observed-behavior notes and the decision we made. This doubles as our interop lab notebook and is a deliverable, not an afterthought.
+- **Man pages are the primary user documentation**: `cloved(8)`, `clove(1)`, `clove.conf(5)`, and the HTTP API documented in a `clove-api(7)`-style page. Every page has a real EXAMPLES section. README stays short and defers to them.
+- **`PROTOCOL.i2p-bt`**: file recording our precise interpretation of the I2P BitTorrent dialect — every place the upstream spec is vague gets our observed-behavior notes and the decision we made. This doubles as our interop lab notebook and is a deliverable, not an afterthought.
 - rustdoc on every public item (`#![deny(missing_docs)]` on library crates); module-level docs explain *why*, not just *what*.
 
-### Testing (the SQLite lesson)
+### Testing
 - Aspiration: **test code volume exceeds source code volume.** Tracked, not enforced by gate.
 - **Paranoid debug builds:** release builds stay lean; debug builds are dense with invariant assertions (piece accounting sums, choker state consistency, bitfield/on-disk agreement, session-tree supervision invariants) that run continuously under CI and fuzzing. Bugs should be unable to survive contact with the assertion net even when no test targets them directly.
-- Hostile-input torture suites as first-class citizens: malformed/adversarial bencode, evil peer behavior (protocol violations, slow-loris, bad hashes, PEX spam), truncated/corrupted resume files, SAM bridge lying or dying mid-operation. Fuzzing (cargo-fuzz) for every parser from M2.
+- Hostile-input torture suites as first-class citizens: malformed/adversarial bencode, evil peer behavior (protocol violations, slow-loris, bad hashes, PEX spam), truncated/corrupted resume files, SAM bridge lying or dying mid-operation. Fuzzing (cargo-fuzz) for every parser.
 - Chaos tests (router kill/restart, disk-full, SIGKILL during state write) run in CI, not just manually.
-- **Regress runnable by anyone (OpenBSD regress doctrine):** `make test` from a clean checkout runs tier 1 with zero infrastructure; tier 2 requires nothing beyond a local i2pd. If contributors can't run the tests, the tests decay into ours alone, then nobody's.
+- **Regress runnable by anyone:** `make test` from a clean checkout runs tier 1 with zero infrastructure; tier 2 requires nothing beyond a local i2pd. If contributors can't run the tests, the tests decay into ours alone, then nobody's.
 
 ### Releases & project hygiene
-- Few, boring, well-tested releases over frequent ones. Signed tags, reproducible-build attempt documented. No release with a failing interop matrix.
-- **Culture of deletion (OpenSSH doctrine):** every feature must justify its continued existence at each release; removals are announced proudly in release notes, not buried. The LOC metric above is allowed — encouraged — to go down.
-- **SECURITY.md before release 0.1:** reporting contact, disclosure expectations, and the release-signing key published before anyone needs them — never retrofitted after the first report.
+- **Boring is good:** Few, boring, well-tested releases over frequent ones. No release with a failing interop matrix.
+- **Culture of deletion:** every feature must justify its continued existence at each release; removals are announced proudly in release notes, not buried. The LOC metric above is allowed — encouraged — to go down.
 
 ## 10. Out of Scope Forever (unless explicitly re-scoped)
 

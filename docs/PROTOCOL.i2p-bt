@@ -1,11 +1,11 @@
 clove PROTOCOL notes — the I2P BitTorrent dialect and SAM interop
 =================================================================
 
-OpenSSH keeps a PROTOCOL file recording where its implementation pins down
-things the specs leave vague. This is ours. It doubles as the interop lab
-notebook (SCOPE §9): every place the upstream spec is underspecified or a
-library/router behaves surprisingly, the observation and clove's decision
-land here. Entries are dated by milestone, not calendar.
+This is a recording of where we pin down things the specs leave vague.
+It doubles as the interop lab notebook (SCOPE §9): every place the
+upstream spec is underspecified or a library/router behaves surprisingly,
+the observation and clove's decision land here. Entries are dated by
+milestone, not calendar.
 
 Status legend:
   [decided]   clove behaves this way; verified in-tree or against a router.
