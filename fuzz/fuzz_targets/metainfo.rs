@@ -29,6 +29,47 @@ fuzz_target!(|data: &[u8]| {
         for tier in &meta.trackers {
             for url in tier {
                 assert!(url.to_ascii_lowercase().contains(".i2p"));
+                // The filter and the announce builder must agree exactly: a
+                // URL kept here is one the announcer will be handed, and one
+                // it cannot build is a tracker that fails on every attempt for
+                // the life of the torrent, far from the URL that caused it.
+                // They disagreed once, each having its own parser.
+                let params = clove_core::tracker::AnnounceParams {
+                    info_hash: meta.info_hash.0,
+                    peer_id: *b"-CV0001-fuzzfuzzfuzz",
+                    uploaded: 0,
+                    downloaded: 0,
+                    left: 0,
+                    event: clove_core::tracker::Event::Started,
+                    numwant: 30,
+                    our_dest_b64: "DESTINATION",
+                };
+                let (host, request) = clove_core::tracker::build_announce(url, &params)
+                    .expect("metainfo kept a URL that build_announce refuses");
+
+                // Whatever the torrent said, what goes on the wire is exactly
+                // the request we meant to write: a request line, Host,
+                // User-Agent, Connection. A torrent-supplied path carrying a
+                // CRLF would append headers of its choosing to an announce we
+                // send under our own name, and the count is what notices.
+                let text = String::from_utf8(request.clone()).expect("ascii request");
+                let head = text.split("\r\n\r\n").next().unwrap_or(&text);
+                assert_eq!(
+                    head.split("\r\n").count(),
+                    4,
+                    "the request grew a line: {head:?}"
+                );
+                assert!(!host.contains(['\r', '\n', ' ']), "host {host:?}");
+
+                // And the destination we send is never echoed back into what
+                // gets logged when the announce fails. Asserted as "the ip
+                // parameter is redacted" rather than "the sentinel is absent
+                // from the line": the *path* comes from the torrent, so a
+                // torrent announcing to `/DESTINATION` would fail the second
+                // form while nothing was wrong.
+                let logged = clove_core::tracker::announced_url(&host, &request);
+                assert!(logged.contains("ip=<redacted>"), "{logged}");
+                assert!(!logged.contains('\r') && !logged.contains('\n'), "{logged}");
             }
         }
     }

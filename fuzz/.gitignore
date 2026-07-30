@@ -1,5 +1,9 @@
 target/
+# Loose corpus files stay out; the committed seed is the tarball beside them,
+# which `ci/fuzz.sh` unpacks into here before a run.
 corpus/
 artifacts/
 coverage/
+# Reports from `make fuzz-all` — a run's own output, not a repo artifact.
+report-*.txt
 Cargo.lock
