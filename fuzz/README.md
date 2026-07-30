@@ -85,7 +85,7 @@ beyond "did not panic":
 | `resume` | on-disk state, possibly tampered with | bitfield lengths match the piece count; priorities in range; round trip agrees |
 | `json` | daemon replies read by the CLI | round trip agrees |
 | `http` | tracker responses and API requests | — |
-| `wire` | peer messages and handshakes | — |
+| `wire` | a peer's whole byte stream: framing, messages, handshake | a message survives its own encoder unchanged |
 | `tracker` | announce responses | a hostile `interval` cannot make us announce inside the local floor |
 | `extensions` | `i2p_pex`, `ut_metadata`, BEP 10 handshake | the PEX peer cap holds |
 | `magnet` | magnet URIs | non-I2P trackers are filtered out |
@@ -123,57 +123,107 @@ between fuzzing the parser and idling in front of it.
 The other seven dictionaries were written on the same reasoning rather than on
 per-target evidence, and six of them moved a target that the pre-dictionary
 reports had called saturated — see the coverage column below. `wire` is the
-one that did not.
+one that did not, and the cause turned out to be the target rather than the
+dictionary. Most of `wire.dict` is length-prefixed framing —
+`"\x00\x00\x00\x0d\x06"` is a request — and a target that handed its input
+straight to `Message::parse` read that as a *body*, where a five-byte request
+header is nothing but a wrong-length message. The vocabulary was written for a
+reader that did not exist yet. It does now; see Budgets.
 
 ## Budgets
 
-Not flat, and set from what the last report measured rather than from taste.
-The `--- results ---` section of any report is the input to this table; the
-figure that matters is edges gained per 100 seconds, because it is the only one
-that says whether more time would buy anything.
+Not flat, and set from what the reports measured rather than from taste.
 
-| Target | Budget | Cov before | Cov now | Gained | Edges/100s |
-|---|---:|---:|---:|---:|---:|
-| `wire` | 60s | 168 | 168 | 0 | 0.0 |
-| `bencode` | 180s | 387 | 389 | +2 | 0.0 |
-| `json` | 240s | 732 | 735 | +3 | 0.0 |
-| `metainfo` | 240s | 448 | 454 | +6 | 0.3 |
-| `extensions` | 420s | 322 | 416 | +94 | 2.0 |
-| `http` | 420s | 469 | 559 | +90 | 3.9 |
-| `tracker` | 480s | 595 | 642 | +47 | 9.0 |
-| `resume` | 480s | 283 | 336 | +53 | 21.7 |
-| `magnet` | 840s | 402 | 498 | +96 | 21.1 |
+The two sweeps of 2026-07-30 are what the current table rests on, and together
+they are a controlled experiment rather than two readings. Both started from
+the same corpus — the `INITED` coverage libFuzzer prints after replaying the
+seeds was identical in all nine targets — and the second ran at `--scale 8`.
+The only difference between them is time, which is the only thing a budget
+buys.
 
-"Cov before" is the 2026-07-30 pre-dictionary report; "cov now" is after the
-sweep of the same date that introduced them. The per-100s column is from that
-sweep alone, which is why `extensions` and `http` read low despite large
-absolute gains: both banked almost all of it in the first thirty seconds and
-then flattened.
+| Target | Budget | +edges at 1x | +edges at 8x | What 7x more time bought |
+|---|---:|---:|---:|---:|
+| `tracker` | 480s → **900s** | +47 | +94 | +47 |
+| `resume` | 480s → **600s** | +53 | +70 | +17 |
+| `extensions` | 420s | +94 | +103 | +9 |
+| `metainfo` | 240s | +6 | +8 | +2 |
+| `http` | 420s | +90 | +91 | +1 |
+| `bencode` | 180s | +2 | +2 | 0 |
+| `json` | 240s | +3 | +3 | 0 |
+| `magnet` | 840s → **240s** | +96 | +96 | 0 |
+| `wire` | 60s → **120s** | 0 | 0 | 0 |
 
-The ordering this implies is nothing like the allocation it replaced, which had
-`magnet` and `resume` — the two fastest climbers — on the lowest tier, and
-`metainfo` at 0.3 edges/100s on the joint highest. The total is unchanged at
-3360s: a reallocation, not a bigger bill.
+`magnet` is what moved the table. It held the largest budget in the file on the
+strength of +96 edges in 840 seconds — and returned exactly +96 in 6720. Seven
+eighths of the biggest allocation here was buying nothing, and the dictionary
+A/B had already said so from the other end: 120 seconds from an *empty*
+directory reached 498, the same ceiling both sweeps stopped at. `tracker` was
+the only target still clearly paying for time at the far end, and takes most of
+what `magnet` gives up.
+
+Nothing else moves. Cutting `http` or `json` below the budget they were
+measured at would be extrapolation from a pair of runs that only ever tested
+them upwards. The report now measures that directly instead, so the next one
+settles them without guessing. The total is unchanged at 3360s: a reallocation,
+not a bigger bill.
 
 The table lives in exactly one place, `budget_for` in `ci/fuzz.sh`. CI asks for
 it — `./ci/fuzz.sh --budget magnet` — rather than keeping a second copy in the
 workflow matrix, which is what it used to do under a comment saying the two
 must agree. Revising a budget is now one edit.
 
-A plateau means "saturated given this corpus and these mutators", not "fully
-explored", and this table is the demonstration. Every target the previous
-reports had flat was flat against a fuzzer with no dictionary; six of them
-moved as soon as it had one. So treat these budgets as current rather than
-settled — this is the first dictionary-enabled sweep, some of the gain above is
-newly-opened ground being consumed once, and the next report will say so.
+### Reading a run for what it says about time
 
-`wire` is the exception that stayed put: 168 edges, no new units, across five
-independent runs and 190M executions. Sixty seconds is the right budget, but
-the reading is not "the wire codec is exhausted" — it is that a target which
-parses one message in isolation has run out of things to say about a protocol
-whose bugs live in *sequences*. `docs/CODE-REVIEW-2026-07.md` §C already
-carries the fix, a stateful target driving `Message::parse` → `on_message` over
-a real `Torrent`; these runs are the evidence for it.
+A previous version of this table carried an "edges per 100s" column and set the
+ordering from it. It does not reproduce from its own inputs — `extensions` is
+listed at 2.0 where +94 edges in 420 seconds is 22.4, `http` at 3.9 where +90
+in 420 is 21.4 — so the ordering it justified could not be checked. It is gone,
+replaced by something measured rather than derived: `ci/fuzz.sh` now reports
+the point in the run at which coverage stopped growing.
+
+```
+      note: +313 edges, all of them by 12% of the run — the rest bought nothing
+```
+
+libFuzzer prints `cov:` on every progress line, so the first line carrying the
+run's final figure is the moment it stopped learning; everything after it is
+budget that demonstrably bought nothing. Past the halfway mark the note reads
+the other way instead — still gaining at *n*% of the run, worth more time — so
+a budget that is genuinely too small says so in the same sentence.
+
+A total on its own can say neither, and got it exactly backwards here: this
+script called `magnet` "still climbing, worth more time" on +96 edges, and
+eight times the budget returned +96 again.
+
+A plateau still means "saturated given this corpus and these mutators", not
+"fully explored". `wire` is the standing proof of that.
+
+### `wire`
+
+`wire` sat at 168 edges through the scale-8 sweep's 239M executions, having not
+moved since it was written. The reading was never "the codec is exhausted": a
+peer connection is a handshake and then a *stream*, and the target parsed one
+body in isolation. `read_frame` — the length prefix, the oversize ceiling, the
+short read — was not fuzzed at all, and `wire.dict` was mostly framing tokens
+that a body parser can only reject.
+
+It now reads a stream of frames and asserts that a message survives its own
+encoder. Same toolchain, same 40-file corpus, same dictionary, 120s per arm,
+three RNG seeds each:
+
+| | Edges reached | Corpus after |
+|---|---:|---:|
+| body parser | 168, 168, 168 | 40, 40, 40 |
+| frame stream | 337, 337, 337 | 302, 272, 316 |
+
+Sixty seconds was the right budget for a target that could not use more. 120s
+is provisional for one that can — all three arms reached 337 inside the first
+1% of the run, so this is a floor to re-derive from the next report rather than
+a settled figure.
+
+What it does not yet cover is a *session*: `Message::parse` feeding
+`on_message` against a real `Torrent`, where the state machine's bugs live.
+This target reaches the codec, not the protocol.
 
 ## Corpus
 
@@ -194,24 +244,50 @@ the question "is this a torrent" rather than the parser behind it.
 
 **A corpus is an asset only while it is minimised.** libFuzzer keeps an input
 for reaching a new execution-count *bucket*, not a new edge, so a corpus grows
-without the coverage growing with it. The 2026-07-30 sweep ended with 19 310
-files; `cmin` took them to 4 943 at the same coverage:
+without the coverage growing with it. The scale-8 sweep of 2026-07-30 ended
+with 25 003 files; `cmin` took them to 5 173 at the same coverage:
 
 ```
-cmin: bencode        833 -> 388     cmin: wire            40 -> 40
-cmin: metainfo       578 -> 380     cmin: tracker       1699 -> 757
-cmin: resume         743 -> 304     cmin: extensions     637 -> 300
-cmin: json          4491 -> 1300    cmin: magnet        7191 -> 770
-cmin: http          3098 -> 704
+cmin: bencode        953 -> 395     cmin: wire            40 -> 40
+cmin: metainfo       571 -> 393     cmin: tracker       3491 -> 833
+cmin: resume        1089 -> 315     cmin: extensions     879 -> 319
+cmin: json          7859 -> 1329    cmin: magnet        5884 -> 848
+cmin: http          4237 -> 701
 ```
 
-Nine files in ten were carrying nothing, and `magnet` alone had accumulated
-7191 to hold what 770 hold. That bloat is charged to the next run twice —
-startup replays all of it, and mutation energy is then split across all of it.
-On `magnet` the cost had already grown larger than the benefit of seeding at
-all: 120s from the 561-file seed reached 308 edges, where the same 120s from an
+Four files in five were carrying nothing, and `json` alone had accumulated 7859
+to hold what 1329 hold. That bloat is charged to the next run twice — startup
+replays all of it, and mutation energy is then split across all of it. On
+`magnet` the cost had already grown larger than the benefit of seeding at all:
+120s from the 561-file seed reached 308 edges, where the same 120s from an
 *empty* directory reached 498. Seeding is not free, and `cmin` is not
 housekeeping.
+
+**What is committed is checked, not assumed.** A seed is only worth its size if
+it actually reaches what the run that produced it reached, so the coverage of
+the packed tarball is measured — replay each target over it with `-runs=0` and
+read the `INITED` line:
+
+| | `bencode` | `metainfo` | `resume` | `json` | `http` | `wire` | `tracker` | `extensions` | `magnet` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Sweep reached | 389 | 456 | 353 | 735 | 560 | — | 689 | 425 | 498 |
+| Committed seed reaches | 389 | 456 | 353 | 735 | 560 | 337 | 689 | 425 | 498 |
+
+That check is worth running because the alternative is silent. The two sweeps
+of 2026-07-30 began from *identical* coverage in all nine targets — the second
+never received the first's findings, so 26 880 seconds of fuzzing went into
+re-deriving ground that had already been covered once. A seed corpus that does
+not compound is a seed corpus that is not doing its job, and the only way to
+know which one you have is to measure it.
+
+The same check is what decided what to keep here. The previously committed seed
+was merged with the sweep's and re-minimised, on the theory that the older
+corpus might hold edges the sweep had dropped: it did not. The union reached
+exactly the same coverage in all nine targets and cost 389 extra files, so the
+sweep's own corpus is what is committed — plus a fresh `wire` corpus, since
+that target now reads its input as a frame stream and the old 40 files reach 35
+edges of the 337 available. One more `cmin` pass over the result took 5426
+files to 5375, which is what the tarball holds.
 
 So fold runs back in, rather than letting `fuzz/corpus/` accumulate until it
 dies with the working tree:
