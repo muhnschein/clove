@@ -96,6 +96,11 @@ pub struct Config {
     /// Ceiling on peer connections for any one torrent, applied under
     /// [`peer_limit`](Config::peer_limit).
     pub torrent_peer_limit: usize,
+    /// How many incomplete torrents may run at once; the rest wait in the
+    /// queue (`docs/PHASE-H.md` §4).
+    pub max_active_downloads: usize,
+    /// How many complete torrents may seed at once.
+    pub max_active_seeds: usize,
 }
 
 /// Client-wide peer ceiling when the config does not say otherwise.
@@ -111,6 +116,20 @@ pub const DEFAULT_PEER_LIMIT: usize = 200;
 /// long-standing `SwarmConfig::max_peers` default, now a sub-cap rather than
 /// the only cap.
 pub const DEFAULT_TORRENT_PEER_LIMIT: usize = 50;
+
+/// Concurrently downloading torrents when the config does not say otherwise.
+///
+/// Three, because on I2P the scarce thing is tunnels rather than bandwidth:
+/// three torrents each holding a healthy peer set finish sooner, one after
+/// another, than twenty sharing the same ceiling and all crawling.
+pub const DEFAULT_MAX_ACTIVE_DOWNLOADS: usize = 3;
+
+/// Concurrently seeding torrents when the config does not say otherwise.
+///
+/// Higher than the download limit: a seed answers requests rather than chasing
+/// pieces, so it costs peers but little else, and being a good swarm citizen
+/// is most of what an I2P client is for.
+pub const DEFAULT_MAX_ACTIVE_SEEDS: usize = 5;
 
 /// Why configuration was rejected. Messages are written for the operator:
 /// they name the line, the key, and what to do about it.
@@ -218,6 +237,8 @@ impl Config {
         let mut preallocate: Option<(usize, bool)> = None;
         let mut peer_limit: Option<(usize, usize)> = None;
         let mut torrent_peer_limit: Option<(usize, usize)> = None;
+        let mut max_active_downloads: Option<(usize, usize)> = None;
+        let mut max_active_seeds: Option<(usize, usize)> = None;
 
         for (index, raw) in text.lines().enumerate() {
             let line = index + 1;
@@ -258,6 +279,14 @@ impl Config {
                 "torrent_peer_limit" => {
                     let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
                     set(&mut torrent_peer_limit, line, count)?;
+                }
+                "max_active_downloads" => {
+                    let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
+                    set(&mut max_active_downloads, line, count)?;
+                }
+                "max_active_seeds" => {
+                    let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
+                    set(&mut max_active_seeds, line, count)?;
                 }
                 other => return Err(at(Problem::UnknownKey(other.to_owned()))),
             }
@@ -304,6 +333,9 @@ impl Config {
             preallocate: preallocate.is_some_and(|(_, v)| v),
             peer_limit: peer_limit.map_or(DEFAULT_PEER_LIMIT, |(_, v)| v),
             torrent_peer_limit: torrent_peer_limit.map_or(DEFAULT_TORRENT_PEER_LIMIT, |(_, v)| v),
+            max_active_downloads: max_active_downloads
+                .map_or(DEFAULT_MAX_ACTIVE_DOWNLOADS, |(_, v)| v),
+            max_active_seeds: max_active_seeds.map_or(DEFAULT_MAX_ACTIVE_SEEDS, |(_, v)| v),
         })
     }
 }
@@ -433,6 +465,8 @@ mod tests {
         assert!(!c.preallocate);
         assert_eq!(c.peer_limit, DEFAULT_PEER_LIMIT);
         assert_eq!(c.torrent_peer_limit, DEFAULT_TORRENT_PEER_LIMIT);
+        assert_eq!(c.max_active_downloads, DEFAULT_MAX_ACTIVE_DOWNLOADS);
+        assert_eq!(c.max_active_seeds, DEFAULT_MAX_ACTIVE_SEEDS);
         assert_eq!(c.data_dir, PathBuf::from("/home/u/.local/share/clove"));
         assert_eq!(c.api_socket, PathBuf::from("/run/user/1000/clove.sock"));
     }

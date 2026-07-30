@@ -60,6 +60,10 @@ pub(crate) struct Limits {
     /// [`SwarmConfig::max_peers`] and the demux, which is where it was
     /// already, and one value with two homes is how they drift apart.
     pub(crate) peer_limit: usize,
+    /// How many incomplete torrents may run at once.
+    pub(crate) max_active_downloads: usize,
+    /// How many complete torrents may seed at once.
+    pub(crate) max_active_seeds: usize,
 }
 
 impl Default for Limits {
@@ -67,6 +71,8 @@ impl Default for Limits {
         Limits {
             preallocate: false,
             peer_limit: config::DEFAULT_PEER_LIMIT,
+            max_active_downloads: config::DEFAULT_MAX_ACTIVE_DOWNLOADS,
+            max_active_seeds: config::DEFAULT_MAX_ACTIVE_SEEDS,
         }
     }
 }
@@ -76,6 +82,8 @@ impl From<&config::Config> for Limits {
         Limits {
             preallocate: config.preallocate,
             peer_limit: config.peer_limit,
+            max_active_downloads: config.max_active_downloads,
+            max_active_seeds: config.max_active_seeds,
         }
     }
 }
@@ -189,6 +197,41 @@ impl ScanJob {
     }
 }
 
+/// Whether a hosted torrent should be running, and if not, why not.
+///
+/// An enum rather than the `paused`/`queued` pair it replaces, per `SCOPE.md`
+/// §9: three mutually exclusive answers stored as two booleans has a fourth
+/// combination that means nothing, and the compiler cannot stop anyone writing
+/// it. The transitions are:
+///
+/// | From | To | On |
+/// |---|---|---|
+/// | `Running` | `Paused` | `clove pause` |
+/// | `Running` | `Queued` | a rebalance finding no free slot |
+/// | `Queued` | `Running` | a rebalance finding one |
+/// | `Queued` | `Paused` | `clove pause` |
+/// | `Paused` | `Running` | `clove resume`/`start`, if a slot is free |
+/// | `Paused` | `Queued` | `clove resume`, if none is |
+///
+/// Only `Paused` is persisted (resume `paused`); the other two are recomputed
+/// from scratch by every [`rebalance`](Registry::rebalance), because which
+/// torrents are queued is a function of the limits and the add order and
+/// nothing else.
+///
+/// Orthogonal to all of it is [`Hosted::scanning`]: a hash pass can be running
+/// over a paused torrent, which is exactly what `clove verify` does, so that
+/// stays a separate flag rather than a fourth variant here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wanted {
+    /// Should run, and does when the session is up.
+    Running,
+    /// Wanted and startable, but past the active limit (`docs/PHASE-H.md` §4).
+    Queued,
+    /// The operator stopped it. Survives restarts; nothing but the operator
+    /// takes a torrent out of this state.
+    Paused,
+}
+
 /// One hosted torrent's in-memory summary.
 struct Hosted {
     meta: MetaInfo,
@@ -224,7 +267,8 @@ struct Hosted {
     announces_ok: u32,
     announces_failed: u32,
     last_announce_error: Option<String>,
-    paused: bool,
+    /// Whether this torrent should be running, and if not, why not.
+    wanted: Wanted,
     /// Pick pieces in order rather than rarest-first (SCOPE §3).
     sequential: bool,
     /// When this torrent was added (Unix seconds), which is the order the
@@ -242,6 +286,12 @@ struct Hosted {
     /// The counters and the moment [`Registry::refresh`] last read them, which
     /// is what the rates above are a difference of.
     rate_mark: Option<(Instant, u64, u64)>,
+    /// Jump the queue at the next rebalance (`clove start`).
+    ///
+    /// Deliberately not persisted: forcing is a statement about right now, and
+    /// a flag that survived a restart would keep overriding a queue order the
+    /// operator had forgotten setting.
+    forced: bool,
     /// A hash of everything on disk is running for this torrent, outside the
     /// registry lock. Nothing may start its engine or publish a have-set until
     /// that finishes.
@@ -322,7 +372,7 @@ impl Hosted {
             uploaded: self.uploaded,
             downloaded: self.downloaded,
             trackers: self.meta.trackers.clone(),
-            paused: self.paused,
+            paused: self.wanted == Wanted::Paused,
             sequential: self.sequential,
             added: self.added,
         }
@@ -482,12 +532,121 @@ where
             dest_b64,
             naming,
         });
-        let hashes: Vec<[u8; 20]> = self.torrents.keys().copied().collect();
-        for info_hash in hashes {
+        self.rebalance();
+    }
+
+    /// Bring the set of running torrents in line with the queue limits.
+    ///
+    /// The one place that decides what runs. Everything that could change the
+    /// answer — an add, a pause, a resume, a removal, a completion, a session
+    /// coming up — calls this rather than starting or stopping a torrent
+    /// itself, so the limits cannot be honoured in one path and forgotten in
+    /// another.
+    ///
+    /// Order is the queue: forced torrents (`clove start`) first, then add
+    /// order (`docs/PHASE-H.md` §7). Downloads and seeds draw on separate
+    /// allowances, which is what makes a completion promote the next waiting
+    /// *download* rather than competing with it — the finished torrent has
+    /// moved to the other budget.
+    ///
+    /// **Stable by construction.** The decision is a function of the torrents'
+    /// states and add order, not of what happens to be running, so a rebalance
+    /// that changes nothing stops nothing: torrents already live stay live and
+    /// keep their peers. That matters because stopping and restarting a
+    /// torrent costs its whole peer set and a fresh announce.
+    pub(crate) fn rebalance(&mut self) {
+        if self.network.is_none() {
+            // Nothing can run without a session, and `waiting-for-router` is
+            // the honest state for all of them — not `queued`.
+            for hosted in self.torrents.values_mut() {
+                if hosted.wanted == Wanted::Queued {
+                    hosted.wanted = Wanted::Running;
+                }
+            }
+            return;
+        }
+
+        let mut order: Vec<[u8; 20]> = self.torrents.keys().copied().collect();
+        order.sort_by_key(|info_hash| {
+            let hosted = self.torrents.get(info_hash);
+            let forced = hosted.is_some_and(|h| h.forced);
+            let added = hosted.map_or(0, |h| h.added);
+            // `!forced` first, so forced torrents sort ahead of everything.
+            (!forced, added, *info_hash)
+        });
+
+        let mut downloads = self.limits.max_active_downloads;
+        let mut seeds = self.limits.max_active_seeds;
+        let mut start = Vec::new();
+        let mut stop = Vec::new();
+        for info_hash in order {
+            let Some(hosted) = self.torrents.get(&info_hash) else {
+                continue;
+            };
+            // A paused torrent is the operator's decision and a scanning one
+            // has no publishable have-set yet; neither is in the queue at all.
+            if hosted.wanted == Wanted::Paused || hosted.scanning {
+                stop.push((info_hash, false));
+                continue;
+            }
+            let allowance = if hosted.is_complete() {
+                &mut seeds
+            } else {
+                &mut downloads
+            };
+            if *allowance > 0 {
+                *allowance -= 1;
+                start.push(info_hash);
+            } else {
+                stop.push((info_hash, true));
+            }
+        }
+
+        for (info_hash, queued) in stop {
+            self.stop_live(&info_hash);
+            if let Some(hosted) = self.torrents.get_mut(&info_hash)
+                && queued
+            {
+                hosted.wanted = Wanted::Queued;
+            }
+        }
+        for info_hash in start {
+            if let Some(hosted) = self.torrents.get_mut(&info_hash) {
+                hosted.wanted = Wanted::Running;
+            }
             if let Err(e) = self.start_live(&info_hash) {
                 eprintln!("cloved: starting {}: {e}", hex(&info_hash));
             }
         }
+    }
+
+    /// Put a torrent at the head of the queue and unpause it (`clove start`).
+    ///
+    /// # Errors
+    ///
+    /// [`ActionError::NotFound`], or a filesystem error persisting the
+    /// un-pause.
+    pub(crate) fn force_start(&mut self, info_hash: &[u8; 20]) -> Result<(), ActionError> {
+        {
+            let hosted = self
+                .torrents
+                .get_mut(info_hash)
+                .ok_or(ActionError::NotFound)?;
+            hosted.forced = true;
+            hosted.wanted = Wanted::Running;
+        }
+        // Only this one is forced: two torrents both jumping the queue is a
+        // queue nobody asked for, and the second `clove start` means "that one
+        // instead", not "both at once".
+        for (other, hosted) in &mut self.torrents {
+            if other != info_hash {
+                hosted.forced = false;
+            }
+        }
+        self.rebalance();
+        let hosted = self.torrents.get(info_hash).ok_or(ActionError::NotFound)?;
+        write_resume_file(&self.state_dir, info_hash, &hosted.resume(*info_hash))
+            .map_err(ActionError::Io)
     }
 
     /// Detach the network backend (session lost): every live torrent goes
@@ -516,7 +675,7 @@ where
         // A scan in flight owns this torrent's have-set until it publishes.
         // Starting the engine now would hand it an empty one and re-download
         // data that is already on disk.
-        if hosted.paused || hosted.live.is_some() || hosted.scanning {
+        if hosted.wanted != Wanted::Running || hosted.live.is_some() || hosted.scanning {
             return Ok(());
         }
         let storage = Arc::new(Storage::create(
@@ -681,6 +840,12 @@ where
     /// Called periodically by the daemon and around lifecycle transitions.
     pub(crate) fn persist_progress(&mut self) {
         self.refresh();
+        // A torrent that finished since the last tick has moved from the
+        // download allowance to the seed one, which frees a slot for the next
+        // queued download. Nothing else notices a completion — it happens in
+        // the engine, not through an API call — so this is where the queue
+        // learns about it.
+        self.rebalance();
         for (info_hash, hosted) in &mut self.torrents {
             let Some(live) = &hosted.live else {
                 continue;
@@ -762,13 +927,15 @@ where
             announces_ok: 0,
             announces_failed: 0,
             last_announce_error: None,
-            paused: false,
+            wanted: Wanted::Running,
             sequential: false,
             // The listing's order is add order, and this is the add.
             added: now_unix_millis(),
             up_rate: 0.0,
             down_rate: 0.0,
             rate_mark: None,
+            // Recomputed by the rebalance that follows the initial scan.
+            forced: false,
             scanning: true,
             live: None,
         };
@@ -951,13 +1118,23 @@ where
                     "a verification is running for this torrent; it will start on its own when that finishes",
                 ));
             }
-            hosted.paused = paused;
+            hosted.wanted = if paused {
+                Wanted::Paused
+            } else {
+                Wanted::Running
+            };
         }
         if paused {
-            self.stop_live(info_hash);
-        } else {
-            self.start_live(info_hash).map_err(ActionError::Io)?;
+            // Pausing drops the forced flag: "run this one now" and "do not
+            // run this one" cannot both be in force, and the pause is the
+            // later instruction.
+            if let Some(hosted) = self.torrents.get_mut(info_hash) {
+                hosted.forced = false;
+            }
         }
+        // Not a start or a stop but a rebalance, so pausing one torrent also
+        // promotes whichever queued torrent has been waiting for the slot.
+        self.rebalance();
         let hosted = self.torrents.get(info_hash).ok_or(ActionError::NotFound)?;
         let resume = hosted.resume(*info_hash);
         write_resume_file(&self.state_dir, info_hash, &resume).map_err(ActionError::Io)
@@ -1043,7 +1220,7 @@ where
             .torrents
             .get_mut(info_hash)
             .ok_or(ActionError::NotFound)?;
-        if hosted.paused {
+        if hosted.wanted == Wanted::Paused {
             return Err(ActionError::BadInput("torrent is paused"));
         }
         let Some(live) = &mut hosted.live else {
@@ -1138,8 +1315,9 @@ where
         let resume = hosted.resume(info_hash);
         write_resume_file(&self.state_dir, &info_hash, &resume).map_err(ActionError::Io)?;
         // Nothing could start it while the scan was in flight, so this is where
-        // an added or freshly-verified torrent goes live.
-        self.start_live(&info_hash).map_err(ActionError::Io)?;
+        // an added or freshly-verified torrent enters the queue — and runs, if
+        // there is room for it.
+        self.rebalance();
         Ok(count)
     }
 
@@ -1199,10 +1377,12 @@ where
             let _ = fs::remove_dir(self.downloads_dir.join(&hosted.meta.name));
         }
         self.torrents.remove(info_hash);
+        // Its slot is free now, so whatever was next in the queue starts.
+        self.rebalance();
         Ok(())
     }
 
-    /// The torrents as a JSON array, one object each, ordered by info-hash.
+    /// The torrents as a JSON array, one object each, in add order.
     /// Live progress is refreshed first.
     pub(crate) fn list(&mut self) -> Value {
         self.refresh();
@@ -1383,7 +1563,11 @@ where
                 announces_ok: 0,
                 announces_failed: 0,
                 last_announce_error: None,
-                paused: resume.paused,
+                wanted: if resume.paused {
+                    Wanted::Paused
+                } else {
+                    Wanted::Running
+                },
                 sequential: resume.sequential,
                 // 0 for anything written before resume v4, which sorts it
                 // ahead of everything added since — true, as it happens.
@@ -1391,6 +1575,8 @@ where
                 up_rate: 0.0,
                 down_rate: 0.0,
                 rate_mark: None,
+                // Not persisted: forcing is a statement about right now.
+                forced: false,
                 // Claimed here so nothing can start the torrent before the scan
                 // publishes; `pending_scans` hands out the job at startup.
                 scanning: rescan,
@@ -1419,6 +1605,13 @@ impl Hosted {
     /// torrent: a download with files set to skip is finished when the files it
     /// was told to fetch are, and reporting it at 60% for ever — never
     /// "seeding", never done — would be describing a job it was told not to do.
+    /// Whether every piece this torrent was told to fetch is present — which
+    /// is to say, whether it draws on the seed allowance or the download one.
+    fn is_complete(&self) -> bool {
+        let (wanted, held) = self.wanted_and_held();
+        held == wanted
+    }
+
     fn wanted_and_held(&self) -> (u32, u32) {
         let priorities = self.meta.piece_priorities(&self.priorities);
         let mut wanted = 0;
@@ -1436,14 +1629,20 @@ impl Hosted {
     }
 
     fn state(&self) -> &'static str {
-        let (wanted, held) = self.wanted_and_held();
-        let complete = held == wanted;
+        let complete = self.is_complete();
         if self.scanning {
             "verifying"
-        } else if self.paused {
+        } else if self.wanted == Wanted::Paused {
             "paused"
         } else if self.live.is_some() {
             if complete { "seeding" } else { "downloading" }
+        } else if self.wanted == Wanted::Queued {
+            // Wanted and startable, but past the active limit. Distinct from
+            // both `paused` (the operator's decision) and `waiting-for-router`
+            // (nothing could run), because the answer to "why is this not
+            // moving" is different for each and that is the question being
+            // asked.
+            "queued"
         } else if complete {
             "complete"
         } else {
@@ -2682,6 +2881,159 @@ mod tests {
         // fix, and what a watch directory picking up a batch would hit every
         // time.
         assert_eq!(added.len(), 3);
+    }
+
+    /// Every torrent's state, in listing order — the queue as an operator
+    /// sees it.
+    fn states(registry: &mut Registry<MockDialer>) -> Vec<String> {
+        registry
+            .list()
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(|item| item.get("state").and_then(clove_core::json::Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn the_queue_runs_the_limit_and_holds_the_rest() {
+        let net = MockNet::new();
+        let data = TempDir::new("queue");
+        let limits = Limits {
+            max_active_downloads: 2,
+            ..Limits::default()
+        };
+        let mut registry = Registry::<MockDialer>::open(&data.0, limits).unwrap();
+
+        // Five incomplete torrents, added in a known order.
+        let mut hashes = Vec::new();
+        for name in ["a", "b", "c", "d", "e"] {
+            let (_, bytes) = fixture(name);
+            hashes.push(add_and_scan(&mut registry, &bytes));
+        }
+
+        // Without a session nothing runs, and "queued" would be a lie: the
+        // reason none of them is moving is the router, not the limit.
+        assert_eq!(states(&mut registry), ["waiting-for-router"; 5]);
+
+        let ep = net.endpoint();
+        registry.attach_network(
+            ep.dialer(),
+            InboundDemux::new(8),
+            *b"-CV0001-leechleechle",
+            quick_swarm(),
+            "leecher-b64".to_owned(),
+        );
+
+        // Two run, three wait, and it is the first two added that run.
+        assert_eq!(
+            states(&mut registry),
+            ["downloading", "downloading", "queued", "queued", "queued"]
+        );
+
+        // Pausing a running one promotes exactly one waiting one — the next in
+        // add order, not an arbitrary one.
+        registry.set_paused(&hashes[0], true).expect("pause");
+        assert_eq!(
+            states(&mut registry),
+            ["paused", "downloading", "downloading", "queued", "queued"]
+        );
+
+        // Resuming returns it to *its* place in the queue — which, being the
+        // first added, is at the front — rather than to the back. The torrent
+        // promoted while it was paused goes back to waiting.
+        //
+        // The cost is real and deliberate: that torrent acquired peers and
+        // loses them (its progress is snapshotted, so only the peer set and an
+        // announce are spent). The alternative, letting an incumbent keep its
+        // slot, makes queue position depend on unobservable history and lets a
+        // torrent added first starve behind newer ones. Add order is the order.
+        registry.set_paused(&hashes[0], false).expect("resume");
+        assert_eq!(
+            states(&mut registry),
+            ["downloading", "downloading", "queued", "queued", "queued"]
+        );
+
+        // `clove start` jumps the queue, and displaces the last-started
+        // torrent rather than running three at once.
+        registry.force_start(&hashes[4]).expect("start");
+        let after = states(&mut registry);
+        assert_eq!(after.iter().filter(|s| *s == "downloading").count(), 2);
+        assert_eq!(after[4], "downloading", "the forced torrent runs");
+
+        // Only one torrent is forced at a time: the second `start` means
+        // "that one instead", not "both".
+        registry.force_start(&hashes[3]).expect("start another");
+        let after = states(&mut registry);
+        assert_eq!(after.iter().filter(|s| *s == "downloading").count(), 2);
+        assert_eq!(after[3], "downloading", "the newly forced torrent runs");
+
+        // Removing a running torrent frees its slot for the queue.
+        registry.remove(&hashes[3], false).expect("remove");
+        let after = states(&mut registry);
+        assert_eq!(after.len(), 4);
+        assert_eq!(after.iter().filter(|s| *s == "downloading").count(), 2);
+
+        // Losing the session takes everything offline, and none of it is
+        // "queued" any more — the limit is not why they stopped.
+        registry.detach_network();
+        assert!(
+            states(&mut registry)
+                .iter()
+                .all(|s| s == "waiting-for-router" || s == "paused"),
+            "{:?}",
+            states(&mut registry)
+        );
+    }
+
+    #[test]
+    fn seeds_and_downloads_have_separate_allowances() {
+        let net = MockNet::new();
+        let data = TempDir::new("queue-seeds");
+        let limits = Limits {
+            max_active_downloads: 1,
+            max_active_seeds: 2,
+            ..Limits::default()
+        };
+        let mut registry = Registry::<MockDialer>::open(&data.0, limits).unwrap();
+
+        // Two torrents complete on disk (added with their content already
+        // there) and two still to fetch.
+        let mut complete = Vec::new();
+        for name in ["done-1", "done-2"] {
+            let (content, bytes) = fixture(name);
+            let meta = MetaInfo::parse(&bytes).unwrap();
+            let storage = Storage::create(&meta, &data.0.join("downloads"), false).unwrap();
+            for p in 0..storage.num_pieces() {
+                let start = p as usize * BLOCK_LEN as usize;
+                let end = (start + storage.piece_len(p) as usize).min(content.len());
+                storage.write_block(p, 0, &content[start..end]).unwrap();
+            }
+            complete.push(add_and_scan(&mut registry, &bytes));
+        }
+        for name in ["todo-1", "todo-2"] {
+            let (_, bytes) = fixture(name);
+            add_and_scan(&mut registry, &bytes);
+        }
+
+        let ep = net.endpoint();
+        registry.attach_network(
+            ep.dialer(),
+            InboundDemux::new(8),
+            *b"-CV0001-leechleechle",
+            quick_swarm(),
+            "leecher-b64".to_owned(),
+        );
+
+        let after = states(&mut registry);
+        // Both seeds run even though only one download does: the two
+        // allowances are separate, which is what stops a queue of downloads
+        // from stopping the client seeding what it already has.
+        assert_eq!(after.iter().filter(|s| *s == "seeding").count(), 2);
+        assert_eq!(after.iter().filter(|s| *s == "downloading").count(), 1);
+        assert_eq!(after.iter().filter(|s| *s == "queued").count(), 1);
+        assert_eq!(complete.len(), 2);
     }
 
     #[test]

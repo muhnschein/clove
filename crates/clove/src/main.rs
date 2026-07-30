@@ -96,6 +96,7 @@ fn run() -> Result<(), Fail> {
         Some("show") => cmd_show(&where_, json, &operands),
         Some("pause") => cmd_action(&where_, &operands, "pause", "paused"),
         Some("resume") => cmd_action(&where_, &operands, "resume", "resumed"),
+        Some("start") => cmd_action(&where_, &operands, "start", "started"),
         Some("verify") => cmd_verify(&where_, &operands),
         Some("peer") => cmd_peer(&where_, &operands),
         Some("priorities") => cmd_priorities(&where_, &operands),
@@ -130,6 +131,7 @@ fn print_help() {
     println!("  remove <torrent…> [--data]     remove torrents (--data also deletes files)");
     println!("  pause <torrent…>               pause torrents");
     println!("  resume <torrent…>              resume torrents");
+    println!("  start <torrent…>               resume and jump the queue");
     println!("  verify <torrent…>              re-check data on disk");
     println!("  peer <torrent> <b32-addr>      hand a running torrent a peer to dial");
     println!("  priorities <torrent> <spec>    set per-file priorities (e.g. 1,0,2)");

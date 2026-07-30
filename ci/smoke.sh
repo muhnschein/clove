@@ -317,6 +317,35 @@ run resume --all >/dev/null || fail "resume --all failed"
 expect_contains "$(run show "$info_hash" --json)" '"state":"waiting-for-router"' "resumed by --all"
 run remove "$second_hash" >/dev/null || fail "removing the second torrent failed"
 
+echo "smoke: the queue holds torrents past the active limit"
+# A daemon of its own, so the tight limit does not disturb everything above.
+qdir="$work/queue"
+mkdir -p "$qdir/data" "$qdir/run"
+cat >"$qdir/clove.conf" <<EOF
+data_dir $qdir/data
+api_socket $qdir/run/clove.sock
+max_active_downloads 1
+EOF
+timeout 60 "$cloved" -c "$qdir/clove.conf" >"$work/daemon-queue.log" 2>&1 &
+queue_pid=$!
+i=0
+until timeout 5 "$clove" -c "$qdir/clove.conf" status >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -gt 200 ] && fail "queue daemon never answered (log: $(cat "$work/daemon-queue.log"))"
+    sleep 0.05
+done
+qrun() { timeout 20 "$clove" -c "$qdir/clove.conf" "$@"; }
+qrun add "$work/demo.torrent" >/dev/null || fail "queue add 1"
+qrun add "$work/second.torrent" >/dev/null || fail "queue add 2"
+# No router here either, so neither is "queued" — the limit is not why they
+# are stopped, and saying so would send an operator chasing the wrong thing.
+expect_contains "$(qrun list)" "waiting-for-router" "no router means no queue"
+# `start` works whatever the router is doing, and is a real endpoint.
+qrun start 1 >/dev/null || fail "start by position failed"
+expect_contains "$(qrun list)" "waiting-for-router" "still waiting on the router"
+kill "$queue_pid" 2>/dev/null
+wait "$queue_pid" 2>/dev/null || true
+
 echo "smoke: resume, then remove both torrents"
 run resume "$info_hash" >/dev/null || fail "resume failed"
 run remove "$info_hash" --data >/dev/null || fail "remove failed"

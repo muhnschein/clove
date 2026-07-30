@@ -94,6 +94,10 @@ Print a command summary and exit.
 Daemon and router state: version, uptime, SAM address, torrent count, and
 the router connection state
 .Pq Sy connecting , Sy waiting-for-router , Sy connected .
+It also carries the client-wide transfer rates, the number of peers attached
+across every torrent, and the
+.Ic peer_limit
+those peers come from.
 .It Cm list Op Fl -json
 One line per torrent: its position, progress, state, size, current down and up
 rates, name, and the leading characters of the info-hash.
@@ -170,6 +174,21 @@ Stop peer acquisition and disconnect these torrents' peers.
 The paused state persists across daemon restarts.
 .It Cm resume Ar torrent ... | Fl -all
 Bring paused torrents back online.
+A torrent returns to its own place in the queue, which is the order torrents
+were added; if the active limit is already met it waits there as
+.Sy queued .
+.It Cm start Ar torrent ... | Fl -all
+Resume a torrent and put it at the head of the queue, ahead of everything
+waiting.
+.Pp
+For when the queue order is not the order you want right now.
+Only one torrent is at the head at a time — a second
+.Cm start
+means that one instead, not both — and the position is not remembered across a
+restart of
+.Xr cloved 8 ,
+because forcing is a statement about the moment rather than a property of the
+torrent.
 .It Cm verify Ar torrent ... | Fl -all
 Re-read each torrent's data from disk and re-check every piece against the
 metainfo hashes.

@@ -1,6 +1,6 @@
 # Phase H — Daily-drivable: many torrents, and a view worth watching
 
-**Status:** In progress — **H0 and H4 landed**, the rest as designed below.
+**Status:** In progress — **H0, H4, H1 and H5 landed**; H2, H3, H6 and the TUI as designed below.
 This pinned the design before the wiring, the way `PHASE-F.md` did, so the
 architecture was argued on paper where arguing is cheap. Maps to no new milestone: this is what M4's *"a CLI pleasant
 enough for daily use"* (`SCOPE.md` §1) turns out to mean once you run more than
@@ -163,7 +163,7 @@ any single session, since a router restart returns every slot on its own.
 
 ---
 
-## 4. H2 — The queue
+## 4. H2 — The queue — **landed**
 
 The budget stops the daemon hurting itself. The queue is what an operator
 actually wants: twenty torrents added, three downloading, the rest waiting
@@ -190,8 +190,32 @@ problems at different grains, and both are wanted. The queue keeps the
 *steady state* sane; the budget is what holds when twelve torrents are all
 inside their announce interval at once.
 
-**Cost:** ~200 lines in `registry.rs`, one resume field (`queue_position`), one
-new state string, three config keys. No new dependency.
+**Cost:** ~200 lines in `registry.rs`, one new state string, two config keys.
+**No resume field**: queue position is derived from H5's `added` rather than
+stored, so there is nothing to migrate and nothing that can disagree with the
+add order.
+
+**As built.** One `rebalance()` is the only thing that decides what runs;
+every path that could change the answer — add, pause, resume, remove,
+completion noticed by the periodic tick, a session coming up — calls it rather
+than starting or stopping a torrent itself. It is a pure function of the
+torrents' states and add order, so a rebalance that changes nothing stops
+nothing, and a torrent already running keeps its peers.
+
+`paused` and `queued` became one `Wanted` enum with an exhaustive transition
+table, because clippy's `struct_excessive_bools` fired and it was right: two
+booleans for three mutually exclusive answers has a fourth combination that
+means nothing, which is exactly the "implicit states smeared across booleans"
+`SCOPE.md` §9 forbids. `scanning` stays a separate flag — a hash pass runs over
+a *paused* torrent, which is what `clove verify` does, so it is orthogonal
+rather than a fourth variant.
+
+**The cost worth naming:** queue position is add order, so resuming a paused
+torrent returns it to *its* place, which can displace a newer torrent promoted
+in its absence. That torrent keeps its data and loses its peers and an
+announce. The alternative — letting an incumbent keep its slot — makes position
+depend on unobservable history and lets the first-added torrent starve behind
+newer ones. `clove start` exists for when the order is not what you want.
 
 ---
 

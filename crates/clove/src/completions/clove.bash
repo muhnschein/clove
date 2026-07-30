@@ -16,7 +16,7 @@ _clove() {
         # here can enumerate without talking to the daemon; the flags are what
         # completion can usefully offer.
         remove) COMPREPLY=( $(compgen -W "--all --data" -- "${cur}") ) ;;
-        pause|resume|verify|announce) COMPREPLY=( $(compgen -W "--all" -- "${cur}") ) ;;
+        pause|resume|start|verify|announce) COMPREPLY=( $(compgen -W "--all" -- "${cur}") ) ;;
     esac
     return 0
 }

@@ -127,6 +127,8 @@ is one of
 .Sy complete
 .Pq complete but offline ,
 .Sy paused ,
+.Sy queued
+.Pq wanted, but past Ic max_active_downloads No or Ic max_active_seeds ,
 .Sy waiting-for-router ,
 .Sy verifying
 .Pq its data is being hashed ,
@@ -182,6 +184,12 @@ its downloaded files are deleted too.
 .It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /resume
 Take the torrent offline or bring it back.
 Pausing disconnects its peers and persists across restarts.
+A resumed torrent returns to its place in the queue, which may be
+.Sy queued
+rather than running.
+.It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /start
+Resume the torrent and move it to the head of the queue.
+At most one torrent is at the head; the position is not persisted.
 .It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /verify
 Re-check every piece against the metainfo hashes and answer with the
 .Sy verified

@@ -914,6 +914,7 @@ fn torrent_action(
         ("POST", Some("resume")) => {
             action_result(lock(&daemon.registry).set_paused(&info_hash, false))
         }
+        ("POST", Some("start")) => action_result(lock(&daemon.registry).force_start(&info_hash)),
         ("POST", Some("peers")) => {
             let text = String::from_utf8_lossy(&request.body);
             let Some(peer) = DestHash::from_b32(&text) else {
