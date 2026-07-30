@@ -221,8 +221,10 @@ fn watch_frame(socket: &Path, token: &str, interval: u64) -> Result<String, Fail
     let status = parse_body(&request(socket, token, "GET", "/v1/status", &[])?)?;
     let torrents = parse_body(&request(socket, token, "GET", "/v1/torrents", &[])?)?;
 
-    let router = status.get("router").and_then(Value::as_str).unwrap_or("-");
-    let version = status.get("version").and_then(Value::as_str).unwrap_or("-");
+    // The router line carries whatever the SAM bridge last said, so it is not
+    // ours either — see `display`.
+    let router = field_str(&status, "router");
+    let version = field_str(&status, "version");
     let count = status.get("torrents").and_then(Value::as_u64).unwrap_or(0);
     let uptime = status
         .get("uptime_secs")
@@ -466,12 +468,12 @@ fn render_detail(value: &Value) -> String {
         };
         let rendered = match key {
             "size" | "downloaded" | "uploaded" => {
-                field.as_u64().map_or_else(|| field.to_line(), human_size)
+                field.as_u64().map_or_else(|| cell(field), human_size)
             }
             "progress" => field
                 .as_f64()
-                .map_or_else(|| field.to_line(), |p| format!("{:.0}%", p * 100.0)),
-            _ => field.to_line(),
+                .map_or_else(|| cell(field), |p| format!("{:.0}%", p * 100.0)),
+            _ => cell(field),
         };
         // Wide enough for the longest key printed here (`last_announce_error`),
         // so the value column does not step right when a torrent has a
@@ -490,11 +492,7 @@ fn render_detail(value: &Value) -> String {
                 .get("priority")
                 .and_then(Value::as_u64)
                 .map_or_else(|| "-".to_owned(), priority_name);
-            let path = file
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("-")
-                .to_owned();
+            let path = display(file.get("path").and_then(Value::as_str).unwrap_or("-"));
             rows.push(vec![size, priority, path]);
         }
         out.push_str(&align(&["SIZE", "PRIORITY", "PATH"], &rows));
@@ -505,11 +503,78 @@ fn render_detail(value: &Value) -> String {
         out.push_str("\ntrackers:\n");
         for tracker in trackers {
             if let Some(url) = tracker.as_str() {
-                let _ = writeln!(out, "  {url}");
+                let _ = writeln!(out, "  {}", display(url));
             }
         }
     }
     out
+}
+
+/// How wide a torrent name is allowed to be in a table cell before it is
+/// elided. Long enough for anything an operator recognises a torrent by,
+/// short enough that one pathological name cannot push the info-hash column
+/// off the far side of the terminal.
+const NAME_WIDTH: usize = 60;
+
+/// Make an attacker-controlled string safe to write to a terminal.
+///
+/// A `.torrent` is not trusted input. `info.name`, the file paths under it and
+/// the tracker URLs beside it are all chosen by whoever made the torrent, and
+/// `metainfo::check_component` — which refuses separators, `.`, `..` and NUL —
+/// has no opinion about `ESC`. Printed verbatim, a torrent named
+/// `"\x1b[2J\x1b[1;31m…"` clears the reader's screen and recolours it, and one
+/// named `"\x1b]0;…\x07"` retitles their terminal. `SECURITY.md` already scopes
+/// torrent names as hostile input; this is the same bytes reaching a different
+/// interpreter.
+///
+/// This belongs *here* and not in the daemon. `json::write_string` already
+/// escapes everything below `0x20` as `\u00XX`, so the API is inert and
+/// `--json` consumers were never affected. What the JSON has to keep is the
+/// torrent's actual name — sanitising there would misreport it — so the
+/// substitution happens at the one boundary where bytes become a terminal's
+/// input.
+///
+/// Replaced with `.`:
+/// - the `Cc` category (C0, `DEL` and C1), which is where the escapes live;
+/// - the bidirectional overrides, which reorder *neighbouring* text rather
+///   than drawing anything themselves, and so can make `…rat.exe` render as
+///   `…exe.tar` in the list an operator is reading to decide what to trust.
+///
+/// Everything else passes through, including the UTF-8 that makes [`align`]
+/// approximate — it counts characters, not display columns, which is unchanged
+/// here and not worth a dependency to fix.
+fn display(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            c if c.is_control() => '.',
+            // LRM/RLM, the LRE/RLE/PDF/LRO/RLO run, and the isolates.
+            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '.',
+            c => c,
+        })
+        .collect()
+}
+
+/// [`display`], then clamp to `width` characters, marking any elision.
+///
+/// Character count rather than display width, to stay consistent with
+/// [`align`]: two functions disagreeing about how wide a string is would
+/// misalign the table in a way neither of them looks wrong doing.
+fn elide(s: &str, width: usize) -> String {
+    let safe = display(s);
+    if safe.chars().count() <= width {
+        return safe;
+    }
+    let mut out: String = safe.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// A JSON value rendered into a table cell, sanitised ([`display`]).
+///
+/// Every site that turns a daemon response into terminal output goes through
+/// this or [`elide`]; `to_line` on its own is the bug.
+fn cell(value: &Value) -> String {
+    display(&value.to_line())
 }
 
 fn priority_name(priority: u64) -> String {
@@ -537,7 +602,7 @@ fn render_object(value: &Value) -> String {
     let width = fields.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     let mut out = String::new();
     for (key, val) in fields {
-        let _ = writeln!(out, "{key:<width$}  {}", val.to_line());
+        let _ = writeln!(out, "{key:<width$}  {}", cell(val));
     }
     out
 }
@@ -562,7 +627,10 @@ fn render_torrents(value: &Value) -> String {
             .get("size")
             .and_then(Value::as_u64)
             .map_or_else(|| "-".to_owned(), human_size);
-        let name = field_str(item, "name");
+        let name = elide(
+            item.get("name").and_then(Value::as_str).unwrap_or("-"),
+            NAME_WIDTH,
+        );
         let hash = item.get("info_hash").and_then(Value::as_str).unwrap_or("-");
         let hash_short = hash.get(..12).unwrap_or(hash).to_owned();
         rows.push(vec![progress, state, size, name, hash_short]);
@@ -571,10 +639,7 @@ fn render_torrents(value: &Value) -> String {
 }
 
 fn field_str(item: &Value, key: &str) -> String {
-    item.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or("-")
-        .to_owned()
+    display(item.get(key).and_then(Value::as_str).unwrap_or("-"))
 }
 
 /// Left-align columns to the widest cell (header included); the last column is
@@ -782,6 +847,100 @@ mod tests {
         assert_eq!(human_duration(86_400), "1d0h");
         assert_eq!(human_duration(90_000), "1d1h");
         assert_eq!(human_duration(u64::MAX), "213503982334601d7h");
+    }
+
+    #[test]
+    fn a_torrent_name_cannot_drive_the_terminal() {
+        // The whole point: these bytes come out of a `.torrent` written by
+        // whoever wanted us to have it, and `check_component` lets every one
+        // of them through — it only refuses separators, `.`, `..` and NUL.
+        let hostile = "\u{1b}[2J\u{1b}[1;31mowned\u{7}\u{9b}0;title\u{7}\u{0}end";
+        let safe = display(hostile);
+        for bad in ['\u{1b}', '\u{7}', '\u{9b}', '\u{0}'] {
+            assert!(!safe.contains(bad), "{bad:?} survived in {safe:?}");
+        }
+        // One `.` per control character, and the inert remainder of each
+        // sequence left visible rather than swallowed — an operator seeing
+        // `.[2J` in a name should be able to tell what it was trying to do.
+        assert_eq!(safe, ".[2J.[1;31mowned..0;title..end");
+        // Tab and newline are controls too, and a name containing either
+        // would break the table by itself.
+        assert_eq!(display("a\tb\nc\r\n"), "a.b.c..");
+
+        // Trojan-source reordering: the override characters draw nothing
+        // themselves but reverse what is printed around them, so a name can
+        // render as a different extension than the one it has.
+        assert_eq!(display("safe\u{202e}gnp.exe"), "safe.gnp.exe");
+        for c in [
+            '\u{200e}', '\u{200f}', '\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}',
+        ] {
+            assert_eq!(display(&c.to_string()), ".");
+        }
+
+        // What must *not* change: ordinary text, and the non-ASCII that a
+        // legitimately-named torrent is full of.
+        for ok in ["ubuntu-24.04.iso", "Дистрибутив", "日本語", "café", "🎉"] {
+            assert_eq!(display(ok), ok);
+        }
+
+        // And it has to hold through the renderer an operator actually reads,
+        // not just the helper.
+        let table = render_torrents(&Value::Array(vec![obj(&[
+            ("name", Value::from(hostile)),
+            ("state", Value::from("seeding\u{1b}[2J")),
+            ("info_hash", Value::from("ab".repeat(20))),
+        ])]));
+        assert!(!table.contains('\u{1b}'), "{table:?}");
+        let detail = render_detail(&obj(&[
+            ("name", Value::from(hostile)),
+            (
+                "last_announce_error",
+                Value::from("connect failed\u{1b}[2J"),
+            ),
+            (
+                "files",
+                Value::Array(vec![obj(&[
+                    ("path", Value::from("dir/\u{1b}[2Jevil")),
+                    ("length", Value::UInt(1)),
+                ])]),
+            ),
+            (
+                "trackers",
+                Value::Array(vec![Value::from("http://t.i2p/a\u{1b}[2J")]),
+            ),
+        ]));
+        assert!(!detail.contains('\u{1b}'), "{detail:?}");
+        // `clove status` renders through a different function; it reads the
+        // router's last word, which is not ours either.
+        let status = render_object(&obj(&[("router", Value::from("lost\u{1b}[2J"))]));
+        assert!(!status.contains('\u{1b}'), "{status:?}");
+    }
+
+    #[test]
+    fn long_names_are_elided_rather_than_wrapping() {
+        assert_eq!(elide("short", 10), "short");
+        // Exactly the limit is not elided; one past it is.
+        assert_eq!(elide(&"x".repeat(10), 10), "x".repeat(10));
+        let cut = elide(&"x".repeat(11), 10);
+        assert_eq!(cut.chars().count(), 10);
+        assert!(cut.ends_with('…'), "{cut:?}");
+        // Elision counts characters, so a multi-byte name is cut at a
+        // character boundary and not mid-codepoint.
+        let wide = elide(&"é".repeat(80), NAME_WIDTH);
+        assert_eq!(wide.chars().count(), NAME_WIDTH);
+        // Sanitising happens first: an elided name cannot smuggle an escape
+        // through in the part that survives.
+        assert!(!elide(&format!("\u{1b}[2J{}", "x".repeat(80)), NAME_WIDTH).contains('\u{1b}'));
+
+        // A pathological name must not push the last column out of the
+        // terminal, which is what the width is for.
+        let table = render_torrents(&Value::Array(vec![obj(&[
+            ("name", Value::from("n".repeat(400))),
+            ("info_hash", Value::from("cd".repeat(20))),
+        ])]));
+        for line in table.lines() {
+            assert!(line.chars().count() < 120, "{} chars", line.chars().count());
+        }
     }
 
     #[test]

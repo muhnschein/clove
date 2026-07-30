@@ -29,6 +29,24 @@ which the daemon creates mode 0600 on first start; running
 .Nm
 therefore requires the same user as the daemon, or read access to that file.
 .Pp
+Text that came out of a torrent
+.Pq its name, its file paths, its tracker URLs
+is chosen by whoever made that torrent, so
+.Nm
+does not print it to a terminal unaltered: control characters and the
+bidirectional overrides are replaced with
+.Ql \&. ,
+and a name too long for its column is elided with
+.Ql … .
+Without this a torrent could name itself in escape sequences and repaint the
+screen of anyone who ran
+.Cm list .
+.Fl -json
+is unaffected and always carries the torrent's true name — the daemon's JSON
+escapes control characters as
+.Ql \eu00XX
+rather than removing them.
+.Pp
 The options are as follows:
 .Bl -tag -width Ds
 .It Fl -socket Ar path
