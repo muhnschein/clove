@@ -59,20 +59,40 @@ done
 [ -n "$TARGETS" ] || TARGETS="$TARGETS_ALL"
 
 # Per-target budget in seconds. Deliberately not flat, and set from what the
-# last report measured rather than from taste. The comments are edges gained
-# per 100 seconds in the 2026-07-30 sweep — the first with dictionaries — and
-# the ordering they imply is nothing like the previous allocation, which had
-# `magnet` and `resume` (the two fastest climbers) on the lowest tier and
-# `metainfo` (0.3) on the joint highest. Total is unchanged at 3360s: this is
-# a reallocation, not a bigger bill.
+# reports measured rather than from taste.
+#
+# The two 2026-07-30 sweeps are where these come from, and together they are a
+# controlled experiment rather than two readings. Both started from the same
+# corpus — identical INITED coverage in all nine targets — and the second ran
+# at `--scale 8`. The difference between them is time and nothing else, which
+# is the only question a budget actually asks. Seven times the budget bought:
+#
+#   tracker  +47 edges    resume  +17    extensions  +9    metainfo  +2
+#   http      +1          bencode   0    json         0    magnet     0    wire  0
+#
+# `magnet` is what moved the table. It held the largest budget in the file on
+# the strength of +96 edges in 840s — and returned exactly +96 in 6720s, so
+# seven eighths of the biggest allocation was buying nothing. The dictionary
+# A/B says the same thing from the other end: 120s from an *empty* directory
+# already reached 498, which is the ceiling both sweeps stopped at. `tracker`
+# was the only target still clearly paying for time at the far end, and takes
+# most of what `magnet` gives up.
+#
+# Only the budgets with a measurement behind them move. Cutting `http` or
+# `json` below the budget they were tested at would be extrapolation, and the
+# report now measures the plateau point per target — the fraction of the run
+# after which coverage stopped growing — so the next one answers that directly
+# instead. Total is unchanged at 3360s: a reallocation, not a bigger bill.
 budget_for() {
     case "$1" in
-        wire) echo 60 ;;                        # 0.0 — nothing new in 36M execs
-        bencode) echo 180 ;;                    # 0.0
-        json|metainfo) echo 240 ;;              # 0.0, 0.3
-        http|extensions) echo 420 ;;            # 3.9, 2.0
-        resume|tracker) echo 480 ;;             # 21.7, 9.0
-        magnet) echo 840 ;;                     # 21.1, and 190 edges in absolute
+        wire) echo 120 ;;                       # new surface, provisional; see below
+        magnet) echo 240 ;;                     # +0 for 8x the time, and 120s from
+                                                # empty already reaches the ceiling
+        bencode) echo 180 ;;                    # +0 for 7x; untested below 180s
+        json|metainfo) echo 240 ;;              # +0, +2
+        http|extensions) echo 420 ;;            # +1, +9
+        resume) echo 600 ;;                     # +17
+        tracker) echo 900 ;;                    # +47, the best margin in the table
         *) echo 300 ;;
     esac
 }
@@ -253,20 +273,40 @@ for t in $TARGETS; do
     # kept for hitting a new *counter bucket*; only coverage says the run
     # learned something about the parser.
     #
-    # Three bands, not two, because "+1 edge in six hundred seconds" and "+191"
-    # are not the same message and the earlier wording called both of them
-    # climbing. The line between trickling and climbing is drawn at 1% of the
-    # target's own coverage, so it means the same thing for `wire` at 168 edges
-    # as for `json` at 732.
+    # How much it gained is still the wrong question on its own, though, and
+    # the scale-8 sweep is what proved it: this script called `magnet` "still
+    # climbing, worth more time" on +96 edges, and eight times the budget
+    # returned +96 again. A total says nothing about the margin. *When* the
+    # gain arrived does — libFuzzer prints `cov:` on every progress line, so
+    # the first line carrying the run's final figure is the moment it stopped
+    # learning, and the rest of the budget demonstrably bought nothing.
+    plateau=''
+    if [ -n "${cov:-}" ] && [ -n "${execs:-}" ] && [ "$execs" -gt 0 ] 2>/dev/null; then
+        at=$(awk -v final="$cov" '
+            $1 ~ /^#[0-9]+$/ {
+                for (i = 2; i < NF; i++)
+                    if ($i == "cov:") {
+                        if ($(i + 1) + 0 == final + 0) { print substr($1, 2); exit }
+                        break
+                    }
+            }' "$logs/$t.log" 2>/dev/null)
+        if [ -n "$at" ]; then
+            plateau=$((at * 100 / execs))
+            [ "$plateau" -gt 100 ] && plateau=100
+        fi
+    fi
+
     if [ -n "$gained" ]; then
         edges=edges
         [ "$gained" -eq 1 ] && edges=edge
         if [ "$gained" -eq 0 ]; then
             note "      note: no new edges — this budget is more than it needs"
-        elif [ $((gained * 100)) -lt "${cov:-0}" ]; then
-            note "      note: +$gained $edges — barely moving; trim before adding"
+        elif [ -z "$plateau" ]; then
+            note "      note: +$gained $edges"
+        elif [ "$plateau" -le 50 ]; then
+            note "      note: +$gained $edges, all of them by $plateau% of the run — the rest bought nothing"
         else
-            note "      note: +$gained $edges — still climbing, worth more time"
+            note "      note: +$gained $edges, still gaining at $plateau% of the run — worth more time"
         fi
     fi
     note ""
