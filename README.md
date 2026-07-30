@@ -16,6 +16,7 @@ live swarms on i2pd and Java I2P.
 - [`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) — running against real routers, and the interop matrix
 - [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt) — the I2P-BitTorrent dialect, and every live finding
 - [`docs/PHASE-F.md`](docs/PHASE-F.md) — daemon/CLI/API design, and the TUI decision
+- [`docs/PHASE-H.md`](docs/PHASE-H.md) — proposed: the multi-torrent budget, the queue, and `clove top`
 - [`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md) — the data directory and the resume file
 - [`DEPENDENCIES.md`](DEPENDENCIES.md) — the dependency allowlist
 - [`SECURITY.md`](SECURITY.md) — how to report a vulnerability, and what counts as one

@@ -107,6 +107,16 @@ last (§7), after the plain commands, since it is just a redraw loop over `list`
 If a full curses-style UI is ever genuinely wanted, it is a separate,
 budget-spending decision — not smuggled in with M4.
 
+**That memo was written: `DECISIONS.md` S2 (2026-07-30).** The framework
+rejection above stands and is now quantified — `ratatui` measures at 91 crates
+stripped and 181 with defaults, against clove's 48, and `iocraft` at 68. What
+S2 separates out is that "a TUI" and "a TUI framework" are not the same
+purchase: `rustix`, which entered the tree in Phase G *after* this section was
+written, supplies raw mode and window size through features whose closure is
+already wholly present, so a hand-rolled full-screen view costs zero new
+crates. It is specified as `clove top` in `PHASE-H.md` §9. `clove watch` is
+unchanged by any of it.
+
 ## 7. Build order (incremental, each tier-1-green)
 
 1. **Foundation — landed:** HTTP/1.1 server primitives (`http`) + JSON encoder
