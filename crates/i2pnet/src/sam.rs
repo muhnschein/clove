@@ -1,4 +1,4 @@
-//! `SAMv3` backend (Phase D, `docs/PLAN.md`).
+//! `SAMv3` backend — the M1 half of `SCOPE.md` §8.
 //!
 //! This is the *only* code here that talks to a real router. Its runtime
 //! behavior against a live router is verified out-of-CI
