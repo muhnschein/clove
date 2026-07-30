@@ -19,8 +19,9 @@ use crate::bencode::{self, Value};
 ///
 /// History: v1 initial; v2 added the optional `paused` flag (a v1 file reads
 /// as not paused); v3 added the optional `sequential` flag (an earlier file
-/// reads as rarest-first).
-pub const VERSION: i64 = 3;
+/// reads as rarest-first); v4 added the optional `added` timestamp (an earlier
+/// file reads as 0, which sorts it before anything added since).
+pub const VERSION: i64 = 4;
 
 /// Everything clove needs to pick a torrent back up after a restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +52,26 @@ pub struct Resume {
     /// per-torrent sequential flag). Optional on disk (added in v3); an
     /// earlier file, or any file omitting it, reads as `false`.
     pub sequential: bool,
+    /// When the torrent was added, as **milliseconds** since the Unix epoch.
+    ///
+    /// The listing's order, and nothing else. Torrents were keyed by info-hash
+    /// and listed in that order, which is to say shuffled — and reshuffled the
+    /// moment one is added, so the row under an operator's eye moves while
+    /// they are reading it.
+    ///
+    /// Milliseconds rather than seconds because the resolution is the whole
+    /// point: at one-second granularity every torrent of a bulk add — a
+    /// scripted loop, or a watch directory picking up a batch — shares a
+    /// timestamp, falls through to the info-hash tie-break, and comes out
+    /// shuffled again. Adds are serialised by the registry lock and each does
+    /// file I/O, so a millisecond collision needs two adds inside the same
+    /// millisecond; ties still break on info-hash, so the order stays total
+    /// and stable either way.
+    ///
+    /// Optional on disk (added in v4); an earlier file, or any file omitting
+    /// it, reads as 0 and therefore sorts before everything added since. That
+    /// is the right answer for an upgrade: those torrents *were* added first.
+    pub added: u64,
 }
 
 /// Why a resume file was refused. Refusal never writes anything.
@@ -91,7 +112,7 @@ pub fn bitfield_len(num_pieces: u32) -> usize {
     num_pieces.div_ceil(8) as usize
 }
 
-const KEYS: [&[u8]; 11] = [
+const KEYS: [&[u8]; 12] = [
     b"version",
     b"info_hash",
     b"num_pieces",
@@ -103,6 +124,7 @@ const KEYS: [&[u8]; 11] = [
     b"trackers",
     b"paused",
     b"sequential",
+    b"added",
 ];
 
 impl Resume {
@@ -143,6 +165,10 @@ impl Resume {
         put(b"trackers", Value::List(tiers));
         put(b"paused", Value::Int(i64::from(self.paused)));
         put(b"sequential", Value::Int(i64::from(self.sequential)));
+        put(
+            b"added",
+            Value::Int(i64::try_from(self.added).unwrap_or(i64::MAX)),
+        );
         bencode::encode(&Value::Dict(map))
     }
 
@@ -249,6 +275,16 @@ impl Resume {
             .and_then(Value::as_int)
             .is_some_and(|n| n != 0);
 
+        // Optional since v4. A negative value is a clock that ran backwards
+        // rather than a corrupt file, and the listing's order is not worth
+        // refusing to start over, so it clamps to 0 — the same place an
+        // upgraded torrent lands.
+        let added = root
+            .get(b"added")
+            .and_then(Value::as_int)
+            .and_then(|n| u64::try_from(n).ok())
+            .unwrap_or(0);
+
         Ok(Resume {
             info_hash,
             num_pieces,
@@ -260,6 +296,7 @@ impl Resume {
             trackers,
             paused,
             sequential,
+            added,
         })
     }
 }
@@ -305,6 +342,7 @@ mod tests {
             trackers: vec![vec!["http://t.i2p/a".into()], vec!["http://u.i2p/a".into()]],
             paused: true,
             sequential: true,
+            added: 1_800_000_000,
         }
     }
 
@@ -356,17 +394,59 @@ mod tests {
     }
 
     #[test]
+    fn a_file_without_added_sorts_first() {
+        // Strip `added` to simulate a v3 file. It reads as 0, which puts it
+        // ahead of anything added since — which is true of it.
+        let mut r = sample();
+        r.added = 0;
+        let encoded = r.encode();
+        let needle = b"5:addedi0e";
+        let pos = encoded
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("the encoder writes `added`");
+        let mut stripped = encoded[..pos].to_vec();
+        stripped.extend_from_slice(&encoded[pos + needle.len()..]);
+        assert_eq!(Resume::decode(&stripped).unwrap().added, 0);
+
+        // And a clock that ran backwards costs an ordering, not a start: the
+        // listing's sort is not worth refusing to load a torrent over.
+        let mut negative = sample();
+        negative.added = 0;
+        let encoded = negative.encode();
+        let mut patched = Vec::new();
+        let pos = encoded
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("the encoder writes `added`");
+        patched.extend_from_slice(&encoded[..pos]);
+        patched.extend_from_slice(b"5:addedi-5e");
+        patched.extend_from_slice(&encoded[pos + needle.len()..]);
+        assert_eq!(Resume::decode(&patched).unwrap().added, 0);
+    }
+
+    #[test]
     fn refuses_the_future_cleanly() {
-        let mut r = sample().encode();
-        // Bump the version int in place past the current VERSION (3 -> 4).
-        let pos = r.windows(9).position(|w| w == b"7:version").map(|p| p + 10);
-        let pos = pos.unwrap();
-        assert_eq!(r[pos], b'3');
-        r[pos] = b'4';
+        // Written against VERSION rather than against its current digits, so
+        // the next format bump does not have to come here and edit a literal —
+        // which is how this test came to assert `3` while the code said 4.
+        let encoded = sample().encode();
+        let current = format!("7:versioni{VERSION}e").into_bytes();
+        let future = format!("7:versioni{}e", VERSION + 1).into_bytes();
+        let pos = encoded
+            .windows(current.len())
+            .position(|w| w == current.as_slice())
+            .expect("the encoder writes the current version");
+        let mut r = encoded[..pos].to_vec();
+        r.extend_from_slice(&future);
+        r.extend_from_slice(&encoded[pos + current.len()..]);
+
         match Resume::decode(&r) {
-            Err(Error::FutureVersion(4)) => {}
-            other => panic!("expected FutureVersion, got {other:?}"),
+            Err(Error::FutureVersion(v)) if v == VERSION + 1 => {}
+            other => panic!("expected FutureVersion({}), got {other:?}", VERSION + 1),
         }
+        // The current version is of course still readable.
+        assert!(Resume::decode(&encoded).is_ok());
     }
 
     #[test]

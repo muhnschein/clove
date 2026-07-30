@@ -274,7 +274,7 @@ resumable. Two fixes, both narrower than they first looked:
 
 ---
 
-## 7. H5 — Rates, and an order that means something
+## 7. H5 — Rates, and an order that means something — **landed**
 
 Two gaps that only appear with more than one torrent, and that §9 needs before
 it is worth building:
@@ -299,9 +299,19 @@ it is worth building:
   index that means something different after an add is a footgun, and the
   daemon must not hold one.
 
-**Cost:** ~120 lines. One resume-format version bump — which per `SCOPE.md` §3
-is a headline item and gets its `STATE-FORMAT.md` entry, forward-compatible in
-the usual direction.
+**Cost:** ~120 lines. One resume-format version bump — **v4**, not v3: the
+format was already at v3 (`sequential`) when this was written. It gets its
+`STATE-FORMAT.md` entry and is forward-compatible in the usual direction, a
+file without `added` reading as 0 and sorting first.
+
+**Two things the tests found.** `added` is stored in **milliseconds**, not
+seconds: at one-second resolution every torrent of a bulk add shares a
+timestamp, falls through to the info-hash tie-break, and comes out in hash
+order — the exact shuffle the field exists to remove, and what a watch
+directory (H6) would hit every time. And a listing position is **one to three
+digits**, which makes positions and references disjoint by construction, since
+the shortest accepted prefix is four characters. Without that bound an
+all-digit info-hash — `0000…0000` is legal — was read as position zero.
 
 ---
 

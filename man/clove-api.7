@@ -86,11 +86,19 @@ Daemon and router state:
 .Sy uptime_secs ,
 .Sy sam_address ,
 .Sy torrents ,
+.Sy up_rate
+and
+.Sy down_rate
+.Pq client-wide, bytes per second ,
+.Sy peers
+and
+.Sy peer_limit
+.Pq attached across every torrent, and the ceiling they come from ,
 and
 .Sy router
 .Pq Sy connecting , Sy waiting-for-router , Sy connected , Sy unsupported-sam-address .
 .It Sy GET Pa /v1/torrents
-An array of torrent summaries:
+An array of torrent summaries, in the order the torrents were added:
 .Sy info_hash ,
 .Sy name ,
 .Sy size ,
@@ -100,6 +108,12 @@ An array of torrent summaries:
 .Pq 0.0 to 1.0 ,
 .Sy uploaded ,
 .Sy downloaded ,
+.Sy up_rate
+and
+.Sy down_rate
+.Pq bytes per second, smoothed ,
+.Sy added
+.Pq milliseconds since the Unix epoch ,
 .Sy peers
 .Pq connected right now ,
 .Sy priorities ,

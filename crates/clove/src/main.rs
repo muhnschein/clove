@@ -137,13 +137,13 @@ fn print_help() {
     println!("  sequential <torrent> on|off    pick pieces in order instead of rarest-first");
     println!("  completions <bash|zsh|fish>    print a shell completion script");
     println!();
-    println!("<torrent> is an info-hash or a unique prefix of one; commands taking");
-    println!("<torrent…> accept several, or --all for every hosted torrent.");
+    println!("<torrent> is an info-hash, a unique prefix of one, or a # from");
+    println!("`clove list`; commands taking <torrent…> accept several, or --all.");
 }
 
 /// What a command calls the torrent it wants: a full info-hash or a unique
 /// prefix of one. Resolved by the daemon, not here.
-const REF_HELP: &str = "an info-hash or a unique prefix of one";
+const REF_HELP: &str = "an info-hash, a unique prefix of one, or a # from `clove list`";
 
 /// Extract the single required torrent reference.
 fn one_info_hash(operands: &[String]) -> Result<&str, Fail> {
@@ -185,6 +185,15 @@ fn expand(socket: &Path, token: &str, refs: &[String], all: bool) -> Result<Vec<
                 "this command needs a torrent ({REF_HELP}), or --all"
             )));
         }
+        // A bare number is the `#` column of the listing, resolved here
+        // against the listing as it is right now. Deliberately client-side and
+        // deliberately not an identity the daemon knows: a position means
+        // something different the moment a torrent is added, so nothing may
+        // store one, and `clove list` printing the index it just used is the
+        // only honest way to offer it.
+        if refs.iter().any(|r| is_index(r)) {
+            return resolve_indices(socket, token, refs);
+        }
         return Ok(refs.to_vec());
     }
     if !refs.is_empty() {
@@ -207,6 +216,75 @@ fn expand(socket: &Path, token: &str, refs: &[String], all: bool) -> Result<Vec<
         .filter_map(|item| item.get("info_hash").and_then(Value::as_str))
         .map(str::to_owned)
         .collect())
+}
+
+/// Longest listing position accepted as one: `999`, three digits.
+///
+/// The bound is what keeps positions and info-hashes from overlapping, and it
+/// is not arbitrary. The daemon's shortest accepted hash prefix is four
+/// characters, so **no string of one to three digits can be a torrent
+/// reference at all** — and every string of four or more is treated as one,
+/// including an all-digit hash like `0000…0000`, which is a perfectly legal
+/// info-hash and was briefly being read as position zero.
+///
+/// The cost is that a client hosting a thousand torrents cannot name the
+/// thousandth by position. It can still name it by prefix, which is the
+/// spelling that scales.
+const MAX_INDEX_DIGITS: usize = 3;
+
+/// Whether a reference is a listing position rather than a torrent reference.
+///
+/// See [`MAX_INDEX_DIGITS`] for why the two cannot collide.
+fn is_index(reference: &str) -> bool {
+    !reference.is_empty()
+        && reference.len() <= MAX_INDEX_DIGITS
+        && reference.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Turn `#` positions into info-hashes, against one fetch of the listing.
+///
+/// One listing for the whole command, so `clove pause 1 2 3` cannot act on
+/// three different orderings.
+fn resolve_indices(socket: &Path, token: &str, refs: &[String]) -> Result<Vec<String>, Fail> {
+    let listed = parse_body(&request(socket, token, "GET", "/v1/torrents", &[])?)?;
+    let items = listed
+        .as_array()
+        .ok_or_else(|| Fail::Failed("daemon did not return a torrent list".to_owned()))?;
+    let mut out = Vec::with_capacity(refs.len());
+    for reference in refs {
+        if !is_index(reference) {
+            out.push(reference.clone());
+            continue;
+        }
+        let position: usize = reference
+            .parse()
+            .map_err(|_| Fail::Usage(format!("{reference} is not a listing position")))?;
+        let hash = position
+            .checked_sub(1)
+            .and_then(|i| items.get(i))
+            .and_then(|item| item.get("info_hash"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Fail::Failed(format!(
+                    "no torrent at position {reference} (the listing has {})",
+                    items.len()
+                ))
+            })?;
+        out.push(hash.to_owned());
+    }
+    Ok(out)
+}
+
+/// [`resolve_indices`] for the commands that take exactly one torrent, so a
+/// `#` position means the same thing everywhere it can be typed.
+fn one_target(socket: &Path, token: &str, reference: &str) -> Result<String, Fail> {
+    if !is_index(reference) {
+        return Ok(reference.to_owned());
+    }
+    let refs = [reference.to_owned()];
+    resolve_indices(socket, token, &refs)?
+        .pop()
+        .ok_or_else(|| Fail::Failed(format!("could not resolve {reference}")))
 }
 
 /// Apply `op` to every target, and report the worst thing that happened.
@@ -403,8 +481,9 @@ fn cmd_remove(where_: &Where, operands: &[String]) -> Result<(), Fail> {
 }
 
 fn cmd_show(where_: &Where, json: bool, operands: &[String]) -> Result<(), Fail> {
-    let info_hash = one_info_hash(operands)?;
+    let reference = one_info_hash(operands)?;
     let (socket, token) = resolve(where_)?;
+    let info_hash = one_target(&socket, &token, reference)?;
     let body = request(
         &socket,
         &token,
@@ -467,6 +546,7 @@ fn cmd_peer(where_: &Where, operands: &[String]) -> Result<(), Fail> {
         ));
     };
     let (socket, token) = resolve(where_)?;
+    let info_hash = one_target(&socket, &token, info_hash)?;
     request(
         &socket,
         &token,
@@ -485,6 +565,7 @@ fn cmd_priorities(where_: &Where, operands: &[String]) -> Result<(), Fail> {
         ));
     };
     let (socket, token) = resolve(where_)?;
+    let info_hash = one_target(&socket, &token, info_hash)?;
     request(
         &socket,
         &token,
@@ -510,6 +591,7 @@ fn cmd_sequential(where_: &Where, operands: &[String]) -> Result<(), Fail> {
         }
     };
     let (socket, token) = resolve(where_)?;
+    let info_hash = one_target(&socket, &token, info_hash)?;
     request(
         &socket,
         &token,
@@ -567,6 +649,8 @@ fn render_detail(value: &Value) -> String {
         "inbound_peers",
         "downloaded",
         "uploaded",
+        "down_rate",
+        "up_rate",
         "announces_ok",
         "announces_failed",
         // Last, and unwrapped: it is a sentence, not a field, and it is the
@@ -580,6 +664,7 @@ fn render_detail(value: &Value) -> String {
             "size" | "downloaded" | "uploaded" => {
                 field.as_u64().map_or_else(|| cell(field), human_size)
             }
+            "down_rate" | "up_rate" => human_rate(field.as_u64()),
             "progress" => field
                 .as_f64()
                 .map_or_else(|| cell(field), |p| format!("{:.0}%", p * 100.0)),
@@ -725,9 +810,18 @@ fn render_torrents(value: &Value) -> String {
     if items.is_empty() {
         return "no torrents\n".to_owned();
     }
-    let headers = ["PROGRESS", "STATE", "SIZE", "NAME", "INFO-HASH"];
+    let headers = [
+        "#",
+        "PROGRESS",
+        "STATE",
+        "SIZE",
+        "DOWN",
+        "UP",
+        "NAME",
+        "INFO-HASH",
+    ];
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(items.len());
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
         let progress = item
             .get("progress")
             .and_then(Value::as_f64)
@@ -743,7 +837,16 @@ fn render_torrents(value: &Value) -> String {
         );
         let hash = item.get("info_hash").and_then(Value::as_str).unwrap_or("-");
         let hash_short = hash.get(..12).unwrap_or(hash).to_owned();
-        rows.push(vec![progress, state, size, name, hash_short]);
+        rows.push(vec![
+            (index + 1).to_string(),
+            progress,
+            state,
+            size,
+            human_rate(item.get("down_rate").and_then(Value::as_u64)),
+            human_rate(item.get("up_rate").and_then(Value::as_u64)),
+            name,
+            hash_short,
+        ]);
     }
     align(&headers, &rows)
 }
@@ -785,6 +888,18 @@ fn write_row(out: &mut String, cells: &[String], widths: &[usize]) {
         }
     }
     out.push('\n');
+}
+
+/// A transfer rate, or a dash when there is nothing moving.
+///
+/// Zero prints as `-` rather than `0 B/s`: a listing is mostly idle torrents,
+/// and a column of zeroes is noise that hides the one row that is doing
+/// something — which is the whole reason the column is there.
+fn human_rate(bytes_per_sec: Option<u64>) -> String {
+    match bytes_per_sec {
+        Some(0) | None => "-".to_owned(),
+        Some(rate) => format!("{}/s", human_size(rate)),
+    }
 }
 
 /// Human-readable byte size (powers of 1024).
@@ -1180,6 +1295,43 @@ mod tests {
         // "--dat" that the daemon would then fail to resolve.
         assert!(matches!(refs(&["--dat"]), Err(Fail::Usage(_))));
         assert!(matches!(refs(&["3f2a", "-x"]), Err(Fail::Usage(_))));
+    }
+
+    #[test]
+    fn a_listing_position_can_never_be_an_info_hash() {
+        // Positions: one to three digits, which the daemon could not read as a
+        // reference anyway since its shortest prefix is four characters.
+        for index in ["1", "2", "42", "999"] {
+            assert!(is_index(index), "{index} should be a position");
+        }
+        // Four or more characters is a reference, all-digit or not. This is
+        // the regression: an all-zero info-hash is legal, is 40 digits, and
+        // was being read as position zero — so `clove pause <that hash>`
+        // reported "no torrent at position 0…0" instead of "no such torrent".
+        for reference in [
+            &"0".repeat(40),
+            &"1234".to_owned(),
+            &"0000".to_owned(),
+            &"3f2a".to_owned(),
+            &"1000".to_owned(),
+        ] {
+            assert!(!is_index(reference), "{reference} should be a reference");
+        }
+        // And nothing else is either.
+        for neither in ["", "1a", "-1", "1.0", " 1"] {
+            assert!(!is_index(neither), "{neither:?} should not be a position");
+        }
+    }
+
+    #[test]
+    fn rates_read_as_rates_and_idle_reads_as_nothing() {
+        // A listing is mostly idle torrents; a column of "0 B/s" hides the one
+        // row that is doing something.
+        assert_eq!(human_rate(None), "-");
+        assert_eq!(human_rate(Some(0)), "-");
+        assert_eq!(human_rate(Some(1)), "1 B/s");
+        assert_eq!(human_rate(Some(1024)), "1.0 KiB/s");
+        assert_eq!(human_rate(Some(1024 * 1024)), "1.0 MiB/s");
     }
 
     #[test]

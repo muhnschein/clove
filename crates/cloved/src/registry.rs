@@ -227,6 +227,21 @@ struct Hosted {
     paused: bool,
     /// Pick pieces in order rather than rarest-first (SCOPE §3).
     sequential: bool,
+    /// When this torrent was added (Unix seconds), which is the order the
+    /// listing is in. Persisted since resume v4; 0 for anything added before
+    /// that, which sorts it first.
+    added: u64,
+    /// Up and down rates in bytes per second, smoothed over the refresh tick.
+    ///
+    /// The listing had lifetime totals and nothing else, so it could not
+    /// answer the first question anybody asks a torrent client — is anything
+    /// moving *now*. Computed here rather than differenced by each client, so
+    /// there is one implementation and `--json` consumers get it too.
+    up_rate: f64,
+    down_rate: f64,
+    /// The counters and the moment [`Registry::refresh`] last read them, which
+    /// is what the rates above are a difference of.
+    rate_mark: Option<(Instant, u64, u64)>,
     /// A hash of everything on disk is running for this torrent, outside the
     /// registry lock. Nothing may start its engine or publish a have-set until
     /// that finishes.
@@ -251,6 +266,44 @@ struct Live {
 }
 
 impl Hosted {
+    /// Fold this refresh's byte counts into the smoothed rates.
+    ///
+    /// Uses the wall-clock gap since the last call rather than assuming the
+    /// refresh interval: refreshes also happen on demand — every `list` and
+    /// `show` triggers one — so the gap is whatever it is, and dividing by a
+    /// nominal tick would report a rate several times too high the moment
+    /// anybody polled.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a byte delta over one refresh tick is nowhere near 2^53, and \
+                  the result is a displayed rate"
+    )]
+    fn update_rates(&mut self) {
+        let now = Instant::now();
+        let Some((then, up_then, down_then)) = self.rate_mark else {
+            // First reading: a baseline to measure the next one against, and
+            // no rate yet. Guessing one from lifetime totals would report a
+            // week's average as the current speed.
+            self.rate_mark = Some((now, self.uploaded, self.downloaded));
+            return;
+        };
+        let elapsed = now.duration_since(then).as_secs_f64();
+        // Two refreshes in the same instant divide by ~zero; keep the previous
+        // estimate rather than inventing an enormous one.
+        if elapsed < 0.05 {
+            return;
+        }
+        let up = self.uploaded.saturating_sub(up_then) as f64 / elapsed;
+        let down = self.downloaded.saturating_sub(down_then) as f64 / elapsed;
+        self.up_rate = self
+            .up_rate
+            .mul_add(RATE_SMOOTHING, up * (1.0 - RATE_SMOOTHING));
+        self.down_rate = self
+            .down_rate
+            .mul_add(RATE_SMOOTHING, down * (1.0 - RATE_SMOOTHING));
+        self.rate_mark = Some((now, self.uploaded, self.downloaded));
+    }
+
     /// The resume record to persist for this torrent's current state.
     fn resume(&self, info_hash: [u8; 20]) -> Resume {
         Resume {
@@ -271,8 +324,51 @@ impl Hosted {
             trackers: self.meta.trackers.clone(),
             paused: self.paused,
             sequential: self.sequential,
+            added: self.added,
         }
     }
+}
+
+/// Milliseconds since the Unix epoch, or 0 if the clock is before it.
+///
+/// Only ever used for the listing's order, so a clock that cannot be read
+/// sensibly costs an ordering, not a start. Milliseconds because seconds are
+/// not enough to order a bulk add — see [`Resume::added`].
+///
+/// [`Resume::added`]: clove_core::resume::Resume::added
+fn now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// How much of the previous rate estimate survives each refresh.
+///
+/// An exponentially weighted mean rather than the raw per-tick difference:
+/// piece traffic is bursty enough that the instantaneous number jumps around
+/// too much to read, and a rate an operator cannot read is not a rate. Low
+/// enough to still respond within a few seconds of a torrent stalling.
+const RATE_SMOOTHING: f64 = 0.6;
+
+/// A smoothed rate as whole bytes per second, for the API.
+///
+/// Integer rather than float on the wire: a rate is a measurement with maybe
+/// two useful digits, and a JSON reader should not have to look at
+/// `1234.5678901` and wonder which of it means anything.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "guarded finite, positive and below the clamp before the cast; \
+              the result is a displayed rate"
+)]
+fn rounded(rate: f64) -> u64 {
+    // A rate that reaches this is not a rate, and anything at all is a better
+    // answer than a wrapped one.
+    const CLAMP: f64 = 1e18;
+    if !rate.is_finite() || rate <= 0.0 {
+        return 0;
+    }
+    rate.min(CLAMP) as u64
 }
 
 /// Why a torrent action (pause, verify, set priorities…) failed.
@@ -569,7 +665,15 @@ where
                 // engine's own counter starts at zero.
                 hosted.peers = 0;
                 hosted.known_peers = 0;
+                // An offline torrent moves nothing. Leaving the last live
+                // figures in place would show a paused torrent still pulling
+                // 400 KiB/s, which is the same class of lie as the peer count
+                // above.
+                hosted.up_rate = 0.0;
+                hosted.down_rate = 0.0;
+                hosted.rate_mark = None;
             }
+            hosted.update_rates();
         }
     }
 
@@ -660,6 +764,11 @@ where
             last_announce_error: None,
             paused: false,
             sequential: false,
+            // The listing's order is add order, and this is the add.
+            added: now_unix_millis(),
+            up_rate: 0.0,
+            down_rate: 0.0,
+            rate_mark: None,
             scanning: true,
             live: None,
         };
@@ -1097,7 +1206,17 @@ where
     /// Live progress is refreshed first.
     pub(crate) fn list(&mut self) -> Value {
         self.refresh();
-        let mut items: Vec<Value> = self.torrents.values().map(Hosted::to_json).collect();
+        // Add order, not info-hash order. The map is keyed by hash, so the
+        // listing used to be sorted by a hash — which is to say shuffled, and
+        // reshuffled on every add, so a row moved out from under whoever was
+        // reading it. Ties break on the hash, so the order is total and does
+        // not wobble between calls for torrents added in the same second.
+        let mut ordered: Vec<(&[u8; 20], &Hosted)> = self.torrents.iter().collect();
+        ordered.sort_by_key(|(info_hash, hosted)| (hosted.added, **info_hash));
+        let mut items: Vec<Value> = ordered
+            .into_iter()
+            .map(|(_, hosted)| hosted.to_json())
+            .collect();
         for (info_hash, pending) in &self.pending {
             let name = pending
                 .magnet
@@ -1266,6 +1385,12 @@ where
                 last_announce_error: None,
                 paused: resume.paused,
                 sequential: resume.sequential,
+                // 0 for anything written before resume v4, which sorts it
+                // ahead of everything added since — true, as it happens.
+                added: resume.added,
+                up_rate: 0.0,
+                down_rate: 0.0,
+                rate_mark: None,
                 // Claimed here so nothing can start the torrent before the scan
                 // publishes; `pending_scans` hands out the job at startup.
                 scanning: rescan,
@@ -1358,6 +1483,9 @@ impl Hosted {
             ("progress".to_owned(), Value::Float(self.progress())),
             ("uploaded".to_owned(), Value::UInt(self.uploaded)),
             ("downloaded".to_owned(), Value::UInt(self.downloaded)),
+            ("up_rate".to_owned(), Value::UInt(rounded(self.up_rate))),
+            ("down_rate".to_owned(), Value::UInt(rounded(self.down_rate))),
+            ("added".to_owned(), Value::UInt(self.added)),
             (
                 "peers".to_owned(),
                 Value::UInt(u64::try_from(self.peers).unwrap_or(u64::MAX)),
@@ -1402,6 +1530,9 @@ impl Hosted {
             ("progress".to_owned(), Value::Float(self.progress())),
             ("uploaded".to_owned(), Value::UInt(self.uploaded)),
             ("downloaded".to_owned(), Value::UInt(self.downloaded)),
+            ("up_rate".to_owned(), Value::UInt(rounded(self.up_rate))),
+            ("down_rate".to_owned(), Value::UInt(rounded(self.down_rate))),
+            ("added".to_owned(), Value::UInt(self.added)),
             (
                 "peers".to_owned(),
                 Value::UInt(u64::try_from(self.peers).unwrap_or(u64::MAX)),
@@ -1460,6 +1591,20 @@ fn write_resume_file(state_dir: &Path, info_hash: &[u8; 20], resume: &Resume) ->
 /// is something you have to go looking for — and when it happens the answer is
 /// [`ResolveError::Ambiguous`], not a guess.
 pub(crate) const MIN_PREFIX: usize = 4;
+
+/// What the whole client is doing right now, for `GET /v1/status`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Totals {
+    /// Bytes per second out, summed over every torrent.
+    pub(crate) up_rate: u64,
+    /// Bytes per second in, summed over every torrent.
+    pub(crate) down_rate: u64,
+    /// Peers attached across every torrent — the draw on the budget below.
+    pub(crate) peers: usize,
+    /// The ceiling those peers come from (`peer_limit`), reported beside them
+    /// because a peer count means nothing without the number it is approaching.
+    pub(crate) peer_limit: usize,
+}
 
 /// A torrent that a prefix could have meant.
 #[derive(Debug)]
@@ -1541,6 +1686,30 @@ where
                 many.iter().map(|ih| self.candidate(ih)).collect(),
             )),
         }
+    }
+
+    /// Client-wide totals for `GET /v1/status`: current up and down rates in
+    /// bytes per second, peers attached, and the budget those peers come from.
+    ///
+    /// One refresh for the whole answer, so the rates here and the ones in the
+    /// listing are the same reading rather than two a moment apart.
+    pub(crate) fn totals(&mut self) -> Totals {
+        self.refresh();
+        let mut totals = Totals {
+            up_rate: 0,
+            down_rate: 0,
+            peers: 0,
+            peer_limit: self.budget.limit(),
+        };
+        let (mut up, mut down) = (0.0, 0.0);
+        for hosted in self.torrents.values() {
+            up += hosted.up_rate;
+            down += hosted.down_rate;
+            totals.peers += hosted.peers;
+        }
+        totals.up_rate = rounded(up);
+        totals.down_rate = rounded(down);
+        totals
     }
 
     /// Whether this info-hash is a magnet still waiting for its metadata.
@@ -2460,6 +2629,90 @@ mod tests {
             registry.resolve("aaaa"),
             Err(ResolveError::Malformed)
         ));
+    }
+
+    #[test]
+    fn the_listing_is_in_add_order_not_hash_order() {
+        let data = TempDir::new("order");
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
+
+        // Added in a deliberate order; their info-hashes are SHA-1 of the info
+        // dict and so land in whatever order they land in. Before this, the
+        // listing was that order — reshuffled on every add.
+        let names = ["third", "first", "second"];
+        let mut added = Vec::new();
+        for name in names {
+            let (_, bytes) = fixture(name);
+            added.push(add_and_scan(&mut registry, &bytes));
+        }
+
+        let listed = registry.list();
+        let order: Vec<&str> = listed
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(|item| item.get("name").and_then(clove_core::json::Value::as_str))
+            .collect();
+        assert_eq!(
+            order, names,
+            "the listing must be in the order torrents were added"
+        );
+
+        // Stable across calls, which is what stops a row moving under the
+        // cursor of whoever is reading it.
+        let again = registry.list();
+        assert_eq!(listed.encode(), again.encode());
+
+        // Adding one puts it last and disturbs nothing before it.
+        let (_, bytes) = fixture("fourth");
+        add_and_scan(&mut registry, &bytes);
+        let listed = registry.list();
+        let order: Vec<&str> = listed
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(|item| item.get("name").and_then(clove_core::json::Value::as_str))
+            .collect();
+        assert_eq!(order, ["third", "first", "second", "fourth"]);
+
+        // The reason `added` is milliseconds and not seconds: these were all
+        // added inside the same second, and at one-second resolution they
+        // shared a timestamp, fell through to the info-hash tie-break, and
+        // came out shuffled — which is the exact failure the field exists to
+        // fix, and what a watch directory picking up a batch would hit every
+        // time.
+        assert_eq!(added.len(), 3);
+    }
+
+    #[test]
+    fn rates_start_at_zero_and_need_two_readings() {
+        let data = TempDir::new("rates");
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
+        let (_, bytes) = fixture("rated");
+        add_and_scan(&mut registry, &bytes);
+
+        // A torrent with no engine reports no rate, and the first refresh
+        // takes a baseline rather than dividing a lifetime total by a tick —
+        // which would report a week's average as the current speed.
+        let listed = registry.list();
+        let first = &listed.as_array().expect("an array")[0];
+        assert_eq!(
+            first
+                .get("up_rate")
+                .and_then(clove_core::json::Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            first
+                .get("down_rate")
+                .and_then(clove_core::json::Value::as_u64),
+            Some(0)
+        );
+
+        let totals = registry.totals();
+        assert_eq!((totals.up_rate, totals.down_rate), (0, 0));
+        assert_eq!(totals.peers, 0);
+        assert_eq!(totals.peer_limit, Limits::default().peer_limit);
     }
 
     #[test]

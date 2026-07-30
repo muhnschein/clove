@@ -29,9 +29,18 @@ which the daemon creates mode 0600 on first start; running
 .Nm
 therefore requires the same user as the daemon, or read access to that file.
 .Pp
-A command names a torrent by its info-hash, or by any prefix of that hash
-long enough to be unique among the hosted torrents — four characters at the
-least.
+A command names a torrent by its info-hash, by any prefix of that hash long
+enough to be unique among the hosted torrents — four characters at the least —
+or by its position in
+.Cm list ,
+the number in the
+.Sy #
+column.
+A position is one to three digits, which is why it can never be mistaken for a
+hash prefix: the shortest prefix is four characters.
+A position means whatever the listing says at that moment and is resolved
+against a listing fetched for the command, so it is a convenience for typing,
+never something to store in a script.
 A prefix that matches more than one torrent is an error listing the ones it
 matched; it is never resolved by choosing.
 A full 40-character hash is matched exactly and is never treated as a prefix,
@@ -86,8 +95,16 @@ Daemon and router state: version, uptime, SAM address, torrent count, and
 the router connection state
 .Pq Sy connecting , Sy waiting-for-router , Sy connected .
 .It Cm list Op Fl -json
-One line per torrent: progress, state, size, name, and the leading bytes of
-the info-hash.
+One line per torrent: its position, progress, state, size, current down and up
+rates, name, and the leading characters of the info-hash.
+.Pp
+Torrents are listed in the order they were added, which does not change as
+others are added or removed — so a row does not move out from under you while
+you are reading it.
+A rate of
+.Ql -
+means nothing is moving, printed that way rather than as a zero so the torrents
+that are doing something stand out.
 .It Cm watch Op Fl -interval Ar seconds
 Repaint
 .Cm status
@@ -231,9 +248,11 @@ $ clove watch
 List torrents, then look at one in detail:
 .Bd -literal -offset indent
 $ clove list
-PROGRESS  STATE        SIZE     NAME          INFO-HASH
- 42%      downloading  1.4 GiB  release.iso   58e2fc46a8dc
+#  PROGRESS  STATE        SIZE     DOWN        UP    NAME         INFO-HASH
+1   42%      downloading  1.4 GiB  82.1 KiB/s  -     release.iso  58e2fc46a8dc
+2  100%      seeding      700 MiB  -           9 B/s notes.tar    9b1c04e7f215
 $ clove show 58e2
+$ clove show 1
 .Ed
 .Pp
 The listing prints the leading characters of each info-hash because that is

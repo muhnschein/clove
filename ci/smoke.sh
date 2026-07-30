@@ -270,6 +270,28 @@ expect_contains "$out" "matches 2 torrents" "the refusal says how many it hit"
 run remove "$amb_a" >/dev/null || fail "removing ambiguous magnet a"
 run remove "$amb_b" >/dev/null || fail "removing ambiguous magnet b"
 
+echo "smoke: the listing is in add order and carries rates"
+# The magnet was added after the torrent, so it comes second whatever the two
+# info-hashes sort like — which is the point.
+first_row=$(run list | sed -n '2p')
+expect_contains "$first_row" "smoke.txt" "the first-added torrent lists first"
+expect_contains "$(run list)" "DOWN" "the listing carries a rate column"
+expect_contains "$(run status --json)" '"down_rate"' "status carries client-wide rates"
+expect_contains "$(run status --json)" '"peer_limit"' "status reports the peer budget"
+# Nothing is moving, so every rate is a dash rather than a column of zeroes.
+expect_contains "$(run show "$info_hash")" "down_rate" "detail carries rates"
+
+echo "smoke: a torrent answers to its listing position"
+run pause 1 >/dev/null || fail "pause by listing position failed"
+expect_contains "$(run show 1 --json)" '"state":"paused"' "show by position"
+run resume 1 >/dev/null || fail "resume by position failed"
+set +e
+out=$(run pause 99 2>&1)
+code=$?
+set -e
+expect_status "$code" 1 "a position past the end of the listing"
+expect_contains "$out" "no torrent at position 99" "the refusal names the position"
+
 echo "smoke: several torrents in one command, and --all"
 second=$(run add "$work/second.torrent") || fail "adding the second torrent failed"
 second_hash=$(printf '%s' "$second" | awk '{print $2}')

@@ -1063,6 +1063,13 @@ fn query_has_data(query: &str) -> bool {
 }
 
 fn status_json(daemon: &Daemon) -> Vec<u8> {
+    // One lock, one refresh: the count and the rates are then the same
+    // reading, rather than two taken a moment apart that do not add up.
+    let (count, totals) = {
+        let mut registry = lock(&daemon.registry);
+        let count = registry.count();
+        (count, registry.totals())
+    };
     Value::Object(vec![
         ("version".to_owned(), Value::from(env!("CARGO_PKG_VERSION"))),
         (
@@ -1075,7 +1082,17 @@ fn status_json(daemon: &Daemon) -> Vec<u8> {
         ),
         (
             "torrents".to_owned(),
-            Value::UInt(u64::try_from(lock(&daemon.registry).count()).unwrap_or(u64::MAX)),
+            Value::UInt(u64::try_from(count).unwrap_or(u64::MAX)),
+        ),
+        ("up_rate".to_owned(), Value::UInt(totals.up_rate)),
+        ("down_rate".to_owned(), Value::UInt(totals.down_rate)),
+        (
+            "peers".to_owned(),
+            Value::UInt(u64::try_from(totals.peers).unwrap_or(u64::MAX)),
+        ),
+        (
+            "peer_limit".to_owned(),
+            Value::UInt(u64::try_from(totals.peer_limit).unwrap_or(u64::MAX)),
         ),
         (
             "router".to_owned(),
