@@ -1,4 +1,4 @@
-.Dd July 30, 2026
+.Dd July 31, 2026
 .Dt CLOVE.CONF 5
 .Os
 .Sh NAME
@@ -235,8 +235,60 @@ Polled rather than watched through the kernel: a directory listing on a timer
 needs nothing that is not already here, and nobody notices five seconds on a
 torrent about to spend minutes building tunnels.
 .Pp
-This is how other tooling drives clove without an API of its own.
+This is how other tooling drives clove without speaking to it at all;
+.Sy transmission_rpc
+is the other way.
 The daemon needs write access to the directory, since it renames what it takes.
+.It Ic api_listen Ar host:port
+Also serve the local API on this loopback TCP address, in addition to the unix
+socket.
+Default: none, and only the socket is served.
+.Pp
+The unix socket is always served and cannot be turned off:
+.Xr clove 1
+finds it from this file and would have nothing to talk to.
+This key exists because most third-party frontends cannot speak to a unix
+socket at all.
+.Pp
+The address must be loopback \(em
+.Pa 127.0.0.0/8 ,
+.Pa localhost ,
+or
+.Pa [::1] .
+Anything else is refused at startup and by
+.Nm cloved Fl C ,
+and unlike
+.Sy sam_address
+there is no override that permits it.
+To reach the daemon from another machine, forward the port:
+.Bd -literal -offset indent
+$ ssh -N -L 9091:127.0.0.1:9091 user@host
+.Ed
+.Pp
+That puts the authentication and the transport encryption in a tool built for
+both, rather than exposing a token-authenticated HTTP service to a network.
+The same holds for a VPN interface you control.
+.It Ic transmission_rpc Ar yes | Ar no
+Answer Transmission's RPC protocol at
+.Pa /transmission/rpc ,
+so that existing Transmission frontends can drive the daemon.
+Default:
+.Sy no .
+.Pp
+Off by default because the sane default is that only
+.Xr clove 1
+talks to
+.Xr cloved 8 :
+this adds a second authentication scheme
+.Pq HTTP Basic against the API token, plus Transmission\(aqs session-id handshake
+and a daemon nobody asked to expose one should not carry it.
+.Pp
+Normally set together with
+.Sy api_listen ,
+since clients need a port.
+The protocol, the methods answered, and the fields that are constants or
+absent are documented in
+.Xr clove-api 7 .
 .El
 .Sh EXAMPLES
 The recommended configuration is no file at all.
@@ -254,6 +306,14 @@ seeding at twice what was downloaded or after a day with nobody asking.
 watch_dir /srv/torrents/inbox
 seed_ratio 2
 seed_idle_minutes 1440
+.Ed
+.Pp
+Drive it from a Transmission frontend on the same machine, or over an
+.Xr ssh 1
+forward from another:
+.Bd -literal -offset indent
+api_listen 127.0.0.1:9091
+transmission_rpc yes
 .Ed
 .Pp
 A throwaway identity for a one-off download:

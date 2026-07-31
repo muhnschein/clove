@@ -120,7 +120,14 @@ commit. Closure sizes are recorded when the dependency is actually added.
 
 ## Currency
 
-Checked against crates.io on 2026-07-25. `yosemite` 0.7.0 is current;
+Checked against crates.io on 2026-07-25. Phase I (the Transmission RPC
+surface, `docs/PHASE-I.md`) added **nothing**: it is served by the HTTP/1.1
+server and the JSON parser already here, and the one parser it needed —
+standard-alphabet base64, since `i2pnet::addr` only speaks I2P's `-`/`~`
+variant — is about forty lines in `clove-core` with its own fuzz target. The
+`rustix` `fs` feature already in the tree covers `statvfs` for `free-space`.
+`Cargo.lock` is byte-identical across that phase.
+ `yosemite` 0.7.0 is current;
 `sha1`/`sha2` were moved 0.10 → 0.11 together; `getrandom` is held at 0.2 on
 purpose (above). Total transitive closure: **48 crates**, the bulk of it
 yosemite's (`rand`, `thiserror`, `nom`, `tracing` and the proc-macro trio).

@@ -1,4 +1,4 @@
-.Dd July 30, 2026
+.Dd July 31, 2026
 .Dt CLOVE-API 7
 .Os
 .Sh NAME
@@ -13,8 +13,18 @@ is its only client today; this page documents the interface so that other
 tools, and a future web interface, can use it directly.
 .Pp
 The API is local-only.
-It is not, and will not be, compatible with the Transmission or qBittorrent
-APIs.
+.Pp
+Two surfaces are served on the same listeners.
+.Pa /v1/
+is clove's own, described first and authoritative.
+.Pa /transmission/rpc
+is a compatibility surface that lets existing Transmission frontends drive
+.Xr cloved 8 ;
+it is off unless
+.Sy transmission_rpc yes
+is configured, and is described under
+.Sx TRANSMISSION RPC .
+The qBittorrent API is not implemented.
 .Ss Conventions
 Every path is versioned under
 .Pa /v1/ .
@@ -260,6 +270,190 @@ The setting is persisted and reported as
 by
 .Sy GET Pa /v1/torrents/ Ns Ar info-hash .
 .El
+.Sh TRANSMISSION RPC
+When
+.Sy transmission_rpc yes
+is set
+.Pq see Xr clove.conf 5 ,
+.Xr cloved 8
+additionally answers Transmission's RPC protocol at
+.Pa /transmission/rpc
+.Pq with or without a trailing slash .
+Point tremc, transgui, Transdroid, Flood, or an
+.Sy *arr
+download client at it and it works.
+.Pp
+Most clients need a TCP port rather than a unix socket, so this is normally
+paired with
+.Sy api_listen .
+That address must be loopback and there is no setting that makes it anything
+else; see
+.Sx Reaching it from another machine .
+.Ss Authentication
+Two gates, in this order.
+.Bl -enum
+.It
+.Sy HTTP Basic .
+The password is the same API token
+.Pa <data_dir>/token
+that
+.Pa /v1/
+uses; the username is ignored.
+There is no second secret to manage.
+A wrong or missing password is
+.Sy 401
+with a
+.Sy WWW-Authenticate
+challenge.
+.It
+.Sy The session id .
+A request without a matching
+.Sy X-Transmission-Session-Id
+header is answered
+.Sy 409
+carrying the correct one, which the client then repeats on every later
+request.
+Every Transmission client performs this handshake automatically.
+.El
+.Pp
+The order matters: an unauthenticated caller is never handed a session id.
+The id is generated once per daemon run and is not persisted.
+.Ss Methods
+Implemented:
+.Sy session-get ,
+.Sy session-stats ,
+.Sy free-space ,
+.Sy torrent-get ,
+.Sy torrent-add ,
+.Sy torrent-remove ,
+.Sy torrent-start ,
+.Sy torrent-start-now ,
+.Sy torrent-stop ,
+.Sy torrent-verify ,
+.Sy torrent-reannounce ,
+.Sy torrent-set ,
+.Sy queue-move-top ,
+.Sy port-test .
+.Pp
+Refused, each with a message saying why rather than a silent success:
+.Bl -tag -width Ds
+.It Sy session-set
+clove reads its settings from
+.Xr clove.conf 5
+and applies them at start; nothing rewrites that file.
+Accepting a change and dropping it would be worse than refusing it.
+.It Sy torrent-set-location , Sy torrent-rename-path
+There is one downloads directory, and the daemon confines itself to it after
+start.
+.It Sy queue-move-up , Sy queue-move-down , Sy queue-move-bottom
+Queue position is the order torrents were added and is not stored, so there
+is nothing to write.
+.Sy queue-move-top
+is honoured: it means "run this one now", the same as
+.Nm clove Cm start .
+.It Sy blocklist-update
+There is no blocklist; a peer is an I2P destination.
+.It Sy session-close
+Stop the daemon with your service manager.
+.El
+.Pp
+.Sy torrent-add
+takes a base64
+.Sy metainfo
+or a
+.Sy magnet:
+link in
+.Sy filename .
+A
+.Sy http:
+or
+.Sy https:
+URL in
+.Sy filename
+is refused: fetching it would be a clearnet request, which clove is built to
+be incapable of making.
+Adding a torrent that is already hosted is not an error \(em it answers
+.Sy torrent-duplicate ,
+so a client that retries is idempotent.
+.Ss Fields that are constants
+These describe what clove is rather than how it is configured, and never
+change:
+.Sy peer-port
+0,
+.Sy port-forwarding-enabled
+false,
+.Sy dht-enabled
+false,
+.Sy lpd-enabled
+false,
+.Sy utp-enabled
+false,
+.Sy blocklist-enabled
+false,
+.Sy pex-enabled
+true
+.Pq clove speaks i2p_pex ,
+.Sy encryption
+.Qq required
+.Pq every I2P stream is encrypted by the network itself ,
+and
+.Sy port-test
+false
+.Pq there is no port to open .
+The speed limits report "unlimited" because clove does not implement rate
+limiting, and
+.Sy labels
+is empty because it has no labels.
+.Ss Fields that are absent
+Requested fields that clove cannot answer are omitted rather than filled in.
+.Bl -tag -width Ds
+.It Sy peers
+The per-peer array.
+The daemon does not put peer destinations on the API, so a client's peer tab
+shows nothing.
+.Sy peersConnected
+is real and is what list views use.
+.It Sy pieces
+The piece bitfield: large, polled often, and needed by nothing.
+.It Sy magnetLink , Sy comment , Sy creator
+Not retained.
+.El
+.Ss Fields that are approximations
+.Bl -tag -width Ds
+.It Sy version
+Reports
+.Qq 4.0.0 (clove <version>) .
+It has to name a Transmission version because clients gate features on it; it
+carries clove's own so that a human reading it is not misled.
+.It Sy leftUntilDone , Sy haveValid
+Piece-granular, not byte-exact, because clove counts verified pieces.
+.It Sy activityDate
+clove records no last-activity time.
+This is the current time while bytes are moving and the add time otherwise.
+.It Sy trackerStats
+clove counts announces per torrent rather than per tracker, so every tracker
+row carries the same counters.
+The scrape fields report "never": clove announces and does not scrape.
+.It Sy peersGettingFromUs , Sy peersSendingToUs
+Always 0.
+clove counts peers, not directions; the true number is
+.Sy peersConnected .
+.El
+.Ss Reaching it from another machine
+.Sy api_listen
+refuses anything but a loopback address, and unlike
+.Sy sam_address
+there is no override.
+Forward the port instead, which puts the authentication and the transport
+encryption in a tool that does both for a living:
+.Bd -literal -offset indent
+$ ssh -N -L 9091:127.0.0.1:9091 user@host
+.Ed
+.Pp
+Then point the client at
+.Pa 127.0.0.1:9091
+on the local machine.
+A VPN interface the operator controls works the same way.
 .Sh EXAMPLES
 Query status with
 .Xr curl 1 :
@@ -310,6 +504,28 @@ A missing token is refused:
 $ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock http://clove/v1/status
 {"error":"missing or invalid API token"}
 .Ed
+.Pp
+Drive the Transmission surface with
+.Xr transmission-remote 1 ,
+given
+.Sy api_listen 127.0.0.1:9091
+and
+.Sy transmission_rpc yes :
+.Bd -literal -offset indent
+$ tok=$(cat ~/.local/share/clove/token)
+$ transmission-remote 127.0.0.1:9091 --auth "clove:$tok" -l
+$ transmission-remote 127.0.0.1:9091 --auth "clove:$tok" -a release.torrent
+.Ed
+.Pp
+The same by hand, showing the 409 handshake every client performs:
+.Bd -literal -offset indent
+$ sid=$(curl -si -u "clove:$tok" -X POST \e
+    http://127.0.0.1:9091/transmission/rpc -d '{}' \e
+    | tr -d '\r' | sed -n 's/^x-transmission-session-id: //p')
+$ curl -s -u "clove:$tok" -H "X-Transmission-Session-Id: $sid" \e
+    -X POST http://127.0.0.1:9091/transmission/rpc \e
+    -d '{"method":"torrent-get","arguments":{"fields":["id","name","status"]}}'
+.Ed
 .Sh SEE ALSO
 .Xr clove 1 ,
 .Xr clove.conf 5 ,
@@ -320,3 +536,10 @@ The API is versioned under
 and will stay compatible within that prefix, but it is young: expect fields
 to be added.
 Clients should ignore unknown fields rather than reject them.
+.Pp
+The Transmission surface is a compatibility layer, not an emulation.
+It restates what clove knows in Transmission's vocabulary; where clove has no
+equivalent it reports a documented constant or omits the field, and it never
+invents a value.
+A client that requires a field listed above as absent will show it as empty
+rather than wrong.

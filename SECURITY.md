@@ -31,7 +31,15 @@ communicate outside I2P, or that ties an I2P identity to a network identity:
   tracker, `.torrent`, magnet, or resume file. Parsers here are hostile-input
   surfaces by assumption.
 - Local API authentication bypass, or disclosure of the API token or the
-  client's destination key to another local user.
+  client's destination key to another local user. This covers both surfaces:
+  `/v1/`, and the Transmission-compatible one at `/transmission/rpc` when
+  `transmission_rpc yes` is configured. The latter authenticates with HTTP
+  Basic against the same token plus Transmission's session-id handshake; a way
+  past either, or a way to obtain the session id without authenticating first,
+  is a report.
+- A non-loopback bind of the local API. `api_listen` accepts loopback
+  addresses only and has no override; a spelling that gets past that check is
+  in scope even though the daemon would still require the token.
 - The destination key, or any part of the SAM `DESTINATION=` blob behind it,
   reaching a tracker, a peer, a log or the control API. Only the public
   destination on the front of that blob may ever leave the process

@@ -116,13 +116,17 @@ mod error_code {
 ///
 /// Deliberately absent, with reasons:
 ///
-/// - **`peers`** — the per-peer array. `crates/cloved/src/registry.rs` carries a
-///   test asserting that a peer's address never reaches the API, and that is a
-///   policy worth more than a populated peer tab. `peersConnected` is real and
-///   is what list views actually render; a GUI's peer tab shows nothing, which
-///   reads as "no data" rather than as plausible-but-wrong data. *Trigger for
-///   revisiting:* an operator who wants their own node's peer table can have one
-///   behind an explicit opt-in, since it is their own view of their own daemon.
+/// - **`peers`** — the per-peer array. `SECURITY.md` puts *"leaking the client's
+///   destination, or a peer's, to somewhere it does not belong — including
+///   logs, error messages, or the local API"* in scope as a vulnerability, and
+///   `registry.rs` carries a test asserting a peer's address never reaches the
+///   API. Filling this array is that leak, on request, by design. It is
+///   omitted: `peersConnected` is real and is what list views actually render,
+///   and a GUI's peer tab shows nothing, which reads as "no data" rather than
+///   as plausible-but-wrong data. *Trigger for revisiting:* an operator wanting
+///   their own node's peer table can have one behind an explicit opt-in — it is
+///   their view of their own daemon — but that needs its own argument, not a
+///   corner of this.
 /// - **`pieces`** — the base64 bitfield. Large, polled often, and no client
 ///   needs it to function.
 /// - **`webseeds`**, **`magnetLink`**, **`comment`**, **`creator`** — clove

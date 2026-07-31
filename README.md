@@ -7,7 +7,9 @@ speaking SAMv3 to an external I2P router.
 
 **Pre-alpha.** Feature-complete against its v1 scope — daemon, CLI,
 engine, tracker, PEX, magnets, persistence — and it downloads from and seeds to
-live swarms on i2pd and Java I2P. Phase H added what running *many* torrents
+live swarms on i2pd and Java I2P. It runs many torrents under one budget and a
+queue, and it answers Transmission's RPC, so tremc, transgui, Transdroid and
+the \*arr download clients drive it without a web UI existing. Phase H added what running *many* torrents
 needs: a client-wide peer budget, a download/seed queue, seeding limits,
 torrents named by hash prefix, and `clove top`.
 
@@ -18,6 +20,7 @@ torrents named by hash prefix, and `clove top`.
 - [`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) — running against real routers, and the interop matrix
 - [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt) — the I2P-BitTorrent dialect, and every live finding
 - [`docs/PHASE-F.md`](docs/PHASE-F.md) — daemon/CLI/API design, and the TUI decision
+- [`docs/PHASE-I.md`](docs/PHASE-I.md) — the Transmission RPC surface, and what it refuses to invent
 - [`docs/PHASE-H.md`](docs/PHASE-H.md) — the multi-torrent budget, the queue, seeding limits, and `clove top`
 - [`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md) — the data directory and the resume file
 - [`DEPENDENCIES.md`](DEPENDENCIES.md) — the dependency allowlist

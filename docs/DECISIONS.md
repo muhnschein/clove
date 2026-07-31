@@ -206,3 +206,80 @@ stays live for whatever the view grows into next.* And if
 `clove top` lands and nobody uses it over `clove watch`, §9 of `SCOPE.md`
 applies in its usual direction — *removals are announced proudly* — and it
 goes.
+
+## S3 — The Transmission RPC shim, built (2026-07-31)
+
+`SCOPE.md` §3 put a compatibility shim in v2: *"Explicitly not compatible with
+the Transmission/qBittorrent APIs in v1 (compat shim is a v2 candidate — worth
+it for \*arr-style tooling, not worth the constraint now)."* `PHASE-H.md` §11
+repeated the deferral unchanged. It is now built, for Transmission only, and
+`docs/PHASE-I.md` is the design.
+
+**The evidence.** The deferral rested on a cost estimate — "the constraint" —
+made before Phase F existed. What Phase F and H actually built removed most of
+that cost:
+
+- a hand-rolled HTTP/1.1 **server** (Q6), which did not exist when §3 was
+  written;
+- a hostile-input-hardened JSON **parser** as well as an encoder, added in
+  Phase F §7 3 for the CLI and reusable here;
+- rates, queue states, add ordering, seed limits and a global peer budget
+  (`PHASE-H.md` H1–H5) — which are, between them, most of the fields
+  `torrent-get` and `session-get` are asked for. Without H5's rates the shim
+  would have had to lie about speed or omit it.
+
+So the shim is one file over parts already paid for. `Cargo.lock` is unchanged
+by it, which was the constraint §9 actually cares about.
+
+**What it buys, weighed against the alternative.** `SCOPE.md` §2 defers a web
+UI indefinitely, and §9's budget is why. Transmission's RPC is a protocol
+rather than a library: implementing it costs a file, and it buys every frontend
+that already speaks it — tremc, transgui, Transdroid, Flood, Torrent Control,
+and the \*arr download-client interface — none of which clove has to build,
+ship, or keep working. There is no other item in the backlog with that ratio.
+
+**Why this does not weaken §5.** The surface is a presentation layer that emits
+strings and constants and never constructs a type, so `clippy.toml`'s
+`disallowed_types` and `ci/check-net-deps.sh` both pass **unchanged**. That they
+needed no edit is the test of it: an implementation that required relaxing
+either would have meant IP vocabulary reaching the engine, and would have been
+the wrong implementation. The one new capability — a loopback TCP listener,
+since no Transmission client can speak to a unix socket — uses the
+loopback-validating helper `i2pnet` has had since Phase F, and gets **no**
+override for a wider bind. `i_know_sam_is_remote` exists because a remote SAM
+bridge is a real deployment; a remote API bind is not, and §5's answer to
+reaching the daemon from elsewhere is a forwarded port.
+
+**Conditions this was accepted on.**
+
+- **Off by default** (`transmission_rpc no`), so a daemon nobody asked to
+  expose one does not carry a second authentication scheme.
+- **No engine change.** It reads the JSON `/v1/` already emits and calls the
+  registry operations `/v1/` already calls. The two additions it did make to
+  the registry — `piece_length` in the detail object, and one listing pass that
+  renders every torrent in full — serve `clove show` and `clove top` equally.
+- **No field invented that a client would act on.** Where clove has no answer
+  the field is a documented constant that is true of every I2P torrent, or it
+  is absent. `peers` is absent because `registry.rs` already asserts a peer's
+  address never reaches the API, and that policy outranks a populated peer tab.
+- **The one property traded is written down**, not discovered later:
+  `PHASE-F.md` §2's "the daemon never parses JSON" stops being true whenever
+  this is enabled. It parses with the already-fuzzed parser, under the existing
+  body cap.
+- **A real client in CI.** `ci/transmission.sh` installs and drives
+  `transmission-remote` rather than trusting curl. This was not a formality:
+  it found two defects in the first minute — a route that missed the trailing
+  slash every client sends, and a tracker section that rendered as nothing —
+  and every unit test was green through both (`PHASE-I.md` §7).
+
+**Reversal condition.** Two. If the surface starts pulling engine changes
+toward Transmission's model rather than restating clove's — a stored queue
+position, a peer table the daemon would not otherwise keep, per-file byte
+accounting — then the "presentation layer" premise has failed and it is
+re-costed as a feature rather than a file. And if `SCOPE.md` §9's usual
+direction applies — nobody drives clove this way — it goes, proudly, in one
+commit, because that is what one file with one job and no engine state is for.
+
+qBittorrent's API is **not** covered by this and stays a v2 candidate on §3's
+original terms. *Trigger:* a frontend somebody actually wants that speaks only
+qBittorrent; most speak both.

@@ -90,6 +90,18 @@ They are never contacted, and never logged beyond a count.
 .Pp
 The API token is required on every request, including over the unix socket.
 Keep the data directory readable only by the daemon's user.
+.Pp
+Both optional ways in stay loopback-only.
+.Sy api_listen
+refuses any non-loopback address, at startup and under
+.Fl C ,
+with no override; and the Transmission surface
+.Pq Sy transmission_rpc
+is served on the same listeners under the same rule.
+Reach either from another machine with an
+.Xr ssh 1
+port forward rather than by widening the bind \(em see
+.Xr clove-api 7 .
 .Ss Self-restriction
 Once initialisation is finished \(em configuration read, data directory
 created, token loaded, torrents loaded, control socket bound \(em

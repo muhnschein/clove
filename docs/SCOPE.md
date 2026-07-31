@@ -71,7 +71,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 
 ### HTTP API
 - Local-only (unix socket default). Token auth even on localhost TCP.
-- REST-ish JSON; versioned under `/v1/`. Explicitly not compatible with the Transmission/qBittorrent APIs in v1 (compat shim is a v2 candidate — worth it for *arr-style tooling, not worth the constraint now).
+- REST-ish JSON; versioned under `/v1/`. **Amended by `DECISIONS.md` S3:** the Transmission compatibility shim was a v2 candidate here — "worth it for *arr-style tooling, not worth the constraint now" — and is built, because Phase F and H had by then paid for the HTTP server, the JSON parser and the rates it needs, leaving one file and no new dependency. Off by default; `docs/PHASE-I.md` is the design. qBittorrent's API stays a v2 candidate on the original terms.
 
 ## 4. Architecture
 
