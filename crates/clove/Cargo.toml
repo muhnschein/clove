@@ -7,9 +7,31 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# A library as well as a binary, so the escape-sequence decoder in `term` can
+# carry a fuzz target like every other parser here (`fuzz/README.md`). The
+# binary is still where everything else lives.
+[lib]
+name = "clove"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clove"
+path = "src/main.rs"
+
 [dependencies]
 clove-core = { path = "../clove-core" }
 i2pnet = { path = "../i2pnet" }
+# Raw mode and the window size, and nothing else: `tcgetattr`/`tcsetattr` and
+# `tcgetwinsize` are the only two things a full-screen view needs that are not
+# an escape sequence, and `unsafe_code = "forbid"` rules out reaching for them
+# directly. Every crate this resolves to is already in the tree at the same
+# version (`DEPENDENCIES.md`), so the closure does not grow — and `net` stays
+# off, as `ci/check-net-deps.sh` enforces.
+rustix = { version = "1", default-features = false, features = [
+    "std",
+    "stdio",
+    "termios",
+] }
 
 [lints]
 workspace = true

@@ -158,6 +158,19 @@ fn run() -> Result<(), String> {
     if let Some(parent) = config.api_socket.parent() {
         read_write.push(parent);
     }
+    // The watch directory, if there is one, is the one path an operator names
+    // that is deliberately *outside* the data directory — and the daemon both
+    // reads it and renames within it. Granted here, before the domain closes,
+    // which is the whole discipline this layer runs on: what is not unveiled
+    // before the restriction cannot be reached after it.
+    //
+    // Getting this wrong is silent in the worst way. Landlock is best-effort,
+    // so on a kernel without it the watcher works and on a kernel with it the
+    // directory simply reads as empty — nothing added, nothing logged, no
+    // error anywhere. CI found it; a local run had not.
+    if let Some(dir) = &config.watch_dir {
+        read_write.push(dir);
+    }
     eprintln!(
         "cloved: {}",
         sandbox::enter_post_init(&sandbox::Limits {

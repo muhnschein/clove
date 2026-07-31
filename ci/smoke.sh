@@ -366,6 +366,10 @@ until timeout 5 "$clove" -c "$work/watch.conf" status >/dev/null 2>&1; do
     [ "$i" -gt 200 ] && fail "watch daemon never answered (log: $(cat "$work/daemon-watch.log"))"
     sleep 0.05
 done
+# The watch directory is outside the data directory on purpose: this is the
+# case Landlock silently breaks if the path is not granted before the daemon
+# restricts itself, and where a kernel with Landlock and one without would
+# otherwise disagree with no error either way.
 cp "$work/demo.torrent" "$wdir/dropped.torrent"
 printf 'not a torrent at all' >"$wdir/junk.torrent"
 i=0
