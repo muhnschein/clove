@@ -146,6 +146,9 @@ fn resume_bytes() -> Vec<u8> {
         trackers: vec![vec!["http://tracker.i2p/announce".to_owned()]],
         paused: false,
         sequential: false,
+        added: 1_800_000_000,
+        pause_reason: 0,
+        seed_ratio_milli: 0,
     }
     .encode()
 }

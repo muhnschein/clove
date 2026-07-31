@@ -1,4 +1,4 @@
-.Dd July 25, 2026
+.Dd July 30, 2026
 .Dt CLOVE 1
 .Os
 .Sh NAME
@@ -29,6 +29,52 @@ which the daemon creates mode 0600 on first start; running
 .Nm
 therefore requires the same user as the daemon, or read access to that file.
 .Pp
+A command names a torrent by its info-hash, by any prefix of that hash long
+enough to be unique among the hosted torrents — four characters at the least —
+or by its position in
+.Cm list ,
+the number in the
+.Sy #
+column.
+A position is one to three digits, which is why it can never be mistaken for a
+hash prefix: the shortest prefix is four characters.
+A position means whatever the listing says at that moment and is resolved
+against a listing fetched for the command, so it is a convenience for typing,
+never something to store in a script.
+A prefix that matches more than one torrent is an error listing the ones it
+matched; it is never resolved by choosing.
+A full 40-character hash is matched exactly and is never treated as a prefix,
+so a script that names torrents in full is unaffected by what else gets added.
+.Pp
+The commands marked
+.Ar torrent ...
+take any number of torrents, or
+.Fl -all
+for every hosted one.
+Each is acted on separately, and one failure does not abandon the rest: the
+failures are reported per torrent and the command exits 1 if any of them
+failed.
+The exception is a daemon that cannot be reached, which stops the command
+where it stands.
+.Pp
+Text that came out of a torrent
+.Pq its name, its file paths, its tracker URLs
+is chosen by whoever made that torrent, so
+.Nm
+does not print it to a terminal unaltered: control characters and the
+bidirectional overrides are replaced with
+.Ql \&. ,
+and a name too long for its column is elided with
+.Ql … .
+Without this a torrent could name itself in escape sequences and repaint the
+screen of anyone who ran
+.Cm list .
+.Fl -json
+is unaffected and always carries the torrent's true name — the daemon's JSON
+escapes control characters as
+.Ql \eu00XX
+rather than removing them.
+.Pp
 The options are as follows:
 .Bl -tag -width Ds
 .It Fl -socket Ar path
@@ -48,9 +94,21 @@ Print a command summary and exit.
 Daemon and router state: version, uptime, SAM address, torrent count, and
 the router connection state
 .Pq Sy connecting , Sy waiting-for-router , Sy connected .
+It also carries the client-wide transfer rates, the number of peers attached
+across every torrent, and the
+.Ic peer_limit
+those peers come from.
 .It Cm list Op Fl -json
-One line per torrent: progress, state, size, name, and the leading bytes of
-the info-hash.
+One line per torrent: its position, progress, state, size, current down and up
+rates, name, and the leading characters of the info-hash.
+.Pp
+Torrents are listed in the order they were added, which does not change as
+others are added or removed — so a row does not move out from under you while
+you are reading it.
+A rate of
+.Ql -
+means nothing is moving, printed that way rather than as a zero so the torrents
+that are doing something stand out.
 .It Cm watch Op Fl -interval Ar seconds
 Repaint
 .Cm status
@@ -64,9 +122,76 @@ This is a plain redraw loop, not a full-screen program: the terminal is
 never put into raw mode, so
 .Ic Ctrl-C
 leaves it exactly as it was.
-.It Cm show Ar info-hash Op Fl -json
-One torrent in detail: sizes, progress, state, peer counts, bytes moved, the
-file table with per-file priorities, and the announce URLs.
+.It Cm top
+A full-screen view with a selection cursor and keys.
+.Pp
+.Bl -tag -width "p" -compact -offset indent
+.It Ic ↑ Ns / Ns Ic k , Ic ↓ Ns / Ns Ic j
+move the cursor
+.It Ic PgUp Ns / Ns Ic PgDn , Ic g , Ic G
+move by a screen, to the top, to the bottom
+.It Ic ⏎
+show the selected torrent in detail, and again to go back
+.It Ic p
+pause a running torrent, resume a stopped one
+.It Ic s
+start it, ahead of the queue
+.It Ic v
+verify its data
+.It Ic a
+announce to its trackers
+.It Ic d , Ic D
+remove it, or remove it and its data; both ask first, and only
+.Ic y
+confirms
+.It Ic r
+refresh now
+.It Ic q Ns / Ns Ic Ctrl-C
+quit
+.El
+.Pp
+Every key sends the same request the equivalent command does.
+.Nm top
+adds no interface of its own to
+.Xr cloved 8 ,
+holds no state, and can be interrupted at any point.
+.Pp
+Unlike
+.Cm watch ,
+this puts the terminal into raw mode and uses the alternate screen, both of
+which it restores on exit and on a panic.
+It does not restore them if the process is killed outright — a handler for
+.Dv SIGTERM
+would need either unsafe code or another dependency, and clove takes neither —
+so a
+.Xr kill 1 Ns ed
+.Nm top
+leaves a terminal wanting
+.Ic stty sane .
+.Ic Ctrl-C
+is not affected: in raw mode it arrives as an ordinary byte and quits cleanly.
+.Pp
+Columns are padded by character count rather than display width, so a name
+written in characters that occupy two columns each
+.Pq CJK, some emoji
+will not line up exactly.
+.Cm list
+has always done the same.
+Use
+.Cm watch
+over a pipe, in a terminal that cannot do better, or when nothing should be
+left to restore;
+.Nm top
+refuses to start when its input is not a terminal.
+.It Cm show Ar torrent Op Fl -json
+One torrent in detail: sizes, progress, state, peer counts, bytes moved, its
+share ratio and the limit it is held to, the file table with per-file
+priorities, and the announce URLs.
+.Pp
+.Sy paused_because
+appears whenever the torrent is stopped, and says whether that was the
+operator, its seed ratio or the idle limit — so a torrent that stopped on its
+own is never just "paused".
 .Pp
 The peer counts answer different questions.
 .Sy peers
@@ -91,39 +216,76 @@ answer the first question a torrent with no peers raises: whether its trackers
 are replying at all.
 .Sy last_announce_error
 appears only when an announce has failed, and carries the tracker's own words.
-.It Cm add Ar file | Ar magnet
+.It Cm stats Op Fl -json
+What the whole client is doing: how many torrents there are and in which
+states, the current rates, peers against the
+.Ic peer_limit
+they come from, lifetime bytes moved, and how long the daemon has been up.
+.Pp
+.Cm status
+answers whether the daemon and its router are alright;
+this answers what your client is doing.
+They are read at different moments.
+.It Cm add Ar file | Ar magnet Op Fl -paused Op Fl -sequential
 Add a torrent from a
 .Pa .torrent
 file or a
 .Ar magnet:\&
 URI.
+.Pp
+.Fl -paused
+adds it stopped, and
+.Fl -sequential
+picks pieces in file order from the outset — both settings a torrent would
+otherwise need a second command to change, after it had already started doing
+the other thing.
 A magnet is stored immediately and listed as
 .Sy fetching-metadata
 while the daemon fetches its info dictionary from peers; it becomes an
 ordinary torrent once that succeeds.
-.It Cm remove Ar info-hash Op Fl -data
-Remove a torrent.
+.It Cm remove Ar torrent ... | Fl -all Op Fl -data
+Remove torrents.
 With
 .Fl -data
-its downloaded files are deleted as well.
-.It Cm pause Ar info-hash
-Stop peer acquisition and disconnect this torrent's peers.
+their downloaded files are deleted as well.
+.Pp
+.Fl -all Fl -data
+deletes the data of every hosted torrent and cannot be undone.
+Both flags are required to spell it, which is the only guard there is: a
+control program that stopped to ask would be one that cannot be scripted.
+.It Cm pause Ar torrent ... | Fl -all
+Stop peer acquisition and disconnect these torrents' peers.
 The paused state persists across daemon restarts.
-.It Cm resume Ar info-hash
-Bring a paused torrent back online.
-.It Cm verify Ar info-hash
-Re-read the torrent's data from disk and re-check every piece against the
+.It Cm resume Ar torrent ... | Fl -all
+Bring paused torrents back online.
+A torrent returns to its own place in the queue, which is the order torrents
+were added; if the active limit is already met it waits there as
+.Sy queued .
+.It Cm start Ar torrent ... | Fl -all
+Resume a torrent and put it at the head of the queue, ahead of everything
+waiting.
+.Pp
+For when the queue order is not the order you want right now.
+Only one torrent is at the head at a time — a second
+.Cm start
+means that one instead, not both — and the position is not remembered across a
+restart of
+.Xr cloved 8 ,
+because forcing is a statement about the moment rather than a property of the
+torrent.
+.It Cm verify Ar torrent ... | Fl -all
+Re-read each torrent's data from disk and re-check every piece against the
 metainfo hashes.
-The torrent must be paused first, since a running one is writing to the same
+A torrent must be paused first, since a running one is writing to the same
 files.
-.It Cm peer Ar info-hash Ar b32-address
+.It Cm peer Ar torrent Ar b32-address
 Hand a running torrent a peer to dial, as a
 .Ar 52-character
 b32 address with or without the
 .Pa .b32.i2p
 suffix.
 Useful for private swarms and for lab testing between two known instances.
-.It Cm priorities Ar info-hash Ar spec
+.It Cm priorities Ar torrent Ar spec
 Set per-file priorities from a comma-separated list, one value per file in
 the torrent's own order:
 .Sy 0
@@ -140,13 +302,13 @@ receives whatever shares a piece with a neighbour it is keeping: at most
 one piece at each end of it.
 A torrent counts as finished, and starts seeding, once every file it was
 told to fetch is present; the skipped ones are not waited for.
-.It Cm announce Ar info-hash
-Announce to every one of the torrent's trackers immediately, ignoring the
+.It Cm announce Ar torrent ... | Fl -all
+Announce to every one of each torrent's trackers immediately, ignoring the
 intervals they last asked for.
 For an operator who suspects a stale peer set; it is not something to put in
 a loop, and the daemon refuses a second forced announce within a minute.
 The torrent must be running and have at least one I2P tracker.
-.It Cm sequential Ar info-hash Cm on | Cm off
+.It Cm sequential Ar torrent Cm on | Cm off
 Pick pieces in file order rather than rarest-first.
 Useful for media you want to start watching before the download finishes; it
 is worse for the swarm and slightly worse for you, because the rare pieces
@@ -154,6 +316,18 @@ you would otherwise have fetched early may leave before you ask for them.
 The change takes effect immediately and survives a restart.
 Blocks already requested are left alone, so the switch costs nothing already
 in flight.
+.It Cm seed-ratio Ar torrent Ar ratio
+Stop seeding this torrent once it has uploaded
+.Ar ratio
+times what it downloaded, overriding
+.Ic seed_ratio
+in
+.Xr clove.conf 5 .
+.Ar 0
+follows the configured value again.
+.Pp
+Raising it on a torrent that has already stopped for its ratio starts it back
+up, so the effect of the change is visible rather than waiting for a restart.
 .It Cm completions Ar bash | Ar zsh | Ar fish
 Print a shell completion script on standard output.
 .El
@@ -183,37 +357,62 @@ Add a torrent and watch it:
 .Bd -literal -offset indent
 $ clove add ~/Downloads/release.torrent
 added 58e2fc46a8dc57c78191f079648750b0644d03a2
+$ clove top
+.Ed
+.Pp
+The same thing without raw mode, for a pipe or a terminal that cannot do
+better:
+.Bd -literal -offset indent
 $ clove watch
 .Ed
 .Pp
 List torrents, then look at one in detail:
 .Bd -literal -offset indent
 $ clove list
-PROGRESS  STATE        SIZE     NAME          INFO-HASH
- 42%      downloading  1.4 GiB  release.iso   58e2fc46a8dc
-$ clove show 58e2fc46a8dc57c78191f079648750b0644d03a2
+#  PROGRESS  STATE        SIZE     DOWN        UP    NAME         INFO-HASH
+1   42%      downloading  1.4 GiB  82.1 KiB/s  -     release.iso  58e2fc46a8dc
+2  100%      seeding      700 MiB  -           9 B/s notes.tar    9b1c04e7f215
+$ clove show 58e2
+$ clove show 1
+.Ed
+.Pp
+The listing prints the leading characters of each info-hash because that is
+all a command needs.
+Should a prefix be ambiguous, the daemon says which torrents it hit rather
+than picking one:
+.Bd -literal -offset indent
+$ clove pause 58
+clove: that prefix matches 2 torrents; use more characters
 .Ed
 .Pp
 Download only the second of three files:
 .Bd -literal -offset indent
-$ clove priorities 58e2fc46a8dc57c78191f079648750b0644d03a2 0,1,0
+$ clove priorities 58e2 0,1,0
 .Ed
 .Pp
 Start watching a film before it has finished downloading, then ask the
 trackers for more peers:
 .Bd -literal -offset indent
-$ clove sequential 58e2fc46a8dc57c78191f079648750b0644d03a2 on
-58e2fc46a8dc57c78191f079648750b0644d03a2 now picks pieces in order
-$ clove announce 58e2fc46a8dc57c78191f079648750b0644d03a2
-announcing 58e2fc46a8dc57c78191f079648750b0644d03a2
+$ clove sequential 58e2 on
+58e2 now picks pieces in order
+$ clove announce 58e2
+announcing 58e2
+.Ed
+.Pp
+Act on several torrents at once, or on all of them:
+.Bd -literal -offset indent
+$ clove pause 58e2 9b1c
+paused 58e2
+paused 9b1c
+$ clove resume --all
 .Ed
 .Pp
 Re-check a torrent's data on disk:
 .Bd -literal -offset indent
-$ clove pause 58e2fc46a8dc57c78191f079648750b0644d03a2
-$ clove verify 58e2fc46a8dc57c78191f079648750b0644d03a2
-verified 5721 piece(s) for 58e2fc46a8dc57c78191f079648750b0644d03a2
-$ clove resume 58e2fc46a8dc57c78191f079648750b0644d03a2
+$ clove pause 58e2
+$ clove verify 58e2
+verified 5721 piece(s) for 58e2
+$ clove resume 58e2
 .Ed
 .Pp
 Connect two instances directly, without a tracker.

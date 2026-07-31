@@ -3,7 +3,7 @@
 clove's on-disk state is an **API**, not an implementation detail (the SQLite
 doctrine, `SCOPE.md` §3). This file specifies it. The rules:
 
-- Every resume file carries an integer `version` (currently **3**).
+- Every resume file carries an integer `version` (currently **5**).
 - **Newer clove reads older state.** Older clove **refuses newer state
   cleanly** — a clear error, no write, no corruption (worst case: you downgrade
   and re-add the torrent).
@@ -59,9 +59,20 @@ key means version discipline failed somewhere:
 | `trackers` | list of list of byte-strings | Announce tiers (BEP 12) in current order. |
 | `paused` | int (optional, v2+) | `1` if paused. Absent (a v1 file) reads as `0`. |
 | `sequential` | int (optional, v3+) | `1` to pick pieces in file order instead of rarest-first. Absent (a v1 or v2 file) reads as `0`. |
+| `pause_reason` | int (optional, v5+) | Why the torrent is paused, when it is: `0` the operator, `1` its seed ratio, `2` the seed idle limit. Meaningless unless `paused` is set. An unknown code reads as `0` — a paused torrent is paused whatever the label says, and refusing to load one over a label would be the wrong trade. |
+| `seed_ratio_milli` | int (optional, v5+) | This torrent's own seeding ratio in **thousandths** (`1500` is 1.5), or `0` to follow the daemon's `seed_ratio`. Thousandths because bencode has integers and no floats, and a ratio round-tripped through a float can persist as 1.499 where the operator wrote 1.5. |
+| `added` | int (optional, v4+) | When the torrent was added, in **milliseconds** since the Unix epoch. The order `clove list` is in. Absent (v1–v3) reads as `0`, sorting before anything added since — which is true of it. A negative value clamps to `0`: a clock that ran backwards costs an ordering, not a start. |
 
 Version history: **v1** initial; **v2** added the optional `paused` flag; **v3**
-added the optional `sequential` flag.
+added the optional `sequential` flag; **v4** added the optional `added`
+timestamp; **v5** added the optional `pause_reason` and `seed_ratio_milli`.
+
+`added` is milliseconds rather than seconds on purpose. Ordering is the only
+thing it is for, and at one-second resolution every torrent of a bulk add — a
+scripted loop, or a watch directory picking up a batch — shares a timestamp,
+falls through to the info-hash tie-break, and comes out in hash order: exactly
+the shuffle the field exists to remove. Ties still break on info-hash, so the
+order is total whatever the clock does.
 
 `have` and `verified` are stored separately on purpose: a crash between writing
 a piece and verifying it costs a re-verification, never false trust.

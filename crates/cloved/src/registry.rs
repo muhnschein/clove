@@ -24,9 +24,11 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clove_core::bitfield::Bitfield;
+use clove_core::budget::PeerBudget;
+use clove_core::config;
 use clove_core::json::Value;
 use clove_core::magnet::{self, Magnet};
 use clove_core::metainfo::{self, MetaInfo};
@@ -41,6 +43,61 @@ use clove_core::tracker::MIN_ANNOUNCE_INTERVAL;
 use i2pnet::naming::NamingCache;
 use i2pnet::{DestHash, I2pDialer, I2pNamingLookup};
 
+/// The `clove.conf` tunables the registry acts on.
+///
+/// One struct rather than a growing argument list: the registry is where the
+/// operator's ceilings meet the engine, and every one of them arrives the same
+/// way. [`Default`] is the empty-config configuration — what a fresh install
+/// runs with, and what tests want.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Limits {
+    /// Lay files out at full length on creation rather than letting them go
+    /// sparse (`preallocate` in clove.conf(5)).
+    pub(crate) preallocate: bool,
+    /// Ceiling on peer connections across every hosted torrent at once.
+    ///
+    /// The per-torrent ceiling is not here: it reaches the engine through
+    /// [`SwarmConfig::max_peers`] and the demux, which is where it was
+    /// already, and one value with two homes is how they drift apart.
+    pub(crate) peer_limit: usize,
+    /// How many incomplete torrents may run at once.
+    pub(crate) max_active_downloads: usize,
+    /// How many complete torrents may seed at once.
+    pub(crate) max_active_seeds: usize,
+    /// Stop seeding at this ratio, in thousandths; `0` seeds without limit.
+    pub(crate) seed_ratio_milli: u64,
+    /// Stop seeding after this long with no peer; `0` never stops.
+    pub(crate) seed_idle_minutes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            preallocate: false,
+            peer_limit: config::DEFAULT_PEER_LIMIT,
+            max_active_downloads: config::DEFAULT_MAX_ACTIVE_DOWNLOADS,
+            max_active_seeds: config::DEFAULT_MAX_ACTIVE_SEEDS,
+            // Seeding without limit: stopping is a deviation an operator opts
+            // into, not something a fresh install does behind their back.
+            seed_ratio_milli: 0,
+            seed_idle_minutes: 0,
+        }
+    }
+}
+
+impl From<&config::Config> for Limits {
+    fn from(config: &config::Config) -> Self {
+        Limits {
+            preallocate: config.preallocate,
+            peer_limit: config.peer_limit,
+            max_active_downloads: config.max_active_downloads,
+            max_active_seeds: config.max_active_seeds,
+            seed_ratio_milli: config.seed_ratio_milli,
+            seed_idle_minutes: config.seed_idle_minutes,
+        }
+    }
+}
+
 /// The set of hosted torrents plus where their state lives.
 pub(crate) struct Registry<D: I2pDialer + I2pNamingLookup + Clone + Send + Sync + 'static>
 where
@@ -48,9 +105,15 @@ where
 {
     state_dir: PathBuf,
     downloads_dir: PathBuf,
-    /// Lay files out at full length on creation rather than letting them go
-    /// sparse (`preallocate` in clove.conf(5)).
-    preallocate: bool,
+    limits: Limits,
+    /// The client-wide connection ceiling every hosted torrent draws on
+    /// (`docs/PHASE-H.md` §3).
+    ///
+    /// Owned by the registry rather than by the attached network, because it
+    /// outlives any one session: a router restart tears every peer down and
+    /// returns their slots, and the ceiling itself is the operator's
+    /// configuration, not the session's.
+    budget: Arc<PeerBudget>,
     torrents: BTreeMap<[u8; 20], Hosted>,
     /// Magnet adds still fetching their metadata (BEP 9). Promoted into
     /// `torrents` by [`complete_magnet`](Registry::complete_magnet).
@@ -144,6 +207,90 @@ impl ScanJob {
     }
 }
 
+/// Whether a hosted torrent should be running, and if not, why not.
+///
+/// An enum rather than the `paused`/`queued` pair it replaces, per `SCOPE.md`
+/// §9: three mutually exclusive answers stored as two booleans has a fourth
+/// combination that means nothing, and the compiler cannot stop anyone writing
+/// it. The transitions are:
+///
+/// | From | To | On |
+/// |---|---|---|
+/// | `Running` | `Paused` | `clove pause` |
+/// | `Running` | `Queued` | a rebalance finding no free slot |
+/// | `Queued` | `Running` | a rebalance finding one |
+/// | `Queued` | `Paused` | `clove pause` |
+/// | `Paused` | `Running` | `clove resume`/`start`, if a slot is free |
+/// | `Paused` | `Queued` | `clove resume`, if none is |
+///
+/// Only `Paused` is persisted (resume `paused`); the other two are recomputed
+/// from scratch by every [`rebalance`](Registry::rebalance), because which
+/// torrents are queued is a function of the limits and the add order and
+/// nothing else.
+///
+/// Orthogonal to all of it is [`Hosted::scanning`]: a hash pass can be running
+/// over a paused torrent, which is exactly what `clove verify` does, so that
+/// stays a separate flag rather than a fourth variant here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wanted {
+    /// Should run, and does when the session is up.
+    Running,
+    /// Wanted and startable, but past the active limit (`docs/PHASE-H.md` §4).
+    Queued,
+    /// Stopped, and why. Survives restarts; nothing but the operator takes a
+    /// torrent out of this state, whichever reason put it there.
+    Paused(Why),
+}
+
+/// Why a torrent is stopped.
+///
+/// Carried by [`Wanted::Paused`] rather than kept alongside it, so a stopped
+/// torrent cannot exist without an answer to the question its operator will
+/// ask. A torrent that stops for a reason nobody can read is a bug report
+/// about a torrent that "stopped working".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    /// `clove pause`, or a torrent loaded from a resume file that predates
+    /// this distinction.
+    Operator,
+    /// It reached its seed ratio (`seed_ratio`, `docs/PHASE-H.md` §5).
+    SeedRatio,
+    /// It seeded with no peer for `seed_idle_minutes`.
+    SeedIdle,
+}
+
+impl Why {
+    /// The wire/on-disk tag. Explicit rather than derived from the variant
+    /// order, because these numbers are in a file format.
+    fn code(self) -> i64 {
+        match self {
+            Why::Operator => 0,
+            Why::SeedRatio => 1,
+            Why::SeedIdle => 2,
+        }
+    }
+
+    /// Read a tag back. An unknown code reads as [`Why::Operator`]: a paused
+    /// torrent is paused whatever the reason field says, and refusing to load
+    /// one over a label would be the wrong trade entirely.
+    fn from_code(code: i64) -> Why {
+        match code {
+            1 => Why::SeedRatio,
+            2 => Why::SeedIdle,
+            _ => Why::Operator,
+        }
+    }
+
+    /// What `clove show` says about it.
+    fn describe(self) -> &'static str {
+        match self {
+            Why::Operator => "paused by the operator",
+            Why::SeedRatio => "stopped: seed ratio reached",
+            Why::SeedIdle => "stopped: no peers for the idle limit",
+        }
+    }
+}
+
 /// One hosted torrent's in-memory summary.
 struct Hosted {
     meta: MetaInfo,
@@ -179,9 +326,40 @@ struct Hosted {
     announces_ok: u32,
     announces_failed: u32,
     last_announce_error: Option<String>,
-    paused: bool,
+    /// Whether this torrent should be running, and if not, why not.
+    wanted: Wanted,
     /// Pick pieces in order rather than rarest-first (SCOPE §3).
     sequential: bool,
+    /// When this torrent was added (Unix seconds), which is the order the
+    /// listing is in. Persisted since resume v4; 0 for anything added before
+    /// that, which sorts it first.
+    added: u64,
+    /// Up and down rates in bytes per second, smoothed over the refresh tick.
+    ///
+    /// The listing had lifetime totals and nothing else, so it could not
+    /// answer the first question anybody asks a torrent client — is anything
+    /// moving *now*. Computed here rather than differenced by each client, so
+    /// there is one implementation and `--json` consumers get it too.
+    up_rate: f64,
+    down_rate: f64,
+    /// The counters and the moment [`Registry::refresh`] last read them, which
+    /// is what the rates above are a difference of.
+    rate_mark: Option<(Instant, u64, u64)>,
+    /// This torrent's own seed ratio in thousandths, or `0` to follow the
+    /// daemon's. Persisted (resume v5).
+    seed_ratio_milli: u64,
+    /// Since when this torrent has been seeding with nobody attached, for the
+    /// idle limit. `None` while it has a peer, or is not seeding at all.
+    ///
+    /// In memory only: a restart starts the clock again, which is the
+    /// forgiving direction — it costs a torrent nothing but time.
+    idle_since: Option<Instant>,
+    /// Jump the queue at the next rebalance (`clove start`).
+    ///
+    /// Deliberately not persisted: forcing is a statement about right now, and
+    /// a flag that survived a restart would keep overriding a queue order the
+    /// operator had forgotten setting.
+    forced: bool,
     /// A hash of everything on disk is running for this torrent, outside the
     /// registry lock. Nothing may start its engine or publish a have-set until
     /// that finishes.
@@ -206,6 +384,44 @@ struct Live {
 }
 
 impl Hosted {
+    /// Fold this refresh's byte counts into the smoothed rates.
+    ///
+    /// Uses the wall-clock gap since the last call rather than assuming the
+    /// refresh interval: refreshes also happen on demand — every `list` and
+    /// `show` triggers one — so the gap is whatever it is, and dividing by a
+    /// nominal tick would report a rate several times too high the moment
+    /// anybody polled.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a byte delta over one refresh tick is nowhere near 2^53, and \
+                  the result is a displayed rate"
+    )]
+    fn update_rates(&mut self) {
+        let now = Instant::now();
+        let Some((then, up_then, down_then)) = self.rate_mark else {
+            // First reading: a baseline to measure the next one against, and
+            // no rate yet. Guessing one from lifetime totals would report a
+            // week's average as the current speed.
+            self.rate_mark = Some((now, self.uploaded, self.downloaded));
+            return;
+        };
+        let elapsed = now.duration_since(then).as_secs_f64();
+        // Two refreshes in the same instant divide by ~zero; keep the previous
+        // estimate rather than inventing an enormous one.
+        if elapsed < 0.05 {
+            return;
+        }
+        let up = self.uploaded.saturating_sub(up_then) as f64 / elapsed;
+        let down = self.downloaded.saturating_sub(down_then) as f64 / elapsed;
+        self.up_rate = self
+            .up_rate
+            .mul_add(RATE_SMOOTHING, up * (1.0 - RATE_SMOOTHING));
+        self.down_rate = self
+            .down_rate
+            .mul_add(RATE_SMOOTHING, down * (1.0 - RATE_SMOOTHING));
+        self.rate_mark = Some((now, self.uploaded, self.downloaded));
+    }
+
     /// The resume record to persist for this torrent's current state.
     fn resume(&self, info_hash: [u8; 20]) -> Resume {
         Resume {
@@ -224,10 +440,58 @@ impl Hosted {
             uploaded: self.uploaded,
             downloaded: self.downloaded,
             trackers: self.meta.trackers.clone(),
-            paused: self.paused,
+            paused: matches!(self.wanted, Wanted::Paused(_)),
+            pause_reason: match self.wanted {
+                Wanted::Paused(why) => why.code(),
+                _ => 0,
+            },
+            seed_ratio_milli: self.seed_ratio_milli,
             sequential: self.sequential,
+            added: self.added,
         }
     }
+}
+
+/// Milliseconds since the Unix epoch, or 0 if the clock is before it.
+///
+/// Only ever used for the listing's order, so a clock that cannot be read
+/// sensibly costs an ordering, not a start. Milliseconds because seconds are
+/// not enough to order a bulk add — see [`Resume::added`].
+///
+/// [`Resume::added`]: clove_core::resume::Resume::added
+fn now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// How much of the previous rate estimate survives each refresh.
+///
+/// An exponentially weighted mean rather than the raw per-tick difference:
+/// piece traffic is bursty enough that the instantaneous number jumps around
+/// too much to read, and a rate an operator cannot read is not a rate. Low
+/// enough to still respond within a few seconds of a torrent stalling.
+const RATE_SMOOTHING: f64 = 0.6;
+
+/// A smoothed rate as whole bytes per second, for the API.
+///
+/// Integer rather than float on the wire: a rate is a measurement with maybe
+/// two useful digits, and a JSON reader should not have to look at
+/// `1234.5678901` and wonder which of it means anything.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "guarded finite, positive and below the clamp before the cast; \
+              the result is a displayed rate"
+)]
+fn rounded(rate: f64) -> u64 {
+    // A rate that reaches this is not a rate, and anything at all is a better
+    // answer than a wrapped one.
+    const CLAMP: f64 = 1e18;
+    if !rate.is_finite() || rate <= 0.0 {
+        return 0;
+    }
+    rate.min(CLAMP) as u64
 }
 
 /// Why a torrent action (pause, verify, set priorities…) failed.
@@ -249,6 +513,20 @@ impl fmt::Display for ActionError {
             ActionError::Io(e) => write!(f, "{e}"),
         }
     }
+}
+
+/// What an operator asked for at add time.
+///
+/// Both settings are ones a torrent would otherwise need a second command to
+/// change, after it had already started doing the wrong thing — beginning a
+/// download you meant to queue for later, or picking pieces rarest-first when
+/// you added it to watch.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AddOptions {
+    /// Add it stopped rather than letting it start.
+    pub(crate) paused: bool,
+    /// Pick pieces in file order from the outset.
+    pub(crate) sequential: bool,
 }
 
 /// Why adding a torrent failed (mapped to an HTTP status by the caller).
@@ -304,7 +582,7 @@ where
     /// # Errors
     ///
     /// The state or downloads directory cannot be created.
-    pub(crate) fn open(data_dir: &Path, preallocate: bool) -> io::Result<Registry<D>> {
+    pub(crate) fn open(data_dir: &Path, limits: Limits) -> io::Result<Registry<D>> {
         let state_dir = data_dir.join("state");
         let downloads_dir = data_dir.join("downloads");
         fs::create_dir_all(&state_dir)?;
@@ -312,7 +590,8 @@ where
         let mut registry = Registry {
             state_dir,
             downloads_dir,
-            preallocate,
+            limits,
+            budget: PeerBudget::new(limits.peer_limit),
             torrents: BTreeMap::new(),
             pending: BTreeMap::new(),
             network: None,
@@ -340,12 +619,219 @@ where
             dest_b64,
             naming,
         });
-        let hashes: Vec<[u8; 20]> = self.torrents.keys().copied().collect();
-        for info_hash in hashes {
+        self.rebalance();
+    }
+
+    /// Bring the set of running torrents in line with the queue limits.
+    ///
+    /// The one place that decides what runs. Everything that could change the
+    /// answer — an add, a pause, a resume, a removal, a completion, a session
+    /// coming up — calls this rather than starting or stopping a torrent
+    /// itself, so the limits cannot be honoured in one path and forgotten in
+    /// another.
+    ///
+    /// Order is the queue: forced torrents (`clove start`) first, then add
+    /// order (`docs/PHASE-H.md` §7). Downloads and seeds draw on separate
+    /// allowances, which is what makes a completion promote the next waiting
+    /// *download* rather than competing with it — the finished torrent has
+    /// moved to the other budget.
+    ///
+    /// **Stable by construction.** The decision is a function of the torrents'
+    /// states and add order, not of what happens to be running, so a rebalance
+    /// that changes nothing stops nothing: torrents already live stay live and
+    /// keep their peers. That matters because stopping and restarting a
+    /// torrent costs its whole peer set and a fresh announce.
+    pub(crate) fn rebalance(&mut self) {
+        if self.network.is_none() {
+            // Nothing can run without a session, and `waiting-for-router` is
+            // the honest state for all of them — not `queued`.
+            for hosted in self.torrents.values_mut() {
+                if hosted.wanted == Wanted::Queued {
+                    hosted.wanted = Wanted::Running;
+                }
+            }
+            return;
+        }
+
+        let mut order: Vec<[u8; 20]> = self.torrents.keys().copied().collect();
+        order.sort_by_key(|info_hash| {
+            let hosted = self.torrents.get(info_hash);
+            let forced = hosted.is_some_and(|h| h.forced);
+            let added = hosted.map_or(0, |h| h.added);
+            // `!forced` first, so forced torrents sort ahead of everything.
+            (!forced, added, *info_hash)
+        });
+
+        let mut downloads = self.limits.max_active_downloads;
+        let mut seeds = self.limits.max_active_seeds;
+        let mut start = Vec::new();
+        let mut stop = Vec::new();
+        for info_hash in order {
+            let Some(hosted) = self.torrents.get(&info_hash) else {
+                continue;
+            };
+            // A paused torrent is the operator's decision and a scanning one
+            // has no publishable have-set yet; neither is in the queue at all.
+            if matches!(hosted.wanted, Wanted::Paused(_)) || hosted.scanning {
+                stop.push((info_hash, false));
+                continue;
+            }
+            let allowance = if hosted.is_complete() {
+                &mut seeds
+            } else {
+                &mut downloads
+            };
+            if *allowance > 0 {
+                *allowance -= 1;
+                start.push(info_hash);
+            } else {
+                stop.push((info_hash, true));
+            }
+        }
+
+        for (info_hash, queued) in stop {
+            self.stop_live(&info_hash);
+            if let Some(hosted) = self.torrents.get_mut(&info_hash)
+                && queued
+            {
+                hosted.wanted = Wanted::Queued;
+            }
+        }
+        for info_hash in start {
+            if let Some(hosted) = self.torrents.get_mut(&info_hash) {
+                hosted.wanted = Wanted::Running;
+            }
             if let Err(e) = self.start_live(&info_hash) {
                 eprintln!("cloved: starting {}: {e}", hex(&info_hash));
             }
         }
+    }
+
+    /// Stop any torrent that has met its seeding limits.
+    ///
+    /// Run from the periodic tick, before the rebalance, so a torrent that
+    /// stops here frees its slot in the same pass rather than a tick later.
+    ///
+    /// Only *seeding* torrents are candidates: a ratio is meaningless while a
+    /// torrent is still fetching, and stopping an incomplete download because
+    /// it had no peers for an hour would turn a quiet swarm into a torrent
+    /// that never finishes.
+    fn enforce_seed_limits(&mut self) {
+        let idle_limit = (self.seed_idle_minutes() > 0)
+            .then(|| Duration::from_secs(self.seed_idle_minutes().saturating_mul(60)));
+        let default_ratio = self.limits.seed_ratio_milli;
+        let now = Instant::now();
+        let mut stop: Vec<([u8; 20], Why)> = Vec::new();
+
+        for (info_hash, hosted) in &mut self.torrents {
+            if hosted.live.is_none() || !hosted.is_complete() {
+                hosted.idle_since = None;
+                continue;
+            }
+            let ratio = hosted.effective_seed_ratio(default_ratio);
+            if ratio > 0 && hosted.ratio_milli() >= ratio {
+                stop.push((*info_hash, Why::SeedRatio));
+                continue;
+            }
+            // The idle clock runs only while seeding with nobody attached, and
+            // resets the moment a peer arrives — so "idle" means genuinely
+            // nobody wants this, not "quiet for a while".
+            if hosted.peers > 0 {
+                hosted.idle_since = None;
+                continue;
+            }
+            let since = *hosted.idle_since.get_or_insert(now);
+            if let Some(limit) = idle_limit
+                && now.duration_since(since) >= limit
+            {
+                stop.push((*info_hash, Why::SeedIdle));
+            }
+        }
+
+        for (info_hash, why) in stop {
+            let Some(hosted) = self.torrents.get_mut(&info_hash) else {
+                continue;
+            };
+            hosted.wanted = Wanted::Paused(why);
+            hosted.forced = false;
+            hosted.idle_since = None;
+            eprintln!("cloved: {}: {}", hex(&info_hash), why.describe());
+            self.stop_live(&info_hash);
+            if let Some(hosted) = self.torrents.get(&info_hash) {
+                let resume = hosted.resume(info_hash);
+                if let Err(e) = write_resume_file(&self.state_dir, &info_hash, &resume) {
+                    eprintln!("cloved: persisting {}: {e}", hex(&info_hash));
+                }
+            }
+        }
+    }
+
+    /// The configured idle limit in minutes.
+    fn seed_idle_minutes(&self) -> u64 {
+        self.limits.seed_idle_minutes
+    }
+
+    /// Set one torrent's seed ratio, in thousandths; `0` follows the daemon's.
+    ///
+    /// A torrent stopped *because* of its ratio is un-stopped by raising it —
+    /// otherwise the operator raises the limit, nothing happens, and the
+    /// reason is invisible.
+    ///
+    /// # Errors
+    ///
+    /// [`ActionError::NotFound`], or a filesystem error persisting it.
+    pub(crate) fn set_seed_ratio(
+        &mut self,
+        info_hash: &[u8; 20],
+        milli: u64,
+    ) -> Result<(), ActionError> {
+        {
+            let default_ratio = self.limits.seed_ratio_milli;
+            let hosted = self
+                .torrents
+                .get_mut(info_hash)
+                .ok_or(ActionError::NotFound)?;
+            hosted.seed_ratio_milli = milli;
+            if hosted.wanted == Wanted::Paused(Why::SeedRatio) {
+                let ratio = hosted.effective_seed_ratio(default_ratio);
+                if ratio == 0 || hosted.ratio_milli() < ratio {
+                    hosted.wanted = Wanted::Running;
+                }
+            }
+        }
+        self.rebalance();
+        let hosted = self.torrents.get(info_hash).ok_or(ActionError::NotFound)?;
+        write_resume_file(&self.state_dir, info_hash, &hosted.resume(*info_hash))
+            .map_err(ActionError::Io)
+    }
+
+    /// Put a torrent at the head of the queue and unpause it (`clove start`).
+    ///
+    /// # Errors
+    ///
+    /// [`ActionError::NotFound`], or a filesystem error persisting the
+    /// un-pause.
+    pub(crate) fn force_start(&mut self, info_hash: &[u8; 20]) -> Result<(), ActionError> {
+        {
+            let hosted = self
+                .torrents
+                .get_mut(info_hash)
+                .ok_or(ActionError::NotFound)?;
+            hosted.forced = true;
+            hosted.wanted = Wanted::Running;
+        }
+        // Only this one is forced: two torrents both jumping the queue is a
+        // queue nobody asked for, and the second `clove start` means "that one
+        // instead", not "both at once".
+        for (other, hosted) in &mut self.torrents {
+            if other != info_hash {
+                hosted.forced = false;
+            }
+        }
+        self.rebalance();
+        let hosted = self.torrents.get(info_hash).ok_or(ActionError::NotFound)?;
+        write_resume_file(&self.state_dir, info_hash, &hosted.resume(*info_hash))
+            .map_err(ActionError::Io)
     }
 
     /// Detach the network backend (session lost): every live torrent goes
@@ -374,20 +860,21 @@ where
         // A scan in flight owns this torrent's have-set until it publishes.
         // Starting the engine now would hand it an empty one and re-download
         // data that is already on disk.
-        if hosted.paused || hosted.live.is_some() || hosted.scanning {
+        if hosted.wanted != Wanted::Running || hosted.live.is_some() || hosted.scanning {
             return Ok(());
         }
         let storage = Arc::new(Storage::create(
             &hosted.meta,
             &self.downloads_dir,
-            self.preallocate,
+            self.limits.preallocate,
         )?);
-        let torrent = Torrent::new(
+        let torrent = Torrent::with_budget(
             &hosted.meta,
             storage,
             &hosted.have,
             hosted.mode(),
             network.peer_id,
+            Arc::clone(&self.budget),
         );
         // Before anything is dialed, so the first pick already knows what the
         // user asked for. Persisted priorities that never reached the engine
@@ -522,7 +1009,15 @@ where
                 // engine's own counter starts at zero.
                 hosted.peers = 0;
                 hosted.known_peers = 0;
+                // An offline torrent moves nothing. Leaving the last live
+                // figures in place would show a paused torrent still pulling
+                // 400 KiB/s, which is the same class of lie as the peer count
+                // above.
+                hosted.up_rate = 0.0;
+                hosted.down_rate = 0.0;
+                hosted.rate_mark = None;
             }
+            hosted.update_rates();
         }
     }
 
@@ -530,6 +1025,15 @@ where
     /// Called periodically by the daemon and around lifecycle transitions.
     pub(crate) fn persist_progress(&mut self) {
         self.refresh();
+        // Seeding limits first, so a torrent that stops here frees its slot
+        // in the same pass rather than a tick later.
+        self.enforce_seed_limits();
+        // A torrent that finished since the last tick has moved from the
+        // download allowance to the seed one, which frees a slot for the next
+        // queued download. Nothing else notices a completion — it happens in
+        // the engine, not through an API call — so this is where the queue
+        // learns about it.
+        self.rebalance();
         for (info_hash, hosted) in &mut self.torrents {
             let Some(live) = &hosted.live else {
                 continue;
@@ -583,7 +1087,11 @@ where
     ///
     /// [`AddError`] if the bytes do not parse, the torrent is already hosted,
     /// or persistence fails.
-    pub(crate) fn add_torrent(&mut self, bytes: &[u8]) -> Result<([u8; 20], ScanJob), AddError> {
+    pub(crate) fn add_torrent(
+        &mut self,
+        bytes: &[u8],
+        options: AddOptions,
+    ) -> Result<([u8; 20], ScanJob), AddError> {
         let meta = MetaInfo::parse(bytes).map_err(AddError::Parse)?;
         let info_hash = meta.info_hash.0;
         if self.torrents.contains_key(&info_hash) {
@@ -611,8 +1119,22 @@ where
             announces_ok: 0,
             announces_failed: 0,
             last_announce_error: None,
-            paused: false,
-            sequential: false,
+            wanted: if options.paused {
+                Wanted::Paused(Why::Operator)
+            } else {
+                Wanted::Running
+            },
+            sequential: options.sequential,
+            // The listing's order is add order, and this is the add.
+            added: now_unix_millis(),
+            up_rate: 0.0,
+            down_rate: 0.0,
+            rate_mark: None,
+            // Recomputed by the rebalance that follows the initial scan.
+            forced: false,
+            // No per-torrent override until one is set; the daemon's applies.
+            seed_ratio_milli: 0,
+            idle_since: None,
             scanning: true,
             live: None,
         };
@@ -635,7 +1157,7 @@ where
                 info_hash,
                 meta,
                 downloads_dir: self.downloads_dir.clone(),
-                preallocate: self.preallocate,
+                preallocate: self.limits.preallocate,
             },
         ))
     }
@@ -703,7 +1225,7 @@ where
                 info_hash: *info_hash,
                 meta: hosted.meta.clone(),
                 downloads_dir: self.downloads_dir.clone(),
-                preallocate: self.preallocate,
+                preallocate: self.limits.preallocate,
             })
             .collect()
     }
@@ -769,7 +1291,7 @@ where
         info_hash: &[u8; 20],
         torrent_bytes: &[u8],
     ) -> Result<ScanJob, AddError> {
-        let (_, job) = self.add_torrent(torrent_bytes)?;
+        let (_, job) = self.add_torrent(torrent_bytes, AddOptions::default())?;
         self.pending.remove(info_hash);
         let _ = fs::remove_file(self.state_dir.join(format!("{}.magnet", hex(info_hash))));
         Ok(job)
@@ -795,13 +1317,23 @@ where
                     "a verification is running for this torrent; it will start on its own when that finishes",
                 ));
             }
-            hosted.paused = paused;
+            hosted.wanted = if paused {
+                Wanted::Paused(Why::Operator)
+            } else {
+                Wanted::Running
+            };
         }
         if paused {
-            self.stop_live(info_hash);
-        } else {
-            self.start_live(info_hash).map_err(ActionError::Io)?;
+            // Pausing drops the forced flag: "run this one now" and "do not
+            // run this one" cannot both be in force, and the pause is the
+            // later instruction.
+            if let Some(hosted) = self.torrents.get_mut(info_hash) {
+                hosted.forced = false;
+            }
         }
+        // Not a start or a stop but a rebalance, so pausing one torrent also
+        // promotes whichever queued torrent has been waiting for the slot.
+        self.rebalance();
         let hosted = self.torrents.get(info_hash).ok_or(ActionError::NotFound)?;
         let resume = hosted.resume(*info_hash);
         write_resume_file(&self.state_dir, info_hash, &resume).map_err(ActionError::Io)
@@ -887,7 +1419,7 @@ where
             .torrents
             .get_mut(info_hash)
             .ok_or(ActionError::NotFound)?;
-        if hosted.paused {
+        if matches!(hosted.wanted, Wanted::Paused(_)) {
             return Err(ActionError::BadInput("torrent is paused"));
         }
         let Some(live) = &mut hosted.live else {
@@ -925,7 +1457,7 @@ where
     /// running or already being scanned.
     pub(crate) fn begin_verify(&mut self, info_hash: &[u8; 20]) -> Result<ScanJob, ActionError> {
         let downloads_dir = self.downloads_dir.clone();
-        let preallocate = self.preallocate;
+        let preallocate = self.limits.preallocate;
         let hosted = self
             .torrents
             .get_mut(info_hash)
@@ -982,8 +1514,9 @@ where
         let resume = hosted.resume(info_hash);
         write_resume_file(&self.state_dir, &info_hash, &resume).map_err(ActionError::Io)?;
         // Nothing could start it while the scan was in flight, so this is where
-        // an added or freshly-verified torrent goes live.
-        self.start_live(&info_hash).map_err(ActionError::Io)?;
+        // an added or freshly-verified torrent enters the queue — and runs, if
+        // there is room for it.
+        self.rebalance();
         Ok(count)
     }
 
@@ -1043,14 +1576,26 @@ where
             let _ = fs::remove_dir(self.downloads_dir.join(&hosted.meta.name));
         }
         self.torrents.remove(info_hash);
+        // Its slot is free now, so whatever was next in the queue starts.
+        self.rebalance();
         Ok(())
     }
 
-    /// The torrents as a JSON array, one object each, ordered by info-hash.
+    /// The torrents as a JSON array, one object each, in add order.
     /// Live progress is refreshed first.
     pub(crate) fn list(&mut self) -> Value {
         self.refresh();
-        let mut items: Vec<Value> = self.torrents.values().map(Hosted::to_json).collect();
+        // Add order, not info-hash order. The map is keyed by hash, so the
+        // listing used to be sorted by a hash — which is to say shuffled, and
+        // reshuffled on every add, so a row moved out from under whoever was
+        // reading it. Ties break on the hash, so the order is total and does
+        // not wobble between calls for torrents added in the same second.
+        let mut ordered: Vec<(&[u8; 20], &Hosted)> = self.torrents.iter().collect();
+        ordered.sort_by_key(|(info_hash, hosted)| (hosted.added, **info_hash));
+        let mut items: Vec<Value> = ordered
+            .into_iter()
+            .map(|(_, hosted)| hosted.to_json())
+            .collect();
         for (info_hash, pending) in &self.pending {
             let name = pending
                 .magnet
@@ -1217,8 +1762,22 @@ where
                 announces_ok: 0,
                 announces_failed: 0,
                 last_announce_error: None,
-                paused: resume.paused,
+                wanted: if resume.paused {
+                    Wanted::Paused(Why::from_code(resume.pause_reason))
+                } else {
+                    Wanted::Running
+                },
                 sequential: resume.sequential,
+                // 0 for anything written before resume v4, which sorts it
+                // ahead of everything added since — true, as it happens.
+                added: resume.added,
+                up_rate: 0.0,
+                down_rate: 0.0,
+                rate_mark: None,
+                // Not persisted: forcing is a statement about right now.
+                forced: false,
+                seed_ratio_milli: resume.seed_ratio_milli,
+                idle_since: None,
                 // Claimed here so nothing can start the torrent before the scan
                 // publishes; `pending_scans` hands out the job at startup.
                 scanning: rescan,
@@ -1247,6 +1806,39 @@ impl Hosted {
     /// torrent: a download with files set to skip is finished when the files it
     /// was told to fetch are, and reporting it at 60% for ever — never
     /// "seeding", never done — would be describing a job it was told not to do.
+    /// The ratio this torrent is held to: its own if set, else the daemon's.
+    fn effective_seed_ratio(&self, default_milli: u64) -> u64 {
+        if self.seed_ratio_milli > 0 {
+            self.seed_ratio_milli
+        } else {
+            default_milli
+        }
+    }
+
+    /// Uploaded over downloaded, in thousandths.
+    ///
+    /// A torrent that downloaded nothing — added complete, or every file
+    /// skipped — has no ratio to speak of, and dividing by zero to get one
+    /// would stop it the instant it served a byte. It reports `0`, so only an
+    /// explicit ratio of 0 (meaning "no limit") applies to it, which is to say
+    /// it seeds until the operator says otherwise.
+    fn ratio_milli(&self) -> u64 {
+        if self.downloaded == 0 {
+            return 0;
+        }
+        self.uploaded
+            .saturating_mul(1000)
+            .checked_div(self.downloaded)
+            .unwrap_or(0)
+    }
+
+    /// Whether every piece this torrent was told to fetch is present — which
+    /// is to say, whether it draws on the seed allowance or the download one.
+    fn is_complete(&self) -> bool {
+        let (wanted, held) = self.wanted_and_held();
+        held == wanted
+    }
+
     fn wanted_and_held(&self) -> (u32, u32) {
         let priorities = self.meta.piece_priorities(&self.priorities);
         let mut wanted = 0;
@@ -1264,14 +1856,20 @@ impl Hosted {
     }
 
     fn state(&self) -> &'static str {
-        let (wanted, held) = self.wanted_and_held();
-        let complete = held == wanted;
+        let complete = self.is_complete();
         if self.scanning {
             "verifying"
-        } else if self.paused {
+        } else if matches!(self.wanted, Wanted::Paused(_)) {
             "paused"
         } else if self.live.is_some() {
             if complete { "seeding" } else { "downloading" }
+        } else if self.wanted == Wanted::Queued {
+            // Wanted and startable, but past the active limit. Distinct from
+            // both `paused` (the operator's decision) and `waiting-for-router`
+            // (nothing could run), because the answer to "why is this not
+            // moving" is different for each and that is the question being
+            // asked.
+            "queued"
         } else if complete {
             "complete"
         } else {
@@ -1311,6 +1909,9 @@ impl Hosted {
             ("progress".to_owned(), Value::Float(self.progress())),
             ("uploaded".to_owned(), Value::UInt(self.uploaded)),
             ("downloaded".to_owned(), Value::UInt(self.downloaded)),
+            ("up_rate".to_owned(), Value::UInt(rounded(self.up_rate))),
+            ("down_rate".to_owned(), Value::UInt(rounded(self.down_rate))),
+            ("added".to_owned(), Value::UInt(self.added)),
             (
                 "peers".to_owned(),
                 Value::UInt(u64::try_from(self.peers).unwrap_or(u64::MAX)),
@@ -1355,6 +1956,9 @@ impl Hosted {
             ("progress".to_owned(), Value::Float(self.progress())),
             ("uploaded".to_owned(), Value::UInt(self.uploaded)),
             ("downloaded".to_owned(), Value::UInt(self.downloaded)),
+            ("up_rate".to_owned(), Value::UInt(rounded(self.up_rate))),
+            ("down_rate".to_owned(), Value::UInt(rounded(self.down_rate))),
+            ("added".to_owned(), Value::UInt(self.added)),
             (
                 "peers".to_owned(),
                 Value::UInt(u64::try_from(self.peers).unwrap_or(u64::MAX)),
@@ -1363,6 +1967,8 @@ impl Hosted {
                 "known_peers".to_owned(),
                 Value::UInt(u64::try_from(self.known_peers).unwrap_or(u64::MAX)),
             ),
+            ("ratio".to_owned(), Value::UInt(self.ratio_milli())),
+            ("seed_ratio".to_owned(), Value::UInt(self.seed_ratio_milli)),
             ("pex_peers".to_owned(), Value::UInt(self.pex_peers)),
             ("inbound_peers".to_owned(), Value::UInt(self.inbound_peers)),
             (
@@ -1381,6 +1987,11 @@ impl Hosted {
         ];
         // Only present when there is one: an absent key reads as "nothing has
         // gone wrong", which an empty string does not.
+        // Why a stopped torrent stopped, which is the question its operator
+        // will ask — and the reason `Wanted::Paused` carries one at all.
+        if let Wanted::Paused(why) = self.wanted {
+            fields.push(("paused_because".to_owned(), Value::from(why.describe())));
+        }
         if let Some(why) = &self.last_announce_error {
             fields.push(("last_announce_error".to_owned(), Value::from(why.clone())));
         }
@@ -1404,6 +2015,164 @@ fn write_resume_file(state_dir: &Path, info_hash: &[u8; 20], resume: &Resume) ->
         &state_dir.join(format!("{}.resume", hex(info_hash))),
         &resume.encode(),
     )
+}
+
+/// Shortest prefix that may stand in for an info-hash.
+///
+/// Four hex characters is 16 bits. That is short enough to type from a listing
+/// and long enough that a collision across the tens of torrents a client hosts
+/// is something you have to go looking for — and when it happens the answer is
+/// [`ResolveError::Ambiguous`], not a guess.
+pub(crate) const MIN_PREFIX: usize = 4;
+
+/// What the whole client is doing right now, for `GET /v1/status`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Totals {
+    /// Bytes per second out, summed over every torrent.
+    pub(crate) up_rate: u64,
+    /// Bytes per second in, summed over every torrent.
+    pub(crate) down_rate: u64,
+    /// Peers attached across every torrent — the draw on the budget below.
+    pub(crate) peers: usize,
+    /// The ceiling those peers come from (`peer_limit`), reported beside them
+    /// because a peer count means nothing without the number it is approaching.
+    pub(crate) peer_limit: usize,
+}
+
+/// A torrent that a prefix could have meant.
+#[derive(Debug)]
+pub(crate) struct Candidate {
+    /// Full hex info-hash.
+    pub(crate) info_hash: String,
+    /// Its display name, for telling two candidates apart.
+    pub(crate) name: String,
+}
+
+/// Why a torrent reference did not name exactly one torrent.
+#[derive(Debug)]
+pub(crate) enum ResolveError {
+    /// Not hex, too short, or longer than an info-hash (400).
+    Malformed,
+    /// Well-formed, but no hosted torrent starts with it (404).
+    NotFound,
+    /// More than one does (409). Never resolved by picking one.
+    Ambiguous(Vec<Candidate>),
+}
+
+impl<D: I2pDialer + I2pNamingLookup + Clone + Send + Sync + 'static> Registry<D>
+where
+    D::Stream: 'static,
+{
+    /// Resolve an operator's torrent reference — a full info-hash, or a unique
+    /// hex prefix of one — to exactly one info-hash.
+    ///
+    /// Prefixes are git's affordance, and they exist here for the same reason:
+    /// every per-torrent command used to require all forty characters, which is
+    /// fine for the one torrent you just added and unusable for the twentieth.
+    ///
+    /// Two rules make this safe to hand a script. A **full 40-character hash
+    /// keeps its exact-match path** and never consults the table, so anything
+    /// that works today keeps working and cannot start meaning a different
+    /// torrent because of what else got added. And an **ambiguous prefix is an
+    /// error carrying the candidates**, never a choice — the failure mode this
+    /// must not have is `clove remove --data` quietly picking one of two.
+    ///
+    /// Resolution happens here rather than in `clove(1)` because the CLI is a
+    /// one-request client: resolving there means a listing fetch before every
+    /// action, two round trips, and a window in which the answer changes
+    /// between the fetch and the act.
+    ///
+    /// # Errors
+    ///
+    /// [`ResolveError`] — malformed, unmatched, or matching more than one.
+    pub(crate) fn resolve(&self, text: &str) -> Result<[u8; 20], ResolveError> {
+        if let Some(exact) = parse_info_hash(text) {
+            return Ok(exact);
+        }
+        if text.len() < MIN_PREFIX
+            || text.len() > 40
+            || !text.bytes().all(|b| hex_digit(b).is_some())
+        {
+            return Err(ResolveError::Malformed);
+        }
+        // Linear over a map of tens. A `BTreeMap` range would be asymptotically
+        // nicer and is not worth it: the bound is the number of torrents one
+        // person hosts, and an odd-length prefix makes the byte range fiddly
+        // enough to get subtly wrong.
+        //
+        // Magnets still fetching their metadata are listed and can be removed,
+        // so they answer to a prefix too.
+        let found: Vec<[u8; 20]> = self
+            .torrents
+            .keys()
+            .chain(self.pending.keys())
+            .filter(|info_hash| hex(*info_hash).starts_with(text))
+            .copied()
+            .collect();
+        match found.as_slice() {
+            [] => Err(ResolveError::NotFound),
+            [one] => Ok(*one),
+            // Names are looked up only here: the answer an operator needs from
+            // an ambiguous prefix is which torrents it hit, and the resolving
+            // path that succeeds should not pay to build that.
+            many => Err(ResolveError::Ambiguous(
+                many.iter().map(|ih| self.candidate(ih)).collect(),
+            )),
+        }
+    }
+
+    /// Client-wide totals for `GET /v1/status`: current up and down rates in
+    /// bytes per second, peers attached, and the budget those peers come from.
+    ///
+    /// One refresh for the whole answer, so the rates here and the ones in the
+    /// listing are the same reading rather than two a moment apart.
+    pub(crate) fn totals(&mut self) -> Totals {
+        self.refresh();
+        let mut totals = Totals {
+            up_rate: 0,
+            down_rate: 0,
+            peers: 0,
+            peer_limit: self.budget.limit(),
+        };
+        let (mut up, mut down) = (0.0, 0.0);
+        for hosted in self.torrents.values() {
+            up += hosted.up_rate;
+            down += hosted.down_rate;
+            totals.peers += hosted.peers;
+        }
+        totals.up_rate = rounded(up);
+        totals.down_rate = rounded(down);
+        totals
+    }
+
+    /// Whether this info-hash is a magnet still waiting for its metadata.
+    ///
+    /// Such an entry is listed, resolvable and removable, but has no engine and
+    /// no file list, so every other operation has nothing to act on. The
+    /// distinction exists so those can say *why* rather than claiming the
+    /// torrent does not exist — which, for something `clove list` is showing,
+    /// is just untrue.
+    pub(crate) fn is_pending(&self, info_hash: &[u8; 20]) -> bool {
+        self.pending.contains_key(info_hash)
+    }
+
+    /// One resolution candidate: its hash, and the name that tells it apart.
+    fn candidate(&self, info_hash: &[u8; 20]) -> Candidate {
+        let full = hex(info_hash);
+        let name = self.torrents.get(info_hash).map_or_else(
+            || {
+                self.pending
+                    .get(info_hash)
+                    .and_then(|p| p.magnet.display_name.clone())
+                    .unwrap_or_else(|| full.clone())
+            },
+            |hosted| hosted.meta.name.clone(),
+        );
+        Candidate {
+            info_hash: full,
+            name,
+        }
+    }
 }
 
 /// Parse a 40-char lowercase-hex info-hash into 20 bytes.
@@ -1556,7 +2325,9 @@ mod tests {
     /// and must not happen under the lock; a test that only called the first
     /// half would leave the torrent stuck in "verifying" and never started.
     fn add_and_scan(registry: &mut Registry<MockDialer>, bytes: &[u8]) -> [u8; 20] {
-        let (info_hash, job) = registry.add_torrent(bytes).expect("add");
+        let (info_hash, job) = registry
+            .add_torrent(bytes, AddOptions::default())
+            .expect("add");
         let scanned = job.run();
         registry
             .finish_scan(&job, scanned)
@@ -1580,7 +2351,7 @@ mod tests {
         let (seed_dest, _seed_dir) = spawn_seeder(&net, &content, &bytes);
 
         let data = TempDir::new("data");
-        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
         let leech_ep = net.endpoint();
         registry.attach_network(
             leech_ep.dialer(),
@@ -1604,7 +2375,7 @@ mod tests {
 
         // A fresh registry (daemon restart) sees the completed state from
         // the persisted resume file alone.
-        let mut reopened = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let mut reopened = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
         assert_eq!(reopened.count(), 1);
         assert!((first_progress(&mut reopened) - 1.0).abs() < f64::EPSILON);
     }
@@ -1615,7 +2386,7 @@ mod tests {
         let (_content, bytes) = fixture("pause-demo");
 
         let data = TempDir::new("data");
-        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
         let ep = net.endpoint();
         registry.attach_network(
             ep.dialer(),
@@ -1643,7 +2414,7 @@ mod tests {
     fn without_a_network_torrents_wait_for_the_router() {
         let (_content, bytes) = fixture("waiting-demo");
         let data = TempDir::new("data");
-        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
         let info_hash = add_and_scan(&mut registry, &bytes);
         let state = registry
             .list()
@@ -1659,7 +2430,7 @@ mod tests {
         let (_content, bytes) = fixture("sequential-demo");
         let data = TempDir::new("data");
         let info_hash = {
-            let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+            let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
             let info_hash = add_and_scan(&mut registry, &bytes);
             // Rarest-first is the default; nothing is claimed until asked.
             assert_eq!(sequential_flag(&mut registry, &info_hash), Some(false));
@@ -1669,7 +2440,7 @@ mod tests {
         };
         // A fresh registry over the same data dir reads the flag back out of
         // the resume file — the point of putting it in the format at all.
-        let mut reopened = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let mut reopened = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
         assert_eq!(sequential_flag(&mut reopened, &info_hash), Some(true));
         reopened.set_sequential(&info_hash, false).unwrap();
         assert_eq!(sequential_flag(&mut reopened, &info_hash), Some(false));
@@ -1679,7 +2450,7 @@ mod tests {
     fn announce_now_refuses_a_torrent_that_is_not_running() {
         let (_content, bytes) = fixture("announce-demo");
         let data = TempDir::new("data");
-        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
         let info_hash = add_and_scan(&mut registry, &bytes);
         // No router yet: the error names that, rather than pretending to
         // announce into a void.
@@ -1721,7 +2492,7 @@ mod tests {
         let info_hash = meta.info_hash.0;
 
         let data = TempDir::new("magnet-unresolvable");
-        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
         let ep = net.endpoint();
         registry.attach_network(
             ep.dialer(),
@@ -1807,7 +2578,7 @@ mod tests {
         });
 
         let data = TempDir::new("magnet-data");
-        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
         let ep = net.endpoint();
         registry.attach_network(
             ep.dialer(),
@@ -1882,14 +2653,14 @@ mod tests {
         let (_content, bytes) = fixture("mismatch-demo");
         let data = TempDir::new("mismatch");
         let info_hash = {
-            let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+            let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
             add_and_scan(&mut registry, &bytes)
         };
         let resume_path = data.0.join(format!("state/{}.resume", hex(&info_hash)));
 
         // Reopening as-is finds it.
         assert_eq!(
-            Registry::<MockDialer>::open(&data.0, false)
+            Registry::<MockDialer>::open(&data.0, Limits::default())
                 .unwrap()
                 .count(),
             1
@@ -1905,7 +2676,7 @@ mod tests {
         bad.verified = bad.have.clone();
         fs::write(&resume_path, bad.encode()).unwrap();
         assert_eq!(
-            Registry::<MockDialer>::open(&data.0, false)
+            Registry::<MockDialer>::open(&data.0, Limits::default())
                 .unwrap()
                 .count(),
             0,
@@ -1916,7 +2687,7 @@ mod tests {
         // not about rejecting resume files in general.
         fs::write(&resume_path, good.encode()).unwrap();
         assert_eq!(
-            Registry::<MockDialer>::open(&data.0, false)
+            Registry::<MockDialer>::open(&data.0, Limits::default())
                 .unwrap()
                 .count(),
             1
@@ -1937,7 +2708,7 @@ mod tests {
         let (_content, bytes) = fixture("forged-demo");
         let data = TempDir::new("forged");
         let info_hash = {
-            let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+            let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
             add_and_scan(&mut registry, &bytes)
         };
         let resume_path = data.0.join(format!("state/{}.resume", hex(&info_hash)));
@@ -1963,7 +2734,7 @@ mod tests {
         forged.have = full;
         fs::write(&resume_path, forged.encode()).unwrap();
 
-        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
         assert_eq!(registry.count(), 1, "the torrent still loads");
         assert!(
             first_progress(&mut registry).abs() < f64::EPSILON,
@@ -1988,7 +2759,7 @@ mod tests {
         let (_content, bytes) = fixture("subset-demo");
         let data = TempDir::new("subset");
         let info_hash = {
-            let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+            let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
             add_and_scan(&mut registry, &bytes)
         };
         let resume_path = data.0.join(format!("state/{}.resume", hex(&info_hash)));
@@ -2003,7 +2774,7 @@ mod tests {
             "verified must not be able to exceed have"
         );
         assert_eq!(
-            Registry::<MockDialer>::open(&data.0, false)
+            Registry::<MockDialer>::open(&data.0, Limits::default())
                 .unwrap()
                 .count(),
             0,
@@ -2018,7 +2789,7 @@ mod tests {
         let (_content, bytes) = fixture("prio-count-demo");
         let data = TempDir::new("prio-count");
         let info_hash = {
-            let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+            let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
             add_and_scan(&mut registry, &bytes)
         };
         let resume_path = data.0.join(format!("state/{}.resume", hex(&info_hash)));
@@ -2028,7 +2799,7 @@ mod tests {
         bad.priorities = vec![1u8; good.priorities.len() + 1];
         fs::write(&resume_path, bad.encode()).unwrap();
         assert_eq!(
-            Registry::<MockDialer>::open(&data.0, false)
+            Registry::<MockDialer>::open(&data.0, Limits::default())
                 .unwrap()
                 .count(),
             0,
@@ -2037,7 +2808,7 @@ mod tests {
 
         fs::write(&resume_path, good.encode()).unwrap();
         assert_eq!(
-            Registry::<MockDialer>::open(&data.0, false)
+            Registry::<MockDialer>::open(&data.0, Limits::default())
                 .unwrap()
                 .count(),
             1
@@ -2082,7 +2853,7 @@ mod tests {
         });
 
         let data = TempDir::new("peer-name");
-        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
         let ep = net.endpoint();
         registry.attach_network(
             ep.dialer(),
@@ -2132,7 +2903,7 @@ mod tests {
     #[test]
     fn a_failed_promotion_leaves_the_magnet_recoverable() {
         let data = TempDir::new("promote-fail");
-        let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
         let info_hash = registry
             .add_magnet(&format!("magnet:?xt=urn:btih:{}", "ab".repeat(20)))
             .expect("add magnet");
@@ -2153,7 +2924,7 @@ mod tests {
 
         // And a restart still finds it, which is the part that matters after a
         // crash rather than an error return.
-        let reopened = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let reopened = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
         assert_eq!(reopened.pending_hashes(), vec![info_hash]);
     }
 
@@ -2168,7 +2939,7 @@ mod tests {
         let (_content, bytes) = fixture("leftover-demo");
         let data = TempDir::new("leftover");
         let info_hash = {
-            let mut registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+            let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
             add_and_scan(&mut registry, &bytes)
         };
 
@@ -2180,7 +2951,7 @@ mod tests {
         )
         .unwrap();
 
-        let registry = Registry::<MockDialer>::open(&data.0, false).unwrap();
+        let registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
         assert_eq!(registry.count(), 1, "the torrent loads");
         assert!(
             registry.pending_hashes().is_empty(),
@@ -2205,5 +2976,463 @@ mod tests {
         assert!(parse_info_hash("short").is_none());
         assert!(parse_info_hash(&"g".repeat(40)).is_none());
         assert!(parse_info_hash(&"A".repeat(40)).is_none()); // uppercase not accepted
+    }
+
+    /// Magnets are how a test picks the info-hash it wants: a `.torrent`'s is
+    /// SHA-1 of its info dict and cannot be chosen, but `xt=urn:btih:` is
+    /// whatever we write. That is what makes the ambiguous case testable at
+    /// all.
+    fn add_magnet_named(registry: &mut Registry<MockDialer>, hash_hex: &str, name: &str) {
+        registry
+            .add_magnet(&format!("magnet:?xt=urn:btih:{hash_hex}&dn={name}"))
+            .expect("add magnet");
+    }
+
+    #[test]
+    fn a_prefix_names_a_torrent_and_an_ambiguous_one_never_guesses() {
+        let data = TempDir::new("resolve");
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
+
+        let a = format!("aaaa{}", "1".repeat(36));
+        let b = format!("aaaa{}", "2".repeat(36));
+        let c = format!("bbbb{}", "3".repeat(36));
+        add_magnet_named(&mut registry, &a, "first");
+        add_magnet_named(&mut registry, &b, "second");
+        add_magnet_named(&mut registry, &c, "third");
+
+        // A full hash resolves to itself, and is the one form that never
+        // consults the table — so it cannot start meaning a different torrent
+        // because of what else got added.
+        assert_eq!(hex(&registry.resolve(&a).expect("exact")), a);
+
+        // A prefix that names exactly one torrent resolves to it, at the
+        // shortest accepted length and beyond.
+        assert_eq!(hex(&registry.resolve("bbbb").expect("unique")), c);
+        assert_eq!(hex(&registry.resolve("bbbb3333").expect("longer")), c);
+        assert_eq!(
+            hex(&registry.resolve("aaaa1").expect("one past the fork")),
+            a
+        );
+
+        // The failure this must never have: two candidates and a choice made.
+        match registry.resolve("aaaa") {
+            Err(ResolveError::Ambiguous(candidates)) => {
+                assert_eq!(candidates.len(), 2);
+                let mut names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+                names.sort_unstable();
+                assert_eq!(names, ["first", "second"]);
+                // The candidates carry full hashes, so the operator can retype
+                // one of them without going back to `clove list`.
+                for candidate in &candidates {
+                    assert_eq!(candidate.info_hash.len(), 40);
+                }
+            }
+            _ => panic!("an ambiguous prefix must not resolve"),
+        }
+
+        // Well-formed but matching nothing.
+        assert!(matches!(
+            registry.resolve("cccc"),
+            Err(ResolveError::NotFound)
+        ));
+        // A *full* hash that names nothing still resolves: the exact path
+        // answers "what hash is this", and whether a torrent by that name
+        // exists is the action's question, answered with the same 404. Keeping
+        // the two separate is what lets a full hash skip the table entirely.
+        let unknown = "9".repeat(40);
+        assert_eq!(hex(&registry.resolve(&unknown).expect("exact")), unknown);
+
+        // Malformed: too short to be worth guessing from, not hex, longer than
+        // an info-hash, or the uppercase `parse_info_hash` already refuses.
+        for bad in [
+            "",
+            "a",
+            "aaa",
+            "zzzz",
+            "aaaa!",
+            &"a".repeat(41),
+            &"A".repeat(40),
+        ] {
+            assert!(
+                matches!(registry.resolve(bad), Err(ResolveError::Malformed)),
+                "{bad:?} should be malformed"
+            );
+        }
+        // The boundary itself is accepted rather than refused.
+        assert_eq!(MIN_PREFIX, 4);
+        assert!(!matches!(
+            registry.resolve("aaaa"),
+            Err(ResolveError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn the_listing_is_in_add_order_not_hash_order() {
+        let data = TempDir::new("order");
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
+
+        // Added in a deliberate order; their info-hashes are SHA-1 of the info
+        // dict and so land in whatever order they land in. Before this, the
+        // listing was that order — reshuffled on every add.
+        let names = ["third", "first", "second"];
+        let mut added = Vec::new();
+        for name in names {
+            let (_, bytes) = fixture(name);
+            added.push(add_and_scan(&mut registry, &bytes));
+        }
+
+        let listed = registry.list();
+        let order: Vec<&str> = listed
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(|item| item.get("name").and_then(clove_core::json::Value::as_str))
+            .collect();
+        assert_eq!(
+            order, names,
+            "the listing must be in the order torrents were added"
+        );
+
+        // Stable across calls, which is what stops a row moving under the
+        // cursor of whoever is reading it.
+        let again = registry.list();
+        assert_eq!(listed.encode(), again.encode());
+
+        // Adding one puts it last and disturbs nothing before it.
+        let (_, bytes) = fixture("fourth");
+        add_and_scan(&mut registry, &bytes);
+        let listed = registry.list();
+        let order: Vec<&str> = listed
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(|item| item.get("name").and_then(clove_core::json::Value::as_str))
+            .collect();
+        assert_eq!(order, ["third", "first", "second", "fourth"]);
+
+        // The reason `added` is milliseconds and not seconds: these were all
+        // added inside the same second, and at one-second resolution they
+        // shared a timestamp, fell through to the info-hash tie-break, and
+        // came out shuffled — which is the exact failure the field exists to
+        // fix, and what a watch directory picking up a batch would hit every
+        // time.
+        assert_eq!(added.len(), 3);
+    }
+
+    /// Every torrent's state, in listing order — the queue as an operator
+    /// sees it.
+    fn states(registry: &mut Registry<MockDialer>) -> Vec<String> {
+        registry
+            .list()
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(|item| item.get("state").and_then(clove_core::json::Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn the_queue_runs_the_limit_and_holds_the_rest() {
+        let net = MockNet::new();
+        let data = TempDir::new("queue");
+        let limits = Limits {
+            max_active_downloads: 2,
+            ..Limits::default()
+        };
+        let mut registry = Registry::<MockDialer>::open(&data.0, limits).unwrap();
+
+        // Five incomplete torrents, added in a known order.
+        let mut hashes = Vec::new();
+        for name in ["a", "b", "c", "d", "e"] {
+            let (_, bytes) = fixture(name);
+            hashes.push(add_and_scan(&mut registry, &bytes));
+        }
+
+        // Without a session nothing runs, and "queued" would be a lie: the
+        // reason none of them is moving is the router, not the limit.
+        assert_eq!(states(&mut registry), ["waiting-for-router"; 5]);
+
+        let ep = net.endpoint();
+        registry.attach_network(
+            ep.dialer(),
+            InboundDemux::new(8),
+            *b"-CV0001-leechleechle",
+            quick_swarm(),
+            "leecher-b64".to_owned(),
+        );
+
+        // Two run, three wait, and it is the first two added that run.
+        assert_eq!(
+            states(&mut registry),
+            ["downloading", "downloading", "queued", "queued", "queued"]
+        );
+
+        // Pausing a running one promotes exactly one waiting one — the next in
+        // add order, not an arbitrary one.
+        registry.set_paused(&hashes[0], true).expect("pause");
+        assert_eq!(
+            states(&mut registry),
+            ["paused", "downloading", "downloading", "queued", "queued"]
+        );
+
+        // Resuming returns it to *its* place in the queue — which, being the
+        // first added, is at the front — rather than to the back. The torrent
+        // promoted while it was paused goes back to waiting.
+        //
+        // The cost is real and deliberate: that torrent acquired peers and
+        // loses them (its progress is snapshotted, so only the peer set and an
+        // announce are spent). The alternative, letting an incumbent keep its
+        // slot, makes queue position depend on unobservable history and lets a
+        // torrent added first starve behind newer ones. Add order is the order.
+        registry.set_paused(&hashes[0], false).expect("resume");
+        assert_eq!(
+            states(&mut registry),
+            ["downloading", "downloading", "queued", "queued", "queued"]
+        );
+
+        // `clove start` jumps the queue, and displaces the last-started
+        // torrent rather than running three at once.
+        registry.force_start(&hashes[4]).expect("start");
+        let after = states(&mut registry);
+        assert_eq!(after.iter().filter(|s| *s == "downloading").count(), 2);
+        assert_eq!(after[4], "downloading", "the forced torrent runs");
+
+        // Only one torrent is forced at a time: the second `start` means
+        // "that one instead", not "both".
+        registry.force_start(&hashes[3]).expect("start another");
+        let after = states(&mut registry);
+        assert_eq!(after.iter().filter(|s| *s == "downloading").count(), 2);
+        assert_eq!(after[3], "downloading", "the newly forced torrent runs");
+
+        // Removing a running torrent frees its slot for the queue.
+        registry.remove(&hashes[3], false).expect("remove");
+        let after = states(&mut registry);
+        assert_eq!(after.len(), 4);
+        assert_eq!(after.iter().filter(|s| *s == "downloading").count(), 2);
+
+        // Losing the session takes everything offline, and none of it is
+        // "queued" any more — the limit is not why they stopped.
+        registry.detach_network();
+        assert!(
+            states(&mut registry)
+                .iter()
+                .all(|s| s == "waiting-for-router" || s == "paused"),
+            "{:?}",
+            states(&mut registry)
+        );
+    }
+
+    #[test]
+    fn a_seeding_torrent_stops_at_its_ratio_and_says_why() {
+        let data = TempDir::new("ratio");
+        let limits = Limits {
+            // 2.0, as thousandths.
+            seed_ratio_milli: 2000,
+            ..Limits::default()
+        };
+        let mut registry = Registry::<MockDialer>::open(&data.0, limits).unwrap();
+        let (_, bytes) = fixture("seeded");
+        let info_hash = add_and_scan(&mut registry, &bytes);
+
+        // A torrent with no engine is not seeding, so nothing applies to it
+        // however lopsided its counters are.
+        {
+            let hosted = registry.torrents.get_mut(&info_hash).expect("hosted");
+            hosted.downloaded = 1000;
+            hosted.uploaded = 5000;
+        }
+        registry.enforce_seed_limits();
+        assert!(
+            !matches!(
+                registry.torrents[&info_hash].wanted,
+                Wanted::Paused(Why::SeedRatio)
+            ),
+            "an offline torrent must not be stopped for its ratio"
+        );
+
+        // The ratio arithmetic itself, in thousandths and exact.
+        {
+            let hosted = &registry.torrents[&info_hash];
+            assert_eq!(hosted.ratio_milli(), 5000);
+            assert_eq!(hosted.effective_seed_ratio(2000), 2000);
+        }
+
+        // A torrent that downloaded nothing has no ratio to exceed — it was
+        // added complete — and reports 0 rather than dividing by zero.
+        {
+            let hosted = registry.torrents.get_mut(&info_hash).expect("hosted");
+            hosted.downloaded = 0;
+            assert_eq!(hosted.ratio_milli(), 0);
+        }
+
+        // A per-torrent ratio wins over the daemon's, and 0 means "follow it".
+        {
+            let hosted = registry.torrents.get_mut(&info_hash).expect("hosted");
+            hosted.seed_ratio_milli = 500;
+            assert_eq!(hosted.effective_seed_ratio(2000), 500);
+            hosted.seed_ratio_milli = 0;
+            assert_eq!(hosted.effective_seed_ratio(2000), 2000);
+        }
+
+        // Raising the limit on a torrent stopped for its ratio restarts it —
+        // otherwise the operator raises it, nothing happens, and why is
+        // invisible.
+        {
+            let hosted = registry.torrents.get_mut(&info_hash).expect("hosted");
+            hosted.downloaded = 1000;
+            hosted.uploaded = 5000;
+            hosted.wanted = Wanted::Paused(Why::SeedRatio);
+        }
+        registry.set_seed_ratio(&info_hash, 9000).expect("raise");
+        assert_eq!(registry.torrents[&info_hash].wanted, Wanted::Running);
+
+        // But an operator's pause is not undone by it: only the daemon's own
+        // stop is reversible this way.
+        {
+            let hosted = registry.torrents.get_mut(&info_hash).expect("hosted");
+            hosted.wanted = Wanted::Paused(Why::Operator);
+        }
+        registry.set_seed_ratio(&info_hash, 0).expect("clear");
+        assert_eq!(
+            registry.torrents[&info_hash].wanted,
+            Wanted::Paused(Why::Operator)
+        );
+
+        // The reason reaches the operator, which is the whole point of
+        // carrying it on the state rather than beside it.
+        {
+            let hosted = registry.torrents.get_mut(&info_hash).expect("hosted");
+            hosted.wanted = Wanted::Paused(Why::SeedIdle);
+        }
+        let detail = registry.detail(&info_hash).expect("detail");
+        assert_eq!(
+            detail
+                .get("paused_because")
+                .and_then(clove_core::json::Value::as_str),
+            Some("stopped: no peers for the idle limit")
+        );
+
+        // And it survives a restart, which is when the question actually gets
+        // asked. Written the way `enforce_seed_limits` writes it — the
+        // periodic `persist_progress` would skip this torrent, since it has no
+        // engine, which is exactly why the stop path persists for itself
+        // rather than leaving it to the next tick.
+        let hosted = &registry.torrents[&info_hash];
+        registry
+            .write_resume(&info_hash, hosted)
+            .expect("persist the stop");
+        let mut reopened =
+            Registry::<MockDialer>::open(&data.0, Limits::default()).expect("reopen");
+        let detail = reopened.detail(&info_hash).expect("detail after reopen");
+        assert_eq!(
+            detail
+                .get("paused_because")
+                .and_then(clove_core::json::Value::as_str),
+            Some("stopped: no peers for the idle limit")
+        );
+    }
+
+    #[test]
+    fn seeds_and_downloads_have_separate_allowances() {
+        let net = MockNet::new();
+        let data = TempDir::new("queue-seeds");
+        let limits = Limits {
+            max_active_downloads: 1,
+            max_active_seeds: 2,
+            ..Limits::default()
+        };
+        let mut registry = Registry::<MockDialer>::open(&data.0, limits).unwrap();
+
+        // Two torrents complete on disk (added with their content already
+        // there) and two still to fetch.
+        let mut complete = Vec::new();
+        for name in ["done-1", "done-2"] {
+            let (content, bytes) = fixture(name);
+            let meta = MetaInfo::parse(&bytes).unwrap();
+            let storage = Storage::create(&meta, &data.0.join("downloads"), false).unwrap();
+            for p in 0..storage.num_pieces() {
+                let start = p as usize * BLOCK_LEN as usize;
+                let end = (start + storage.piece_len(p) as usize).min(content.len());
+                storage.write_block(p, 0, &content[start..end]).unwrap();
+            }
+            complete.push(add_and_scan(&mut registry, &bytes));
+        }
+        for name in ["todo-1", "todo-2"] {
+            let (_, bytes) = fixture(name);
+            add_and_scan(&mut registry, &bytes);
+        }
+
+        let ep = net.endpoint();
+        registry.attach_network(
+            ep.dialer(),
+            InboundDemux::new(8),
+            *b"-CV0001-leechleechle",
+            quick_swarm(),
+            "leecher-b64".to_owned(),
+        );
+
+        let after = states(&mut registry);
+        // Both seeds run even though only one download does: the two
+        // allowances are separate, which is what stops a queue of downloads
+        // from stopping the client seeding what it already has.
+        assert_eq!(after.iter().filter(|s| *s == "seeding").count(), 2);
+        assert_eq!(after.iter().filter(|s| *s == "downloading").count(), 1);
+        assert_eq!(after.iter().filter(|s| *s == "queued").count(), 1);
+        assert_eq!(complete.len(), 2);
+    }
+
+    #[test]
+    fn rates_start_at_zero_and_need_two_readings() {
+        let data = TempDir::new("rates");
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
+        let (_, bytes) = fixture("rated");
+        add_and_scan(&mut registry, &bytes);
+
+        // A torrent with no engine reports no rate, and the first refresh
+        // takes a baseline rather than dividing a lifetime total by a tick —
+        // which would report a week's average as the current speed.
+        let listed = registry.list();
+        let first = &listed.as_array().expect("an array")[0];
+        assert_eq!(
+            first
+                .get("up_rate")
+                .and_then(clove_core::json::Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            first
+                .get("down_rate")
+                .and_then(clove_core::json::Value::as_u64),
+            Some(0)
+        );
+
+        let totals = registry.totals();
+        assert_eq!((totals.up_rate, totals.down_rate), (0, 0));
+        assert_eq!(totals.peers, 0);
+        assert_eq!(totals.peer_limit, Limits::default().peer_limit);
+    }
+
+    #[test]
+    fn a_prefix_reaches_a_hosted_torrent_too() {
+        // The pending map is only half the picture: the resolver has to see
+        // fully added torrents, which is where every command but `remove`
+        // actually operates.
+        let data = TempDir::new("resolve-hosted");
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
+        let (_, bytes) = fixture("resolvable");
+        let info_hash = add_and_scan(&mut registry, &bytes);
+        let full = hex(&info_hash);
+
+        assert_eq!(registry.resolve(&full).expect("exact"), info_hash);
+        let prefix = &full[..6];
+        assert_eq!(registry.resolve(prefix).expect("prefix"), info_hash);
+
+        // And it stops resolving once the torrent is gone.
+        registry.remove(&info_hash, false).expect("remove");
+        assert!(matches!(
+            registry.resolve(prefix),
+            Err(ResolveError::NotFound)
+        ));
     }
 }

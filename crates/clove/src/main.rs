@@ -2,10 +2,21 @@
 //!
 //! A thin client: hand-rolled arg parsing, one request per invocation over the
 //! local API (unix socket), rendering the daemon's JSON (`--json` passes it
-//! through). Commands: `status`, `list`, `watch`, `show`, `add`, `remove`,
-//! `pause`, `resume`, `verify`, `peer`, `priorities`, `completions`.
-//! `watch` is the live view — a repaint loop over the same renderers, not a
-//! TUI framework (`docs/PHASE-F.md` §6).
+//! through). Commands: `status`, `stats`, `list`, `watch`, `top`, `show`,
+//! `add`, `remove`, `pause`, `resume`, `start`, `verify`, `peer`,
+//! `priorities`, `announce`, `sequential`, `seed-ratio`, `completions`.
+//!
+//! Two live views, and the difference between them is deliberate. `watch` is a
+//! repaint loop over the same renderers — no raw mode, nothing to restore
+//! (`docs/PHASE-F.md` §6). `top` is full-screen with a cursor and keys, still
+//! not a TUI framework (`docs/DECISIONS.md` S2); it lives in [`top`] and the
+//! terminal primitives it needs are in [`clove::term`].
+//!
+//! A torrent is named by info-hash, by a unique prefix of one, or by its
+//! position in `list` — resolved by the daemon except for the position, which
+//! is this end's, since a position is not an identity anything may store.
+
+mod top;
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -89,18 +100,22 @@ fn run() -> Result<(), Fail> {
     };
     match command.as_deref() {
         Some("status") => cmd_status(&where_, json),
+        Some("stats") => cmd_stats(&where_, json),
         Some("list") => cmd_list(&where_, json),
         Some("watch") => cmd_watch(&where_, &operands),
+        Some("top") => cmd_top(&where_, &operands),
         Some("add") => cmd_add(&where_, &operands),
         Some("remove") => cmd_remove(&where_, &operands),
         Some("show") => cmd_show(&where_, json, &operands),
         Some("pause") => cmd_action(&where_, &operands, "pause", "paused"),
         Some("resume") => cmd_action(&where_, &operands, "resume", "resumed"),
+        Some("start") => cmd_action(&where_, &operands, "start", "started"),
         Some("verify") => cmd_verify(&where_, &operands),
         Some("peer") => cmd_peer(&where_, &operands),
         Some("priorities") => cmd_priorities(&where_, &operands),
         Some("announce") => cmd_action(&where_, &operands, "announce", "announcing"),
         Some("sequential") => cmd_sequential(&where_, &operands),
+        Some("seed-ratio") => cmd_seed_ratio(&where_, &operands),
         Some("completions") => cmd_completions(&operands),
         Some(other) => Err(Fail::Usage(format!(
             "unknown command {other:?} (try --help)"
@@ -123,28 +138,210 @@ fn print_help() {
     println!("  -c, --config <path>            read this configuration instead of the default");
     println!("commands:");
     println!("  status [--json]                daemon and router status");
+    println!("  stats [--json]                 totals across every torrent");
     println!("  list [--json]                  hosted torrents");
     println!("  watch [--interval <secs>]      live view, repainted (Ctrl-C to quit)");
-    println!("  show <info-hash> [--json]      one torrent in detail");
+    println!("  top                            full-screen view with keys (q to quit)");
+    println!("  show <torrent> [--json]        one torrent in detail");
     println!("  add <file.torrent|magnet:…>    add a torrent");
-    println!("  remove <info-hash> [--data]    remove a torrent (--data also deletes files)");
-    println!("  pause <info-hash>              pause a torrent");
-    println!("  resume <info-hash>             resume a torrent");
-    println!("  verify <info-hash>             re-check data on disk");
-    println!("  peer <info-hash> <b32-addr>    hand a running torrent a peer to dial");
-    println!("  priorities <info-hash> <spec>  set per-file priorities (e.g. 1,0,2)");
-    println!("  announce <info-hash>           re-announce to every tracker now");
-    println!("  sequential <info-hash> on|off  pick pieces in order instead of rarest-first");
+    println!("      [--paused] [--sequential]  ...stopped, or in file order");
+    println!("  remove <torrent…> [--data]     remove torrents (--data also deletes files)");
+    println!("  pause <torrent…>               pause torrents");
+    println!("  resume <torrent…>              resume torrents");
+    println!("  start <torrent…>               resume and jump the queue");
+    println!("  verify <torrent…>              re-check data on disk");
+    println!("  peer <torrent> <b32-addr>      hand a running torrent a peer to dial");
+    println!("  priorities <torrent> <spec>    set per-file priorities (e.g. 1,0,2)");
+    println!("  announce <torrent…>            re-announce to every tracker now");
+    println!("  sequential <torrent> on|off    pick pieces in order instead of rarest-first");
+    println!("  seed-ratio <torrent> <ratio>   stop seeding it at this ratio (0 = follow config)");
     println!("  completions <bash|zsh|fish>    print a shell completion script");
+    println!();
+    println!("<torrent> is an info-hash, a unique prefix of one, or a # from");
+    println!("`clove list`; commands taking <torrent…> accept several, or --all.");
 }
 
-/// Extract the single required info-hash operand.
+/// What a command calls the torrent it wants: a full info-hash or a unique
+/// prefix of one. Resolved by the daemon, not here.
+const REF_HELP: &str = "an info-hash, a unique prefix of one, or a # from `clove list`";
+
+/// Extract the single required torrent reference.
 fn one_info_hash(operands: &[String]) -> Result<&str, Fail> {
     match operands {
         [ih] => Ok(ih),
-        [] => Err(Fail::Usage("this command needs an info-hash".to_owned())),
+        [] => Err(Fail::Usage(format!(
+            "this command needs a torrent ({REF_HELP})"
+        ))),
         _ => Err(Fail::Usage("too many arguments".to_owned())),
     }
+}
+
+/// Split a command's operands into torrent references and the `--all` flag.
+fn parse_refs(operands: &[String]) -> Result<(Vec<String>, bool), Fail> {
+    let mut refs = Vec::new();
+    let mut all = false;
+    for op in operands {
+        match op.as_str() {
+            "--all" => all = true,
+            other if other.starts_with('-') => {
+                return Err(Fail::Usage(format!("unexpected option {other:?}")));
+            }
+            other => refs.push(other.to_owned()),
+        }
+    }
+    Ok((refs, all))
+}
+
+/// The torrents a command will act on.
+///
+/// `--all` is the one case that needs a listing, and it is the CLI's job
+/// rather than a daemon-side `/v1/torrents/all` endpoint: expanding here keeps
+/// the bulk case made of the same single-torrent requests, so there is one
+/// code path on the daemon and nothing new to authorise.
+fn expand(socket: &Path, token: &str, refs: &[String], all: bool) -> Result<Vec<String>, Fail> {
+    if !all {
+        if refs.is_empty() {
+            return Err(Fail::Usage(format!(
+                "this command needs a torrent ({REF_HELP}), or --all"
+            )));
+        }
+        // A bare number is the `#` column of the listing, resolved here
+        // against the listing as it is right now. Deliberately client-side and
+        // deliberately not an identity the daemon knows: a position means
+        // something different the moment a torrent is added, so nothing may
+        // store one, and `clove list` printing the index it just used is the
+        // only honest way to offer it.
+        if refs.iter().any(|r| is_index(r)) {
+            return resolve_indices(socket, token, refs);
+        }
+        return Ok(refs.to_vec());
+    }
+    if !refs.is_empty() {
+        return Err(Fail::Usage(
+            "--all takes no torrent references of its own".to_owned(),
+        ));
+    }
+    let listed = parse_body(&request(socket, token, "GET", "/v1/torrents", &[])?)?;
+    let items = listed
+        .as_array()
+        .ok_or_else(|| Fail::Failed("daemon did not return a torrent list".to_owned()))?;
+    Ok(items
+        .iter()
+        // A magnet still fetching its metadata is an add in progress, not yet
+        // a torrent: it has no engine to pause, verify or announce, and
+        // including it would make `resume --all` fail for the whole run
+        // because one entry was never resumable. `state` is the one marker
+        // that says so, and using it keeps this rule out of every command.
+        .filter(|item| item.get("state").and_then(Value::as_str) != Some("fetching-metadata"))
+        .filter_map(|item| item.get("info_hash").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Longest listing position accepted as one: `999`, three digits.
+///
+/// The bound is what keeps positions and info-hashes from overlapping, and it
+/// is not arbitrary. The daemon's shortest accepted hash prefix is four
+/// characters, so **no string of one to three digits can be a torrent
+/// reference at all** — and every string of four or more is treated as one,
+/// including an all-digit hash like `0000…0000`, which is a perfectly legal
+/// info-hash and was briefly being read as position zero.
+///
+/// The cost is that a client hosting a thousand torrents cannot name the
+/// thousandth by position. It can still name it by prefix, which is the
+/// spelling that scales.
+const MAX_INDEX_DIGITS: usize = 3;
+
+/// Whether a reference is a listing position rather than a torrent reference.
+///
+/// See [`MAX_INDEX_DIGITS`] for why the two cannot collide.
+fn is_index(reference: &str) -> bool {
+    !reference.is_empty()
+        && reference.len() <= MAX_INDEX_DIGITS
+        && reference.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Turn `#` positions into info-hashes, against one fetch of the listing.
+///
+/// One listing for the whole command, so `clove pause 1 2 3` cannot act on
+/// three different orderings.
+fn resolve_indices(socket: &Path, token: &str, refs: &[String]) -> Result<Vec<String>, Fail> {
+    let listed = parse_body(&request(socket, token, "GET", "/v1/torrents", &[])?)?;
+    let items = listed
+        .as_array()
+        .ok_or_else(|| Fail::Failed("daemon did not return a torrent list".to_owned()))?;
+    let mut out = Vec::with_capacity(refs.len());
+    for reference in refs {
+        if !is_index(reference) {
+            out.push(reference.clone());
+            continue;
+        }
+        let position: usize = reference
+            .parse()
+            .map_err(|_| Fail::Usage(format!("{reference} is not a listing position")))?;
+        let hash = position
+            .checked_sub(1)
+            .and_then(|i| items.get(i))
+            .and_then(|item| item.get("info_hash"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Fail::Failed(format!(
+                    "no torrent at position {reference} (the listing has {})",
+                    items.len()
+                ))
+            })?;
+        out.push(hash.to_owned());
+    }
+    Ok(out)
+}
+
+/// [`resolve_indices`] for the commands that take exactly one torrent, so a
+/// `#` position means the same thing everywhere it can be typed.
+fn one_target(socket: &Path, token: &str, reference: &str) -> Result<String, Fail> {
+    if !is_index(reference) {
+        return Ok(reference.to_owned());
+    }
+    let refs = [reference.to_owned()];
+    resolve_indices(socket, token, &refs)?
+        .pop()
+        .ok_or_else(|| Fail::Failed(format!("could not resolve {reference}")))
+}
+
+/// Apply `op` to every target, and report the worst thing that happened.
+///
+/// One target behaves exactly as it did before there were several — the error
+/// is the command's own, printed once by `main` — so nothing scripted against
+/// the single-torrent form changes shape.
+///
+/// Past that, each failure is printed against the torrent it belongs to and
+/// the command keeps going, because the alternative is a bulk pause that stops
+/// on the first paused torrent. An unreachable daemon is the exception: it is
+/// not a per-torrent failure, and every remaining attempt would rediscover it.
+fn for_each<F>(targets: &[String], mut op: F) -> Result<(), Fail>
+where
+    F: FnMut(&str) -> Result<(), Fail>,
+{
+    if let [only] = targets {
+        return op(only);
+    }
+    let mut failed = 0usize;
+    for target in targets {
+        match op(target) {
+            Ok(()) => {}
+            Err(e @ Fail::Unreachable(_)) => return Err(e),
+            Err(Fail::Usage(m) | Fail::Failed(m)) => {
+                eprintln!("clove: {}: {m}", display(target));
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        return Err(Fail::Failed(format!(
+            "{failed} of {} failed",
+            targets.len()
+        )));
+    }
+    Ok(())
 }
 
 fn cmd_status(where_: &Where, json: bool) -> Result<(), Fail> {
@@ -166,6 +363,52 @@ fn cmd_list(where_: &Where, json: bool) -> Result<(), Fail> {
         return Ok(());
     }
     print!("{}", render_torrents(&parse_body(&body)?));
+    Ok(())
+}
+
+/// Client-wide totals: what every torrent adds up to right now.
+///
+/// Deliberately a separate command from `status`, which answers "is the daemon
+/// and its router alright". This one answers "what is my client doing", and
+/// they are read at different moments.
+fn cmd_stats(where_: &Where, json: bool) -> Result<(), Fail> {
+    let (socket, token) = resolve(where_)?;
+    let body = request(&socket, &token, "GET", "/v1/status", &[])?;
+    if json {
+        println!("{}", String::from_utf8_lossy(&body).trim_end());
+        return Ok(());
+    }
+    let status = parse_body(&body)?;
+    let torrents = parse_body(&request(&socket, &token, "GET", "/v1/torrents", &[])?)?;
+    let empty: Vec<Value> = Vec::new();
+    let items: &[Value] = torrents.as_array().unwrap_or(&empty);
+
+    let mut by_state: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let (mut up, mut down) = (0u64, 0u64);
+    for item in items {
+        *by_state.entry(field_str(item, "state")).or_default() += 1;
+        up += item.get("uploaded").and_then(Value::as_u64).unwrap_or(0);
+        down += item.get("downloaded").and_then(Value::as_u64).unwrap_or(0);
+    }
+
+    let mut out = String::new();
+    let num = |key: &str| status.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let _ = writeln!(out, "torrents      {}", items.len());
+    for (state, count) in &by_state {
+        let _ = writeln!(out, "  {state:<12}{count}");
+    }
+    let _ = writeln!(out, "down rate     {}", human_rate(Some(num("down_rate"))));
+    let _ = writeln!(out, "up rate       {}", human_rate(Some(num("up_rate"))));
+    let _ = writeln!(
+        out,
+        "peers         {} of {}",
+        num("peers"),
+        num("peer_limit")
+    );
+    let _ = writeln!(out, "downloaded    {}", human_size(down));
+    let _ = writeln!(out, "uploaded      {}", human_size(up));
+    let _ = writeln!(out, "session       {}", human_duration(num("uptime_secs")));
+    print!("{out}");
     Ok(())
 }
 
@@ -216,13 +459,29 @@ fn cmd_watch(where_: &Where, operands: &[String]) -> Result<(), Fail> {
     }
 }
 
+/// The full-screen view (`docs/PHASE-H.md` §9).
+///
+/// Separate from [`cmd_watch`] on purpose, and not chosen between by sniffing
+/// whether stdout is a terminal: the two have different interaction models,
+/// and a command that silently becomes a different program depending on where
+/// its output goes is worse than two commands that say what they are.
+fn cmd_top(where_: &Where, operands: &[String]) -> Result<(), Fail> {
+    if let Some(unexpected) = operands.first() {
+        return Err(Fail::Usage(format!("unexpected argument {unexpected:?}")));
+    }
+    let (socket, token) = resolve(where_)?;
+    top::run(&socket, &token)
+}
+
 /// One repaint's worth of text: the daemon summary line, then the torrents.
 fn watch_frame(socket: &Path, token: &str, interval: u64) -> Result<String, Fail> {
     let status = parse_body(&request(socket, token, "GET", "/v1/status", &[])?)?;
     let torrents = parse_body(&request(socket, token, "GET", "/v1/torrents", &[])?)?;
 
-    let router = status.get("router").and_then(Value::as_str).unwrap_or("-");
-    let version = status.get("version").and_then(Value::as_str).unwrap_or("-");
+    // The router line carries whatever the SAM bridge last said, so it is not
+    // ours either — see `display`.
+    let router = field_str(&status, "router");
+    let version = field_str(&status, "version");
     let count = status.get("torrents").and_then(Value::as_u64).unwrap_or(0);
     let uptime = status
         .get("uptime_secs")
@@ -257,16 +516,33 @@ fn human_duration(secs: u64) -> String {
 }
 
 fn cmd_add(where_: &Where, operands: &[String]) -> Result<(), Fail> {
-    let target = operands
-        .first()
-        .ok_or_else(|| Fail::Usage("add needs a .torrent file or magnet link".to_owned()))?;
+    let mut target: Option<&String> = None;
+    let mut flags: Vec<&str> = Vec::new();
+    for op in operands {
+        match op.as_str() {
+            "--paused" => flags.push("paused=1"),
+            "--sequential" => flags.push("sequential=1"),
+            other if other.starts_with("--") => {
+                return Err(Fail::Usage(format!("unexpected option {other:?}")));
+            }
+            _ if target.is_none() => target = Some(op),
+            other => return Err(Fail::Usage(format!("unexpected argument {other:?}"))),
+        }
+    }
+    let target =
+        target.ok_or_else(|| Fail::Usage("add needs a .torrent file or magnet link".to_owned()))?;
     let (socket, token) = resolve(where_)?;
     let body = if target.starts_with("magnet:") {
         target.clone().into_bytes()
     } else {
         std::fs::read(target).map_err(|e| Fail::Failed(format!("reading {target}: {e}")))?
     };
-    let reply = request(&socket, &token, "POST", "/v1/torrents", &body)?;
+    let path = if flags.is_empty() {
+        "/v1/torrents".to_owned()
+    } else {
+        format!("/v1/torrents?{}", flags.join("&"))
+    };
+    let reply = request(&socket, &token, "POST", &path, &body)?;
     let value = parse_body(&reply)?;
     match value.get("info_hash").and_then(Value::as_str) {
         Some(info_hash) => println!("added {info_hash}"),
@@ -276,30 +552,35 @@ fn cmd_add(where_: &Where, operands: &[String]) -> Result<(), Fail> {
 }
 
 fn cmd_remove(where_: &Where, operands: &[String]) -> Result<(), Fail> {
-    let mut info_hash: Option<&str> = None;
     let mut delete_data = false;
-    for op in operands {
-        match op.as_str() {
-            "--data" => delete_data = true,
-            other if info_hash.is_none() => info_hash = Some(other),
-            other => return Err(Fail::Usage(format!("unexpected argument {other:?}"))),
-        }
-    }
-    let info_hash = info_hash.ok_or_else(|| Fail::Usage("remove needs an info-hash".to_owned()))?;
+    let rest: Vec<String> = operands
+        .iter()
+        .filter(|op| {
+            let is_data = op.as_str() == "--data";
+            delete_data |= is_data;
+            !is_data
+        })
+        .cloned()
+        .collect();
+    let (refs, all) = parse_refs(&rest)?;
     let (socket, token) = resolve(where_)?;
-    let target = if delete_data {
-        format!("/v1/torrents/{info_hash}?data=1")
-    } else {
-        format!("/v1/torrents/{info_hash}")
-    };
-    request(&socket, &token, "DELETE", &target, &[])?;
-    println!("removed {info_hash}");
-    Ok(())
+    let targets = expand(&socket, &token, &refs, all)?;
+    for_each(&targets, |target| {
+        let path = if delete_data {
+            format!("/v1/torrents/{target}?data=1")
+        } else {
+            format!("/v1/torrents/{target}")
+        };
+        request(&socket, &token, "DELETE", &path, &[])?;
+        println!("removed {}", display(target));
+        Ok(())
+    })
 }
 
 fn cmd_show(where_: &Where, json: bool, operands: &[String]) -> Result<(), Fail> {
-    let info_hash = one_info_hash(operands)?;
+    let reference = one_info_hash(operands)?;
     let (socket, token) = resolve(where_)?;
+    let info_hash = one_target(&socket, &token, reference)?;
     let body = request(
         &socket,
         &token,
@@ -315,37 +596,44 @@ fn cmd_show(where_: &Where, json: bool, operands: &[String]) -> Result<(), Fail>
     Ok(())
 }
 
-/// A `POST /v1/torrents/{ih}/{action}` with no body; prints `<done> <ih>`.
+/// A `POST /v1/torrents/{ref}/{action}` with no body, for each target;
+/// prints `<done> <ref>`.
 fn cmd_action(where_: &Where, operands: &[String], action: &str, done: &str) -> Result<(), Fail> {
-    let info_hash = one_info_hash(operands)?;
+    let (refs, all) = parse_refs(operands)?;
     let (socket, token) = resolve(where_)?;
-    request(
-        &socket,
-        &token,
-        "POST",
-        &format!("/v1/torrents/{info_hash}/{action}"),
-        &[],
-    )?;
-    println!("{done} {info_hash}");
-    Ok(())
+    let targets = expand(&socket, &token, &refs, all)?;
+    for_each(&targets, |target| {
+        request(
+            &socket,
+            &token,
+            "POST",
+            &format!("/v1/torrents/{target}/{action}"),
+            &[],
+        )?;
+        println!("{done} {}", display(target));
+        Ok(())
+    })
 }
 
 fn cmd_verify(where_: &Where, operands: &[String]) -> Result<(), Fail> {
-    let info_hash = one_info_hash(operands)?;
+    let (refs, all) = parse_refs(operands)?;
     let (socket, token) = resolve(where_)?;
-    let reply = request(
-        &socket,
-        &token,
-        "POST",
-        &format!("/v1/torrents/{info_hash}/verify"),
-        &[],
-    )?;
-    let verified = parse_body(&reply)?
-        .get("verified")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    println!("verified {verified} piece(s) for {info_hash}");
-    Ok(())
+    let targets = expand(&socket, &token, &refs, all)?;
+    for_each(&targets, |target| {
+        let reply = request(
+            &socket,
+            &token,
+            "POST",
+            &format!("/v1/torrents/{target}/verify"),
+            &[],
+        )?;
+        let verified = parse_body(&reply)?
+            .get("verified")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        println!("verified {verified} piece(s) for {}", display(target));
+        Ok(())
+    })
 }
 
 fn cmd_peer(where_: &Where, operands: &[String]) -> Result<(), Fail> {
@@ -355,6 +643,7 @@ fn cmd_peer(where_: &Where, operands: &[String]) -> Result<(), Fail> {
         ));
     };
     let (socket, token) = resolve(where_)?;
+    let info_hash = one_target(&socket, &token, info_hash)?;
     request(
         &socket,
         &token,
@@ -373,6 +662,7 @@ fn cmd_priorities(where_: &Where, operands: &[String]) -> Result<(), Fail> {
         ));
     };
     let (socket, token) = resolve(where_)?;
+    let info_hash = one_target(&socket, &token, info_hash)?;
     request(
         &socket,
         &token,
@@ -398,6 +688,7 @@ fn cmd_sequential(where_: &Where, operands: &[String]) -> Result<(), Fail> {
         }
     };
     let (socket, token) = resolve(where_)?;
+    let info_hash = one_target(&socket, &token, info_hash)?;
     request(
         &socket,
         &token,
@@ -413,6 +704,32 @@ fn cmd_sequential(where_: &Where, operands: &[String]) -> Result<(), Fail> {
         "{info_hash} now picks pieces {}",
         if on { "in order" } else { "rarest-first" }
     );
+    Ok(())
+}
+
+fn cmd_seed_ratio(where_: &Where, operands: &[String]) -> Result<(), Fail> {
+    let [info_hash, ratio] = operands else {
+        return Err(Fail::Usage(
+            "seed-ratio needs <torrent> and a ratio like 2 or 1.75".to_owned(),
+        ));
+    };
+    let (socket, token) = resolve(where_)?;
+    let info_hash = one_target(&socket, &token, info_hash)?;
+    request(
+        &socket,
+        &token,
+        "PUT",
+        &format!("/v1/torrents/{info_hash}/seed-ratio"),
+        ratio.as_bytes(),
+    )?;
+    if ratio == "0" {
+        println!(
+            "{} now follows the daemon's seed_ratio",
+            display(&info_hash)
+        );
+    } else {
+        println!("{} will stop seeding at {ratio}", display(&info_hash));
+    }
     Ok(())
 }
 
@@ -455,10 +772,16 @@ fn render_detail(value: &Value) -> String {
         "inbound_peers",
         "downloaded",
         "uploaded",
+        "down_rate",
+        "up_rate",
+        "ratio",
+        "seed_ratio",
         "announces_ok",
         "announces_failed",
-        // Last, and unwrapped: it is a sentence, not a field, and it is the
-        // one line worth reading when a torrent has no peers.
+        // Last, and unwrapped: each is a sentence rather than a field, and
+        // between them they answer the two questions a stopped or peerless
+        // torrent raises.
+        "paused_because",
         "last_announce_error",
     ] {
         let Some(field) = value.get(key) else {
@@ -466,12 +789,28 @@ fn render_detail(value: &Value) -> String {
         };
         let rendered = match key {
             "size" | "downloaded" | "uploaded" => {
-                field.as_u64().map_or_else(|| field.to_line(), human_size)
+                field.as_u64().map_or_else(|| cell(field), human_size)
             }
+            "down_rate" | "up_rate" => human_rate(field.as_u64()),
+            // Thousandths on the wire, because bencode and JSON integers are
+            // exact and a ratio round-tripped through a float is not.
+            "ratio" | "seed_ratio" => field.as_u64().map_or_else(
+                || cell(field),
+                |milli| {
+                    if milli == 0 && key == "seed_ratio" {
+                        "unlimited (follows the daemon)".to_owned()
+                    } else {
+                        // Integer division, not a float: thousandths are on
+                        // the wire precisely so a ratio never round-trips
+                        // through something that can render 1.5 as 1.499.
+                        format!("{}.{:03}", milli / 1000, milli % 1000)
+                    }
+                },
+            ),
             "progress" => field
                 .as_f64()
-                .map_or_else(|| field.to_line(), |p| format!("{:.0}%", p * 100.0)),
-            _ => field.to_line(),
+                .map_or_else(|| cell(field), |p| format!("{:.0}%", p * 100.0)),
+            _ => cell(field),
         };
         // Wide enough for the longest key printed here (`last_announce_error`),
         // so the value column does not step right when a torrent has a
@@ -490,11 +829,7 @@ fn render_detail(value: &Value) -> String {
                 .get("priority")
                 .and_then(Value::as_u64)
                 .map_or_else(|| "-".to_owned(), priority_name);
-            let path = file
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("-")
-                .to_owned();
+            let path = display(file.get("path").and_then(Value::as_str).unwrap_or("-"));
             rows.push(vec![size, priority, path]);
         }
         out.push_str(&align(&["SIZE", "PRIORITY", "PATH"], &rows));
@@ -505,11 +840,78 @@ fn render_detail(value: &Value) -> String {
         out.push_str("\ntrackers:\n");
         for tracker in trackers {
             if let Some(url) = tracker.as_str() {
-                let _ = writeln!(out, "  {url}");
+                let _ = writeln!(out, "  {}", display(url));
             }
         }
     }
     out
+}
+
+/// How wide a torrent name is allowed to be in a table cell before it is
+/// elided. Long enough for anything an operator recognises a torrent by,
+/// short enough that one pathological name cannot push the info-hash column
+/// off the far side of the terminal.
+const NAME_WIDTH: usize = 60;
+
+/// Make an attacker-controlled string safe to write to a terminal.
+///
+/// A `.torrent` is not trusted input. `info.name`, the file paths under it and
+/// the tracker URLs beside it are all chosen by whoever made the torrent, and
+/// `metainfo::check_component` — which refuses separators, `.`, `..` and NUL —
+/// has no opinion about `ESC`. Printed verbatim, a torrent named
+/// `"\x1b[2J\x1b[1;31m…"` clears the reader's screen and recolours it, and one
+/// named `"\x1b]0;…\x07"` retitles their terminal. `SECURITY.md` already scopes
+/// torrent names as hostile input; this is the same bytes reaching a different
+/// interpreter.
+///
+/// This belongs *here* and not in the daemon. `json::write_string` already
+/// escapes everything below `0x20` as `\u00XX`, so the API is inert and
+/// `--json` consumers were never affected. What the JSON has to keep is the
+/// torrent's actual name — sanitising there would misreport it — so the
+/// substitution happens at the one boundary where bytes become a terminal's
+/// input.
+///
+/// Replaced with `.`:
+/// - the `Cc` category (C0, `DEL` and C1), which is where the escapes live;
+/// - the bidirectional overrides, which reorder *neighbouring* text rather
+///   than drawing anything themselves, and so can make `…rat.exe` render as
+///   `…exe.tar` in the list an operator is reading to decide what to trust.
+///
+/// Everything else passes through, including the UTF-8 that makes [`align`]
+/// approximate — it counts characters, not display columns, which is unchanged
+/// here and not worth a dependency to fix.
+fn display(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            c if c.is_control() => '.',
+            // LRM/RLM, the LRE/RLE/PDF/LRO/RLO run, and the isolates.
+            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '.',
+            c => c,
+        })
+        .collect()
+}
+
+/// [`display`], then clamp to `width` characters, marking any elision.
+///
+/// Character count rather than display width, to stay consistent with
+/// [`align`]: two functions disagreeing about how wide a string is would
+/// misalign the table in a way neither of them looks wrong doing.
+fn elide(s: &str, width: usize) -> String {
+    let safe = display(s);
+    if safe.chars().count() <= width {
+        return safe;
+    }
+    let mut out: String = safe.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// A JSON value rendered into a table cell, sanitised ([`display`]).
+///
+/// Every site that turns a daemon response into terminal output goes through
+/// this or [`elide`]; `to_line` on its own is the bug.
+fn cell(value: &Value) -> String {
+    display(&value.to_line())
 }
 
 fn priority_name(priority: u64) -> String {
@@ -537,7 +939,7 @@ fn render_object(value: &Value) -> String {
     let width = fields.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     let mut out = String::new();
     for (key, val) in fields {
-        let _ = writeln!(out, "{key:<width$}  {}", val.to_line());
+        let _ = writeln!(out, "{key:<width$}  {}", cell(val));
     }
     out
 }
@@ -550,9 +952,18 @@ fn render_torrents(value: &Value) -> String {
     if items.is_empty() {
         return "no torrents\n".to_owned();
     }
-    let headers = ["PROGRESS", "STATE", "SIZE", "NAME", "INFO-HASH"];
+    let headers = [
+        "#",
+        "PROGRESS",
+        "STATE",
+        "SIZE",
+        "DOWN",
+        "UP",
+        "NAME",
+        "INFO-HASH",
+    ];
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(items.len());
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
         let progress = item
             .get("progress")
             .and_then(Value::as_f64)
@@ -562,19 +973,28 @@ fn render_torrents(value: &Value) -> String {
             .get("size")
             .and_then(Value::as_u64)
             .map_or_else(|| "-".to_owned(), human_size);
-        let name = field_str(item, "name");
+        let name = elide(
+            item.get("name").and_then(Value::as_str).unwrap_or("-"),
+            NAME_WIDTH,
+        );
         let hash = item.get("info_hash").and_then(Value::as_str).unwrap_or("-");
         let hash_short = hash.get(..12).unwrap_or(hash).to_owned();
-        rows.push(vec![progress, state, size, name, hash_short]);
+        rows.push(vec![
+            (index + 1).to_string(),
+            progress,
+            state,
+            size,
+            human_rate(item.get("down_rate").and_then(Value::as_u64)),
+            human_rate(item.get("up_rate").and_then(Value::as_u64)),
+            name,
+            hash_short,
+        ]);
     }
     align(&headers, &rows)
 }
 
 fn field_str(item: &Value, key: &str) -> String {
-    item.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or("-")
-        .to_owned()
+    display(item.get(key).and_then(Value::as_str).unwrap_or("-"))
 }
 
 /// Left-align columns to the widest cell (header included); the last column is
@@ -610,6 +1030,18 @@ fn write_row(out: &mut String, cells: &[String], widths: &[usize]) {
         }
     }
     out.push('\n');
+}
+
+/// A transfer rate, or a dash when there is nothing moving.
+///
+/// Zero prints as `-` rather than `0 B/s`: a listing is mostly idle torrents,
+/// and a column of zeroes is noise that hides the one row that is doing
+/// something — which is the whole reason the column is there.
+fn human_rate(bytes_per_sec: Option<u64>) -> String {
+    match bytes_per_sec {
+        Some(0) | None => "-".to_owned(),
+        Some(rate) => format!("{}/s", human_size(rate)),
+    }
 }
 
 /// Human-readable byte size (powers of 1024).
@@ -785,6 +1217,100 @@ mod tests {
     }
 
     #[test]
+    fn a_torrent_name_cannot_drive_the_terminal() {
+        // The whole point: these bytes come out of a `.torrent` written by
+        // whoever wanted us to have it, and `check_component` lets every one
+        // of them through — it only refuses separators, `.`, `..` and NUL.
+        let hostile = "\u{1b}[2J\u{1b}[1;31mowned\u{7}\u{9b}0;title\u{7}\u{0}end";
+        let safe = display(hostile);
+        for bad in ['\u{1b}', '\u{7}', '\u{9b}', '\u{0}'] {
+            assert!(!safe.contains(bad), "{bad:?} survived in {safe:?}");
+        }
+        // One `.` per control character, and the inert remainder of each
+        // sequence left visible rather than swallowed — an operator seeing
+        // `.[2J` in a name should be able to tell what it was trying to do.
+        assert_eq!(safe, ".[2J.[1;31mowned..0;title..end");
+        // Tab and newline are controls too, and a name containing either
+        // would break the table by itself.
+        assert_eq!(display("a\tb\nc\r\n"), "a.b.c..");
+
+        // Trojan-source reordering: the override characters draw nothing
+        // themselves but reverse what is printed around them, so a name can
+        // render as a different extension than the one it has.
+        assert_eq!(display("safe\u{202e}gnp.exe"), "safe.gnp.exe");
+        for c in [
+            '\u{200e}', '\u{200f}', '\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}',
+        ] {
+            assert_eq!(display(&c.to_string()), ".");
+        }
+
+        // What must *not* change: ordinary text, and the non-ASCII that a
+        // legitimately-named torrent is full of.
+        for ok in ["ubuntu-24.04.iso", "Дистрибутив", "日本語", "café", "🎉"] {
+            assert_eq!(display(ok), ok);
+        }
+
+        // And it has to hold through the renderer an operator actually reads,
+        // not just the helper.
+        let table = render_torrents(&Value::Array(vec![obj(&[
+            ("name", Value::from(hostile)),
+            ("state", Value::from("seeding\u{1b}[2J")),
+            ("info_hash", Value::from("ab".repeat(20))),
+        ])]));
+        assert!(!table.contains('\u{1b}'), "{table:?}");
+        let detail = render_detail(&obj(&[
+            ("name", Value::from(hostile)),
+            (
+                "last_announce_error",
+                Value::from("connect failed\u{1b}[2J"),
+            ),
+            (
+                "files",
+                Value::Array(vec![obj(&[
+                    ("path", Value::from("dir/\u{1b}[2Jevil")),
+                    ("length", Value::UInt(1)),
+                ])]),
+            ),
+            (
+                "trackers",
+                Value::Array(vec![Value::from("http://t.i2p/a\u{1b}[2J")]),
+            ),
+        ]));
+        assert!(!detail.contains('\u{1b}'), "{detail:?}");
+        // `clove status` renders through a different function; it reads the
+        // router's last word, which is not ours either.
+        let status = render_object(&obj(&[("router", Value::from("lost\u{1b}[2J"))]));
+        assert!(!status.contains('\u{1b}'), "{status:?}");
+    }
+
+    #[test]
+    fn long_names_are_elided_rather_than_wrapping() {
+        assert_eq!(elide("short", 10), "short");
+        // Exactly the limit is not elided; one past it is.
+        assert_eq!(elide(&"x".repeat(10), 10), "x".repeat(10));
+        let cut = elide(&"x".repeat(11), 10);
+        assert_eq!(cut.chars().count(), 10);
+        assert!(cut.ends_with('…'), "{cut:?}");
+        // Elision counts characters, so a multi-byte name is cut at a
+        // character boundary and not mid-codepoint.
+        let wide = elide(&"é".repeat(80), NAME_WIDTH);
+        assert_eq!(wide.chars().count(), NAME_WIDTH);
+        // Sanitising happens first: an elided name cannot smuggle an escape
+        // through in the part that survives.
+        assert!(!elide(&format!("\u{1b}[2J{}", "x".repeat(80)), NAME_WIDTH).contains('\u{1b}'));
+
+        // A pathological name must not push the last column out of the
+        // terminal, which is what the width is for.
+        let table = render_torrents(&Value::Array(vec![obj(&[
+            ("name", Value::from("n".repeat(400))),
+            ("info_hash", Value::from("cd".repeat(20))),
+        ])]));
+        for line in table.lines() {
+            assert!(line.chars().count() < 120, "{} chars", line.chars().count());
+        }
+    }
+
+    #[test]
     fn columns_align_to_the_widest_cell() {
         let out = align(
             &["A", "LONGHEADER"],
@@ -887,6 +1413,126 @@ mod tests {
             one_info_hash(&["a".to_owned(), "b".to_owned()]),
             Err(Fail::Usage(_))
         ));
+    }
+
+    #[test]
+    fn bulk_commands_separate_references_from_flags() {
+        let refs = |v: &[&str]| {
+            parse_refs(&v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+                .map(|(refs, all)| (refs.join(","), all))
+        };
+        assert_eq!(refs(&["3f2a"]).expect("one"), ("3f2a".to_owned(), false));
+        assert_eq!(
+            refs(&["3f2a", "9b1c"]).expect("several"),
+            ("3f2a,9b1c".to_owned(), false)
+        );
+        assert_eq!(refs(&["--all"]).expect("all"), (String::new(), true));
+        // A flag is never mistaken for a torrent, whichever side it lands on;
+        // `expand` is what then rejects the combination.
+        assert_eq!(
+            refs(&["--all", "3f2a"]).expect("flag first"),
+            refs(&["3f2a", "--all"]).expect("flag last")
+        );
+        // An unknown option is a usage error rather than a torrent named
+        // "--dat" that the daemon would then fail to resolve.
+        assert!(matches!(refs(&["--dat"]), Err(Fail::Usage(_))));
+        assert!(matches!(refs(&["3f2a", "-x"]), Err(Fail::Usage(_))));
+    }
+
+    #[test]
+    fn a_listing_position_can_never_be_an_info_hash() {
+        // Positions: one to three digits, which the daemon could not read as a
+        // reference anyway since its shortest prefix is four characters.
+        for index in ["1", "2", "42", "999"] {
+            assert!(is_index(index), "{index} should be a position");
+        }
+        // Four or more characters is a reference, all-digit or not. This is
+        // the regression: an all-zero info-hash is legal, is 40 digits, and
+        // was being read as position zero — so `clove pause <that hash>`
+        // reported "no torrent at position 0…0" instead of "no such torrent".
+        for reference in [
+            &"0".repeat(40),
+            &"1234".to_owned(),
+            &"0000".to_owned(),
+            &"3f2a".to_owned(),
+            &"1000".to_owned(),
+        ] {
+            assert!(!is_index(reference), "{reference} should be a reference");
+        }
+        // And nothing else is either.
+        for neither in ["", "1a", "-1", "1.0", " 1"] {
+            assert!(!is_index(neither), "{neither:?} should not be a position");
+        }
+    }
+
+    #[test]
+    fn rates_read_as_rates_and_idle_reads_as_nothing() {
+        // A listing is mostly idle torrents; a column of "0 B/s" hides the one
+        // row that is doing something.
+        assert_eq!(human_rate(None), "-");
+        assert_eq!(human_rate(Some(0)), "-");
+        assert_eq!(human_rate(Some(1)), "1 B/s");
+        assert_eq!(human_rate(Some(1024)), "1.0 KiB/s");
+        assert_eq!(human_rate(Some(1024 * 1024)), "1.0 MiB/s");
+    }
+
+    #[test]
+    fn a_bulk_command_reports_the_worst_outcome() {
+        // One target keeps the single-torrent contract exactly: the error is
+        // the command's own, so anything scripted against it is unchanged.
+        let solo = vec!["a".to_owned()];
+        let err = for_each(&solo, |_| Err(Fail::Failed("no such torrent".to_owned())));
+        assert!(matches!(err, Err(Fail::Failed(m)) if m == "no such torrent"));
+        assert!(for_each(&solo, |_| Ok(())).is_ok());
+
+        let many: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_owned()).collect();
+        // All good is good.
+        assert!(for_each(&many, |_| Ok(())).is_ok());
+
+        // A failure part-way does not stop the rest — the point of a bulk
+        // pause is that one already-paused torrent does not abandon the others.
+        let mut seen = Vec::new();
+        let out = for_each(&many, |t| {
+            seen.push(t.to_owned());
+            if t == "b" {
+                Err(Fail::Failed("already paused".to_owned()))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(seen, ["a", "b", "c"], "every target was attempted");
+        assert!(matches!(out, Err(Fail::Failed(m)) if m == "1 of 3 failed"));
+
+        // An unreachable daemon stops immediately: it is not a per-torrent
+        // failure and the remaining attempts would each rediscover it.
+        let mut tried = 0;
+        let out = for_each(&many, |_| {
+            tried += 1;
+            Err(Fail::Unreachable("no socket".to_owned()))
+        });
+        assert_eq!(tried, 1, "gave up after the first");
+        assert!(matches!(out, Err(Fail::Unreachable(_))));
+    }
+
+    #[test]
+    fn expand_refuses_the_ambiguous_invocations() {
+        let socket = Path::new("/nonexistent/clove.sock");
+        // No torrents and no --all is a usage error, named so the operator
+        // learns that a prefix would have done.
+        let err = expand(socket, "t", &[], false).expect_err("nothing to act on");
+        assert!(
+            matches!(&err, Fail::Usage(m) if m.contains("prefix")),
+            "{err:?}"
+        );
+        // Mixing them is a usage error rather than a silent preference for one.
+        let both = expand(socket, "t", &["3f2a".to_owned()], true);
+        assert!(matches!(both, Err(Fail::Usage(_))));
+        // Plain references never touch the socket, which is why this passes a
+        // path that does not exist.
+        assert_eq!(
+            expand(socket, "t", &["3f2a".to_owned(), "9b1c".to_owned()], false).expect("refs"),
+            vec!["3f2a".to_owned(), "9b1c".to_owned()]
+        );
     }
 
     #[test]

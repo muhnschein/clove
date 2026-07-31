@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 use i2pnet::{DestHash, I2pClose, I2pStream};
 
 use crate::bitfield::{self, Bitfield};
+use crate::budget::{PeerBudget, PeerSlot};
 use crate::choker::{Choker, PeerSnapshot};
 use crate::extension::{self, I2P_PEX, UT_METADATA};
 use crate::metadata::{self, METADATA_PIECE_LEN, MetadataMessage};
@@ -235,6 +236,9 @@ pub struct Torrent {
 struct Shared {
     info_hash: [u8; 20],
     peer_id: [u8; 20],
+    /// The client-wide ceiling on concurrent peer connections. Each attached
+    /// peer holds one slot for exactly as long as it is in the table.
+    budget: Arc<PeerBudget>,
     /// Lifetime bytes served to peers this run.
     uploaded: std::sync::atomic::AtomicU64,
     /// Lifetime payload bytes received this run (counted when a solicited
@@ -322,6 +326,13 @@ impl State {
 #[allow(clippy::struct_excessive_bools, clippy::struct_field_names)]
 struct Peer {
     id: u64,
+    /// This connection's slot in the client-wide [`PeerBudget`].
+    ///
+    /// Held rather than read: dropping it with the rest of the entry is what
+    /// returns the slot, so the budget cannot drift from the peer table on any
+    /// of the paths that remove a peer — idle timeout, protocol violation,
+    /// pause, session teardown, or a reader thread that panicked.
+    _slot: PeerSlot,
     /// The peer's I2P destination, for peer exchange.
     dest: DestHash,
     out: SyncSender<Message>,
@@ -395,6 +406,32 @@ impl Torrent {
         mode: Mode,
         peer_id: [u8; 20],
     ) -> Arc<Torrent> {
+        Torrent::with_budget(
+            meta,
+            storage,
+            initial_have,
+            mode,
+            peer_id,
+            PeerBudget::unlimited(),
+        )
+    }
+
+    /// [`new`](Torrent::new), drawing its peer connections from a
+    /// [`PeerBudget`] shared with the other torrents of the same client.
+    ///
+    /// What the daemon uses: the ceiling that matters is on concurrent streams
+    /// against one SAM session, so it belongs to the client rather than to any
+    /// torrent (`docs/PHASE-H.md` §3). A torrent built with [`new`](Torrent::new)
+    /// gets an unlimited budget and behaves as it did before there was one.
+    #[must_use]
+    pub fn with_budget(
+        meta: &MetaInfo,
+        storage: Arc<Storage>,
+        initial_have: &Bitfield,
+        mode: Mode,
+        peer_id: [u8; 20],
+        budget: Arc<PeerBudget>,
+    ) -> Arc<Torrent> {
         let num_pieces = meta.pieces.len().try_into().unwrap_or(u32::MAX);
         let mut picker = Picker::new(num_pieces, meta.piece_length, meta.total_length, mode);
         for index in initial_have.iter_present() {
@@ -411,6 +448,7 @@ impl Torrent {
         let shared = Arc::new(Shared {
             info_hash: meta.info_hash.0,
             peer_id,
+            budget,
             uploaded: std::sync::atomic::AtomicU64::new(0),
             downloaded: std::sync::atomic::AtomicU64::new(0),
             inbound: std::sync::atomic::AtomicU64::new(0),
@@ -648,6 +686,17 @@ impl Torrent {
         lock(&self.shared.state).pex_learned
     }
 
+    /// The client-wide connection budget this torrent draws on.
+    ///
+    /// For callers deciding whether to *start* work — a dial sweep sizing its
+    /// wave, an acceptor about to answer a handshake. What they read from it
+    /// is advisory; the claim inside `attach` is what actually enforces the
+    /// ceiling.
+    #[must_use]
+    pub fn budget(&self) -> &Arc<PeerBudget> {
+        &self.shared.budget
+    }
+
     /// The peers currently attached (handshaken, threads running). The swarm
     /// runner uses this to skip live peers when sweeping `known_peers` for
     /// dial candidates.
@@ -836,6 +885,17 @@ impl Torrent {
         remote: DestHash,
         theirs: &Handshake,
     ) -> std::io::Result<()> {
+        // The client-wide ceiling, claimed before this connection costs
+        // anything more. This is the authoritative check: the dial sweep and
+        // the demux both look at `available()` first to avoid pointless work,
+        // but that read is advisory and two torrents can reach here at the
+        // same instant believing the same slot is free. Only one claim wins.
+        let Some(slot) = self.shared.budget.claim() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "no room in the client's peer budget",
+            ));
+        };
         // Before the split, while the whole stream is still in hand: the two
         // halves are about to belong to threads that block on them, and
         // `remove_peer` needs a way to end the connection that does not.
@@ -845,7 +905,7 @@ impl Torrent {
         let (reader, writer) = stream.split()?;
         let (tx, rx) = sync_channel::<Message>(OUTGOING_QUEUE);
 
-        let id = self.shared.register_peer(tx.clone(), closer, remote);
+        let id = self.shared.register_peer(tx.clone(), closer, remote, slot);
 
         // Announce our piece set, then our extension handshake if the peer
         // speaks BEP 10.
@@ -919,6 +979,7 @@ impl Shared {
         out: SyncSender<Message>,
         closer: Arc<dyn I2pClose + Send + Sync>,
         dest: DestHash,
+        slot: PeerSlot,
     ) -> u64 {
         let mut st = lock(&self.state);
         let id = st.next_id;
@@ -926,6 +987,7 @@ impl Shared {
         st.remember_peer(dest);
         st.peers.push(Peer {
             id,
+            _slot: slot,
             dest,
             out,
             closer,

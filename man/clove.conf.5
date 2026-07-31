@@ -1,4 +1,4 @@
-.Dd July 25, 2026
+.Dd July 30, 2026
 .Dt CLOVE.CONF 5
 .Os
 .Sh NAME
@@ -112,6 +112,131 @@ it downloads.
 Leave it off on a filesystem where sparse files are cheap and free space is
 tight, and on one that does not support sparse files it changes nothing —
 the space is taken either way.
+.It Ic peer_limit Ar count
+The greatest number of peer connections
+.Xr cloved 8
+will hold across
+.Em every
+torrent at once.
+Default:
+.Ar 200 .
+.Pp
+Every peer is an I2P stream on the one SAM session the whole client shares, so
+this is a ceiling on that session as much as on peers.
+The default is the concurrency that has actually been measured — 200 streams
+on one i2pd session, with connect latency independent of how many were open —
+rather than a round number, because above it we would be guessing with the
+session every torrent depends on.
+A session that wedges takes all of them down, not the torrent that overspent.
+.Pp
+Raise it if you have measured your router happily doing more; lower it on a
+small or busy router, or when clove is sharing one with other applications.
+.It Ic torrent_peer_limit Ar count
+The greatest number of peer connections any single torrent will hold.
+Default:
+.Ar 50 .
+.Pp
+Applied underneath
+.Ic peer_limit ,
+which the sum is still bound by: this one stops a single busy torrent taking
+the whole allowance, and is what an operator running many torrents at once
+should lower.
+Both keys take a number from 1 to 10000.
+.Pp
+There is deliberately no fair share between torrents.
+With the defaults, four saturated torrents can hold the entire
+.Ic peer_limit
+and a fifth waits for peers to churn; if that is your situation, lower
+.Ic torrent_peer_limit
+rather than raising
+.Ic peer_limit .
+.It Ic max_active_downloads Ar count
+How many incomplete torrents run at once.
+Default:
+.Ar 3 .
+.Pp
+The rest are
+.Sy queued :
+listed and persisted, but holding no peers, no tunnels and no threads.
+Three because the scarce thing on I2P is tunnels rather than bandwidth — three
+torrents each holding a healthy peer set finish sooner, one after another, than
+twenty sharing the same ceiling and all crawling.
+.It Ic max_active_seeds Ar count
+How many complete torrents seed at once.
+Default:
+.Ar 5 .
+.Pp
+A separate allowance from
+.Ic max_active_downloads ,
+which is what stops a queue of downloads from also stopping the client seeding
+what it has already finished.
+When a download completes it moves from one allowance to the other, freeing its
+download slot for whatever is next in the queue.
+.Pp
+The queue order is the order torrents were added, and it does not change:
+resuming a paused torrent returns it to its own place rather than to the back,
+which can displace a newer torrent that had been promoted in its absence.
+That torrent keeps everything it downloaded; what it loses is its peers and an
+announce.
+.Ic clove start
+puts one torrent at the head of the queue when that is not what you want.
+.It Ic seed_ratio Ar ratio
+Stop seeding a torrent once it has uploaded this multiple of what it
+downloaded.
+Default:
+.Ar 0 ,
+which seeds without limit.
+.Pp
+Written the way a ratio is written —
+.Ar 2 ,
+.Ar 1.75 ,
+.Ar 0.5
+— to at most three decimal places, and stored exactly: the value is kept in
+thousandths rather than as a floating-point number, so
+.Ar 1.5
+is never read back as 1.499.
+.Pp
+A torrent that downloaded nothing has no ratio and is never stopped by this;
+one whose own ratio is set with
+.Ic clove seed-ratio
+uses that instead.
+Stopping is a pause with a reason, reported by
+.Ic clove show ,
+and raising the limit afterwards starts it again.
+.It Ic seed_idle_minutes Ar minutes
+Stop seeding a torrent after this long with no peer attached.
+Default:
+.Ar 0 ,
+which never stops.
+.Pp
+The clock runs only while a torrent is complete and has nobody attached, and
+resets the moment a peer arrives — so this means "nobody wants this" rather
+than "quiet for a while".
+Incomplete torrents are never stopped by it: a download in a slow swarm is
+still a download.
+.It Ic watch_dir Ar path
+Absolute path of a directory to watch for
+.Pa .torrent
+files.
+Default: none, and nothing is watched.
+.Pp
+Every few seconds each
+.Pa .torrent
+in it is added and the file renamed to
+.Pa .torrent.added ,
+which is what stops the same torrent being offered forever.
+One that does not parse becomes
+.Pa .torrent.rejected ,
+for the same reason: it is not going to start parsing, and retrying it every
+few seconds would fill the log with one complaint.
+A torrent that is already hosted counts as added.
+.Pp
+Polled rather than watched through the kernel: a directory listing on a timer
+needs nothing that is not already here, and nobody notices five seconds on a
+torrent about to spend minutes building tunnels.
+.Pp
+This is how other tooling drives clove without an API of its own.
+The daemon needs write access to the directory, since it renames what it takes.
 .El
 .Sh EXAMPLES
 The recommended configuration is no file at all.
@@ -123,9 +248,25 @@ sam_address 127.0.0.1:7000
 data_dir /srv/clove
 .Ed
 .Pp
+Driven by other tooling: pick up torrents dropped in a directory, and stop
+seeding at twice what was downloaded or after a day with nobody asking.
+.Bd -literal -offset indent
+watch_dir /srv/torrents/inbox
+seed_ratio 2
+seed_idle_minutes 1440
+.Ed
+.Pp
 A throwaway identity for a one-off download:
 .Bd -literal -offset indent
 ephemeral yes
+.Ed
+.Pp
+Many torrents on a modest router: hold fewer streams overall, and stop any one
+torrent from taking most of them.
+.Bd -literal -offset indent
+peer_limit 80
+torrent_peer_limit 12
+max_active_downloads 2
 .Ed
 .Pp
 A system-wide instance with a fixed socket path, so a service manager and its

@@ -10,6 +10,7 @@
 mod registry;
 mod sandbox;
 
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -140,7 +141,7 @@ fn run() -> Result<(), String> {
     }
     let token = load_or_create_token(&config.data_dir).map_err(|e| e.to_string())?;
 
-    let registry = Registry::open(&config.data_dir, config.preallocate)
+    let registry = Registry::open(&config.data_dir, registry::Limits::from(&config))
         .map_err(|e| format!("opening registry in {}: {e}", config.data_dir.display()))?;
     eprintln!("cloved: {} torrent(s) loaded", registry.count());
 
@@ -157,6 +158,19 @@ fn run() -> Result<(), String> {
     if let Some(parent) = config.api_socket.parent() {
         read_write.push(parent);
     }
+    // The watch directory, if there is one, is the one path an operator names
+    // that is deliberately *outside* the data directory — and the daemon both
+    // reads it and renames within it. Granted here, before the domain closes,
+    // which is the whole discipline this layer runs on: what is not unveiled
+    // before the restriction cannot be reached after it.
+    //
+    // Getting this wrong is silent in the worst way. Landlock is best-effort,
+    // so on a kernel without it the watcher works and on a kernel with it the
+    // directory simply reads as empty — nothing added, nothing logged, no
+    // error anywhere. CI found it; a local run had not.
+    if let Some(dir) = &config.watch_dir {
+        read_write.push(dir);
+    }
     eprintln!(
         "cloved: {}",
         sandbox::enter_post_init(&sandbox::Limits {
@@ -172,6 +186,7 @@ fn run() -> Result<(), String> {
         token,
         peer_id: build_peer_id().map_err(|e| e.to_string())?,
         registry: Mutex::new(registry),
+        torrent_peer_limit: config.torrent_peer_limit,
         router: Mutex::new("connecting"),
     });
 
@@ -204,7 +219,81 @@ fn run() -> Result<(), String> {
         Identity::new(&config.data_dir, config.ephemeral),
     );
     spawn_persist_loop(&daemon);
+    if let Some(dir) = config.watch_dir.clone() {
+        spawn_watch_dir(&daemon, dir);
+    }
     serve(&listener, &daemon)
+}
+
+/// How often the watch directory is looked at.
+///
+/// Polling, not `inotify`: a directory listing on a timer is a `read_dir` and
+/// no new dependency, against a watch API that would be one. Nobody notices
+/// five seconds on a torrent that is about to spend minutes building tunnels.
+const WATCH_DIR_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Watch a directory for `.torrent` files and add each one it finds.
+///
+/// The file is renamed to `<name>.added` once it has been taken, which is what
+/// stops the same torrent being offered every five seconds forever. A file
+/// that fails to parse becomes `<name>.rejected` for the same reason — it is
+/// not going to start parsing, and retrying it every tick would fill the log
+/// with one complaint.
+///
+/// This is how external tooling drives clove without an API of its own, and it
+/// is deliberately the dumbest thing that works.
+fn spawn_watch_dir(daemon: &Arc<Daemon>, dir: PathBuf) {
+    let daemon = Arc::clone(daemon);
+    std::thread::spawn(move || {
+        loop {
+            scan_watch_dir(&daemon, &dir);
+            std::thread::sleep(WATCH_DIR_INTERVAL);
+        }
+    });
+}
+
+/// One pass over the watch directory.
+fn scan_watch_dir(daemon: &Arc<Daemon>, dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        // Not readable, or not there yet. Said once per tick would be noise;
+        // an operator who set the key and mistyped it sees nothing added,
+        // which is the same information.
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("torrent") {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let added = lock(&daemon.registry).add_torrent(&bytes, registry::AddOptions::default());
+        let suffix = match added {
+            Ok((info_hash, job)) => {
+                // Same as the API path: the initial hash of whatever is
+                // already on disk runs with the registry unlocked.
+                let _ = run_scan(daemon, &job);
+                eprintln!(
+                    "cloved: added {} from {}",
+                    registry::hex(&info_hash),
+                    path.display()
+                );
+                "added"
+            }
+            // A duplicate is not a failure: the operator dropped in something
+            // already hosted, and the file has still been dealt with.
+            Err(AddError::Duplicate) => "added",
+            Err(e) => {
+                eprintln!("cloved: not adding {}: {e}", path.display());
+                "rejected"
+            }
+        };
+        let taken = path.with_extension(format!("torrent.{suffix}"));
+        if let Err(e) = fs::rename(&path, &taken) {
+            eprintln!("cloved: leaving {} where it is: {e}", path.display());
+        }
+    }
 }
 
 /// Daemon state shared across connection threads.
@@ -215,6 +304,10 @@ struct Daemon {
     /// Our wire identity for this run, decided before anything can need it.
     peer_id: [u8; 20],
     registry: Mutex<Registry<Arc<SamSession>>>,
+    /// Per-torrent peer ceiling (`torrent_peer_limit`), applied to the dial
+    /// sweep and the inbound demux when a session comes up. The client-wide
+    /// ceiling is the registry's, since it outlives any one session.
+    torrent_peer_limit: usize,
     /// Router connection state shown in `/v1/status`.
     router: Mutex<&'static str>,
 }
@@ -385,13 +478,21 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str, identity: Ident
             // Only now, with the router having accepted it: a key that failed
             // SESSION CREATE is not one worth keeping.
             identity.remember(session.private_key_b64());
-            let demux = InboundDemux::new(SwarmConfig::default().max_peers);
+            // The per-torrent ceiling reaches the engine by these two paths and
+            // no other — the dial sweep's and the inbound demux's. Both come
+            // from the same configured number, so raising it in clove.conf
+            // raises it for dialling and accepting alike.
+            let swarm_config = SwarmConfig {
+                max_peers: daemon.torrent_peer_limit,
+                ..SwarmConfig::default()
+            };
+            let demux = InboundDemux::new(swarm_config.max_peers);
             let _accept = demux.run(listener);
             lock(&daemon.registry).attach_network(
                 Arc::clone(&session),
                 Arc::clone(&demux),
                 daemon.peer_id,
-                SwarmConfig::default(),
+                swarm_config,
                 session.local_dest_b64().to_owned(),
             );
             *lock(&daemon.router) = "connected";
@@ -793,6 +894,14 @@ fn route(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response {
 }
 
 fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response {
+    // `?paused` and `?sequential` are what an operator wanted *of this add*,
+    // rather than a second command issued after the torrent already started
+    // doing the other thing.
+    let query = request.query().unwrap_or("");
+    let options = registry::AddOptions {
+        paused: query_flag(query, "paused"),
+        sequential: query_flag(query, "sequential"),
+    };
     if request.body.starts_with(b"magnet:") {
         let uri = String::from_utf8_lossy(&request.body).into_owned();
         // Bind first: a `match lock(..)` would hold the registry guard across
@@ -817,7 +926,7 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response 
             Err(e) => error(500, &format!("adding magnet: {e}")),
         };
     }
-    let added = lock(&daemon.registry).add_torrent(&request.body);
+    let added = lock(&daemon.registry).add_torrent(&request.body, options);
     match added {
         Ok((info_hash, job)) => {
             // The initial pass over whatever is already on disk runs with the
@@ -860,13 +969,27 @@ fn torrent_action(
     daemon: &Daemon,
     rest: &str,
 ) -> Response {
-    let (hex, action) = match rest.split_once('/') {
-        Some((hex, action)) => (hex, Some(action)),
+    let (reference, action) = match rest.split_once('/') {
+        Some((reference, action)) => (reference, Some(action)),
         None => (rest, None),
     };
-    let Some(info_hash) = registry::parse_info_hash(hex) else {
-        return error(400, "info-hash must be 40 lowercase-hex characters");
+    let info_hash = match lock(&daemon.registry).resolve(reference) {
+        Ok(info_hash) => info_hash,
+        Err(e) => return resolve_error(&e),
     };
+
+    // A magnet whose metadata has not arrived is listed and can be removed,
+    // but it has no engine, no files and no trackers of its own to act on.
+    // Every such operation used to answer "no such torrent", which is false
+    // about something `clove list` is showing at that moment — and sends the
+    // operator looking for a torrent they can see.
+    if lock(&daemon.registry).is_pending(&info_hash) && !(method == "DELETE" && action.is_none()) {
+        return error(
+            400,
+            "this magnet is still fetching its metadata; until it arrives there is \
+             nothing to act on but removing it",
+        );
+    }
 
     match (method, action) {
         ("GET", None) => match lock(&daemon.registry).detail(&info_hash) {
@@ -887,6 +1010,14 @@ fn torrent_action(
         ("POST", Some("resume")) => {
             action_result(lock(&daemon.registry).set_paused(&info_hash, false))
         }
+        ("POST", Some("start")) => action_result(lock(&daemon.registry).force_start(&info_hash)),
+        ("PUT", Some("seed-ratio")) => match parse_ratio_body(&request.body) {
+            Some(milli) => action_result(lock(&daemon.registry).set_seed_ratio(&info_hash, milli)),
+            None => error(
+                400,
+                "body must be a ratio like 2 or 1.75, or 0 to follow the daemon's seed_ratio",
+            ),
+        },
         ("POST", Some("peers")) => {
             let text = String::from_utf8_lossy(&request.body);
             let Some(peer) = DestHash::from_b32(&text) else {
@@ -950,6 +1081,49 @@ fn action_result(result: Result<(), ActionError>) -> Response {
     }
 }
 
+/// Turn a failed torrent-reference resolution into a response.
+///
+/// The ambiguous case carries the candidates rather than a bare refusal: an
+/// operator who typed too short a prefix wants to see which torrents they hit,
+/// and re-running `clove list` to find out is a step the daemon can save them.
+fn resolve_error(e: &registry::ResolveError) -> Response {
+    match e {
+        registry::ResolveError::Malformed => error(
+            400,
+            &format!(
+                "torrent reference must be a full 40-character lowercase-hex info-hash, \
+                 or a prefix of at least {} of its characters",
+                registry::MIN_PREFIX
+            ),
+        ),
+        registry::ResolveError::NotFound => error(404, "no such torrent"),
+        registry::ResolveError::Ambiguous(candidates) => {
+            let listed: Vec<Value> = candidates
+                .iter()
+                .map(|c| {
+                    Value::Object(vec![
+                        ("info_hash".to_owned(), Value::from(c.info_hash.clone())),
+                        ("name".to_owned(), Value::from(c.name.clone())),
+                    ])
+                })
+                .collect();
+            let body = Value::Object(vec![
+                (
+                    "error".to_owned(),
+                    Value::from(format!(
+                        "that prefix matches {} torrents; use more characters",
+                        candidates.len()
+                    )),
+                ),
+                ("candidates".to_owned(), Value::Array(listed)),
+            ])
+            .encode()
+            .into_bytes();
+            Response::new(409, "application/json", body)
+        }
+    }
+}
+
 fn action_error(e: &ActionError) -> Response {
     match e {
         ActionError::NotFound => error(404, "no such torrent"),
@@ -972,6 +1146,14 @@ fn parse_priorities(body: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Parse a seed-ratio body (`2`, `1.75`, `0`) into thousandths.
+///
+/// The same grammar `clove.conf` accepts, so a ratio means one thing whether
+/// it is typed into a file or handed to the API.
+fn parse_ratio_body(body: &[u8]) -> Option<u64> {
+    clove_core::config::parse_seed_ratio(std::str::from_utf8(body).ok()?.trim())
+}
+
 /// Parse a boolean request body. Deliberately strict — only `true` and
 /// `false`, since a flag that silently reads a typo as "off" is worse than
 /// one that refuses it.
@@ -981,6 +1163,15 @@ fn parse_bool_body(body: &[u8]) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
+}
+
+/// Whether a query string carries `name` as a truthy flag — bare, or set to
+/// `1`, `true` or `yes`.
+fn query_flag(query: &str, name: &str) -> bool {
+    query.split('&').any(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, "1"));
+        key == name && matches!(value, "1" | "true" | "yes")
+    })
 }
 
 /// Whether a query string carries a truthy `data` flag (`data`, `data=1`,
@@ -993,6 +1184,13 @@ fn query_has_data(query: &str) -> bool {
 }
 
 fn status_json(daemon: &Daemon) -> Vec<u8> {
+    // One lock, one refresh: the count and the rates are then the same
+    // reading, rather than two taken a moment apart that do not add up.
+    let (count, totals) = {
+        let mut registry = lock(&daemon.registry);
+        let count = registry.count();
+        (count, registry.totals())
+    };
     Value::Object(vec![
         ("version".to_owned(), Value::from(env!("CARGO_PKG_VERSION"))),
         (
@@ -1005,7 +1203,17 @@ fn status_json(daemon: &Daemon) -> Vec<u8> {
         ),
         (
             "torrents".to_owned(),
-            Value::UInt(u64::try_from(lock(&daemon.registry).count()).unwrap_or(u64::MAX)),
+            Value::UInt(u64::try_from(count).unwrap_or(u64::MAX)),
+        ),
+        ("up_rate".to_owned(), Value::UInt(totals.up_rate)),
+        ("down_rate".to_owned(), Value::UInt(totals.down_rate)),
+        (
+            "peers".to_owned(),
+            Value::UInt(u64::try_from(totals.peers).unwrap_or(u64::MAX)),
+        ),
+        (
+            "peer_limit".to_owned(),
+            Value::UInt(u64::try_from(totals.peer_limit).unwrap_or(u64::MAX)),
         ),
         (
             "router".to_owned(),
@@ -1259,7 +1467,10 @@ mod tests {
             sam_address: "127.0.0.1:7656".to_owned(),
             token: TOKEN.to_owned(),
             peer_id: *b"-CV0001-testtesttes\0",
-            registry: Mutex::new(Registry::open(&dir.0, false).expect("registry")),
+            registry: Mutex::new(
+                Registry::open(&dir.0, registry::Limits::default()).expect("registry"),
+            ),
+            torrent_peer_limit: clove_core::config::DEFAULT_TORRENT_PEER_LIMIT,
             router: Mutex::new("connecting"),
         })
     }
@@ -1390,16 +1601,29 @@ mod tests {
         // Malformed is 400 and absent is 404; the two are different answers
         // on purpose, so a typo in a script reads as a typo.
         for bad in [
-            "/v1/torrents/zzzz",
-            "/v1/torrents/0123456789abcdef0123456789abcdef012345", // 38 chars
+            "/v1/torrents/zzz",                                        // under MIN_PREFIX
+            "/v1/torrents/zzzz",                                       // not hex
             "/v1/torrents/0123456789abcdef0123456789abcdef0123456789", // 42 chars
-            "/v1/torrents/0123456789ABCDEF0123456789ABCDEF01234567", // uppercase
-            "/v1/torrents/0123456789abcdef0123456789abcdef0123456 ", // trailing space
+            "/v1/torrents/0123456789ABCDEF0123456789ABCDEF01234567",   // uppercase
+            "/v1/torrents/0123456789abcdef0123456789abcdef0123456 ",   // trailing space
         ] {
             assert_eq!(status_of(&speak(&d, &get(bad, Some(TOKEN)))), 400, "{bad}");
         }
-        let absent = "/v1/torrents/0123456789abcdef0123456789abcdef01234567";
-        assert_eq!(status_of(&speak(&d, &get(absent, Some(TOKEN)))), 404);
+        // Absent is 404 whether it was named in full or by a prefix. The
+        // 38-character case used to be here as a malformed hash and is now a
+        // well-formed prefix that happens to match nothing — the same answer a
+        // full hash gets, which is the point of accepting prefixes at all.
+        for absent in [
+            "/v1/torrents/0123456789abcdef0123456789abcdef01234567", // full, unknown
+            "/v1/torrents/0123456789abcdef0123456789abcdef012345",   // 38-char prefix
+            "/v1/torrents/0123",                                     // shortest prefix
+        ] {
+            assert_eq!(
+                status_of(&speak(&d, &get(absent, Some(TOKEN)))),
+                404,
+                "{absent}"
+            );
+        }
     }
 
     // ----------------------------------------------------- hostile HTTP
@@ -1600,7 +1824,9 @@ mod tests {
         let bytes = bencode::encode(&Ben::Dict(root));
 
         // Add it, and write the data so the scan has something to hash.
-        let (info_hash, job) = lock(&d.registry).add_torrent(&bytes).expect("add");
+        let (info_hash, job) = lock(&d.registry)
+            .add_torrent(&bytes, registry::AddOptions::default())
+            .expect("add");
         let downloads = dir.0.join("downloads/scan-lock");
         std::fs::write(&downloads, &content).expect("write the data");
         let published = run_scan(&d, &job).expect("first scan");
@@ -1752,7 +1978,10 @@ mod tests {
             sam_address: "127.0.0.1:7656".to_owned(),
             token: String::new(),
             peer_id: *b"-CV0001-testtesttes\0",
-            registry: Mutex::new(Registry::open(&dir.0, false).expect("registry")),
+            registry: Mutex::new(
+                Registry::open(&dir.0, registry::Limits::default()).expect("registry"),
+            ),
+            torrent_peer_limit: clove_core::config::DEFAULT_TORRENT_PEER_LIMIT,
             router: Mutex::new("connecting"),
         });
         for header in [Some(""), Some(" "), None, Some(TOKEN)] {
