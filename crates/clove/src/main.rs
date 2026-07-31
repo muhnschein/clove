@@ -7,6 +7,8 @@
 //! `watch` is the live view — a repaint loop over the same renderers, not a
 //! TUI framework (`docs/PHASE-F.md` §6).
 
+mod top;
+
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -92,6 +94,7 @@ fn run() -> Result<(), Fail> {
         Some("stats") => cmd_stats(&where_, json),
         Some("list") => cmd_list(&where_, json),
         Some("watch") => cmd_watch(&where_, &operands),
+        Some("top") => cmd_top(&where_, &operands),
         Some("add") => cmd_add(&where_, &operands),
         Some("remove") => cmd_remove(&where_, &operands),
         Some("show") => cmd_show(&where_, json, &operands),
@@ -129,6 +132,7 @@ fn print_help() {
     println!("  stats [--json]                 totals across every torrent");
     println!("  list [--json]                  hosted torrents");
     println!("  watch [--interval <secs>]      live view, repainted (Ctrl-C to quit)");
+    println!("  top                            full-screen view with keys (q to quit)");
     println!("  show <torrent> [--json]        one torrent in detail");
     println!("  add <file.torrent|magnet:…>    add a torrent");
     println!("      [--paused] [--sequential]  ...stopped, or in file order");
@@ -444,6 +448,20 @@ fn cmd_watch(where_: &Where, operands: &[String]) -> Result<(), Fail> {
             .map_err(|e| Fail::Failed(format!("writing to the terminal: {e}")))?;
         std::thread::sleep(std::time::Duration::from_secs(interval));
     }
+}
+
+/// The full-screen view (`docs/PHASE-H.md` §9).
+///
+/// Separate from [`cmd_watch`] on purpose, and not chosen between by sniffing
+/// whether stdout is a terminal: the two have different interaction models,
+/// and a command that silently becomes a different program depending on where
+/// its output goes is worse than two commands that say what they are.
+fn cmd_top(where_: &Where, operands: &[String]) -> Result<(), Fail> {
+    if let Some(unexpected) = operands.first() {
+        return Err(Fail::Usage(format!("unexpected argument {unexpected:?}")));
+    }
+    let (socket, token) = resolve(where_)?;
+    top::run(&socket, &token)
 }
 
 /// One repaint's worth of text: the daemon summary line, then the torrents.

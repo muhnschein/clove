@@ -3,7 +3,7 @@
 _clove() {
     local cur cmds
     cur="${COMP_WORDS[COMP_CWORD]}"
-    cmds="status stats list watch show add remove pause resume verify priorities announce sequential seed-ratio peer completions"
+    cmds="status stats list watch top show add remove pause resume start verify priorities announce sequential seed-ratio peer completions"
     if [ "${COMP_CWORD}" -eq 1 ]; then
         COMPREPLY=( $(compgen -W "${cmds}" -- "${cur}") )
         return 0

@@ -1,6 +1,6 @@
 # Phase H — Daily-drivable: many torrents, and a view worth watching
 
-**Status:** In progress — **H0, H4, H1, H5, H2, H3 and H6 landed** (less `--to`, §8); the TUI as designed below.
+**Status:** Complete except `add --to` (§8). H0, H4, H1, H5, H2, H3, H6 and the TUI (§9) have all landed.
 This pinned the design before the wiring, the way `PHASE-F.md` did, so the
 architecture was argued on paper where arguing is cheap. Maps to no new milestone: this is what M4's *"a CLI pleasant
 enough for daily use"* (`SCOPE.md` §1) turns out to mean once you run more than
@@ -405,7 +405,7 @@ subdirectory of the downloads root, because Landlock will refuse anything else
 
 ---
 
-## 9. The TUI
+## 9. The TUI — **landed**
 
 **The framework is rejected; the TUI is not.** The full argument, the measured
 dependency closures, and the reversal condition are `DECISIONS.md` **S2**,
@@ -452,7 +452,25 @@ pays for (§10).
   point.
 
 **Cost:** ~600 lines in `clove`, the largest item in this document — and the
-reason it is last. It is worth building *after* H0 (or it renders hostile text
+reason it is last.
+
+**As built, and the promise kept.** `clove` became a library as well as a
+binary so the escape-sequence decoder could carry a `cargo-fuzz` target like
+every other parser here — S2 made that a condition, and
+`fuzz/fuzz_targets/keys.rs` asserts the properties that matter for a decoder
+rather than for an attacker: every decode makes progress, none over-reads, and
+none follows a sequence past its documented bound.
+
+The dependency claim was checkable and is checked: `Cargo.lock` holds **52
+entries before and after**, because `rustix`'s `termios`/`stdio` features
+resolve entirely to crates already in the tree. `ci/check-net-deps.sh` covers
+the new manifest without changes — its `net`-feature check is per-manifest.
+
+Driven through a pty end to end during development: raw mode, the alternate
+screen, the cursor, `p`/`D`, the confirm-then-act path, and restoration on
+exit. Two defects showed up only there and in no unit test — a state column too
+narrow for `waiting-for-router`, which stepped every column after it, and
+"1 torrents". It is worth building *after* H0 (or it renders hostile text
 full-screen), H4 (or its actions have nothing to name) and H5 (or it is a
 screen full of totals that never move).
 

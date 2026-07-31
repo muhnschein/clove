@@ -90,11 +90,25 @@ commit. Closure sizes are recorded when the dependency is actually added.
   built.
 
   **Socket-capable behind a feature we do not enable.** `rustix::net` exists;
-  `default-features = false` with only `fs` and `std` leaves it out. Because
-  the capability is one word in a `Cargo.toml` away, `rustix` is listed in
-  *both* the deny and allow sets of `ci/check-net-deps.sh`, and that script now
-  also fails if any manifest turns the `net` feature on — the allowlist alone
-  would have said nothing.
+  `default-features = false` leaves it out. Because the capability is one word
+  in a `Cargo.toml` away, `rustix` is listed in *both* the deny and allow sets
+  of `ci/check-net-deps.sh`, and that script now also fails if any manifest
+  turns the `net` feature on — the allowlist alone would have said nothing.
+  That check is per-manifest, so it covers the second consumer below as well.
+
+  **Second consumer, no new crates** (`clove`, Phase H): `termios` and `stdio`,
+  for `clove top`. Raw mode (`tcgetattr`/`tcsetattr`) and the window size
+  (`tcgetwinsize`) are the only two things a full-screen view needs that are
+  not an escape sequence, and `unsafe_code = "forbid"` rules out reaching for
+  them through `libc`. The features resolve to `{rustix, bitflags, errno,
+  libc, linux-raw-sys, windows-link, windows-sys}` — every one already in
+  `Cargo.lock` at the same version, so the closure does not grow at all.
+
+  This is the finding `docs/DECISIONS.md` S2 turns on. Measured against the
+  alternatives on 2026-07-30: `ratatui` 0.30 locks 181 crates with default
+  features and 91 with none, and `iocraft` 0.8 locks 68 — against clove's 48.
+  A TUI *framework* cannot be paid for; the terminal syscalls behind one were
+  already bought.
 - **`getrandom` 0.2** (`cloved`) — entered Phase F. The API token and the
   peer-ID suffix are bytes straight from the OS RNG; `getrandom` is the
   maintained thin wrapper over `getrandom(2)`/`/dev/urandom`, exactly the

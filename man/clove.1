@@ -122,6 +122,67 @@ This is a plain redraw loop, not a full-screen program: the terminal is
 never put into raw mode, so
 .Ic Ctrl-C
 leaves it exactly as it was.
+.It Cm top
+A full-screen view with a selection cursor and keys.
+.Pp
+.Bl -tag -width "p" -compact -offset indent
+.It Ic ↑ Ns / Ns Ic k , Ic ↓ Ns / Ns Ic j
+move the cursor
+.It Ic PgUp Ns / Ns Ic PgDn , Ic g , Ic G
+move by a screen, to the top, to the bottom
+.It Ic ⏎
+show the selected torrent in detail, and again to go back
+.It Ic p
+pause a running torrent, resume a stopped one
+.It Ic s
+start it, ahead of the queue
+.It Ic v
+verify its data
+.It Ic a
+announce to its trackers
+.It Ic d , Ic D
+remove it, or remove it and its data; both ask first, and only
+.Ic y
+confirms
+.It Ic r
+refresh now
+.It Ic q Ns / Ns Ic Ctrl-C
+quit
+.El
+.Pp
+Every key sends the same request the equivalent command does.
+.Nm top
+adds no interface of its own to
+.Xr cloved 8 ,
+holds no state, and can be interrupted at any point.
+.Pp
+Unlike
+.Cm watch ,
+this puts the terminal into raw mode and uses the alternate screen, both of
+which it restores on exit and on a panic.
+It does not restore them if the process is killed outright — a handler for
+.Dv SIGTERM
+would need either unsafe code or another dependency, and clove takes neither —
+so a
+.Xr kill 1 Ns ed
+.Nm top
+leaves a terminal wanting
+.Ic stty sane .
+.Ic Ctrl-C
+is not affected: in raw mode it arrives as an ordinary byte and quits cleanly.
+.Pp
+Columns are padded by character count rather than display width, so a name
+written in characters that occupy two columns each
+.Pq CJK, some emoji
+will not line up exactly.
+.Cm list
+has always done the same.
+Use
+.Cm watch
+over a pipe, in a terminal that cannot do better, or when nothing should be
+left to restore;
+.Nm top
+refuses to start when its input is not a terminal.
 .It Cm show Ar torrent Op Fl -json
 One torrent in detail: sizes, progress, state, peer counts, bytes moved, its
 share ratio and the limit it is held to, the file table with per-file
@@ -296,6 +357,12 @@ Add a torrent and watch it:
 .Bd -literal -offset indent
 $ clove add ~/Downloads/release.torrent
 added 58e2fc46a8dc57c78191f079648750b0644d03a2
+$ clove top
+.Ed
+.Pp
+The same thing without raw mode, for a pipe or a terminal that cannot do
+better:
+.Bd -literal -offset indent
 $ clove watch
 .Ed
 .Pp
