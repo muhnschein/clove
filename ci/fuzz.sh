@@ -61,41 +61,57 @@ done
 # Per-target budget in seconds. Deliberately not flat, and set from what the
 # reports measured rather than from taste.
 #
-# The two 2026-07-30 sweeps are where these come from, and together they are a
-# controlled experiment rather than two readings. Both started from the same
-# corpus — identical INITED coverage in all nine targets — and the second ran
-# at `--scale 8`. The difference between them is time and nothing else, which
-# is the only question a budget actually asks. Seven times the budget bought:
+# The 2026-07-30T11:37Z scale-8 sweep is where these come from, and it asked a
+# different question from the pair before it. Those two started from the same
+# corpus and differed only in time. This one started from the corpus the
+# scale-8 sweep *produced* — its INITED coverage was that sweep's final figure
+# in all nine targets, so the seed round-tripped exactly — which asks what
+# eight times the budget is still worth once the corpus is as good as we have
+# managed to make it. The answer was almost nothing, in eight targets:
 #
-#   tracker  +47 edges    resume  +17    extensions  +9    metainfo  +2
-#   http      +1          bencode   0    json         0    magnet     0    wire  0
+#   tracker  +193 edges, still gaining at ~5470s      resume  +5, at ~4180s
+#   http     +2, all by ~300s                         everything else  0
 #
-# `magnet` is what moved the table. It held the largest budget in the file on
-# the strength of +96 edges in 840s — and returned exactly +96 in 6720s, so
-# seven eighths of the biggest allocation was buying nothing. The dictionary
-# A/B says the same thing from the other end: 120s from an *empty* directory
-# already reached 498, which is the ceiling both sweeps stopped at. `tracker`
-# was the only target still clearly paying for time at the far end, and takes
-# most of what `magnet` gives up.
+# So six targets returned zero edges for 8x their budget, from the best corpus
+# the project has, and `extensions` — which was still worth +9 last time — has
+# joined them. They drop to a 120s floor and `tracker` takes what they give up.
 #
-# Only the budgets with a measurement behind them move. Cutting `http` or
-# `json` below the budget they were tested at would be extrapolation, and the
-# report now measures the plateau point per target — the fraction of the run
-# after which coverage stopped growing — so the next one answers that directly
-# instead. Total is unchanged at 3360s: a reallocation, not a bigger bill.
+# That floor is a choice, and worth being honest about: it is not a measured
+# plateau. With the seed already at a target's ceiling, no budget buys another
+# edge, so no report can say how few seconds are enough — what the seconds
+# still buy there is crash search, which the coverage figures cannot price.
+# 120s is small enough to be cheap and long enough to be a real hunt, and it is
+# where a target sits until either a crash or a target rewrite changes the
+# question. `wire` is the standing warning: it sat at a plateau for three
+# sweeps because the target was too narrow, not because the codec was clean.
+#
+# `http` and `resume` keep theirs: both gains landed inside the budget they
+# already have (`http` at ~300s of 420s) or trail off so late that no plausible
+# budget catches them (`resume`, +5 edges with the last at ~4180s). Total is
+# unchanged at 3360s: a reallocation, not a bigger bill.
 budget_for() {
     case "$1" in
-        wire) echo 120 ;;                       # new surface, provisional; see below
-        magnet) echo 240 ;;                     # +0 for 8x the time, and 120s from
-                                                # empty already reaches the ceiling
-        bencode) echo 180 ;;                    # +0 for 7x; untested below 180s
-        json|metainfo) echo 240 ;;              # +0, +2
-        http|extensions) echo 420 ;;            # +1, +9
-        resume) echo 600 ;;                     # +17
-        tracker) echo 900 ;;                    # +47, the best margin in the table
+        # +0 at 8x, from a corpus that starts them at their ceiling. Floor.
+        wire|magnet|bencode|json|metainfo) echo 120 ;;
+        # +0 at 8x too, but at 1914 execs/s it buys a fortieth of the
+        # executions `json` gets per second — cut, not floored, until the
+        # throughput question in fuzz/README.md is answered.
+        extensions) echo 240 ;;
+        http) echo 420 ;;                       # +2, all of them by ~300s
+        resume) echo 600 ;;                     # +5, trailing off at ~4180s
+        tracker) echo 1500 ;;                   # +193 and still gaining at ~5470s
         *) echo 300 ;;
     esac
 }
+
+# libFuzzer's own default, passed explicitly. The value is not the point — the
+# visibility is. A target that crosses this is killed and its input written to
+# `fuzz/artifacts`, so it arrives in the report as a *crash*, which is a
+# confusing way to be told a fuzzer grew a large corpus in memory. `resume`
+# peaked at 1371 MiB in the 2026-07-30T11:37Z sweep, two thirds of the way
+# here, and nothing in the report said what the ceiling was. Now the header
+# carries it and every target reports its peak against it.
+RSS_LIMIT=2048
 
 # CI asks for the budget rather than carrying its own copy of the table. The
 # two used to be duplicated, with a comment in each telling the reader they
@@ -157,6 +173,7 @@ note "cargo-fuzz $(cargo-fuzz --version 2>/dev/null || echo unknown)"
 note "host      $(uname -srm)"
 note "dicts     $(ls fuzz/dicts/*.dict 2>/dev/null | wc -l | tr -d ' ') file(s) in fuzz/dicts"
 note "scale     $SCALE${QUICK:+ (quick=$QUICK)}"
+note "rss limit $RSS_LIMIT MiB per target"
 note ""
 
 seed_corpus
@@ -200,13 +217,21 @@ unfinished() {
     echo "$n"
 }
 
+# What a target actually gets, once `--quick` and `--scale` have had their
+# say. Asked in two places — once to run the target, once to report what that
+# run's plateau came to in seconds — and the two must agree, so there is one
+# copy of it rather than a rule about keeping two in step.
+seconds_for() {
+    if [ "$QUICK" = yes ]; then
+        echo 30
+    else
+        echo $(( $(budget_for "$1") * SCALE ))
+    fi
+}
+
 started=''
 for t in $sched; do
-    if [ "$QUICK" = yes ]; then
-        secs=30
-    else
-        secs=$(( $(budget_for "$t") * SCALE ))
-    fi
+    secs=$(seconds_for "$t")
 
     # A dictionary of the tokens the parser actually looks for. libFuzzer
     # learns some of these on its own — a `strip_prefix` compiles to an
@@ -222,7 +247,7 @@ for t in $sched; do
     (
         # shellcheck disable=SC2086  # $dict is one flag or nothing
         cargo +nightly fuzz run "$t" -- $dict \
-            -max_total_time="$secs" -print_final_stats=1 \
+            -max_total_time="$secs" -rss_limit_mb="$RSS_LIMIT" -print_final_stats=1 \
             >"$logs/$t.log" 2>&1
         echo "$?" > "$logs/$t.status"
     ) &
@@ -236,6 +261,7 @@ note ""
 fail=0
 for t in $TARGETS; do
     status=$(cat "$logs/$t.status" 2>/dev/null || echo '?')
+    secs=$(seconds_for "$t")
     stat_of() {
         grep -oE "stat::$1: *[0-9]+" "$logs/$t.log" 2>/dev/null |
             tail -1 | grep -oE '[0-9]+$'
@@ -263,8 +289,14 @@ for t in $TARGETS; do
         note "FAIL  $t  (exit $status)"
         fail=1
     fi
-    note "      execs ${execs:-?}  (${per_sec:-?}/s)  cov ${cov:-?}${gained:+ (+$gained this run)}"
-    note "      corpus ${before:-0} -> ${after:-0} files  new-units ${added:-?}  peak-rss ${rss:-?} MiB"
+    # `cov A -> B` rather than the final figure alone. A is what the committed
+    # seed reaches on its own, and it is the number that says whether the seed
+    # round-tripped: the 2026-07-30T11:37Z sweep began at exactly the coverage
+    # the sweep before it ended on, in all nine targets, which is how we know
+    # `cmin` and the repack cost nothing. Establishing that took arithmetic
+    # across two reports; printing the figure makes it a glance.
+    note "      execs ${execs:-?}  (${per_sec:-?}/s)  cov ${inited:-?} -> ${cov:-?}${gained:+ (+$gained this run)}"
+    note "      corpus ${before:-0} -> ${after:-0} files  new-units ${added:-?}  peak-rss ${rss:-?} of $RSS_LIMIT MiB"
 
     # What a budget should be revised from. Not `new_units_added`, which is
     # what the earlier version of this script used and which says almost
@@ -280,7 +312,18 @@ for t in $TARGETS; do
     # gain arrived does — libFuzzer prints `cov:` on every progress line, so
     # the first line carrying the run's final figure is the moment it stopped
     # learning, and the rest of the budget demonstrably bought nothing.
-    plateau=''
+    #
+    # In seconds, not as a percentage of the run. A percentage cannot be
+    # compared against `budget_for`, which is written in seconds, and it is a
+    # percentage of a *scaled* run at that: "still gaining at 76% of the run"
+    # was `tracker` asking for something between 901 and 7200 seconds, which is
+    # most of the answer missing. The same reading in seconds — the last new
+    # edge at ~5470s, six times the 900s budget — is the number the table wants
+    # and can be transcribed into it directly. Executions are the clock here
+    # because that is what libFuzzer counts on its progress lines; wall time is
+    # the budget, and the two are proportional within a run.
+    plateau_pct=''
+    plateau_secs=''
     if [ -n "${cov:-}" ] && [ -n "${execs:-}" ] && [ "$execs" -gt 0 ] 2>/dev/null; then
         at=$(awk -v final="$cov" '
             $1 ~ /^#[0-9]+$/ {
@@ -291,22 +334,35 @@ for t in $TARGETS; do
                     }
             }' "$logs/$t.log" 2>/dev/null)
         if [ -n "$at" ]; then
-            plateau=$((at * 100 / execs))
-            [ "$plateau" -gt 100 ] && plateau=100
+            # awk, not `$(( ))`: execs runs to hundreds of millions and the
+            # budget to thousands of seconds, and their product is past what a
+            # 32-bit shell integer holds. dash is 64-bit here; POSIX does not
+            # promise it.
+            plateau_pct=$(awk -v a="$at" -v e="$execs" 'BEGIN {
+                p = int(a * 100 / e); print (p > 100 ? 100 : p) }')
+            plateau_secs=$(awk -v a="$at" -v e="$execs" -v s="$secs" 'BEGIN {
+                t = int(a * s / e); print (t > s ? s : t) }')
         fi
     fi
+
+    # What the same target would have got at `--scale 1`. A report read six
+    # months from now should not need to know what scale it was run at to be
+    # able to act on it.
+    base=$(budget_for "$t")
+    scaled=''
+    [ "$secs" != "$base" ] && scaled=" (1x budget: ${base}s)"
 
     if [ -n "$gained" ]; then
         edges=edges
         [ "$gained" -eq 1 ] && edges=edge
         if [ "$gained" -eq 0 ]; then
             note "      note: no new edges — this budget is more than it needs"
-        elif [ -z "$plateau" ]; then
+        elif [ -z "$plateau_secs" ]; then
             note "      note: +$gained $edges"
-        elif [ "$plateau" -le 50 ]; then
-            note "      note: +$gained $edges, all of them by $plateau% of the run — the rest bought nothing"
+        elif [ "$plateau_pct" -le 50 ]; then
+            note "      note: +$gained $edges, all of them by ~${plateau_secs}s of ${secs}s$scaled — the rest bought nothing"
         else
-            note "      note: +$gained $edges, still gaining at $plateau% of the run — worth more time"
+            note "      note: +$gained $edges, still gaining at ~${plateau_secs}s of ${secs}s$scaled — worth more time"
         fi
     fi
     note ""

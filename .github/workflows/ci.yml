@@ -49,7 +49,13 @@ jobs:
   fuzz:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Headroom over the largest budget, not a number to itself. `tracker` is
+    # 1500s = 25 minutes, and the job pays for a nightly install, a
+    # `cargo install cargo-fuzz` and a sanitizer build before any of it, then
+    # `cmin` over the largest corpus in the set afterwards. At 60 this was
+    # comfortable when the largest budget was 900s; it is the budget that grew,
+    # so this grows with it rather than finding out at 3am.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:

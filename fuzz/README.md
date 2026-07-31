@@ -134,38 +134,62 @@ reader that did not exist yet. It does now; see Budgets.
 
 Not flat, and set from what the reports measured rather than from taste.
 
-The two sweeps of 2026-07-30 are what the current table rests on, and together
-they are a controlled experiment rather than two readings. Both started from
-the same corpus — the `INITED` coverage libFuzzer prints after replaying the
-seeds was identical in all nine targets — and the second ran at `--scale 8`.
-The only difference between them is time, which is the only thing a budget
-buys.
+The 2026-07-30T11:37Z scale-8 sweep is what the current table rests on, and it
+asked a different question from the pair before it. Those two started from the
+same corpus and differed only in time. This one started from the corpus the
+scale-8 sweep *produced*, which asks the question that actually matters once a
+seed corpus is being carried forward: what is eight times the budget still
+worth when the corpus is already as good as we have managed to make it?
 
-| Target | Budget | +edges at 1x | +edges at 8x | What 7x more time bought |
-|---|---:|---:|---:|---:|
-| `tracker` | 480s → **900s** | +47 | +94 | +47 |
-| `resume` | 480s → **600s** | +53 | +70 | +17 |
-| `extensions` | 420s | +94 | +103 | +9 |
-| `metainfo` | 240s | +6 | +8 | +2 |
-| `http` | 420s | +90 | +91 | +1 |
-| `bencode` | 180s | +2 | +2 | 0 |
-| `json` | 240s | +3 | +3 | 0 |
-| `magnet` | 840s → **240s** | +96 | +96 | 0 |
-| `wire` | 60s → **120s** | 0 | 0 | 0 |
+| Target | Budget | Seed cov | Final cov | Gained | Last new edge |
+|---|---:|---:|---:|---:|---:|
+| `tracker` | 900s → **1500s** | 689 | 882 | +193 | ~5470s of 7200s |
+| `resume` | 600s | 353 | 358 | +5 | ~4180s of 4800s |
+| `http` | 420s | 560 | 562 | +2 | ~300s of 3360s |
+| `extensions` | 420s → **240s** | 425 | 425 | 0 | — |
+| `metainfo` | 240s → **120s** | 456 | 456 | 0 | — |
+| `magnet` | 240s → **120s** | 498 | 498 | 0 | — |
+| `json` | 240s → **120s** | 735 | 735 | 0 | — |
+| `bencode` | 180s → **120s** | 389 | 389 | 0 | — |
+| `wire` | 120s | 337 | 337 | 0 | — |
 
-`magnet` is what moved the table. It held the largest budget in the file on the
-strength of +96 edges in 840 seconds — and returned exactly +96 in 6720. Seven
-eighths of the biggest allocation here was buying nothing, and the dictionary
-A/B had already said so from the other end: 120 seconds from an *empty*
-directory reached 498, the same ceiling both sweeps stopped at. `tracker` was
-the only target still clearly paying for time at the far end, and takes most of
-what `magnet` gives up.
+Six targets returned nothing for eight times their budget, from the best corpus
+the project has, and `extensions` — worth +9 in the sweep before — has joined
+them. They go to a 120s floor. `tracker` takes what they give up: it was the
+one target still clearly paying at the far end last time, and from a corpus 47
+edges better it returned four times as much again and had not stopped.
 
-Nothing else moves. Cutting `http` or `json` below the budget they were
-measured at would be extrapolation from a pair of runs that only ever tested
-them upwards. The report now measures that directly instead, so the next one
-settles them without guessing. The total is unchanged at 3360s: a reallocation,
-not a bigger bill.
+That floor is a choice, and worth being plain about: it is not a measured
+plateau. Once the seed reaches a target's ceiling no budget buys another edge,
+so no report can say how few seconds would do — what the seconds still buy
+there is crash search, which coverage cannot price. 120s is small enough to be
+cheap and long enough to be a real hunt. `wire` is the standing warning against
+reading a floor as a finished target: it sat flat for three sweeps because the
+target was too narrow, not because the codec was clean.
+
+`http` and `resume` keep what they have. `http`'s gain arrived at ~300s, inside
+the 420s it already gets. `resume`'s five edges trail off so late — the last at
+~4180s — that no budget anyone would write catches them, and the two below it
+in the table are worth less.
+
+The total is unchanged at 3360s: a reallocation, not a bigger bill.
+
+### The seed round-tripped exactly
+
+The other thing this sweep settles is whether the corpus survives being packed.
+Its `INITED` coverage — what libFuzzer reports after replaying the seeds, before
+mutating anything — was the previous sweep's *final* figure in all nine targets:
+389, 456, 353, 735, 560, 337, 689, 425, 498. Nothing was lost to `cmin`, the
+repack, or the round trip through git, and the two-sweeps-from-identical-ground
+problem that prompted the last revision is closed.
+
+It is worth checking every time rather than assuming, because `cmin` rewrites
+the corpus rather than trimming it: this one dropped between 17% and 57% of the
+previous seed's files per target and replaced them with new ones. So
+`ci/fuzz-seed.sh` now replays the packed seed with `-runs=0` and prints the
+coverage each target starts from, and `ci/fuzz.sh` reports coverage as
+`cov 689 -> 882` so the same check on the next sweep is a glance rather than
+arithmetic across two reports.
 
 The table lives in exactly one place, `budget_for` in `ci/fuzz.sh`. CI asks for
 it — `./ci/fuzz.sh --budget magnet` — rather than keeping a second copy in the
@@ -182,18 +206,26 @@ replaced by something measured rather than derived: `ci/fuzz.sh` now reports
 the point in the run at which coverage stopped growing.
 
 ```
-      note: +313 edges, all of them by 12% of the run — the rest bought nothing
+      note: +2 edges, all of them by ~300s of 3360s (1x budget: 420s) — the rest bought nothing
 ```
 
 libFuzzer prints `cov:` on every progress line, so the first line carrying the
 run's final figure is the moment it stopped learning; everything after it is
 budget that demonstrably bought nothing. Past the halfway mark the note reads
-the other way instead — still gaining at *n*% of the run, worth more time — so
-a budget that is genuinely too small says so in the same sentence.
+the other way instead — still gaining at ~*n*s, worth more time — so a budget
+that is genuinely too small says so in the same sentence.
 
-A total on its own can say neither, and got it exactly backwards here: this
+A total on its own can say neither, and got it exactly backwards once: the
 script called `magnet` "still climbing, worth more time" on +96 edges, and
 eight times the budget returned +96 again.
+
+In seconds, and against the 1x budget, because the first version of this note
+said "by 12% of the run" and that cannot be transcribed into a table written in
+seconds — least of all from a scaled run, where it is 12% of eight times the
+budget. `tracker` at "still gaining at 76% of the run" was asking for somewhere
+between 901 and 7200 seconds. The same reading as *~5470s, six times the 900s
+budget* is the number `budget_for` wants, and revising the table is now
+transcription rather than arithmetic.
 
 A plateau still means "saturated given this corpus and these mutators", not
 "fully explored". `wire` is the standing proof of that.
@@ -217,13 +249,39 @@ three RNG seeds each:
 | frame stream | 337, 337, 337 | 302, 272, 316 |
 
 Sixty seconds was the right budget for a target that could not use more. 120s
-is provisional for one that can — all three arms reached 337 inside the first
-1% of the run, so this is a floor to re-derive from the next report rather than
-a settled figure.
+was provisional for one that can, pending a report; the report came, and the
+rewritten target reached 337 from the seed and stayed there through 14.5M
+executions at eight times that budget. So 120s is now a measured floor, on the
+same footing as the other five — and carrying the same caveat, which this
+target is the reason for.
 
 What it does not yet cover is a *session*: `Message::parse` feeding
 `on_message` against a real `Torrent`, where the state machine's bugs live.
 This target reaches the codec, not the protocol.
+
+### `extensions`, and what a second is worth
+
+Budgets are written in seconds, but what a target does with a second is not a
+constant, and one target is a long way off the rest. In the 2026-07-30T11:37Z
+sweep:
+
+| Target | Execs/s | Mean input | Execs for 3360s |
+|---|---:|---:|---:|
+| `json` | 59 627 | 131 B | 114.5M in 1920s |
+| `tracker` | 40 585 | 116 B | 292.3M in 7200s |
+| `magnet` | 14 219 | 391 B | 27.3M in 1920s |
+| `extensions` | **1 914** | 322 B | **6.4M in 3360s** |
+
+`extensions` runs at a thirtieth of `json`'s rate on inputs of comparable size,
+so its seconds buy a fortieth of the crash search — which is the *only* thing
+they buy once its coverage has plateaued, as it now has. It parses the same
+input three ways (`pex::PexMessage::parse`, `metadata::MetadataMessage::parse`,
+`extension::Handshake::parse`), and none of the three reads like ~500µs of work
+on 322 bytes, so the cause is not yet known and is not guessed at here. It
+wants measuring — `cargo +nightly fuzz run extensions -- -runs=200000` timed,
+then per-parser — and until it is, the budget is cut rather than floored, on
+the grounds that seconds spent there are worth less than seconds spent
+anywhere else.
 
 ## Corpus
 
@@ -235,8 +293,15 @@ One tarball rather than thousands of files on purpose. The content is about a
 megabyte either way, but as loose files it is thousands of git objects in
 every clone, for inputs nobody is going to review individually. As a tarball
 it is one line in a diff. `ci/fuzz-seed.sh` packs it deterministically — sorted
-names, zeroed mtimes, `gzip -n` — so it shows up in `git status` when its
-contents changed and not merely because it was rebuilt.
+names, zeroed mtimes, fixed owner, fixed **mode**, `gzip -n` — so it shows up in
+`git status` when its contents changed and not merely because it was rebuilt.
+
+The mode is on that list as of this revision, and it is the one that had been
+missed. `cmin` writes the files it keeps, so their permissions come from the
+operator's umask — 0664 under 002, 0644 under 022 — and tar records them, so
+the same corpus packed by two people produced two different tarballs. It was
+found by repacking the 2026-07-30T11:37Z seed on a second machine: identical
+5767 files, identical contents, different bytes.
 
 Starting cold is the thing this avoids. An unseeded run spends much of its
 budget rediscovering that input has to be bencode at all — which is fuzzing
