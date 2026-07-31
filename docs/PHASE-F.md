@@ -117,6 +117,13 @@ already wholly present, so a hand-rolled full-screen view costs zero new
 crates. It is specified as `clove top` in `PHASE-H.md` §9. `clove watch` is
 unchanged by any of it.
 
+**Both were later removed: `DECISIONS.md` S3 (2026-07-31).** S2's own reversal
+condition was exercised — `clove top` went, and `clove watch` went with it, in
+favour of one view (`clove list`, with fixed column widths) and `watch -n 2
+clove list` for a live one. The framework rejection this section made is
+untouched by that; what changed is that clove no longer ships a hand-rolled
+full-screen view *or* a repaint loop of its own.
+
 ## 7. Build order (incremental, each tier-1-green)
 
 1. **Foundation — landed:** HTTP/1.1 server primitives (`http`) + JSON encoder
@@ -164,8 +171,9 @@ unchanged by any of it.
      periodically and around transitions; `verify` requires pause. New state
      `waiting-for-router` for unpaused torrents without a backend, and
      `seeding` for complete live ones. Operator peer bootstrap:
-     `POST /v1/torrents/{ih}/peers` + `clove peer <ih> <b32>` (the only peer
-     source until the tracker client is wired — 5d). `cloved` brings SAM up in
+     `POST /v1/torrents/{ih}/peers` (the only peer source until the tracker
+     client is wired — 5d; it had a `clove peer` wrapper until S3, and is now
+     reached through the API alone). `cloved` brings SAM up in
      the background on the supervisor's backoff (transient identity; Q4 key
      persistence needs live key-export confirmation) and attaches the network
      when it lands. Mock-proven: registry-level download to 100% with
@@ -202,7 +210,8 @@ unchanged by any of it.
      magnets list as `fetching-metadata`, survive restart (the fetch resumes),
      and can be removed. Mock-proven end to end: magnet → tracker → peer →
      metadata → live torrent → 100%.
-6. **`clove watch` — landed:** the hand-rolled live view (§6). Re-fetches
+6. **`clove watch` — landed, then removed (`DECISIONS.md` S3):** the
+   hand-rolled live view (§6). Re-fetches
    `/v1/status` + `/v1/torrents` on an interval (`--interval`, 1..=3600s,
    default 2) and repaints via the *same* renderers the one-shot commands use,
    using two ANSI escapes (erase display, cursor home) and one write per

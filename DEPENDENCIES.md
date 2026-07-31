@@ -96,19 +96,20 @@ commit. Closure sizes are recorded when the dependency is actually added.
   turns the `net` feature on — the allowlist alone would have said nothing.
   That check is per-manifest, so it covers the second consumer below as well.
 
-  **Second consumer, no new crates** (`clove`, Phase H): `termios` and `stdio`,
-  for `clove top`. Raw mode (`tcgetattr`/`tcsetattr`) and the window size
-  (`tcgetwinsize`) are the only two things a full-screen view needs that are
-  not an escape sequence, and `unsafe_code = "forbid"` rules out reaching for
-  them through `libc`. The features resolve to `{rustix, bitflags, errno,
-  libc, linux-raw-sys, windows-link, windows-sys}` — every one already in
-  `Cargo.lock` at the same version, so the closure does not grow at all.
+  **A second consumer entered and left again.** Phase H added `termios` and
+  `stdio` on the `clove` crate for `clove top`'s raw mode and window size —
+  the finding `docs/DECISIONS.md` S2 turned on, and it cost nothing: the
+  features resolved to `{rustix, bitflags, errno, libc, linux-raw-sys,
+  windows-link, windows-sys}`, every one already locked at the same version.
+  The full-screen view was removed on 2026-07-31 (`DECISIONS.md` S3) and those
+  features went with it, so `clove(1)` now has **no dependency on `rustix` at
+  all** and the only consumers are the two above.
 
-  This is the finding `docs/DECISIONS.md` S2 turns on. Measured against the
-  alternatives on 2026-07-30: `ratatui` 0.30 locks 181 crates with default
-  features and 91 with none, and `iocraft` 0.8 locks 68 — against clove's 48.
-  A TUI *framework* cannot be paid for; the terminal syscalls behind one were
-  already bought.
+  S2's measurement stands for whenever the question returns: on 2026-07-30
+  `ratatui` 0.30 locked 181 crates with default features and 91 with none, and
+  `iocraft` 0.8 locked 68 — against clove's 48. A TUI *framework* still cannot
+  be paid for. What changed is that clove no longer buys the syscalls behind
+  one either.
 - **`getrandom` 0.2** (`cloved`) — entered Phase F. The API token and the
   peer-ID suffix are bytes straight from the OS RNG; `getrandom` is the
   maintained thin wrapper over `getrandom(2)`/`/dev/urandom`, exactly the

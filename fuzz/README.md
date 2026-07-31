@@ -89,17 +89,18 @@ beyond "did not panic":
 | `tracker` | announce responses | a hostile `interval` cannot make us announce inside the local floor |
 | `extensions` | `i2p_pex`, `ut_metadata`, BEP 10 handshake | the PEX peer cap holds |
 | `magnet` | magnet URIs | non-I2P trackers are filtered out |
-| `keys` | escape sequences from a terminal, for `clove top` | every decode makes progress and stays inside the sequence bound |
 
 The properties matter as much as the crashes: a parser that accepts a torrent
 whose paths escape the download directory has not crashed, and is still a
 serious bug.
 
-`keys` is the one whose input is not hostile — it is a keyboard. It is here
-because the failure that matters for a decoder is not an attacker but a stall:
-a sequence that consumes nothing loops its caller forever, and every terminal
-emits sequences nobody planned for. `docs/DECISIONS.md` S2 made the target a
-condition of hand-rolling the decoder rather than importing one.
+There was one more, `keys`, over the terminal escape-sequence decoder behind
+`clove top` — the one target whose input was a keyboard rather than an
+attacker, and which asserted progress rather than safety, because the failure
+that matters for a decoder is a stall. It went when the full-screen view did
+(`docs/DECISIONS.md` S3), along with the decoder, the `clove` library target
+that existed to expose it, and this project's only raw-mode surface. A parser
+removed is a fuzz target that never has to run again.
 
 ## Dictionaries
 

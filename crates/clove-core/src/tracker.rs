@@ -376,7 +376,7 @@ impl AnnounceState {
     /// interval and any failure backoff.
     ///
     /// This exists for one caller: an operator asking for a re-announce
-    /// (`clove announce`). Nothing automatic may use it — the interval a
+    /// through the API. Nothing automatic may use it — the interval a
     /// tracker hands back is an instruction, and the whole point of
     /// [`on_success`](Self::on_success) is to obey it. The one automatic
     /// bypass there is has its own, much narrower door:

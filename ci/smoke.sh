@@ -227,12 +227,11 @@ code=$?
 set -e
 expect_status "$code" 2 "sequential with a bad setting"
 
-echo "smoke: announce refuses a torrent with no router"
-set +e
-run announce "$info_hash" >/dev/null 2>&1
-code=$?
-set -e
-expect_status "$code" 1 "announce without a running engine"
+# `announce` has no CLI wrapper to drive any more: it is a versioned endpoint
+# and nothing else. What this used to prove — that a torrent with no engine is
+# refused rather than silently accepted — is
+# `registry::tests::announce_now_refuses_a_torrent_that_is_not_running`, which
+# also covers the rate limit and the unknown-hash case this never reached.
 
 echo "smoke: a torrent answers to a unique prefix of its hash"
 # The whole point of prefixes is not having to paste forty characters, so the
@@ -272,9 +271,11 @@ run remove "$amb_b" >/dev/null || fail "removing ambiguous magnet b"
 echo "smoke: the listing is in add order and carries rates"
 # The magnet was added after the torrent, so it comes second whatever the two
 # info-hashes sort like — which is the point.
-first_row=$(run list | sed -n '2p')
+first_row=$(run list | sed -n '4p')
 expect_contains "$first_row" "smoke.txt" "the first-added torrent lists first"
-expect_contains "$(run list)" "DOWN" "the listing carries a rate column"
+expect_contains "$(run list)" "▼" "the listing carries a rate column"
+expect_contains "$(run list | sed -n '1p')" "clove " "the listing opens with a header bar"
+expect_contains "$(run list | sed -n '3p')" "PEERS" "the listing carries a peer column"
 expect_contains "$(run status --json)" '"down_rate"' "status carries client-wide rates"
 expect_contains "$(run status --json)" '"peer_limit"' "status reports the peer budget"
 # Nothing is moving, so every rate is a dash rather than a column of zeroes.
@@ -345,9 +346,19 @@ expect_contains "$(qrun list)" "waiting-for-router" "still waiting on the router
 kill "$queue_pid" 2>/dev/null
 wait "$queue_pid" 2>/dev/null || true
 
-echo "smoke: stats totals the client"
-expect_contains "$(run stats)" "torrents" "stats reports a torrent count"
-expect_contains "$(run stats)" "peers" "stats reports peers against the budget"
+echo "smoke: status totals the client as well as the daemon"
+expect_contains "$(run status)" "router" "status reports the router state"
+expect_contains "$(run status)" "torrents" "status reports a torrent count"
+expect_contains "$(run status)" "peers" "status reports peers against the budget"
+expect_contains "$(run status)" "uploaded" "status reports lifetime bytes"
+# The commands that went with the simplification must be gone, not aliased.
+for removed in top watch stats announce peer; do
+    set +e
+    run "$removed" >/dev/null 2>&1
+    code=$?
+    set -e
+    expect_status "$code" 2 "$removed is no longer a command"
+done
 
 echo "smoke: a watch directory picks up what is dropped in it"
 wdir="$work/watched"

@@ -80,6 +80,13 @@ without is a quiet drop.
 
 ## S2 — A TUI, but no TUI framework (2026-07-30)
 
+> **Superseded in part by S3 (2026-07-31).** The framework rejection stands
+> and is unweakened. The permission it granted was exercised, `clove top` was
+> built exactly as specified below, and it has since been removed under this
+> memo's own reversal condition. Read what follows as the record of a decision
+> that was made, paid for and then reversed on its own terms — not as a
+> description of the CLI as it stands.
+
 `PHASE-F.md` §6 rejected a TUI and invited this memo in the same breath: *"if a
 full curses-style UI is ever genuinely wanted, it is a separate,
 budget-spending decision — not smuggled in with M4."* It is wanted, this is the
@@ -159,3 +166,55 @@ stays live for whatever the view grows into next.* And if
 `clove top` lands and nobody uses it over `clove watch`, §9 of `SCOPE.md`
 applies in its usual direction — *removals are announced proudly* — and it
 goes.
+
+## S3 — One view, and it is `clove list` (2026-07-31)
+
+S2's reversal condition, exercised in the direction it named: *"if `clove top`
+lands and nobody uses it over `clove watch`, §9 of `SCOPE.md` applies in its
+usual direction — removals are announced proudly — and it goes."* It went, and
+`clove watch` went with it.
+
+**What was removed.** `clove top` (the full-screen view, `top.rs`), the
+terminal primitives it needed (`term.rs`: raw mode, window size, the
+escape-sequence key decoder), `clove watch` (the repaint loop), and — because
+they existed only to serve those — the `clove` library target, its
+`fuzz_targets/keys.rs` target, and the `rustix` dependency on the `clove`
+crate. Removed alongside them, on the same "one obvious way" reasoning:
+`clove stats` (folded into `clove status`), and the `clove announce` and
+`clove peer` command wrappers (the versioned endpoints they called remain).
+
+**Why, when S2 measured the cost so carefully and found it affordable.**
+Because affordable is not the same as earned, and the memo was honest about
+which question it had answered. S2 proved a full-screen view cost zero new
+crates; it could not prove anyone would reach for it over the listing, which
+is why it wrote the reversal condition in the first place. Three views of the
+same table — `list`, `watch`, `top` — is two views too many, and the second
+rendering path was the expensive one: `top` carried its own table renderer
+with its own column arithmetic, its own selection state, its own
+destructive-action confirmation, and the only raw-mode surface in the project.
+
+**What replaced it.** `clove list` grew the header bar `top` opened with, a
+progress bar in the column that was a bare percentage, a peer column, and
+**fixed column widths** — which is the change that makes the rest work. A live
+view is now `watch -n 2 clove list`: an ordinary program composed with this
+one, repainting a table whose columns do not move. That composition was always
+available; what it lacked was a listing worth repainting.
+
+**What this buys, beyond the lines.** No raw mode anywhere in clove. No
+alternate screen, no termios, no `SIGTERM`-leaves-your-terminal-broken caveat,
+no signal-handler question to reopen later. The `clove` binary talks to a
+socket and prints; it has no terminal state to get wrong. S2's costs section
+is not mitigated, it is *gone*.
+
+**What is unchanged.** The framework rejection, entirely — this memo removes a
+hand-rolled view, it does not reopen `ratatui` or `iocraft`. Should a
+full-screen view ever be wanted again, S2's measurements stand and its
+conditions still bind; nothing here makes that decision easier or harder than
+it was, only unspent.
+
+**Reversal condition.** If `watch -n 2 clove list` proves genuinely worse than
+what was removed — a flicker no fixed-width table can settle, or an operation
+that wants a cursor on a row — then the honest answer is a *narrow* selection
+view, re-costed under S2's conditions, and not the restoration of three
+overlapping ones. The listing's fixed widths are the load-bearing part: if
+they are ever measured from the rows again, this memo's premise has failed.

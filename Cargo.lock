@@ -29,7 +29,6 @@ version = "0.0.1"
 dependencies = [
  "clove-core",
  "i2pnet",
- "rustix",
 ]
 
 [[package]]

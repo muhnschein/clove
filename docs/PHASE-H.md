@@ -71,7 +71,9 @@ is the view.
 NUL. It does not reject `ESC`. A torrent whose `info.name` is
 `"\x1b[2J\x1b[1;31mhello"` parses, is hosted, becomes a directory name, and is
 printed **verbatim** by `clove list`, `clove show` and `clove watch`, which
-render `name` straight into the table.
+render `name` straight into the table. (`clove watch` was removed by
+`DECISIONS.md` S3; the sanitising this section installed did not move — it is
+in the renderers, which is why it survived the removal untouched.)
 
 The bytes are attacker-supplied: they arrive in a `.torrent` from anywhere, or
 in a magnet's `dn=`. `SECURITY.md` already puts *"path traversal from torrent
@@ -382,7 +384,9 @@ all-digit info-hash — `0000…0000` is legal — was read as position zero.
 - **`clove stats`.** `PHASE-F.md` §4 lists it in the command surface and it
   was never built; with H5's rates there is finally something to put in it —
   session and lifetime totals, active/queued/seeding counts, the peer budget's
-  current draw.
+  current draw. *(Built here, then folded into `clove status` by
+  `DECISIONS.md` S3: one command answers both "is the daemon alright" and
+  "what is my client doing", which is how they were being read anyway.)*
 
 **Cost:** ~180 lines total, one config key.
 
@@ -414,6 +418,13 @@ not to generalise to *"a full-screen view"* — only to *"a framework"*.
 What Phase H proposes is **`clove top`**: a full-screen, keyboard-driven view,
 hand-rolled, **zero new crates**, built on `rustix` features clove already
 pays for (§10).
+
+> **Built as specified, then removed — `DECISIONS.md` S3 (2026-07-31).** Under
+> S2's own reversal condition, and `clove watch` went with it. What follows is
+> the specification it was built to, kept because S3's reasoning only makes
+> sense against it; it is not a description of the CLI today. The parts that
+> outlived it are in `clove list`: the header bar, and the rule that there is
+> one table implementation.
 
 - **`clove watch` does not change.** It stays the dumb repaint loop —
   no raw mode, works over a pipe, works in a terminal that cannot do better,
@@ -527,9 +538,10 @@ A deferral with a trigger is a decision; one without is a quiet drop
   `SCOPE.md` §3, and H6's `watch_dir` covers most of what *arr-style tooling
   actually needs. Unchanged by this phase.
 - **Web UI.** Still `SCOPE.md` §2, still deferred, and nothing here moves it.
-  Worth noting the opposite of the usual direction, though: `clove top` is
-  evidence *for* the deferral, because it is the same JSON a web UI would
-  consume, proving the API is sufficient without one.
+  Worth noting the opposite of the usual direction, though: `clove top` was
+  evidence *for* the deferral, because it was the same JSON a web UI would
+  consume, proving the API is sufficient without one. Its removal (S3) does
+  not weaken that: the JSON it proved sufficient is unchanged.
 - **Per-torrent identities.** Q4 put them in v2 and this phase does not
   disturb that — H1's budget is per *session*, and per-torrent destinations
   would mean N sessions, which is the supervision cost Q4 declined.
@@ -551,6 +563,10 @@ Each step is tier-1 green on its own and each is useful before the next lands.
 6. **H3** — seed ratio and idle stopping.
 7. **H6** — add flags, `watch_dir`, `clove stats`.
 8. **§9** — `clove top`.
+
+*(Both of 7's and 8's view commands were later removed or folded — `clove
+stats` into `clove status`, `clove top` and `clove watch` into `clove list`
+plus `watch -n 2 clove list`. See `DECISIONS.md` S3.)*
 
 Steps 1–4 are the ones that would make the difference between "works" and
 "pleasant" if the phase stopped early; 5–6 are what let it run unattended; 7–8

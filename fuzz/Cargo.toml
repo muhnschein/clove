@@ -12,9 +12,6 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 clove-core = { path = "../crates/clove-core" }
-# For the `keys` target: `clove` is a library as well as a binary so its
-# terminal decoder can be fuzzed like every other parser here.
-clove = { path = "../crates/clove" }
 
 [[bin]]
 name = "bencode"
@@ -31,12 +28,6 @@ doc = false
 [[bin]]
 name = "resume"
 path = "fuzz_targets/resume.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "keys"
-path = "fuzz_targets/keys.rs"
 test = false
 doc = false
 
