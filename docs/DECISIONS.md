@@ -191,12 +191,18 @@ hand-rolled full-screen view is permitted, specified as `clove top` in
   padded by character count so wide glyphs misalign — which is what
   `clove list` already does.
 - The escape-sequence input decoder gets a `cargo-fuzz` target like every
-  other parser here.
+  other parser here. **Done:** `fuzz/fuzz_targets/keys.rs`, which is why
+  `clove` is a library as well as a binary. For a decoder the failure that
+  matters is a stall rather than an attacker, so it asserts that every decode
+  makes progress, over-reads nothing, and follows no sequence past its bound.
 
 **Reversal condition.** Two, in opposite directions. If the hand-rolled view
 exceeds roughly 800 lines in `clove`, or if terminal restoration needs a signal
 handler after all, the "write it ourselves" premise has failed and `ratatui` is
-re-costed honestly against that failure rather than against an estimate. And if
+re-costed honestly against that failure rather than against an estimate. *As
+built it is ~640 lines across `term` and `top`, and `Cargo.lock` holds the same
+52 entries it did before — so the premise held, on both counts, and the bound
+stays live for whatever the view grows into next.* And if
 `clove top` lands and nobody uses it over `clove watch`, §9 of `SCOPE.md`
 applies in its usual direction — *removals are announced proudly* — and it
 goes.

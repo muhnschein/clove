@@ -2,10 +2,19 @@
 //!
 //! A thin client: hand-rolled arg parsing, one request per invocation over the
 //! local API (unix socket), rendering the daemon's JSON (`--json` passes it
-//! through). Commands: `status`, `list`, `watch`, `show`, `add`, `remove`,
-//! `pause`, `resume`, `verify`, `peer`, `priorities`, `completions`.
-//! `watch` is the live view — a repaint loop over the same renderers, not a
-//! TUI framework (`docs/PHASE-F.md` §6).
+//! through). Commands: `status`, `stats`, `list`, `watch`, `top`, `show`,
+//! `add`, `remove`, `pause`, `resume`, `start`, `verify`, `peer`,
+//! `priorities`, `announce`, `sequential`, `seed-ratio`, `completions`.
+//!
+//! Two live views, and the difference between them is deliberate. `watch` is a
+//! repaint loop over the same renderers — no raw mode, nothing to restore
+//! (`docs/PHASE-F.md` §6). `top` is full-screen with a cursor and keys, still
+//! not a TUI framework (`docs/DECISIONS.md` S2); it lives in [`top`] and the
+//! terminal primitives it needs are in [`clove::term`].
+//!
+//! A torrent is named by info-hash, by a unique prefix of one, or by its
+//! position in `list` — resolved by the daemon except for the position, which
+//! is this end's, since a position is not an identity anything may store.
 
 mod top;
 
