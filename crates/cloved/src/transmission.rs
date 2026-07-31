@@ -50,6 +50,22 @@ use clove_core::json::{self, Value};
 /// every client fills in for you.
 pub(crate) const PATH: &str = "/transmission/rpc";
 
+/// Whether `path` addresses this surface.
+///
+/// **A trailing slash is part of the protocol in practice.** `transmission
+/// -remote` 4.0.5 sends `POST /transmission/rpc/`, not `/transmission/rpc`, and
+/// an exact match against [`PATH`] therefore answered a real client with
+/// `/v1/`'s "missing or invalid API token" — a 401 about a header it has no
+/// reason to send, on a surface it could not tell it had failed to reach.
+///
+/// Found by running the client rather than by testing the parser, which is the
+/// pattern the whole of `docs/PROTOCOL.i2p-bt` is written in: every defect that
+/// has mattered here came from contact with a real implementation, and the unit
+/// suite was green through this one too.
+pub(crate) fn is_rpc_path(path: &str) -> bool {
+    path == PATH || path.strip_suffix('/') == Some(PATH)
+}
+
 /// The RPC protocol version we claim. 18 is Transmission 4.0's; clients gate
 /// features on it, so it has to name a version whose *shape* we implement.
 const RPC_VERSION: i64 = 18;
@@ -967,6 +983,7 @@ fn tracker_stats(view: &Value) -> Value {
     // tracker and report zero for the rest, which is wrong more precisely.
     let ok = signed(get_u64(view, "announces_ok"));
     let failed = signed(get_u64(view, "announces_failed"));
+    let announced = ok + failed > 0;
     Value::Array(
         trackers
             .map(|list| {
@@ -974,16 +991,47 @@ fn tracker_stats(view: &Value) -> Value {
                     .enumerate()
                     .map(|(i, url)| {
                         let announce = url.as_str().unwrap_or("");
+                        let id = i64::try_from(i).unwrap_or(0);
                         Value::Object(vec![
-                            ("id".to_owned(), Value::Int(i64::try_from(i).unwrap_or(0))),
+                            ("id".to_owned(), Value::Int(id)),
                             ("announce".to_owned(), Value::from(announce)),
-                            ("host".to_owned(), Value::from(announce)),
-                            ("tier".to_owned(), Value::Int(i64::try_from(i).unwrap_or(0))),
+                            ("host".to_owned(), Value::from(origin_of(announce))),
+                            ("sitename".to_owned(), Value::from(sitename_of(announce))),
+                            // clove tracks announce URLs independently rather
+                            // than in strict BEP 12 tiers (`PHASE-F.md` §7 5d),
+                            // so every tracker reports as its own tier and none
+                            // is a backup for another.
+                            ("tier".to_owned(), Value::Int(id)),
+                            ("isBackup".to_owned(), Value::Bool(false)),
+                            // 1 = waiting for its next announce, which is what
+                            // a torrent between announces is doing.
                             ("announceState".to_owned(), Value::Int(1)),
-                            ("hasAnnounced".to_owned(), Value::Bool(ok + failed > 0)),
+                            ("hasAnnounced".to_owned(), Value::Bool(announced)),
                             ("lastAnnounceSucceeded".to_owned(), Value::Bool(ok > 0)),
+                            ("lastAnnounceTimedOut".to_owned(), Value::Bool(false)),
                             ("lastAnnouncePeerCount".to_owned(), Value::Int(0)),
                             ("lastAnnounceResult".to_owned(), Value::from(last_error)),
+                            // clove keeps no announce timestamps, and these are
+                            // the fields a client renders a tracker row from at
+                            // all: 0 is Transmission's "never", which is a true
+                            // statement about a time we did not record.
+                            ("lastAnnounceTime".to_owned(), Value::Int(0)),
+                            ("lastAnnounceStartTime".to_owned(), Value::Int(0)),
+                            ("nextAnnounceTime".to_owned(), Value::Int(0)),
+                            // Scrape is not implemented — clove announces only
+                            // — so every scrape field says so rather than
+                            // implying a scrape that failed.
+                            ("scrape".to_owned(), Value::from("")),
+                            ("scrapeState".to_owned(), Value::Int(0)),
+                            ("hasScraped".to_owned(), Value::Bool(false)),
+                            ("lastScrapeSucceeded".to_owned(), Value::Bool(false)),
+                            ("lastScrapeTimedOut".to_owned(), Value::Bool(false)),
+                            ("lastScrapeResult".to_owned(), Value::from("")),
+                            ("lastScrapeTime".to_owned(), Value::Int(0)),
+                            ("lastScrapeStartTime".to_owned(), Value::Int(0)),
+                            ("nextScrapeTime".to_owned(), Value::Int(0)),
+                            // -1 is Transmission's "unknown", and it is: these
+                            // come from a scrape clove never makes.
                             ("seederCount".to_owned(), Value::Int(-1)),
                             ("leecherCount".to_owned(), Value::Int(-1)),
                             ("downloadCount".to_owned(), Value::Int(-1)),
@@ -993,6 +1041,23 @@ fn tracker_stats(view: &Value) -> Value {
             })
             .unwrap_or_default(),
     )
+}
+
+/// `scheme://host` of an announce URL, which is what Transmission's `host`
+/// field means. Textual, because this crate has no URL type and wants none.
+fn origin_of(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    format!("{scheme}://{host}")
+}
+
+/// The bare host, which Transmission 4 shows in its tracker list.
+fn sitename_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host = rest.split(['/', '?', '#', ':']).next().unwrap_or(rest);
+    host.to_owned()
 }
 
 /// `torrent-add`: a magnet in `filename`, or a base64 `.torrent` in `metainfo`.
@@ -1841,6 +1906,90 @@ mod tests {
             ratio_to_milli(1e30),
             clove_core::config::MAX_SEED_RATIO_MILLI
         );
+    }
+
+    #[test]
+    fn a_tracker_row_carries_what_a_client_needs_to_render_it() {
+        // Found by running transmission-remote: with only `announce`, `tier`
+        // and the counters, its tracker section printed *nothing at all* — the
+        // timing and scrape fields are what it decides a row exists from. The
+        // values are honest (clove keeps no announce timestamps and never
+        // scrapes); their presence is the point.
+        let trackers = Value::Array(vec![Value::from("http://tracker.i2p:6969/a?x=1")]);
+        let object = render(
+            &view("downloading", vec![("trackers", trackers)]),
+            &["trackerStats"],
+        );
+        let rows = object
+            .get("trackerStats")
+            .and_then(Value::as_array)
+            .expect("trackerStats");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        for key in [
+            "announce",
+            "host",
+            "sitename",
+            "tier",
+            "announceState",
+            "nextAnnounceTime",
+            "lastAnnounceTime",
+            "scrapeState",
+            "seederCount",
+        ] {
+            assert!(row.get(key).is_some(), "{key} missing from a tracker row");
+        }
+        assert_eq!(
+            row.get("host").and_then(Value::as_str),
+            Some("http://tracker.i2p:6969")
+        );
+        assert_eq!(
+            row.get("sitename").and_then(Value::as_str),
+            Some("tracker.i2p")
+        );
+        // Never scraped, and saying so rather than reporting a failed scrape.
+        assert_eq!(row.get("hasScraped").and_then(Value::as_bool), Some(false));
+        assert_eq!(row.get("seederCount").and_then(Value::as_f64), Some(-1.0));
+    }
+
+    #[test]
+    fn an_announce_url_is_split_without_a_url_type() {
+        use super::{origin_of, sitename_of};
+        assert_eq!(origin_of("http://tracker.i2p/a"), "http://tracker.i2p");
+        assert_eq!(
+            origin_of("http://tracker.i2p:6969/announce?x=1"),
+            "http://tracker.i2p:6969"
+        );
+        assert_eq!(sitename_of("http://tracker.i2p:6969/a"), "tracker.i2p");
+        assert_eq!(sitename_of("http://tracker.i2p"), "tracker.i2p");
+        // Anything that is not a URL comes back whole rather than half-parsed
+        // into something that reads like a host.
+        assert_eq!(origin_of("not a url"), "not a url");
+        assert_eq!(sitename_of(""), "");
+    }
+
+    #[test]
+    fn the_rpc_path_is_matched_with_or_without_its_trailing_slash() {
+        // The regression for the one defect a real client found and no unit
+        // test would have: transmission-remote 4.0.5 posts to
+        // `/transmission/rpc/`, and an exact match answered it with `/v1/`'s
+        // token error.
+        assert!(super::is_rpc_path("/transmission/rpc"));
+        assert!(super::is_rpc_path("/transmission/rpc/"));
+        // And nothing else, in particular nothing that merely starts with it —
+        // this decides which authentication scheme runs.
+        for other in [
+            "/transmission/rpc//",
+            "/transmission/rpc/x",
+            "/transmission/rpcx",
+            "/transmission",
+            "/transmission/",
+            "/v1/status",
+            "/",
+            "",
+        ] {
+            assert!(!super::is_rpc_path(other), "{other} should not route here");
+        }
     }
 
     #[test]

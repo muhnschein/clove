@@ -146,40 +146,9 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("opening registry in {}: {e}", config.data_dir.display()))?;
     eprintln!("cloved: {} torrent(s) loaded", registry.count());
 
-    let listener = ApiListener::bind_unix(&config.api_socket)
-        .map_err(|e| format!("binding {}: {e}", config.api_socket.display()))?;
-    eprintln!("cloved: listening on {}", config.api_socket.display());
+    let (listener, tcp_listener) = bind_listeners(&config)?;
 
-    // Initialisation is over: everything that needs a path outside the data
-    // directory, or a capability beyond talking to the router and its own
-    // files, has already happened. Drop the rest (SCOPE §5 Layer 2). This runs
-    // before any thread is spawned — a Landlock domain covers the calling
-    // thread and its descendants, not siblings that already exist.
-    let mut read_write: Vec<&Path> = vec![&config.data_dir];
-    if let Some(parent) = config.api_socket.parent() {
-        read_write.push(parent);
-    }
-    // The watch directory, if there is one, is the one path an operator names
-    // that is deliberately *outside* the data directory — and the daemon both
-    // reads it and renames within it. Granted here, before the domain closes,
-    // which is the whole discipline this layer runs on: what is not unveiled
-    // before the restriction cannot be reached after it.
-    //
-    // Getting this wrong is silent in the worst way. Landlock is best-effort,
-    // so on a kernel without it the watcher works and on a kernel with it the
-    // directory simply reads as empty — nothing added, nothing logged, no
-    // error anywhere. CI found it; a local run had not.
-    if let Some(dir) = &config.watch_dir {
-        read_write.push(dir);
-    }
-    eprintln!(
-        "cloved: {}",
-        sandbox::enter_post_init(&sandbox::Limits {
-            read_write: &read_write,
-            read_only: &[Path::new("/dev/urandom")],
-            connect_tcp: sam_tcp_port(&config.sam_address),
-        })
-    );
+    eprintln!("cloved: {}", restrict_self(&config));
 
     let rpc = build_rpc(&config)?;
 
@@ -225,6 +194,22 @@ fn run() -> Result<(), String> {
     spawn_persist_loop(&daemon);
     if let Some(dir) = config.watch_dir.clone() {
         spawn_watch_dir(&daemon, dir);
+    }
+    // The TCP listener, when there is one, gets its own accept loop on its own
+    // thread; the unix socket keeps the main one. Two loops rather than a
+    // select over both: each is a blocking accept, `serve` already spawns per
+    // connection, and a poll loop here would be a second concurrency model in
+    // a daemon that has exactly one (Q5).
+    if let Some(tcp) = tcp_listener {
+        let daemon = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            if let Err(e) = serve(&tcp, &daemon) {
+                // Not fatal to the daemon: the unix socket is still serving,
+                // and taking every torrent down because a TCP accept loop died
+                // would be a worse outcome than losing the extra way in.
+                eprintln!("cloved: TCP API listener stopped: {e}");
+            }
+        });
     }
     serve(&listener, &daemon)
 }
@@ -879,7 +864,7 @@ fn handle(mut stream: ApiStream, daemon: &Arc<Daemon>) -> std::io::Result<()> {
     let transmission = daemon
         .rpc
         .as_ref()
-        .filter(|_| request.path() == transmission::PATH);
+        .filter(|_| transmission::is_rpc_path(request.path()));
 
     if let Some(rpc) = transmission {
         if let Err(refusal) = transmission::authorize(rpc, &request, &daemon.token) {
@@ -961,6 +946,67 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response 
         Err(AddError::Duplicate) => error(409, "torrent already added"),
         Err(AddError::Io(e)) => error(500, &format!("adding torrent: {e}")),
     }
+}
+
+/// Drop everything initialisation needed and the running daemon does not
+/// (SCOPE §5 Layer 2), returning what the sandbox managed to apply.
+///
+/// Must be called before any thread is spawned: a Landlock domain covers the
+/// calling thread and its descendants, not siblings that already exist.
+fn restrict_self(config: &Config) -> String {
+    let mut read_write: Vec<&Path> = vec![&config.data_dir];
+    if let Some(parent) = config.api_socket.parent() {
+        read_write.push(parent);
+    }
+    // The watch directory, if there is one, is the one path an operator names
+    // that is deliberately *outside* the data directory — and the daemon both
+    // reads it and renames within it. Granted here, before the domain closes,
+    // which is the whole discipline this layer runs on: what is not unveiled
+    // before the restriction cannot be reached after it.
+    //
+    // Getting this wrong is silent in the worst way. Landlock is best-effort,
+    // so on a kernel without it the watcher works and on a kernel with it the
+    // directory simply reads as empty — nothing added, nothing logged, no
+    // error anywhere. CI found it; a local run had not.
+    if let Some(dir) = &config.watch_dir {
+        read_write.push(dir);
+    }
+    // Note what is *not* here: the API listeners. Both are already bound by
+    // this point (`bind_listeners`), and a bound listener keeps accepting
+    // through a Landlock domain and a seccomp filter that would refuse to
+    // create it — which is the whole shape of this layer, and the reason the
+    // TCP one has to be acquired before the door shuts rather than lazily on
+    // first use.
+    sandbox::enter_post_init(&sandbox::Limits {
+        read_write: &read_write,
+        read_only: &[Path::new("/dev/urandom")],
+        connect_tcp: sam_tcp_port(&config.sam_address),
+    })
+}
+
+/// Bind the API listeners: the unix socket, and the loopback TCP one when
+/// `api_listen` asked for it.
+///
+/// Both happen here, before the sandbox closes, because that is the rule
+/// Layer 2 runs on: what is not acquired before self-restriction cannot be
+/// acquired after it.
+///
+/// The unix socket is not optional and does not become so — `clove` resolves it
+/// from the config and would have nothing to talk to — so the second listener
+/// adds a way in rather than replacing one. It exists because a Transmission
+/// client cannot speak to a unix socket, which is most of the point of having
+/// one.
+fn bind_listeners(config: &Config) -> Result<(ApiListener, Option<ApiListener>), String> {
+    let unix = ApiListener::bind_unix(&config.api_socket)
+        .map_err(|e| format!("binding {}: {e}", config.api_socket.display()))?;
+    eprintln!("cloved: listening on {}", config.api_socket.display());
+
+    let Some(addr) = &config.api_listen else {
+        return Ok((unix, None));
+    };
+    let tcp = ApiListener::bind_loopback_tcp(addr).map_err(|e| format!("binding {addr}: {e}"))?;
+    eprintln!("cloved: also listening on {addr}");
+    Ok((unix, Some(tcp)))
 }
 
 /// Build the Transmission surface if the operator asked for one.
@@ -1556,6 +1602,7 @@ mod tests {
             seed_ratio_milli: 0,
             seed_idle_minutes: 0,
             watch_dir: None,
+            api_listen: None,
             transmission_rpc,
         }
     }

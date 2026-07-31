@@ -120,6 +120,15 @@ pub struct Config {
     /// A directory to watch for `.torrent` files to add, or `None` to watch
     /// none — the default.
     pub watch_dir: Option<PathBuf>,
+    /// An extra loopback `host:port` to serve the API on, beside the unix
+    /// socket, or `None` — the default — for the socket alone.
+    ///
+    /// Refused unless it is a loopback address, here as well as at the bind
+    /// (`i2pnet::api`), so `cloved -C` catches it rather than the daemon
+    /// failing to start. There is deliberately no way to spell a non-loopback
+    /// one: `SCOPE.md` §5's answer to remote access is a forwarded port, not a
+    /// wider bind.
+    pub api_listen: Option<String>,
     /// Serve the Transmission-compatible RPC surface at `/transmission/rpc`
     /// alongside `/v1/` (`docs/PHASE-I.md`). Off by default: the sane default
     /// is that only `clove` talks to `cloved`, and a second authentication
@@ -154,6 +163,64 @@ pub const DEFAULT_MAX_ACTIVE_DOWNLOADS: usize = 3;
 /// pieces, so it costs peers but little else, and being a good swarm citizen
 /// is most of what an I2P client is for.
 pub const DEFAULT_MAX_ACTIVE_SEEDS: usize = 5;
+
+/// Whether `value` is a `host:port` this daemon may bind the API to.
+///
+/// Textual, like the SAM check above and for the same reason: this crate has no
+/// `std::net` vocabulary (Layer 1), so the real parse happens in `i2pnet` at
+/// bind time. Checking here as well is what lets `cloved -C` refuse a bad
+/// address before a restart rather than after one.
+///
+/// Note the asymmetry with `sam_address`, and that it is deliberate: a remote
+/// SAM bridge has an ugly, documented override because an operator might really
+/// have one. A remote API bind has none. `SCOPE.md` §5's answer to reaching the
+/// daemon from elsewhere is a forwarded port, which puts the authentication and
+/// the encryption in something that does both for a living.
+fn is_loopback_api_address(value: &str) -> bool {
+    // An IPv6 address has to be bracketed, and this has to insist on it. The
+    // bind parses with `SocketAddr::from_str`, which refuses a bare `::1:9091`
+    // — so accepting it here would be `cloved -C` approving a configuration
+    // that then fails to start, which is the failure `UnsupportedSamTransport`
+    // exists to have stopped happening.
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        match rest.split_once("]:") {
+            Some((host, port)) => (host, port),
+            None => return false,
+        }
+    } else {
+        match value.rsplit_once(':') {
+            // A colon left in the host half means an unbracketed IPv6 address.
+            Some((host, port)) if !host.contains(':') => (host, port),
+            _ => return false,
+        }
+    };
+
+    if !port.bytes().all(|b| b.is_ascii_digit()) || port.parse::<u16>().is_ok_and(|p| p == 0) {
+        return false;
+    }
+    if port.parse::<u16>().is_err() {
+        return false;
+    }
+    // The IPv4 loopback block is a /8, so match the prefix rather than the one
+    // address people usually write. `localhost` is allowed because the rest of
+    // the config already does (SCOPE §5: it is the one name that resolves
+    // without a resolver).
+    host == "localhost" || host == "::1" || is_loopback_v4(host)
+}
+
+/// Whether `host` is a dotted-quad in `127.0.0.0/8`.
+///
+/// Spelled out rather than a `starts_with("127.")`, which would have taken
+/// `127.evil.example` — a name, not an address, and one a resolver would have
+/// been asked about.
+fn is_loopback_v4(host: &str) -> bool {
+    let octets: Vec<&str> = host.split('.').collect();
+    octets.len() == 4
+        && octets[0] == "127"
+        && octets
+            .iter()
+            .all(|part| !part.is_empty() && part.parse::<u8>().is_ok())
+}
 
 /// Largest accepted seed ratio, in thousandths (1000 = 1.0).
 ///
@@ -199,6 +266,10 @@ pub enum Problem {
     BadSamAddress,
     /// SAM address is not loopback and `i_know_sam_is_remote` is not set.
     RemoteSam,
+    /// An `api_listen` that is not a loopback `host:port`. Unlike
+    /// [`RemoteSam`](Problem::RemoteSam) there is no override to offer, so the
+    /// message names the forwarding recipe instead.
+    RemoteApi,
     /// A path value that is not absolute.
     RelativePath,
     /// A `sam_address` this build cannot actually dial.
@@ -253,6 +324,12 @@ impl fmt::Display for Problem {
                 f,
                 "sam_address is not loopback; if you really run SAM remotely, set i_know_sam_is_remote yes (dangerous: your traffic to the router is unprotected)"
             ),
+            Problem::RemoteApi => write!(
+                f,
+                "api_listen must be a loopback host:port such as 127.0.0.1:9091; there is no \
+                 setting for a wider bind. Reach it from another machine with an SSH forward \
+                 (ssh -L 9091:127.0.0.1:9091 host) or over a VPN interface"
+            ),
             Problem::RelativePath => write!(f, "path must be absolute"),
         }
     }
@@ -283,6 +360,7 @@ struct Draft {
     seed_idle_minutes: Option<(usize, u64)>,
     watch_dir: Option<(usize, PathBuf)>,
     transmission_rpc: Option<(usize, bool)>,
+    api_listen: Option<(usize, String)>,
 }
 
 impl Draft {
@@ -331,6 +409,12 @@ impl Draft {
                 set(&mut self.seed_ratio_milli, line, milli)?;
             }
             "watch_dir" => set(&mut self.watch_dir, line, absolute(value, line)?)?,
+            "api_listen" => {
+                if !is_loopback_api_address(value) {
+                    return Err(at(Problem::RemoteApi));
+                }
+                set(&mut self.api_listen, line, value.to_owned())?;
+            }
             "transmission_rpc" => {
                 let flag = parse_bool(value).ok_or_else(|| at(Problem::BadBool))?;
                 set(&mut self.transmission_rpc, line, flag)?;
@@ -394,6 +478,7 @@ impl Config {
             seed_idle_minutes,
             watch_dir,
             transmission_rpc,
+            api_listen,
         } = draft;
 
         let i_know_sam_is_remote = i_know_sam_is_remote.is_some_and(|(_, v)| v);
@@ -444,6 +529,7 @@ impl Config {
             seed_idle_minutes: seed_idle_minutes.map_or(0, |(_, v)| v),
             watch_dir: watch_dir.map(|(_, v)| v),
             transmission_rpc: transmission_rpc.is_some_and(|(_, v)| v),
+            api_listen: api_listen.map(|(_, v)| v),
         })
     }
 }
@@ -622,6 +708,9 @@ mod tests {
         assert_eq!(c.seed_ratio_milli, 0);
         assert_eq!(c.seed_idle_minutes, 0);
         assert_eq!(c.watch_dir, None);
+        // The unix socket alone: a TCP listener is a deviation, and there is
+        // no spelling of a non-loopback one at all.
+        assert_eq!(c.api_listen, None);
         // Only `clove` talks to `cloved` unless asked otherwise: a second
         // authentication scheme is a deviation, not basic function.
         assert!(!c.transmission_rpc);
@@ -745,6 +834,60 @@ preallocate yes
         assert_eq!(idle("seed_idle_minutes 0\n").unwrap(), 0);
         assert!(idle("seed_idle_minutes -5\n").is_err());
         assert!(idle("seed_idle_minutes soon\n").is_err());
+    }
+
+    #[test]
+    fn api_listen_takes_loopback_and_nothing_else() {
+        let d = defaults();
+        for good in [
+            "127.0.0.1:9091",
+            "127.0.0.53:9091",
+            "localhost:9091",
+            "[::1]:9091",
+        ] {
+            assert_eq!(
+                Config::parse(&format!("api_listen {good}\n"), &d)
+                    .unwrap()
+                    .api_listen
+                    .as_deref(),
+                Some(good),
+                "{good} should be accepted"
+            );
+        }
+
+        // There is no `i_know_the_api_is_remote`: every one of these is a
+        // refusal with nowhere to go but an SSH forward, which is the point.
+        for bad in [
+            "0.0.0.0:9091",
+            "::1:9091",
+            "192.168.1.10:9091",
+            "example.com:9091",
+            "127.0.0.1",
+            "127.0.0.1:",
+            "127.0.0.1:0",
+            "127.0.0.1:notaport",
+            "127.0.0.1:99999",
+            // Unbracketed IPv6: SocketAddr refuses it at bind time, so
+            // accepting it here would be `cloved -C` approving a config that
+            // then fails to start.
+            "::1:9091",
+            "[::1]9091",
+            "[::1]:",
+            // A name that only looks like the loopback block.
+            "127.evil.example:9091",
+            "127.0.0:9091",
+            "127.0.0.1.5:9091",
+            "127.0.0.256:9091",
+        ] {
+            let refused = Config::parse(&format!("api_listen {bad}\n"), &d);
+            assert!(refused.is_err(), "{bad} should have been refused");
+        }
+
+        // And the refusal says what to do instead, rather than only "no".
+        let message = Config::parse("api_listen 0.0.0.0:9091\n", &d)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("ssh -L"), "{message}");
     }
 
     #[test]

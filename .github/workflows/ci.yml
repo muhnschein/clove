@@ -38,6 +38,15 @@ jobs:
       # passed all of them).
       - run: cargo build --workspace
       - run: ./ci/smoke.sh
+      # The Transmission RPC surface over a real loopback port. Separate from
+      # smoke because what it proves is different: that the listener survives
+      # the self-restriction applied after it binds, and that a real HTTP
+      # client gets through the 409 handshake. Installs transmission-remote so
+      # the run includes the real-client leg rather than skipping it — the
+      # trailing-slash defect this suite exists for was invisible to curl and
+      # to every unit test, and only that binary found it.
+      - run: sudo apt-get install -y transmission-cli
+      - run: ./ci/transmission.sh
       # Crash and I/O-failure resilience: the temp-then-rename state promise
       # is only worth what it is tested at (SCOPE §9). Runs unprivileged here,
       # so the unwritable-directory case is exercised for real.

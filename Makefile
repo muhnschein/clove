@@ -43,7 +43,7 @@ HOSTS ?=
 
 QUADLET_DIR := $(HOME)/.config/containers/systemd
 
-.PHONY: test smoke chaos test-live sam-stress sam-sweep matrix cross routers report \
+.PHONY: test smoke chaos transmission test-live sam-stress sam-sweep matrix cross routers report \
         router-ready \
         swarm router-up router-down router-wait router-build router-sam-enable \
         router-addressbook \
@@ -75,6 +75,15 @@ test:
 smoke:
 	cargo build --workspace
 	./ci/smoke.sh
+
+## The Transmission RPC surface, end to end over a real loopback TCP port.
+## Proves what the unit tests cannot: that the listener binds, survives the
+## Landlock/seccomp self-restriction applied after it, and answers a real HTTP
+## client through the 409 handshake. Drives `transmission-remote` too when it
+## is installed, and says so when it is not. No router needed.
+transmission:
+	cargo build --workspace
+	./ci/transmission.sh
 
 ## Crash resilience: SIGKILL storms during state writes, torn temporaries, and
 ## a state directory that stops being writable. No router needed. Runs the
