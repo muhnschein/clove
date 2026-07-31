@@ -379,7 +379,7 @@ struct Live {
     /// counters are per-run deltas on top of these.
     stats_base: (u64, u64),
     /// When the operator last forced an announce, so a script cannot turn
-    /// `clove announce` into a tracker flood.
+    /// the manual announce endpoint into a tracker flood.
     last_forced_announce: Option<Instant>,
 }
 
@@ -1915,6 +1915,15 @@ impl Hosted {
             (
                 "peers".to_owned(),
                 Value::UInt(u64::try_from(self.peers).unwrap_or(u64::MAX)),
+            ),
+            // Alongside `peers` rather than only in the detail object: the two
+            // are one reading, and "four connected" says nothing without "out
+            // of how many we know of". A listing that carried the first and
+            // not the second could not tell a small swarm from a torrent that
+            // is failing to dial the swarm it has.
+            (
+                "known_peers".to_owned(),
+                Value::UInt(u64::try_from(self.known_peers).unwrap_or(u64::MAX)),
             ),
             ("state".to_owned(), Value::from(self.state())),
             ("priorities".to_owned(), Value::Array(priorities)),

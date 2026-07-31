@@ -64,7 +64,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 
 ### CLI
 - Daemon `cloved` + control CLI `clove`, speaking to the local HTTP API over a unix socket (default) or localhost TCP (opt-in).
-- Commands: add (file/magnet), remove (with/without data), list, status (per torrent: peers, tunnels, speeds, availability), pause/resume, verify, set file priorities, tracker re-announce, client-level stats.
+- Commands: add (file/magnet), remove (with/without data), list, status (per torrent: peers, tunnels, speeds, availability), pause/resume, verify, set file priorities, tracker re-announce, client-level stats. *Two of those are capabilities rather than commands as built: tracker re-announce and manual peer injection are versioned API endpoints with no CLI wrapper, and client-level stats are part of `clove status` rather than a command of their own (`DECISIONS.md` S3).*
 - Human-friendly default output (aligned tables, progress, rates); `--json` on every read command for scripting.
 - Sensible exit codes, shell completion generation. The `clove fetch`-style one-shot download mode (no daemon) was the one stretch goal here and is **cut from v1** — see §2.
 - Peer identity on the wire: Azureus-style peer-ID prefix and client name string chosen per Q7 and kept stable thereafter; checked against the informal BEP 20 registry to avoid collisions.

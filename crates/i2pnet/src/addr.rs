@@ -460,9 +460,9 @@ mod hostile_tests {
     //! These are attacker-reachable and were outside every existing sweep:
     //! `clove-core/tests/hostile.rs` only reaches parsers in `clove-core`,
     //! and these live here. A b32 label arrives from a magnet link, a PEX
-    //! message or `clove peer`; a full base64 destination arrives from a
-    //! non-compact tracker response and from the router on every inbound
-    //! stream. All of it is bytes someone else chose.
+    //! message or a manually supplied peer; a full base64 destination arrives
+    //! from a non-compact tracker response and from the router on every
+    //! inbound stream. All of it is bytes someone else chose.
     //!
     //! The contract is the same one the rest of the project holds parsers
     //! to: parse or return `None` — never panic, never loop, never accept

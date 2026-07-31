@@ -229,7 +229,7 @@ impl Announcer {
     }
 
     /// Announce to every tracker now, ignoring the intervals they gave us and
-    /// any failure backoff — the operator's `clove announce`, and nothing
+    /// any failure backoff — the operator's manual announce, and nothing
     /// else. Returns as soon as the loop is woken; the announces themselves
     /// happen on the announcer's own thread.
     pub fn announce_now(&self) {

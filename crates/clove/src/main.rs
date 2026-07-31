@@ -2,21 +2,19 @@
 //!
 //! A thin client: hand-rolled arg parsing, one request per invocation over the
 //! local API (unix socket), rendering the daemon's JSON (`--json` passes it
-//! through). Commands: `status`, `stats`, `list`, `watch`, `top`, `show`,
-//! `add`, `remove`, `pause`, `resume`, `start`, `verify`, `peer`,
-//! `priorities`, `announce`, `sequential`, `seed-ratio`, `completions`.
+//! through). Commands: `status`, `list`, `show`, `add`, `remove`, `pause`,
+//! `resume`, `start`, `verify`, `priorities`, `sequential`, `seed-ratio`,
+//! `completions`.
 //!
-//! Two live views, and the difference between them is deliberate. `watch` is a
-//! repaint loop over the same renderers — no raw mode, nothing to restore
-//! (`docs/PHASE-F.md` §6). `top` is full-screen with a cursor and keys, still
-//! not a TUI framework (`docs/DECISIONS.md` S2); it lives in [`top`] and the
-//! terminal primitives it needs are in [`clove::term`].
+//! One view concept, deliberately. `list` is a one-shot table under a summary
+//! header, and a live view is `watch -n 2 clove list` — an ordinary program
+//! composed with this one, rather than a repaint loop and a full-screen mode
+//! carried here. Nothing enters raw mode, nothing owns the alternate screen,
+//! and there is nothing to restore if a command is killed mid-print.
 //!
 //! A torrent is named by info-hash, by a unique prefix of one, or by its
 //! position in `list` — resolved by the daemon except for the position, which
 //! is this end's, since a position is not an identity anything may store.
-
-mod top;
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -100,10 +98,7 @@ fn run() -> Result<(), Fail> {
     };
     match command.as_deref() {
         Some("status") => cmd_status(&where_, json),
-        Some("stats") => cmd_stats(&where_, json),
         Some("list") => cmd_list(&where_, json),
-        Some("watch") => cmd_watch(&where_, &operands),
-        Some("top") => cmd_top(&where_, &operands),
         Some("add") => cmd_add(&where_, &operands),
         Some("remove") => cmd_remove(&where_, &operands),
         Some("show") => cmd_show(&where_, json, &operands),
@@ -111,9 +106,7 @@ fn run() -> Result<(), Fail> {
         Some("resume") => cmd_action(&where_, &operands, "resume", "resumed"),
         Some("start") => cmd_action(&where_, &operands, "start", "started"),
         Some("verify") => cmd_verify(&where_, &operands),
-        Some("peer") => cmd_peer(&where_, &operands),
         Some("priorities") => cmd_priorities(&where_, &operands),
-        Some("announce") => cmd_action(&where_, &operands, "announce", "announcing"),
         Some("sequential") => cmd_sequential(&where_, &operands),
         Some("seed-ratio") => cmd_seed_ratio(&where_, &operands),
         Some("completions") => cmd_completions(&operands),
@@ -137,11 +130,8 @@ fn print_help() {
     println!("usage: clove [-c <config>] [--socket <path>] <command>");
     println!("  -c, --config <path>            read this configuration instead of the default");
     println!("commands:");
-    println!("  status [--json]                daemon and router status");
-    println!("  stats [--json]                 totals across every torrent");
+    println!("  status [--json]                daemon, router, and client-wide totals");
     println!("  list [--json]                  hosted torrents");
-    println!("  watch [--interval <secs>]      live view, repainted (Ctrl-C to quit)");
-    println!("  top                            full-screen view with keys (q to quit)");
     println!("  show <torrent> [--json]        one torrent in detail");
     println!("  add <file.torrent|magnet:…>    add a torrent");
     println!("      [--paused] [--sequential]  ...stopped, or in file order");
@@ -150,9 +140,7 @@ fn print_help() {
     println!("  resume <torrent…>              resume torrents");
     println!("  start <torrent…>               resume and jump the queue");
     println!("  verify <torrent…>              re-check data on disk");
-    println!("  peer <torrent> <b32-addr>      hand a running torrent a peer to dial");
     println!("  priorities <torrent> <spec>    set per-file priorities (e.g. 1,0,2)");
-    println!("  announce <torrent…>            re-announce to every tracker now");
     println!("  sequential <torrent> on|off    pick pieces in order instead of rarest-first");
     println!("  seed-ratio <torrent> <ratio>   stop seeding it at this ratio (0 = follow config)");
     println!("  completions <bash|zsh|fish>    print a shell completion script");
@@ -344,14 +332,28 @@ where
     Ok(())
 }
 
+/// The one client-wide report: is the daemon and its router alright, and what
+/// is the client doing.
+///
+/// These used to be two commands — `status` for the first question and `stats`
+/// for the second — which meant two round trips, two things to remember, and
+/// an operator reading one when the answer was in the other. They are read at
+/// the same moment often enough that splitting them was the mistake.
 fn cmd_status(where_: &Where, json: bool) -> Result<(), Fail> {
     let (socket, token) = resolve(where_)?;
     let body = request(&socket, &token, "GET", "/v1/status", &[])?;
     if json {
+        // Deliberately the endpoint's own answer, unchanged. The state counts
+        // and lifetime totals below are an aggregation this end performs for a
+        // human; inventing a CLI-only JSON shape for them would be a second
+        // schema nobody versions. If they are ever wanted by a script they
+        // belong in `/v1/status` itself.
         println!("{}", String::from_utf8_lossy(&body).trim_end());
         return Ok(());
     }
-    print!("{}", render_object(&parse_body(&body)?));
+    let status = parse_body(&body)?;
+    let torrents = parse_body(&request(&socket, &token, "GET", "/v1/torrents", &[])?)?;
+    print!("{}", render_status(&status, &torrents));
     Ok(())
 }
 
@@ -362,141 +364,12 @@ fn cmd_list(where_: &Where, json: bool) -> Result<(), Fail> {
         println!("{}", String::from_utf8_lossy(&body).trim_end());
         return Ok(());
     }
-    print!("{}", render_torrents(&parse_body(&body)?));
+    // The header bar is the second request, and only on the human path: a
+    // listing worth reading answers "and how is the client overall" in the
+    // same glance — the one thing `top` carried that the listing did not.
+    let status = parse_body(&request(&socket, &token, "GET", "/v1/status", &[])?)?;
+    print!("{}", render_list(&status, &parse_body(&body)?));
     Ok(())
-}
-
-/// Client-wide totals: what every torrent adds up to right now.
-///
-/// Deliberately a separate command from `status`, which answers "is the daemon
-/// and its router alright". This one answers "what is my client doing", and
-/// they are read at different moments.
-fn cmd_stats(where_: &Where, json: bool) -> Result<(), Fail> {
-    let (socket, token) = resolve(where_)?;
-    let body = request(&socket, &token, "GET", "/v1/status", &[])?;
-    if json {
-        println!("{}", String::from_utf8_lossy(&body).trim_end());
-        return Ok(());
-    }
-    let status = parse_body(&body)?;
-    let torrents = parse_body(&request(&socket, &token, "GET", "/v1/torrents", &[])?)?;
-    let empty: Vec<Value> = Vec::new();
-    let items: &[Value] = torrents.as_array().unwrap_or(&empty);
-
-    let mut by_state: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    let (mut up, mut down) = (0u64, 0u64);
-    for item in items {
-        *by_state.entry(field_str(item, "state")).or_default() += 1;
-        up += item.get("uploaded").and_then(Value::as_u64).unwrap_or(0);
-        down += item.get("downloaded").and_then(Value::as_u64).unwrap_or(0);
-    }
-
-    let mut out = String::new();
-    let num = |key: &str| status.get(key).and_then(Value::as_u64).unwrap_or(0);
-    let _ = writeln!(out, "torrents      {}", items.len());
-    for (state, count) in &by_state {
-        let _ = writeln!(out, "  {state:<12}{count}");
-    }
-    let _ = writeln!(out, "down rate     {}", human_rate(Some(num("down_rate"))));
-    let _ = writeln!(out, "up rate       {}", human_rate(Some(num("up_rate"))));
-    let _ = writeln!(
-        out,
-        "peers         {} of {}",
-        num("peers"),
-        num("peer_limit")
-    );
-    let _ = writeln!(out, "downloaded    {}", human_size(down));
-    let _ = writeln!(out, "uploaded      {}", human_size(up));
-    let _ = writeln!(out, "session       {}", human_duration(num("uptime_secs")));
-    print!("{out}");
-    Ok(())
-}
-
-/// Default repaint interval for `clove watch`.
-const WATCH_DEFAULT_SECS: u64 = 2;
-
-/// Slowest repaint we accept, so a typo cannot wedge the view for an hour.
-const WATCH_MAX_SECS: u64 = 3600;
-
-/// The live view (`docs/PHASE-F.md` §6): re-fetch status + torrents on an
-/// interval and repaint the same tables the one-shot commands print.
-///
-/// Deliberately *not* a TUI: no raw mode, no alternate screen, no framework —
-/// two ANSI escapes (erase display, cursor home) and the existing renderers.
-/// The terminal stays in its normal mode throughout, so Ctrl-C at any moment
-/// leaves a sane terminal with nothing to restore.
-fn cmd_watch(where_: &Where, operands: &[String]) -> Result<(), Fail> {
-    let mut interval = WATCH_DEFAULT_SECS;
-    let mut args = operands.iter();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--interval" => {
-                let value = args.next().ok_or_else(|| {
-                    Fail::Usage("--interval needs a number of seconds".to_owned())
-                })?;
-                interval = value
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|secs| (1..=WATCH_MAX_SECS).contains(secs))
-                    .ok_or_else(|| {
-                        Fail::Usage(format!("--interval must be 1..={WATCH_MAX_SECS} seconds"))
-                    })?;
-            }
-            other => return Err(Fail::Usage(format!("unexpected argument {other:?}"))),
-        }
-    }
-
-    let (socket, token) = resolve(where_)?;
-    loop {
-        let frame = watch_frame(&socket, &token, interval)?;
-        // Erase the display and park the cursor at the top-left, then draw.
-        // One write keeps the repaint from tearing on a slow terminal.
-        print!("\x1b[2J\x1b[H{frame}");
-        std::io::stdout()
-            .flush()
-            .map_err(|e| Fail::Failed(format!("writing to the terminal: {e}")))?;
-        std::thread::sleep(std::time::Duration::from_secs(interval));
-    }
-}
-
-/// The full-screen view (`docs/PHASE-H.md` §9).
-///
-/// Separate from [`cmd_watch`] on purpose, and not chosen between by sniffing
-/// whether stdout is a terminal: the two have different interaction models,
-/// and a command that silently becomes a different program depending on where
-/// its output goes is worse than two commands that say what they are.
-fn cmd_top(where_: &Where, operands: &[String]) -> Result<(), Fail> {
-    if let Some(unexpected) = operands.first() {
-        return Err(Fail::Usage(format!("unexpected argument {unexpected:?}")));
-    }
-    let (socket, token) = resolve(where_)?;
-    top::run(&socket, &token)
-}
-
-/// One repaint's worth of text: the daemon summary line, then the torrents.
-fn watch_frame(socket: &Path, token: &str, interval: u64) -> Result<String, Fail> {
-    let status = parse_body(&request(socket, token, "GET", "/v1/status", &[])?)?;
-    let torrents = parse_body(&request(socket, token, "GET", "/v1/torrents", &[])?)?;
-
-    // The router line carries whatever the SAM bridge last said, so it is not
-    // ours either — see `display`.
-    let router = field_str(&status, "router");
-    let version = field_str(&status, "version");
-    let count = status.get("torrents").and_then(Value::as_u64).unwrap_or(0);
-    let uptime = status
-        .get("uptime_secs")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "clove {version}  router: {router}  torrents: {count}  up: {}  (every {interval}s, Ctrl-C to quit)",
-        human_duration(uptime)
-    );
-    out.push('\n');
-    out.push_str(&render_torrents(&torrents));
-    Ok(out)
 }
 
 /// Compact uptime: `9s`, `5m`, `3h12m`, `2d4h`.
@@ -634,25 +507,6 @@ fn cmd_verify(where_: &Where, operands: &[String]) -> Result<(), Fail> {
         println!("verified {verified} piece(s) for {}", display(target));
         Ok(())
     })
-}
-
-fn cmd_peer(where_: &Where, operands: &[String]) -> Result<(), Fail> {
-    let [info_hash, addr] = operands else {
-        return Err(Fail::Usage(
-            "peer needs <info-hash> and a b32 address".to_owned(),
-        ));
-    };
-    let (socket, token) = resolve(where_)?;
-    let info_hash = one_target(&socket, &token, info_hash)?;
-    request(
-        &socket,
-        &token,
-        "POST",
-        &format!("/v1/torrents/{info_hash}/peers"),
-        addr.as_bytes(),
-    )?;
-    println!("peer added to {info_hash}");
-    Ok(())
 }
 
 fn cmd_priorities(where_: &Where, operands: &[String]) -> Result<(), Fail> {
@@ -930,67 +784,270 @@ fn parse_body(body: &[u8]) -> Result<Value, Fail> {
     json::parse(text).map_err(|e| Fail::Failed(format!("parsing response: {e}")))
 }
 
-/// Render a JSON object as an aligned `key   value` table; a non-object value
-/// is printed on one line.
-fn render_object(value: &Value) -> String {
-    let Some(fields) = value.as_object() else {
-        return format!("{}\n", value.to_line());
-    };
-    let width = fields.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+/// Label column for [`render_status`]: two spaces of indent, the longest state
+/// name (`waiting-for-router`, eighteen), and two more before the value — so
+/// the state breakdown nests under the torrent count, and the longest label
+/// there neither pushes the value column right nor runs into it.
+const STATUS_LABEL: usize = 22;
+
+/// The whole client on one screen: the daemon, its router, and what every
+/// torrent adds up to right now.
+///
+/// `status` comes from `/v1/status`; the state breakdown and the lifetime
+/// totals are summed here from `/v1/torrents`, because they are a question
+/// about the collection rather than a field the daemon keeps.
+fn render_status(status: &Value, torrents: &Value) -> String {
+    let empty: Vec<Value> = Vec::new();
+    let items: &[Value] = torrents.as_array().unwrap_or(&empty);
+
+    let mut by_state: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let (mut up, mut down) = (0u64, 0u64);
+    for item in items {
+        *by_state.entry(field_str(item, "state")).or_default() += 1;
+        up += item.get("uploaded").and_then(Value::as_u64).unwrap_or(0);
+        down += item.get("downloaded").and_then(Value::as_u64).unwrap_or(0);
+    }
+
+    let num = |key: &str| status.get(key).and_then(Value::as_u64).unwrap_or(0);
+
+    // Built as rows first so the blank separators are part of the report
+    // rather than something written between two halves of it. An empty label
+    // and an empty value is the blank line.
+    let mut rows: Vec<(String, String)> = vec![
+        // Who is answering, whether it can reach the network, and for how
+        // long. The router line and the SAM address are the daemon's words
+        // rather than ours, so they go through the sanitiser a name does.
+        ("clove".to_owned(), field_str(status, "version")),
+        ("router".to_owned(), field_str(status, "router")),
+        ("sam".to_owned(), field_str(status, "sam_address")),
+        ("uptime".to_owned(), human_duration(num("uptime_secs"))),
+        (String::new(), String::new()),
+        ("torrents".to_owned(), items.len().to_string()),
+    ];
+    rows.extend(
+        by_state
+            .iter()
+            .map(|(state, count)| (format!("  {state}"), count.to_string())),
+    );
+    rows.extend([
+        ("down rate".to_owned(), whole_rate(Some(num("down_rate")))),
+        ("up rate".to_owned(), whole_rate(Some(num("up_rate")))),
+        (
+            "peers".to_owned(),
+            format!("{} of {}", num("peers"), num("peer_limit")),
+        ),
+        (String::new(), String::new()),
+        // Lifetime rather than this session: these are the resume files'
+        // totals, and they keep their decimal — nothing repaints them, and
+        // the difference between 1.2 and 1.9 TiB is why they are read.
+        ("downloaded".to_owned(), human_size(down)),
+        ("uploaded".to_owned(), human_size(up)),
+    ]);
+
     let mut out = String::new();
-    for (key, val) in fields {
-        let _ = writeln!(out, "{key:<width$}  {}", cell(val));
+    for (label, value) in rows {
+        if label.is_empty() {
+            out.push('\n');
+        } else {
+            let _ = writeln!(out, "{label:<STATUS_LABEL$}{value}");
+        }
     }
     out
 }
 
-/// Render the torrents array as an aligned table.
-fn render_torrents(value: &Value) -> String {
-    let Some(items) = value.as_array() else {
-        return format!("{}\n", value.to_line());
+/// The summary line above the listing: the same glance `top` used to open
+/// with, on a command that exits.
+fn list_header(status: &Value) -> String {
+    let num = |key: &str| status.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let count = num("torrents");
+    format!(
+        "clove {}  {}  {}  {count} torrent{}  ▼ {}  ▲ {}  {} ({} max.)\n",
+        field_str(status, "version"),
+        field_str(status, "router"),
+        human_duration(num("uptime_secs")),
+        if count == 1 { "" } else { "s" },
+        whole_rate(Some(num("down_rate"))),
+        whole_rate(Some(num("up_rate"))),
+        num("peers"),
+        num("peer_limit"),
+    )
+}
+
+/// Column widths for the listing, in order: `#`, `PROGRESS`, `STATE`, `SIZE`,
+/// `▼`, `▲`, `PEERS`. `NAME` is last and takes what it needs up to
+/// [`NAME_WIDTH`].
+///
+/// Fixed rather than measured from the rows, which is the point. Widths taken
+/// from the content mean every column after the one that changed steps
+/// sideways the moment a rate crosses into four digits or a torrent finishes
+/// verifying — so a listing being watched (`watch -n 2 clove list`) never
+/// holds still, and the eye has to re-find each column on every repaint. The
+/// numbers are the widest each field can render: `1023 GiB` is eight, a rate
+/// with its unit is ten, and `waiting-for-router` is eighteen.
+const LIST_WIDTHS: [usize; 7] = [3, PROGRESS_WIDTH, 18, 8, 10, 10, 7];
+
+/// The `PROGRESS` cell: the bar, a space, and the percentage right-aligned in
+/// four (`100%`).
+const PROGRESS_WIDTH: usize = BAR_CELLS + 5;
+
+/// Render the listing: a header bar, a blank line, then one row per torrent.
+fn render_list(status: &Value, torrents: &Value) -> String {
+    let Some(items) = torrents.as_array() else {
+        return format!("{}\n", torrents.to_line());
     };
+    let mut out = list_header(status);
+    out.push('\n');
     if items.is_empty() {
-        return "no torrents\n".to_owned();
+        out.push_str("no torrents\n");
+        return out;
     }
-    let headers = [
-        "#",
-        "PROGRESS",
-        "STATE",
-        "SIZE",
-        "DOWN",
-        "UP",
-        "NAME",
-        "INFO-HASH",
-    ];
-    let mut rows: Vec<Vec<String>> = Vec::with_capacity(items.len());
+    // Headers are aligned the way their column is: the numeric ones to the
+    // right, so a figure and its label share an edge.
+    write_fixed(
+        &mut out,
+        &[
+            ("#", Align::Right),
+            ("PROGRESS", Align::Left),
+            ("STATE", Align::Left),
+            ("SIZE", Align::Right),
+            ("▼", Align::Right),
+            ("▲", Align::Right),
+            ("PEERS", Align::Right),
+            ("NAME", Align::Left),
+        ],
+    );
     for (index, item) in items.iter().enumerate() {
-        let progress = item
-            .get("progress")
-            .and_then(Value::as_f64)
-            .map_or_else(|| "-".to_owned(), |p| format!("{:.0}%", p * 100.0));
-        let state = field_str(item, "state");
+        let progress = progress_cell(item.get("progress").and_then(Value::as_f64));
         let size = item
             .get("size")
             .and_then(Value::as_u64)
-            .map_or_else(|| "-".to_owned(), human_size);
+            .map_or_else(|| "-".to_owned(), whole_size);
         let name = elide(
             item.get("name").and_then(Value::as_str).unwrap_or("-"),
             NAME_WIDTH,
         );
-        let hash = item.get("info_hash").and_then(Value::as_str).unwrap_or("-");
-        let hash_short = hash.get(..12).unwrap_or(hash).to_owned();
-        rows.push(vec![
-            (index + 1).to_string(),
-            progress,
-            state,
-            size,
-            human_rate(item.get("down_rate").and_then(Value::as_u64)),
-            human_rate(item.get("up_rate").and_then(Value::as_u64)),
-            name,
-            hash_short,
-        ]);
+        write_fixed(
+            &mut out,
+            &[
+                ((index + 1).to_string().as_str(), Align::Right),
+                (progress.as_str(), Align::Left),
+                (field_str(item, "state").as_str(), Align::Left),
+                (size.as_str(), Align::Right),
+                (
+                    whole_rate(item.get("down_rate").and_then(Value::as_u64)).as_str(),
+                    Align::Right,
+                ),
+                (
+                    whole_rate(item.get("up_rate").and_then(Value::as_u64)).as_str(),
+                    Align::Right,
+                ),
+                (peers_cell(item).as_str(), Align::Right),
+                (name.as_str(), Align::Left),
+            ],
+        );
     }
-    align(&headers, &rows)
+    out
+}
+
+/// Which edge a listing cell is padded against.
+#[derive(Clone, Copy, PartialEq)]
+enum Align {
+    Left,
+    Right,
+}
+
+/// Write one listing row at [`LIST_WIDTHS`], two spaces between columns.
+///
+/// A cell wider than its column is printed in full rather than truncated —
+/// misaligning one row is better than silently reporting a smaller number
+/// than the daemon gave — and the last column is never padded.
+fn write_fixed(out: &mut String, cells: &[(&str, Align)]) {
+    let last = cells.len().saturating_sub(1);
+    for (i, (text, align)) in cells.iter().enumerate() {
+        if i > 0 {
+            out.push_str("  ");
+        }
+        let width = LIST_WIDTHS.get(i).copied().unwrap_or(0);
+        let pad = width.saturating_sub(text.chars().count());
+        if i == last {
+            out.push_str(text);
+        } else if *align == Align::Right {
+            for _ in 0..pad {
+                out.push(' ');
+            }
+            out.push_str(text);
+        } else {
+            out.push_str(text);
+            for _ in 0..pad {
+                out.push(' ');
+            }
+        }
+    }
+    out.push('\n');
+}
+
+/// `connected/known`, the two numbers that separate "this swarm is small" from
+/// "this torrent cannot reach anyone".
+///
+/// A magnet still fetching its metadata knows peers but has no engine holding
+/// connections, so its left half is a dash rather than a zero it did not
+/// measure.
+fn peers_cell(item: &Value) -> String {
+    let count = |key: &str| {
+        item.get(key)
+            .and_then(Value::as_u64)
+            .map_or_else(|| "-".to_owned(), |n| n.to_string())
+    };
+    format!("{}/{}", count("peers"), count("known_peers"))
+}
+
+/// Cells in the progress bar.
+const BAR_CELLS: usize = 10;
+
+/// Partial cells, in eighths of a cell — so the bar moves eight times per cell
+/// rather than once, and a torrent that gains a percent visibly gains it.
+const EIGHTHS: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+
+/// The bar and the figure, in one column: `████▌░░░░░  45%`.
+///
+/// The two never disagree. Both round *down*, so a torrent at 99.6% shows
+/// neither a full bar nor `100%` — `100%` is reserved for a torrent that
+/// actually has every piece it asked for, which is the one thing an operator
+/// reads this column to find out.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "display only: the value is a fraction clamped to 0..=1 and the \
+              result is a cell count under 100"
+)]
+fn progress_cell(progress: Option<f64>) -> String {
+    let Some(fraction) = progress else {
+        return "-".to_owned();
+    };
+    // NaN fails both comparisons and lands on 0.0, which is the honest
+    // rendering of a number the daemon should not have sent.
+    let fraction = if fraction > 1.0 {
+        1.0
+    } else if fraction > 0.0 {
+        fraction
+    } else {
+        0.0
+    };
+    let eighths = (fraction * (BAR_CELLS * EIGHTHS.len()) as f64) as usize;
+    let full = eighths / EIGHTHS.len();
+    let part = eighths % EIGHTHS.len();
+    let mut bar = String::with_capacity(BAR_CELLS * 3);
+    for _ in 0..full {
+        bar.push('█');
+    }
+    if full < BAR_CELLS && part > 0 {
+        bar.push(EIGHTHS[part - 1]);
+    }
+    while bar.chars().count() < BAR_CELLS {
+        bar.push('░');
+    }
+    format!("{bar} {:>3}%", (fraction * 100.0) as u64)
 }
 
 fn field_str(item: &Value, key: &str) -> String {
@@ -1042,6 +1099,46 @@ fn human_rate(bytes_per_sec: Option<u64>) -> String {
         Some(0) | None => "-".to_owned(),
         Some(rate) => format!("{}/s", human_size(rate)),
     }
+}
+
+/// [`human_rate`] without the decimal, for the listing and its header.
+fn whole_rate(bytes_per_sec: Option<u64>) -> String {
+    match bytes_per_sec {
+        Some(0) | None => "-".to_owned(),
+        Some(rate) => format!("{}/s", whole_size(rate)),
+    }
+}
+
+/// [`human_size`] rounded to whole units: `1 GiB`, `700 MiB`.
+///
+/// The listing's columns are a fixed width and are read while they repaint, so
+/// what matters there is that a figure keeps its shape — `9.9 GiB` becoming
+/// `10.0 GiB` is a character of drift for a tenth of a unit nobody is acting
+/// on. `show` keeps the decimal, where the number is read once and precisely.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "display only; the rounded value is bounded by the unit table"
+)]
+fn whole_size(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    // Same trap as `human_size`, one unit further along: 1023.6 MiB rounds to
+    // 1024, which is a size written in units of itself.
+    if size.round() >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{} {}", size.round() as u64, UNITS[unit])
 }
 
 /// Human-readable byte size (powers of 1024).
@@ -1250,13 +1347,16 @@ mod tests {
             assert_eq!(display(ok), ok);
         }
 
-        // And it has to hold through the renderer an operator actually reads,
+        // And it has to hold through the renderers an operator actually reads,
         // not just the helper.
-        let table = render_torrents(&Value::Array(vec![obj(&[
-            ("name", Value::from(hostile)),
-            ("state", Value::from("seeding\u{1b}[2J")),
-            ("info_hash", Value::from("ab".repeat(20))),
-        ])]));
+        let table = render_list(
+            &Value::Null,
+            &Value::Array(vec![obj(&[
+                ("name", Value::from(hostile)),
+                ("state", Value::from("seeding\u{1b}[2J")),
+                ("info_hash", Value::from("ab".repeat(20))),
+            ])]),
+        );
         assert!(!table.contains('\u{1b}'), "{table:?}");
         let detail = render_detail(&obj(&[
             ("name", Value::from(hostile)),
@@ -1277,10 +1377,25 @@ mod tests {
             ),
         ]));
         assert!(!detail.contains('\u{1b}'), "{detail:?}");
-        // `clove status` renders through a different function; it reads the
-        // router's last word, which is not ours either.
-        let status = render_object(&obj(&[("router", Value::from("lost\u{1b}[2J"))]));
+
+        // Every string the daemon hands back reaches a terminal through
+        // `field_str`, so that is the boundary worth pinning directly.
+        assert_eq!(
+            field_str(&obj(&[("router", Value::from("lost\u{1b}[2J"))]), "router"),
+            "lost.[2J"
+        );
+        // `status` and the listing's header bar print the router's last word
+        // and the SAM address, neither of which is ours either.
+        let hostile_status = obj(&[
+            ("router", Value::from("lost\u{1b}[2J")),
+            ("version", Value::from("0.0.1\u{1b}[H")),
+            ("sam_address", Value::from("127.0.0.1:7656\u{7}")),
+        ]);
+        let status = render_status(&hostile_status, &Value::Array(Vec::new()));
         assert!(!status.contains('\u{1b}'), "{status:?}");
+        let header = list_header(&hostile_status);
+        assert!(!header.contains('\u{1b}'), "{header:?}");
+        assert!(!header.contains('\u{7}'), "{header:?}");
     }
 
     #[test]
@@ -1300,13 +1415,23 @@ mod tests {
         assert!(!elide(&format!("\u{1b}[2J{}", "x".repeat(80)), NAME_WIDTH).contains('\u{1b}'));
 
         // A pathological name must not push the last column out of the
-        // terminal, which is what the width is for.
-        let table = render_torrents(&Value::Array(vec![obj(&[
-            ("name", Value::from("n".repeat(400))),
-            ("info_hash", Value::from("cd".repeat(20))),
-        ])]));
+        // terminal, which is what the width is for. The bound is the fixed
+        // columns plus the name's own budget — with fixed widths that is the
+        // widest a row can ever be, whatever the daemon sends.
+        let fixed: usize = LIST_WIDTHS.iter().sum::<usize>() + 2 * LIST_WIDTHS.len();
+        let table = render_list(
+            &Value::Null,
+            &Value::Array(vec![obj(&[
+                ("name", Value::from("n".repeat(400))),
+                ("info_hash", Value::from("cd".repeat(20))),
+            ])]),
+        );
         for line in table.lines() {
-            assert!(line.chars().count() < 120, "{} chars", line.chars().count());
+            assert!(
+                line.chars().count() <= fixed + NAME_WIDTH,
+                "{} chars",
+                line.chars().count()
+            );
         }
     }
 
@@ -1340,41 +1465,195 @@ mod tests {
 
     #[test]
     fn an_empty_list_says_so_rather_than_printing_a_bare_header() {
-        assert_eq!(render_torrents(&Value::Array(Vec::new())), "no torrents\n");
+        let out = render_list(&Value::Null, &Value::Array(Vec::new()));
+        // The header bar still prints: "how is the client" is a question an
+        // empty listing answers as usefully as a full one.
+        assert!(out.starts_with("clove "), "{out}");
+        assert!(out.ends_with("no torrents\n"), "{out}");
     }
 
     #[test]
-    fn the_listing_shortens_hashes_and_fills_missing_fields() {
+    fn the_listing_drops_the_hash_and_fills_missing_fields() {
         let full = "58e2fc46a8dc57c78191f079648750b0644d03a2";
-        let out = render_torrents(&Value::Array(vec![
-            obj(&[
-                ("info_hash", Value::from(full.to_owned())),
-                ("name", Value::from("release.iso".to_owned())),
-                ("size", Value::UInt(1_500_000_000)),
-                ("progress", Value::Float(0.423)),
-                ("state", Value::from("downloading".to_owned())),
+        let out = render_list(
+            &Value::Null,
+            &Value::Array(vec![
+                obj(&[
+                    ("info_hash", Value::from(full.to_owned())),
+                    ("name", Value::from("release.iso".to_owned())),
+                    ("size", Value::UInt(1_500_000_000)),
+                    ("progress", Value::Float(0.423)),
+                    ("state", Value::from("downloading".to_owned())),
+                    ("peers", Value::UInt(4)),
+                    ("known_peers", Value::UInt(20)),
+                ]),
+                // A torrent whose metadata has not arrived yet: every optional
+                // field is absent and must render as a dash, not as "null".
+                obj(&[("info_hash", Value::from("ab".repeat(20)))]),
             ]),
-            // A torrent whose metadata has not arrived yet: every optional
-            // field is absent and must render as a dash, not as "null".
-            obj(&[("info_hash", Value::from("ab".repeat(20)))]),
-        ]));
-        assert!(out.contains("58e2fc46a8dc"), "{out}");
-        assert!(
-            !out.contains(full),
-            "the full hash belongs in show, not list: {out}"
         );
+        // The hash is `show`'s business now. A listing that carried it was
+        // spending fourteen columns on something no eye reads and no command
+        // needs typed back at it — a `#` does that job.
+        assert!(!out.contains("58e2fc46a8dc"), "{out}");
+        assert!(!out.contains(full), "{out}");
+        assert!(!out.contains("INFO-HASH"), "{out}");
         assert!(out.contains("42%"), "{out}");
-        assert!(out.contains("1.4 GiB"), "{out}");
+        // Whole units in the listing, decimals kept for `show`.
+        assert!(out.contains("1 GiB"), "{out}");
+        assert!(!out.contains("1.4 GiB"), "{out}");
+        assert!(out.contains("4/20"), "{out}");
         assert!(!out.contains("null"), "{out}");
-        assert!(out.lines().any(|l| l.contains(" -  ")), "{out}");
+        // The torrent with nothing known about it renders dashes throughout,
+        // including both halves of the peer column.
+        assert!(out.contains("-/-"), "{out}");
     }
 
     #[test]
     fn a_non_array_listing_does_not_pretend_to_be_a_table() {
         // If the daemon ever answered with something unexpected, the CLI
         // prints it rather than rendering an empty table over it.
-        let out = render_torrents(&Value::from("unexpected".to_owned()));
+        let out = render_list(&Value::Null, &Value::from("unexpected".to_owned()));
         assert!(out.contains("unexpected"), "{out}");
+    }
+
+    #[test]
+    fn the_listing_holds_its_columns_still() {
+        // The whole point of fixed widths: two listings whose contents differ
+        // in every measurable way still put every column at the same offset,
+        // so a table being repainted by `watch -n 2 clove list` does not
+        // shuffle itself under the reader.
+        let row = |state: &str, size: u64, rate: u64, peers: u64| {
+            Value::Array(vec![obj(&[
+                ("name", Value::from("x".to_owned())),
+                ("state", Value::from(state.to_owned())),
+                ("size", Value::UInt(size)),
+                ("progress", Value::Float(0.5)),
+                ("down_rate", Value::UInt(rate)),
+                ("up_rate", Value::UInt(rate)),
+                ("peers", Value::UInt(peers)),
+                ("known_peers", Value::UInt(peers)),
+            ])])
+        };
+        let narrow = render_list(&Value::Null, &row("seeding", 1024, 1, 1));
+        let wide = render_list(
+            &Value::Null,
+            &row("waiting-for-router", 1024u64.pow(4), 999 * 1024, 999),
+        );
+        // Characters, not bytes: the bar and the ▼/▲ headers are multi-byte,
+        // and a byte offset would call two aligned columns different.
+        let column_of = |line: &str, needle: &str| {
+            let byte = line.find(needle).expect("the column");
+            line[..byte].chars().count()
+        };
+        let name_at = |table: &str| column_of(table.lines().last().expect("a row"), "x");
+        assert_eq!(name_at(&narrow), name_at(&wide), "{narrow}\n{wide}");
+        // And the header sits over the columns it names.
+        let header_at =
+            |table: &str| column_of(table.lines().nth(2).expect("the column head"), "NAME");
+        assert_eq!(header_at(&narrow), name_at(&narrow), "{narrow}");
+        assert_eq!(header_at(&wide), name_at(&wide), "{wide}");
+    }
+
+    #[test]
+    fn the_progress_bar_and_its_figure_agree() {
+        // Both round down, so neither claims a torrent is finished before it
+        // is — the one thing this column is read to find out.
+        assert_eq!(progress_cell(Some(0.0)), "░░░░░░░░░░   0%");
+        assert_eq!(progress_cell(Some(1.0)), "██████████ 100%");
+        let nearly = progress_cell(Some(0.996));
+        assert!(nearly.ends_with(" 99%"), "{nearly}");
+        assert!(!nearly.starts_with("██████████"), "{nearly}");
+        // Every cell is one character wide and the whole cell is fixed, so the
+        // column cannot breathe as a torrent fills.
+        for step in 0..=1000 {
+            let cell = progress_cell(Some(f64::from(step) / 1000.0));
+            assert_eq!(cell.chars().count(), PROGRESS_WIDTH, "{step}: {cell:?}",);
+        }
+        // Nothing the daemon could send may produce a bar of another width.
+        for odd in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 2.0] {
+            assert_eq!(progress_cell(Some(odd)).chars().count(), PROGRESS_WIDTH);
+        }
+        // A magnet with no progress at all is a dash, not a zero it did not
+        // measure.
+        assert_eq!(progress_cell(None), "-");
+    }
+
+    #[test]
+    fn whole_sizes_and_rates_drop_the_decimal_without_lying() {
+        assert_eq!(whole_size(0), "0 B");
+        assert_eq!(whole_size(1023), "1023 B");
+        assert_eq!(whole_size(1024), "1 KiB");
+        assert_eq!(whole_size(1_500_000_000), "1 GiB");
+        assert_eq!(whole_size(700 * 1024 * 1024), "700 MiB");
+        assert!(whole_size(u64::MAX).ends_with(" PiB"));
+        // Nothing may render as 1024 of a smaller unit, the same trap
+        // `human_size` steps around one decimal place earlier.
+        for n in [1023u64, 1024, 1024 * 1024 - 1, 1024 * 1024 * 1023 + 1] {
+            assert!(
+                !whole_size(n).starts_with("1024 "),
+                "{n} → {}",
+                whole_size(n)
+            );
+        }
+        // Idle still reads as nothing rather than as a zero.
+        assert_eq!(whole_rate(None), "-");
+        assert_eq!(whole_rate(Some(0)), "-");
+        assert_eq!(whole_rate(Some(1024)), "1 KiB/s");
+    }
+
+    #[test]
+    fn status_answers_both_questions_at_once() {
+        // The merge: what `status` used to say about the daemon, and what
+        // `stats` used to say about the torrents, in one report.
+        let status = obj(&[
+            ("version", Value::from("0.0.1".to_owned())),
+            ("router", Value::from("connected".to_owned())),
+            ("sam_address", Value::from("127.0.0.1:7656".to_owned())),
+            ("uptime_secs", Value::UInt(11_520)),
+            ("down_rate", Value::UInt(84_000)),
+            ("up_rate", Value::UInt(9_216)),
+            ("peers", Value::UInt(11)),
+            ("peer_limit", Value::UInt(200)),
+        ]);
+        let torrents = Value::Array(vec![
+            obj(&[
+                ("state", Value::from("downloading".to_owned())),
+                ("downloaded", Value::UInt(1024 * 1024)),
+                ("uploaded", Value::UInt(512 * 1024)),
+            ]),
+            obj(&[
+                ("state", Value::from("seeding".to_owned())),
+                ("downloaded", Value::UInt(1024 * 1024)),
+                ("uploaded", Value::UInt(512 * 1024)),
+            ]),
+            obj(&[("state", Value::from("seeding".to_owned()))]),
+        ]);
+        let out = render_status(&status, &torrents);
+        // The daemon half.
+        assert!(out.contains("connected"), "{out}");
+        assert!(out.contains("127.0.0.1:7656"), "{out}");
+        assert!(out.contains("3h12m"), "{out}");
+        // The client half: a count, the states under it, and the lifetime
+        // totals that only exist by summing the listing.
+        assert!(out.contains("torrents"), "{out}");
+        assert!(out.contains("  downloading"), "{out}");
+        assert!(out.contains("  seeding"), "{out}");
+        assert!(out.contains("11 of 200"), "{out}");
+        // Lifetime totals keep their decimal: nothing repaints them, and the
+        // difference they carry is the reason they are read.
+        assert!(out.contains("2.0 MiB"), "lifetime downloaded: {out}");
+        assert!(out.contains("1.0 MiB"), "lifetime uploaded: {out}");
+        // Rates lose the decimal here too, so the two reports agree.
+        assert!(out.contains("82 KiB/s"), "{out}");
+        assert!(out.contains("9 KiB/s"), "{out}");
+        // Every value starts at one column, including the indented state
+        // rows, so nothing steps right for `waiting-for-router`.
+        for line in out.lines().filter(|l| !l.is_empty()) {
+            let at: Vec<char> = line.chars().collect();
+            assert_eq!(at.get(STATUS_LABEL - 1), Some(&' '), "{line:?}");
+            assert!(at.get(STATUS_LABEL).is_some_and(|c| *c != ' '), "{line:?}");
+        }
     }
 
     #[test]
