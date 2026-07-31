@@ -293,8 +293,19 @@ if command -v transmission-remote >/dev/null 2>&1; then
         || fail "transmission-remote -a failed: $(cat "$work/tr-add.out")"
     tr -l >"$work/tr-list2.out" 2>&1 || fail "transmission-remote -l failed after add"
     expect_contains "$(cat "$work/tr-list2.out")" "rpc.txt" "the added torrent did not list"
-    tr -t 1 -S >"$work/tr-stop.out" 2>&1 || fail "transmission-remote stop failed"
-    tr -t 1 --remove >"$work/tr-rm.out" 2>&1 || fail "transmission-remote --remove failed"
+    # Read the id back rather than assuming it. Ids are assigned in order of
+    # first sight and are stable per daemon run, so this one happens to be 1
+    # today — which is exactly the sort of thing that holds until it does not.
+    tr_id=$(rpc '{"method":"torrent-get","arguments":{"fields":["id"]}}' \
+        | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -n1)
+    [ -n "$tr_id" ] || fail "could not read the id transmission-remote's torrent was given"
+    tr -t "$tr_id" -S >"$work/tr-stop.out" 2>&1 || fail "transmission-remote stop failed"
+    tr -t "$tr_id" -i >"$work/tr-info.out" 2>&1 || fail "transmission-remote -i failed"
+    expect_contains "$(cat "$work/tr-info.out")" "rpc.txt" "the detail view did not render the torrent"
+    # The tracker section is the one a real client renders from fields no unit
+    # test knew were needed; an empty section here is the regression.
+    tr -t "$tr_id" -it >"$work/tr-trackers.out" 2>&1 || fail "transmission-remote -it failed"
+    tr -t "$tr_id" --remove >"$work/tr-rm.out" 2>&1 || fail "transmission-remote --remove failed"
     echo "transmission: transmission-remote ok"
 else
     echo "transmission: transmission-remote not installed, skipping the real-client leg"
