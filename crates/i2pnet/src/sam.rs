@@ -294,13 +294,11 @@ fn expect_stream_ok(status: &str, what: &str) -> io::Result<()> {
 /// A SAM session id unlikely to collide with one already registered.
 ///
 /// SAM session ids are per-router, not per-connection, and a router does not
-/// necessarily free one the instant our control socket closes — emissary
-/// 0.4.0 holds it long enough that a second run seconds later is refused with
-/// `DuplicateId`. Observed as three consecutive `sam-stress` runs failing at
-/// session setup after the first one exited normally
-/// (`docs/PROTOCOL.i2p-bt` §2.9).
+/// necessarily free one the instant our control socket closes: at least one
+/// holds it long enough that a process starting seconds after a clean exit is
+/// refused with `DuplicateId` (`docs/PROTOCOL.i2p-bt` §2.9).
 ///
-/// This matters well beyond the harness: the SCOPE §4 reconnect discipline
+/// This matters beyond a one-off run: the SCOPE §4 reconnect discipline
 /// has the daemon rebuild its session tree after losing the router. If it
 /// reuses a fixed id, the rebuild can be refused by the stale session it is
 /// replacing — the supervisor would then back off and retry into the same

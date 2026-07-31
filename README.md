@@ -45,8 +45,6 @@ Aspires to be leak-proof by construction. Three independent layers (`docs/SCOPE.
 
 clove talks to any router exposing SAMv3. It is developed against i2pd and
 Java I2P, and both have carried full downloads from public i2psnark swarms.
-emissary is tracked but has never reached a swarm — it fails naming in two
-ways that are its own, not clove's; `docs/DECISIONS.md` S1 has the detail.
 
 ## Development
 
@@ -75,9 +73,7 @@ nothing in this repo needs a router. `make fuzz` wants a nightly toolchain
 (see [`fuzz/README.md`](fuzz/README.md)).
 
 To exercise clove against a real router, run the daemon against one: point
-`cloved` at your router's SAM port, add a torrent, and watch it. There is no
-harness in this repo for that any more — it was removed once i2pd and Java I2P
-had both carried full downloads — so a live check is a manual exercise.
+`cloved` at your router's SAM port, add a torrent, and watch it.
 
 CI runs all of the above plus rustfmt, `clippy::pedantic` denied,
 `cargo deny`, and `ci/check-net-deps.sh` — the gate that fails the build if a

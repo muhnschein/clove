@@ -16,7 +16,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 
 1. **Leak-proof by construction.** The client must be architecturally incapable of clearnet communication, independent of any OS-level sandboxing.
 2. **Robust.** Correct handling of session loss, tunnel churn, router restarts, and misbehaving peers. This is the primary quality bar — the reason this project exists is that XD is flakey.
-3. **Interoperable.** A first-class citizen on existing I2P swarms (i2psnark-dominated) and with both major router implementations plus emissary.
+3. **Interoperable.** A first-class citizen on existing I2P swarms (i2psnark-dominated) and with both major router implementations.
 4. **Operable.** A CLI pleasant enough for daily use, plus a local HTTP API for future frontends.
 
 ## 2. Non-Goals (v1)
@@ -26,7 +26,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 - UDP tracker announces (Prop 160, finalized 2025-06). Deferred; requires Datagram2/3 support end-to-end (router, SAM lib, trackers). HTTP announces work everywhere today. Revisit when tracker deployment exists.
 - Web UI. Deferred to v2. The HTTP API is designed so a web UI can be added without engine changes.
 - BitTorrent v2 (BEP 52), uTP, Local Peer Discovery, IP-based anything.
-- Embedded router. We require an external router exposing SAMv3 (i2pd, Java I2P, or emissary).
+- Embedded router. We require an external router exposing SAMv3 (i2pd or Java I2P).
 - `clove fetch`, the daemon-less one-shot download mode. Entered §3 as an explicit stretch goal and is **cut** rather than carried: it needs a second lifecycle (session setup, download, teardown, all in one process) whose failure modes are not the daemon's, and every hour spent on it was an hour not spent on getting the daemon working against a real router. Nothing about the design forecloses it — the engine already runs headless in tests — so it is a v2 candidate, not a rejection.
 
 ## 3. v1 Feature Cut
@@ -89,7 +89,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 +-------------------------------------------------------+
                     | SAMv3 (localhost)
                     v
-           i2pd / Java I2P / emissary
+                i2pd / Java I2P
 ```
 
 - **`i2pnet` module boundary.** All of yosemite is consumed behind our own trait (`I2pDialer`, `I2pListener`, `I2pNamingLookup`, later `I2pDatagram`). Rationale: yosemite is young and small; if it stalls or we outgrow it, we swap the impl without touching the engine. Also gives us a mock implementation for engine tests without a router.
@@ -128,13 +128,11 @@ No layer assumes another is present.
 |---|---|---|
 | Java I2P | P0 | Sanity/reference; what most peers run behind. When routers disagree, this one is presumed right |
 | i2pd | P0 | Also popular; SAM quirks differ from Java |
-| emissary | P2 | Tracked, but not a hard requirement, as it is still considered experimental by I2P. Revisit at its first stable release; see `DECISIONS.md` S1 |
 
 Priority is where to spend attention first, not what to skip. i2pd and Java
 I2P — the deployment target and the reference, one C++ and one Java SAM
 implementation — are the two clove is developed against, and both have carried
-full downloads from public i2psnark swarms. emissary is tracked rather than
-required; the reasoning and its reversal condition are in `DECISIONS.md` S1.
+full downloads from public i2psnark swarms.
 
 **Peer clients (swarm side):**
 
@@ -155,7 +153,7 @@ covered by any test in this repo — `crates/clove-core`'s loopback download is
 | # | Item | Plan |
 |---|---|---|
 | R1 | yosemite maturity (v0.7, few users) | Wrap behind `i2pnet` trait; vendor if needed; upstream fixes (author is responsive/active) |
-| R2 | i2pd SAM behavior under many concurrent streams on one session (possible root of XD flakiness) | **Closed 2026-07-28, negative** (`PROTOCOL.i2p-bt` §2.6e): two `make sam-sweep` ladders on i2pd 2.61.0, 30 runs, every one dialled N of N to 200 concurrent — connect latency uncorrelated with N. Not the root of the flakiness; §2.12 is the better candidate. A separate finding on SAM-bridge stability under session churn is open as §2.6f |
+| R2 | i2pd SAM behavior under many concurrent streams on one session (possible root of XD flakiness) | **Closed 2026-07-28, negative** (`PROTOCOL.i2p-bt` §2.6e): two stress ladders on i2pd 2.61.0, 30 runs, every one dialled N of N to 200 concurrent — connect latency uncorrelated with N. Not the root of the flakiness; §2.12 is the better candidate |
 | R3 | Datagram2/3 availability in yosemite + routers (gates future UDP announces, DHT) | Not needed for v1; track upstream |
 | R4 | i2p_pex flag semantics underspecified ("review libtorrent source") | Conformance testing vs i2psnark; treat i2psnark behavior as normative |
 | R5 | Tunnel latency vs choker/timeout tuning (clearnet BT timing assumptions are wrong on I2P) | Make all timeouts config-tunable; benchmark on live swarms; expect several rounds |
