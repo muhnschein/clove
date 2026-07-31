@@ -15,7 +15,6 @@ torrents named by hash prefix, and `clove top`.
 
 - [`docs/SCOPE.md`](docs/SCOPE.md) — what clove is and is not (the spec)
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — resolved design questions Q1–Q7
-- [`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) — running against real routers, and the interop matrix
 - [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt) — the I2P-BitTorrent dialect, and every live finding
 - [`docs/PHASE-F.md`](docs/PHASE-F.md) — daemon/CLI/API design, and the TUI decision
 - [`docs/PHASE-H.md`](docs/PHASE-H.md) — the multi-torrent budget, the queue, seeding limits, and `clove top`
@@ -44,8 +43,10 @@ Aspires to be leak-proof by construction. Three independent layers (`docs/SCOPE.
    the system one carries the `IPAddressDeny=any` clearnet lock.
    `contrib/netns/` documents the same lock for non-systemd hosts.
 
-`contrib/podman/` has quadlets for all three I2P routers clove targets — i2pd,
-Java I2P and emissary — which run side by side for the interop matrix.
+clove talks to any router exposing SAMv3. It is developed against i2pd and
+Java I2P, and both have carried full downloads from public i2psnark swarms.
+emissary is tracked but has never reached a swarm — it fails naming in two
+ways that are its own, not clove's; `docs/DECISIONS.md` S1 has the detail.
 
 ## Development
 
@@ -55,11 +56,8 @@ Every defect that has mattered was found by running it against a real router
 and a real swarm; none was reachable from a router-free test, and the unit
 suite was green through all of them. They are recorded in
 [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt), each with the test that catches
-it now. Before 0.1: the interop sign-off on i2pd and Java I2P
-([`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md) §6.3). emissary is tracked in
-the same table but no longer gates the release, and
-[`docs/DECISIONS.md`](docs/DECISIONS.md) S1 says why and what would change it
-back.
+it now. clove has since downloaded and seeded a 3.2 GiB torrent from a public
+i2psnark swarm on both i2pd and Java I2P.
 
 
 ## Building and testing
@@ -72,25 +70,14 @@ make chaos                  # SIGKILL storms and failed state writes
 make man-lint               # the manuals still parse
 ```
 
-Everything above runs from a clean checkout with no infrastructure. The tiers
-that need more want a local I2P router (see
-[`docs/LIVE-TESTING.md`](docs/LIVE-TESTING.md)); `make fuzz` wants a nightly
-toolchain (see [`fuzz/README.md`](fuzz/README.md)).
+Everything above runs from a clean checkout with no infrastructure, and
+nothing in this repo needs a router. `make fuzz` wants a nightly toolchain
+(see [`fuzz/README.md`](fuzz/README.md)).
 
-```
-make swarm TORRENT='magnet:?xt=urn:btih:…'   # the real thing, against a real swarm
-make test-live                               # the router-gated loopback tests
-make report ARGS="--up --swarm magnet:?…"    # every tier, into one file
-```
-
-`make swarm` is the one to run first: it builds the binaries, points `cloved`
-at your router, downloads a torrent you name from live i2psnark peers, seeds it
-back, and prints a milestone table saying how far it got — tracker announce,
-metadata, first peer, first verified piece, completion, PEX, bytes served, and
-whether a remote peer dialed us. `make report` runs every tier that applies on
-the machine and writes one file with the verdicts, the router versions and the
-container logs, so a live session produces something reviewable rather than a
-scrollback.
+To exercise clove against a real router, run the daemon against one: point
+`cloved` at your router's SAM port, add a torrent, and watch it. There is no
+harness in this repo for that any more — it was removed once i2pd and Java I2P
+had both carried full downloads — so a live check is a manual exercise.
 
 CI runs all of the above plus rustfmt, `clippy::pedantic` denied,
 `cargo deny`, and `ci/check-net-deps.sh` — the gate that fails the build if a

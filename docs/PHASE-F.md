@@ -214,7 +214,8 @@ unchanged by any of it.
 stands: config + `-C`, token-authed `/v1/` API over a unix socket, the full
 command surface, persistence with a written format spec, engine hosting over
 SAM with supervision, tracker/PEX/magnet peer acquisition, and the live view.
-What remains for the milestone is out-of-CI: the live-router sign-off in
-`LIVE-TESTING.md`. Man pages, sandboxing and packaging are Phase G.
+It has since downloaded and seeded a 3.2 GiB torrent from a public i2psnark
+swarm on both i2pd and Java I2P. Man pages, sandboxing and packaging are
+Phase G.
 
 Layer-2 self-restriction (Landlock/seccomp) and man pages are Phase G, not here.

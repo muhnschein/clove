@@ -85,6 +85,13 @@ requires i2pd and Java I2P. emissary keeps its quadlet, its address-book
 helper and its column in `LIVE-TESTING.md` §6.3; what it loses is the power to
 block a release.
 
+> **Superseded in part (2026-07-31).** The live-testing tier was removed
+> wholesale — the doc, the quadlets, the harness scripts and `sam-stress` —
+> so there is no sign-off left for any router to gate, and the infrastructure
+> this memo promised to keep is gone with it. What survives is the finding:
+> emissary 0.4.0 fails naming in two independent ways, none of them clove's.
+> The reversal condition below is unrunnable as written.
+
 **The evidence.** Across every live session, emissary 0.4.0 has never reached
 a swarm, and the reason is not clove. Its SAM bridge has been fine since the
 first run — sessions come up in 15–60s. Naming is what fails, in two
@@ -121,9 +128,15 @@ not answer NAMING LOOKUP for its own destinations" caveat. Every one of those
 came from chasing an emissary failure, all of them make *every* router's
 results legible, and none of them is going anywhere.
 
+*(The infrastructure half of that did not hold: it was all removed on
+2026-07-31. The diagnostics it names — the metadata fetch's stage reporting,
+the negative-cache countdown — are in the daemon and did stay.)*
+
 **Reversal condition.** emissary reaches a stable release. Re-run `make swarm
 TORRENT=… ROUTER=emissary`; if it carries a download, it returns to the gate
 and this memo is struck. Until then its column is recorded, not required.
+*(`make swarm` no longer exists; running clove against emissary is now a
+manual exercise.)*
 
 ## S2 — A TUI, but no TUI framework (2026-07-30)
 

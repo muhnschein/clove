@@ -1,10 +1,10 @@
 //! `SAMv3` backend — the M1 half of `SCOPE.md` §8.
 //!
-//! This is the *only* code here that talks to a real router. Its runtime
-//! behavior against a live router is verified out-of-CI
-//! (`docs/LIVE-TESTING.md`); everything that does not need a router — address
-//! derivation, the forwarded destination-line parse, and every way a bridge
-//! can misbehave — is unit-tested here over loopback TCP.
+//! This is the *only* code here that talks to a real router, and its runtime
+//! behavior against one is therefore not covered by any test in this repo.
+//! Everything that does not need a router — address derivation, the forwarded
+//! destination-line parse, and every way a bridge can misbehave — is
+//! unit-tested here over loopback TCP.
 //!
 //! - [`SamSession`] implements [`I2pDialer`] and [`I2pNamingLookup`]. It owns
 //!   its control connection: `HELLO VERSION` and `SESSION CREATE` are spoken
@@ -24,7 +24,7 @@
 //! - [`SamListener`] implements [`I2pListener`] for **inbound** streams via
 //!   SAM `STREAM FORWARD` to a loopback [`TcpListener`] we own (an allowed
 //!   Layer-1 IP socket, bound to `127.0.0.1`). This is the topology chosen
-//!   over `STREAM ACCEPT` in `docs/LIVE-TESTING.md` §3: `accept` takes
+//!   over `STREAM ACCEPT`, and the reason is concurrency: `accept` takes
 //!   `&mut self` and serializes every inbound stream on the one session,
 //!   whereas `forward` lets the router fan connections into a plain accept
 //!   loop. With `SILENT=false` (yosemite's default) the router prepends each
@@ -1047,10 +1047,10 @@ fn map_err(e: yosemite::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    //! Router-free coverage. A *working* SAM session needs a live router
-    //! (`docs/LIVE-TESTING.md`), but everything about a router that is
-    //! **not** working can be tested here, and that is the half that decides
-    //! whether the daemon degrades or wedges.
+    //! Router-free coverage. A *working* SAM session needs a live router and
+    //! so cannot be exercised here, but everything about a router that is
+    //! **not** working can be, and that is the half that decides whether the
+    //! daemon degrades or wedges.
     //!
     //! Three groups:
     //!

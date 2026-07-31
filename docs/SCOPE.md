@@ -27,7 +27,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 - Web UI. Deferred to v2. The HTTP API is designed so a web UI can be added without engine changes.
 - BitTorrent v2 (BEP 52), uTP, Local Peer Discovery, IP-based anything.
 - Embedded router. We require an external router exposing SAMv3 (i2pd, Java I2P, or emissary).
-- `clove fetch`, the daemon-less one-shot download mode. Entered §3 as an explicit stretch goal and is **cut** rather than carried: it needs a second lifecycle (session setup, download, teardown, all in one process) whose failure modes are not the daemon's, and every hour spent on it is an hour not spent on the live-router sign-off that actually gates 0.1. Nothing about the design forecloses it — the engine already runs headless in tests — so it is a v2 candidate, not a rejection.
+- `clove fetch`, the daemon-less one-shot download mode. Entered §3 as an explicit stretch goal and is **cut** rather than carried: it needs a second lifecycle (session setup, download, teardown, all in one process) whose failure modes are not the daemon's, and every hour spent on it was an hour not spent on getting the daemon working against a real router. Nothing about the design forecloses it — the engine already runs headless in tests — so it is a v2 candidate, not a rejection.
 
 ## 3. v1 Feature Cut
 
@@ -130,14 +130,11 @@ No layer assumes another is present.
 | i2pd | P0 | Also popular; SAM quirks differ from Java |
 | emissary | P2 | Tracked, but not a hard requirement, as it is still considered experimental by I2P. Revisit at its first stable release; see `DECISIONS.md` S1 |
 
-Priority is where to spend attention first, not what to skip: **0.1 requires
-the live sign-off on i2pd and Java I2P** — the deployment target and the
-reference, one C++ and one Java SAM implementation. All three routers have a
-podman quadlet in `contrib/podman/` and publish SAM on different loopback
-ports, so they run side by side and `make matrix` sweeps them in one command;
-results go in `docs/LIVE-TESTING.md` §6.3, emissary's column included. An
-empty or failing emissary column is a finding to record, not a release
-blocker — the amendment and its reversal condition are in `DECISIONS.md` S1.
+Priority is where to spend attention first, not what to skip. i2pd and Java
+I2P — the deployment target and the reference, one C++ and one Java SAM
+implementation — are the two clove is developed against, and both have carried
+full downloads from public i2psnark swarms. emissary is tracked rather than
+required; the reasoning and its reversal condition are in `DECISIONS.md` S1.
 
 **Peer clients (swarm side):**
 
@@ -147,17 +144,18 @@ blocker — the amendment and its reversal condition are in `DECISIONS.md` S1.
 | BiglyBT (+I2P Helper) | P1 | Second-largest population; different codebase = different bugs |
 | XD | P2 | Same-protocol sibling; useful for controlled two-client lab tests |
 
-**Test tiers:**
-1. Unit + engine tests against mocked `i2pnet` (no router needed; runs in CI).
-2. Loopback integration: two client instances over one local router (operator machine, not CI — see `docs/LIVE-TESTING.md` §2), private torrent, full download both directions, kill-router-mid-transfer chaos tests. Repeated against each router in the table above.
-3. Live-network smoke tests (manual/nightly): join a well-seeded public I2P swarm, verify download + PEX peer acquisition + sustained seeding against i2psnark peers.
+**Testing:** unit + engine tests against mocked `i2pnet`, the binaries end to
+end (`make smoke`), crash resilience (`make chaos`) and coverage-guided fuzzing.
+All of it is router-free and runs in CI. Behaviour against a real router is not
+covered by any test in this repo — `crates/clove-core`'s loopback download is
+`#[ignore]`d and needs a router and an environment variable to run by hand.
 
 ## 7. Risks & Open Questions
 
 | # | Item | Plan |
 |---|---|---|
 | R1 | yosemite maturity (v0.7, few users) | Wrap behind `i2pnet` trait; vendor if needed; upstream fixes (author is responsive/active) |
-| R2 | i2pd SAM behavior under many concurrent streams on one session (possible root of XD flakiness) | **Closed 2026-07-28, negative** (`PROTOCOL.i2p-bt` §2.6e): two `make sam-sweep` ladders on i2pd 2.61.0, 30 runs, every one dialled N of N to 200 concurrent — connect latency uncorrelated with N. Not the root of the flakiness; §2.12 is the better candidate. `sam-stress`/`sam-sweep` stay as regression instruments. A separate finding on SAM-bridge stability under session churn is open as §2.6f |
+| R2 | i2pd SAM behavior under many concurrent streams on one session (possible root of XD flakiness) | **Closed 2026-07-28, negative** (`PROTOCOL.i2p-bt` §2.6e): two `make sam-sweep` ladders on i2pd 2.61.0, 30 runs, every one dialled N of N to 200 concurrent — connect latency uncorrelated with N. Not the root of the flakiness; §2.12 is the better candidate. A separate finding on SAM-bridge stability under session churn is open as §2.6f |
 | R3 | Datagram2/3 availability in yosemite + routers (gates future UDP announces, DHT) | Not needed for v1; track upstream |
 | R4 | i2p_pex flag semantics underspecified ("review libtorrent source") | Conformance testing vs i2psnark; treat i2psnark behavior as normative |
 | R5 | Tunnel latency vs choker/timeout tuning (clearnet BT timing assumptions are wrong on I2P) | Make all timeouts config-tunable; benchmark on live swarms; expect several rounds |
@@ -172,11 +170,11 @@ Q1–Q7 from the draft are resolved as reversible defaults — see `DECISIONS.md
 - **M2 — Engine core:** wire protocol, piece picker, storage, verification; downloads a torrent from a single known peer (lab, two instances).
 - **M3 — Swarm citizen:** HTTP tracker announces, i2p_pex, BEP 9 magnets, choker; downloads from and seeds to live i2psnark swarms.
 - **M4 — Operable:** `cloved` + HTTP API + `clove` CLI incl. `-C` config check, resume/persistence with format spec, Layer-2 self-restriction (Landlock/seccomp with graceful fallback), man pages, SECURITY.md, packaging (systemd unit, sandbox docs), no-clearnet CI gates in place from M1 onward.
-- **M5 — Hardening:** chaos tests, long-running seed soak, timeout tuning on live swarms, interop matrix sign-off.
+- **M5 — Hardening:** chaos tests, long-running seed soak, timeout tuning on live swarms.
 
 Each milestone ends in something runnable; M2 onward each produce a demo you can verify on your own router.
 
-Status is not tracked here — it lives in `LIVE-TESTING.md` §6.3, per router and dated, because a milestone is only "met" against a specific router version.
+A milestone is only "met" against a specific router version, so any claim that one is should name the router and the date it was checked.
 
 ## 9. Engineering Standards
 
@@ -205,10 +203,10 @@ Reference class: OpenBSD base, OpenSSH (non-portable), doas, opentracker, SQLite
 - **Paranoid debug builds:** release builds stay lean; debug builds are dense with invariant assertions (piece accounting sums, choker state consistency, bitfield/on-disk agreement, session-tree supervision invariants) that run continuously under CI and fuzzing. Bugs should be unable to survive contact with the assertion net even when no test targets them directly.
 - Hostile-input torture suites as first-class citizens: malformed/adversarial bencode, evil peer behavior (protocol violations, slow-loris, bad hashes, PEX spam), truncated/corrupted resume files, SAM bridge lying or dying mid-operation. Fuzzing (cargo-fuzz) for every parser.
 - Chaos tests (router kill/restart, disk-full, SIGKILL during state write) run in CI, not just manually.
-- **Regress runnable by anyone:** `make test` from a clean checkout runs tier 1 with zero infrastructure; tier 2 requires nothing beyond a local i2pd. If contributors can't run the tests, the tests decay into ours alone, then nobody's.
+- **Regress runnable by anyone:** `make test` from a clean checkout runs the whole suite with zero infrastructure. If contributors can't run the tests, the tests decay into ours alone, then nobody's.
 
 ### Releases & project hygiene
-- **Boring is good:** Few, boring, well-tested releases over frequent ones. No release with a failing interop matrix.
+- **Boring is good:** Few, boring, well-tested releases over frequent ones.
 - **Culture of deletion:** every feature must justify its continued existence at each release; removals are announced proudly in release notes, not buried. The LOC metric above is allowed — encouraged — to go down.
 
 ## 10. Out of Scope Forever (unless explicitly re-scoped)

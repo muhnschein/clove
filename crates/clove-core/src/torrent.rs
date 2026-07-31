@@ -286,11 +286,10 @@ struct State {
     /// How many destinations we first heard of from a peer's `i2p_pex`
     /// message rather than from a tracker or an inbound connection.
     ///
-    /// Counted because "PEX acquisition observed" is an M3 exit criterion
-    /// (`docs/LIVE-TESTING.md` §6.2) and there was no way to observe it from
-    /// outside the engine: `known_peers` grows from three sources at once, so
-    /// watching it climb during a live run proves nothing about which one was
-    /// responsible. This number is only ever bumped on the PEX path.
+    /// Counted because there is otherwise no way to observe PEX acquisition
+    /// from outside the engine: `known_peers` grows from three sources at
+    /// once, so watching it climb during a live run proves nothing about which
+    /// one was responsible. This number is only ever bumped on the PEX path.
     pex_learned: u64,
     /// Announces attempted, and why the last one failed if it did.
     ///
@@ -677,10 +676,9 @@ impl Torrent {
 
     /// How many peer destinations we first learned from an `i2p_pex` message.
     ///
-    /// The M3 exit criterion is "peers learned via `i2p_pex` beyond the
-    /// tracker's set" (`docs/LIVE-TESTING.md` §6.2), which was previously
+    /// "Peers learned via `i2p_pex` beyond the tracker's set" was previously
     /// only checkable by reading a packet capture or trusting a hunch. A
-    /// non-zero value here is that criterion, met.
+    /// non-zero value here is that claim, made checkable.
     #[must_use]
     pub fn pex_learned(&self) -> u64 {
         lock(&self.shared.state).pex_learned
@@ -2061,10 +2059,9 @@ mod tests {
             "B never learned peer X via i2p_pex"
         );
 
-        // The counter M3's "PEX acquisition observed" criterion is read from
-        // (docs/LIVE-TESTING.md §6.2). It must count only what PEX taught us:
-        // B also knows A, from the connection itself, and A knows both B and
-        // X without either arriving over PEX.
+        // The counter "PEX acquisition observed" is read from. It must count
+        // only what PEX taught us: B also knows A, from the connection itself,
+        // and A knows both B and X without either arriving over PEX.
         assert_eq!(b.pex_learned(), 1, "B learned exactly one peer over PEX");
         assert_eq!(
             a.pex_learned(),
@@ -2351,23 +2348,30 @@ mod tests {
         }
     }
 
-    /// The M1 loopback download: the same seeder/leecher exchange as the mock
+    /// The loopback download: the same seeder/leecher exchange as the mock
     /// test, but over a **real** local router via the SAM backend — a seeder
     /// that `STREAM FORWARD`s and a leecher that dials its destination.
     ///
-    /// Router-gated: `#[ignore]`d so tier-1 `cargo test` skips it; run it with
-    /// `make test-live` (which sets `CLOVE_SAM_PORT` and waits for SAM). See
-    /// `docs/LIVE-TESTING.md` §6.1 — this is the automatable half of M1's exit
-    /// criteria; the router-restart chaos step there stays a manual procedure.
+    /// Router-gated, so `#[ignore]`d: nothing in CI or `make test` runs it,
+    /// and no target in this repo sets it up. To run it by hand, point it at a
+    /// router already exposing `SAMv3` and ask for ignored tests:
+    ///
+    /// ```text
+    /// CLOVE_SAM_PORT=7656 cargo test -p clove-core -- --ignored --nocapture
+    /// ```
+    ///
+    /// Both destinations live on the one router, which is the harder topology:
+    /// it asks the router to resolve a leaseSet it published seconds ago. A
+    /// failure here is as likely to be the router as clove.
     #[test]
-    #[ignore = "needs a live I2P router; run via `make test-live` (CLOVE_SAM_PORT)"]
+    #[ignore = "needs a live I2P router; set CLOVE_SAM_PORT and run with --ignored"]
     fn two_instances_download_over_sam() {
         use i2pnet::sam::{SamConfig, SamListener, SamSession};
 
         let port: u16 = std::env::var("CLOVE_SAM_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
-            .expect("set CLOVE_SAM_PORT (e.g. 7656) — run via `make test-live`");
+            .expect("set CLOVE_SAM_PORT (e.g. 7656) and run with --ignored");
 
         // ~5 pieces, last one short. Single file keeps the test focused on the
         // transport; the mock test already covers multi-file piece mapping.

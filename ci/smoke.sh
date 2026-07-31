@@ -10,7 +10,6 @@
 # No router is needed — and, importantly, none is *used* even if one happens to
 # be running: the daemon is pointed at a loopback port nothing listens on, so
 # "waiting-for-router" is a property of the fixture rather than of the machine.
-# Live-router coverage is `make test-live` (docs/LIVE-TESTING.md).
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)

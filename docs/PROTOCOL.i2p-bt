@@ -18,6 +18,14 @@ being deleted or silently rewritten — being able to see that §2.6a's
 constraint was removed, and that the code shaped around it was not revisited
 for another week, is worth more than a tidy file.
 
+The live-testing tier that produced most of the findings below — `make swarm`,
+`make sam-stress`, `ci/live-swarm.sh`, the router quadlets and
+docs/LIVE-TESTING.md — was removed on 2026-07-31, once i2pd and Java I2P had
+each carried a full 3.2 GiB download and a six-hour seed. Entries still name
+those tools, because that is what observed them and rewriting the record to
+hide a deleted harness would cost more than the dangling names do. Read them
+as history; none of them is a command you can still run.
+
   1. Addresses and peer identity
   2. SAM and the routers — the session, dialing, and every live surprise
   3. Reconnect discipline
@@ -108,7 +116,7 @@ for another week, is worth more than a tidy file.
     allowed Layer-1 IP socket), so inbound concurrency is a plain accept loop,
     not a lock. This matches the "one PRIMARY session + forwarded listener"
     topology in SCOPE §4. Implemented in i2pnet::sam (SamListener /
-    ForwardedStream), decision recorded in LIVE-TESTING.md §3.
+    ForwardedStream).
     With SILENT=false (yosemite's default, set explicitly) the router prepends
     each forwarded connection with the peer's base64 destination line,
     optionally followed by FROM_PORT/TO_PORT params, terminated by '\n'; we
@@ -116,7 +124,7 @@ for another week, is worth more than a tidy file.
     is left untouched) and derive the DestHash via §1.3. The split/parse logic
     is unit-tested over loopback TCP; the exact forwarded framing and that a
     forwarded peer's derived hash reconciles with its dialed hash are the
-    first things confirmed against a live router (LIVE-TESTING.md §6.1, M1).
+    first things confirmed against a live router.
 
 2.6 [open] R2 — i2pd SAM behavior under many concurrent streams on one
     session is the suspected root of XD-style flakiness. The reconnect
@@ -248,7 +256,7 @@ for another week, is worth more than a tidy file.
       dialled 200 concurrent streams on a single session without losing one.
 
       **Evidence for churn over uptime or load, same day, same router.** A
-      six-hour seed soak (LIVE-TESTING §6.3) held *one* identity for seven
+      six-hour seed soak held *one* identity for seven
       hours across 8 announces, 19 inbound dials and 1.3 GiB served, with no
       SAM trouble of any kind. Same i2pd 2.61.0 that dropped its bridge twice
       under the sweeps. The variable that distinguishes them is destination
@@ -265,7 +273,7 @@ for another week, is worth more than a tidy file.
       warmup, not a fault; the live test and sam-stress retry the dial through
       it, as the real peer-acquisition path must. Distinct from a *cold router*
       (reseed incomplete → no peers → CantReachPeer indefinitely), which is an
-      operator/setup problem (see LIVE-TESTING.md troubleshooting).
+      operator/setup problem.
 
       Observed 2026-07-26, all three routers, warmup far longer than "~seconds":
       emissary logged `unable to open stream, lease set not found … Timeout`
@@ -395,7 +403,7 @@ for another week, is worth more than a tidy file.
           hosts itself, so a same-router dial needs a full floodfill round trip
           — which a young router with a thin netDb cannot complete. Java I2P
           and i2pd both answer locally, which is why the loopback topology
-          (LIVE-TESTING §5.2) was assumed cheap.
+          was assumed cheap.
       (b) the router was simply too young (~30 min, first boot) and would
           succeed given hours.
 
@@ -455,11 +463,9 @@ for another week, is worth more than a tidy file.
 
     The bridge binds early in the router's startup; the router behind it was
     still coming up. Port-open and HELLO-OK are both necessary and neither is
-    sufficient, so `make router-ready` (two sessions, one dial, bounded) is
-    the gate worth trusting before a live tier, and the report now runs it
-    first rather than spending five minutes per stress level to learn the
-    same thing. How long Java I2P actually needs before SESSION CREATE
-    succeeds is still unmeasured.
+    sufficient: before trusting a router, make it carry one stream between
+    two of its own destinations. How long Java I2P actually needs before
+    SESSION CREATE succeeds is still unmeasured.
 
 
 2.11 [decided] The loopback topology every tier-2 test uses is *harder* on the
@@ -483,12 +489,9 @@ for another week, is worth more than a tidy file.
     far side answers without a netDb lookup. A leecher that no floodfill has
     ever heard of still completes a download.
 
-    Consequence for the test suite, not for the wire: run the swarm tier first
-    (`make swarm`, ci/live-swarm.sh), and treat a loopback failure alongside
-    swarm success as a finding about the router. The loopback tier stays — it
-    is a fine diagnostic, and sam-stress is still the only instrument that
-    answers R2 — but it is no longer the gate, and ci/live-report.sh no longer
-    skips everything behind it.
+    Consequence for testing, not for the wire: check the swarm path first, and
+    treat a loopback failure alongside swarm success as a finding about the
+    router rather than about clove.
 
     Note the direction of the remaining gap: *seeding* does need our leaseSet
     published and resolvable by a remote router, since that is how a peer
@@ -1045,7 +1048,7 @@ for another week, is worth more than a tidy file.
     Neither behaviour is wrong — caching a miss is the point — but both were
     invisible. The lookup error now states the remaining hold, and
     `try_fetch_round` reports which stage failed rather than dropping it
-    (first found live 2026-07-27; see LIVE-TESTING §7a). An operator hitting
+    (first found live 2026-07-27). An operator hitting
     this can sidestep it with a b32 tracker URL.
 
     **Confirmed against emissary, 2026-07-28**, in the run that made the case
