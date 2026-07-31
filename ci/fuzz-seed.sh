@@ -60,8 +60,18 @@ done
 # shows up in `git status` after a sweep that discovered nothing — and once a
 # diff is always there, nobody reads it. With it, the seed changes in git
 # exactly when its contents changed.
+#
+# `--mode` is in that list because the previous version left one input to the
+# archive un-normalised, and it is the one nobody thinks of: permissions.
+# `cmin` writes the corpus files it keeps, so their mode is whatever the
+# operator's umask says — 0664 under 002, 0644 under 022 — and tar records it.
+# Two people packing a byte-identical corpus therefore produced different
+# tarballs, which is precisely the always-dirty diff the rest of this list
+# exists to prevent. Found by repacking the 2026-07-30T11:37Z seed on a second
+# machine: same 5767 files, same contents, different bytes.
 if tar --help 2>&1 | grep -q -- '--sort'; then
     tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+        --mode='u+rwX,go=rX' \
         -cf - -C fuzz corpus | gzip -9n > fuzz/seed-corpus.tar.gz
 else
     # BSD tar has no --sort; the archive is still correct, just not stable
@@ -69,6 +79,35 @@ else
     echo "seed: note: GNU tar not found, archive will not be reproducible" >&2
     tar czf fuzz/seed-corpus.tar.gz -C fuzz corpus
 fi
+
+# Then say what the thing that was just packed is actually worth. `cmin` keeps
+# a subset that reaches the same edges as the whole, and the subset it kept in
+# the 2026-07-30T11:37Z sweep dropped between 17% and 57% of the previous
+# seed's files per target — so "it still reaches everything" is a claim about a
+# rewritten corpus, made by the tool with the most to lose from being wrong.
+#
+# Replaying with `-runs=0` executes the corpus and mutates nothing, so the
+# `INITED cov:` line is exactly the coverage the next run will start from. That
+# figure against the sweep's final coverage is the whole check. It was done by
+# hand last time and was worth keeping; it costs a few seconds a target, and it
+# is the one thing that catches a `cmin` that quietly cost coverage — which
+# nothing else would notice until sweeps had been starting lower for months.
+echo "seed: replaying the packed seed (-runs=0); this is the coverage the next run starts from"
+for t in $TARGETS; do
+    printf 'cov:  %-12s' "$t"
+    if [ ! -d "fuzz/corpus/$t" ]; then
+        printf 'no corpus\n'
+        continue
+    fi
+    log=$(mktemp)
+    if cargo +nightly fuzz run "$t" -- -runs=0 >"$log" 2>&1; then
+        printf '%s\n' "$(grep -oE 'INITED cov: [0-9]+' "$log" | head -1 |
+            grep -oE '[0-9]+$' || echo '?')"
+    else
+        printf 'replay failed\n'
+    fi
+    rm -f "$log"
+done
 
 after_total=$(find fuzz/corpus -type f 2>/dev/null | wc -l | tr -d ' ')
 after_size=$(wc -c < fuzz/seed-corpus.tar.gz | tr -d ' ')
