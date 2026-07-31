@@ -65,28 +65,33 @@ usually the better subject than anything this repo can start for you.
 The results matrix is §6.3; this is the summary it rolls up to.
 
 **Proven live, on i2pd and Java I2P:** a full download from a public i2psnark
-swarm — twice each, at 20.4 MiB and at 286 MiB — peers acquired over PEX beyond
-the tracker's set, and payload served back to real leechers. On i2pd, also a
-remote peer dialing our destination: `STREAM FORWARD` and our leaseSet reaching
-the wider netDb, the half of `PROTOCOL.i2p-bt` §2.5 that no router-free test
-can reach. M1 and M3 are met on those two routers.
+swarm — three times each, at 20.4 MiB, at 286 MiB and at **3.2 GiB** — peers
+acquired over PEX beyond the tracker's set, and payload served back to real
+leechers. On both, a remote peer dialing our destination: `STREAM FORWARD` and
+our leaseSet reaching the wider netDb, the half of `PROTOCOL.i2p-bt` §2.5 that
+no router-free test can reach. M1 and M3 are met on those two routers.
 
 **Also proven, on i2pd:** `sam-stress` to 200 concurrent streams on one
 session, twice over — the R2 question, answered in the negative and closed in
 `SCOPE.md` §7. The dial path does not degrade with concurrency (§2.6e).
 
-**Also proven, on i2pd:** a six-hour seed soak — 2.0 GiB downloaded, then 1.3
-GiB served back over the seeding window with peers steady and inbound dials
-climbing. No session starvation under peer load (§6.3).
+**Also proven, on both:** a six-hour seed soak, now on top of a 3.2 GiB
+download — 1.4 GiB served back on i2pd with inbound dials climbing 68 → 90, and
+1.2 GiB on Java I2P, whose swarm took every peer away mid-soak and got dialled
+back without an operator. No session starvation under peer load (§6.3).
 
-**Not proven:** a router restart mid-transfer, and the soak repeated on Java
-I2P. Those are what stands between here and the 0.1 interop sign-off.
+**Not proven:** a router restart mid-transfer. That is what stands between here
+and the 0.1 interop sign-off, together with the announce-quirk read of §6.2
+that no script can tick for you.
 
 **Not reachable in this environment:** the inbound half against a containerized
 router (§3.1), and with it every tier that needs a listener of ours — the
 loopback download, `sam-stress`, and the cross pairs whose listener is a
 container. These need a host-installed router or clove inside the router's
-namespace; they are blocked on the test rig, not on clove.
+namespace; they are blocked on the test rig, not on clove. That reading is now
+tested rather than argued: Java I2P's `inbound-peer` row was blank for as long
+as its router was a container and filled on the first run against one that was
+not.
 
 **No longer gating:** emissary end to end. Its 0.4.0 fails naming in two
 independent ways (§6.3), it is experimental upstream, and 0.1 now signs off on
@@ -121,13 +126,16 @@ loop.
 
 **(b) was implemented**, and confirmed live: a forwarded peer's derived
 dest-hash reconciles with its dialed hash, and remote peers have dialed us on
-i2pd. The loopback listener is an allowed IP-socket construction site inside
-`i2pnet`, and the `DestHash` derivation reuses `addr`, already tested against
-RFC 4648 vectors.
+i2pd and, since 2026-07-30, on Java I2P. The loopback listener is an allowed
+IP-socket construction site inside `i2pnet`, and the `DestHash` derivation
+reuses `addr`, already tested against RFC 4648 vectors.
 
-Only on i2pd, and §3.1 is why: the host-installed i2pd is the only router in
-this environment that *can* forward to us. An earlier revision of this section
-claimed both i2pd and Java I2P, which its own §6.3 row contradicted.
+On both, but only where the router is host-installed, and §3.1 is why. An
+earlier revision of this section claimed both routers while §6.3's Java row was
+blank, and was corrected to "i2pd only" on that ground. The claim is true now —
+it was still wrong then, because what makes it true is the *topology* the
+router runs in and not the implementation, which is the distinction the
+correction bought and the one to keep.
 
 ### 3.1 The inbound half needs a shared network namespace
 
@@ -172,9 +180,12 @@ What it costs, and where it shows up:
   neither. `ci/live-report.sh` now detects this and skips those steps with the
   reason instead of filing red rows; `sam-stress` says so directly when not one
   forwarded stream arrives.
-- **Java I2P's empty `inbound-peer` row in §6.3 is this**, not the
-  `EXT_PORT`/firewalled note in §6.6. Its container cannot receive a forward.
-  Judge that row again from a Java router that shares clove's namespace.
+- **Java I2P's empty `inbound-peer` row in §6.3 was this**, not the
+  `EXT_PORT`/firewalled note in §6.6. Its container could not receive a
+  forward. **Judged again on 2026-07-30 against a Java router that was not one,
+  and the row filled on the first attempt**: `inbound-peer` at 166s, two remote
+  peers. The diagnosis held, and what that row wanted was a router move rather
+  than a line of clove.
 
 
 ## 4. Bucket 1 — buildable now, no router (landed)
@@ -482,8 +493,10 @@ something fails and you need to know what it was supposed to prove.
       rather than six.
 - [x] Inbound: a forwarded peer's derived `DestHash` reconciles with the hash it
       was dialed at (confirms §2.5, §1.3); §2.5 → [decided]. **i2pd, 2026-07-28**
-      — `inbound-peer` on three runs (11, 2 and 2 remote peers). Only on the
-      host-installed router, and §3.1 is why.
+      — `inbound-peer` on three runs (11, 2 and 2 remote peers), and **90 on a
+      sixteen-hour run, 2026-07-30**. **Java I2P, 2026-07-30** — 2 peers at
+      166s, the first Java run against a router that could forward at all.
+      Only on host-installed routers, on both implementations, and §3.1 is why.
 - [ ] Two-instance loopback download completes **both directions** on i2pd.
       Same §3.1 constraint: both instances need the router to forward to them.
 - [ ] Kill-router-mid-transfer: `systemctl --user restart i2pd` (or `podman
@@ -493,8 +506,12 @@ something fails and you need to know what it was supposed to prove.
       against a real router.
 - [x] **Java I2P pass: done, 2026-07-28** — two full swarm downloads, faster to
       a session than either other router, PEX and bytes served. Its one blank
-      is `inbound-peer`, which §3.1 accounts for and which no amount of clove
-      work would change while the router sits in a container.
+      was `inbound-peer`, which §3.1 accounted for and which no amount of clove
+      work would have changed while the router sat in a container. **Filled
+      2026-07-30** off a host-installed 2.13.0, along with a third download at
+      3.2 GiB and a six-hour soak. On the swarm rows Java I2P is now level with
+      i2pd, and its remaining empties — announce quirks, router restart — are
+      i2pd's too.
       *(emissary is no longer on this list: `DECISIONS.md` S1. Its deltas are
       still worth recording in §6.3 when a run happens.)*
 - [x] Layer 2 is actually on: `cloved`'s startup line reads
@@ -515,13 +532,19 @@ in its table; tick them from the run rather than from impressions.
 
 - [x] Join a well-seeded public i2psnark swarm: full download completes.
       **i2pd and Java I2P, 2026-07-28** — 20.4 MiB in 226s and 286s, 82/82
-      pieces re-verified.
+      pieces re-verified. **Again at 3.2 GiB, 2026-07-30** — 38409s on i2pd and
+      22882s on Java, **12911/12911 pieces re-verified on each**, which is the
+      size at which a piece picker, a request deadline and a hash check stop
+      being exercised in miniature.
       → `download-complete`, plus the script's closing `verify` pass, which
       re-hashes every byte on disk against the metainfo rather than trusting
       our own counters.
 - [x] PEX acquisition observed — peers learned via `i2p_pex` beyond the
       tracker's set (confirms §4.3; the flags stay [open]).
-      **Both routers, 2026-07-28.**
+      **Both routers, 2026-07-28**, and again on 2026-07-30 at 13 peers on
+      i2pd and 17 on Java — the latter against 2 previously, and its largest
+      contribution so far. The count tracks the swarm, not the router: i2pd's
+      own best is still the 68 of an earlier run.
       → `pex-acquisition`, i.e. `pex_peers > 0` in `clove show --json`.
 - [ ] Announce quirks confirmed against a live tracker: the `ip=<base64 dest>`
       value form (§5.1) and `event=started`/numwant behavior (§5.4) → [decided].
@@ -533,6 +556,11 @@ in its table; tick them from the run rather than from impressions.
       **i2pd 2.61.0, 2026-07-28** — six hours of seeding after a 2.0 GiB
       download, 1.3 GiB served in that window, peers steady at 20–44 and
       inbound climbing 5 → 19. No starvation, so Q1 stands. Detail in §6.3.
+      **Both routers, 2026-07-30** — six hours each on top of the 3.2 GiB
+      download: 1.4 GiB served on i2pd with inbound climbing 68 → 90, 1.2 GiB
+      on Java, which is also the run where the swarm took every peer away and
+      clove dialled its way back from zero unattended. Q1 still stands, now on
+      a sixteen-hour session as well as a seven-hour one.
       → `make swarm … SWARM_ARGS='--deadline … --seed-for 21600 --keep'` after
       a completed download; `bytes-served` and `inbound-peer` are the signals
       that peers are actually taking data from us rather than us merely being
@@ -540,7 +568,6 @@ in its table; tick them from the run rather than from impressions.
       nothing and reads as a clove defect (§6.3 cost a week to that once). Pass
       `--keep`: the cleanup trap fires on `INT`, so a Ctrl-C otherwise takes
       the data directory *and* the verify pass with it.
-      Still open on **Java I2P**, whose §6.3 cell is empty.
 - [ ] Wire identity `-CV0001-` re-checked against observed swarm peer IDs before
       the first announce (Q7 checkpoint — the wire-permanent moment).
 
@@ -556,13 +583,13 @@ client works", and because they no longer depend on the loopback rows passing.
 
 | Check | i2pd | Java I2P | emissary (not gating) |
 |---|---|---|---|
-| Router boots, SAM answers | ok — 2.61.0, 2026-07-28 | ok — 2026-07-28 ‡ | ok — 0.4.0, 2026-07-28 |
-| **Public i2psnark swarm: full download** (`download-complete`) | **ok** — 2.61.0, 226s and 4450s | **ok** — 286s and 4345s, 2026-07-28 ‡ | blocked before the swarm — see below |
-| **PEX acquisition observed** (`pex_peers > 0`) | **ok** — 2.61.0, 68 peers | **ok** — 2 peers at 76s, 2026-07-28 ‡ | |
-| **Bytes served to a swarm peer** (`bytes-served`) | **ok** — 2.61.0, 95.0 MiB | **ok** — 54.0 MiB, 2026-07-28 ‡ | |
-| **A remote peer dialed us** (`inbound-peer`, §2.5) | **ok** — 2.61.0, 11 and 2 peers | not reachable in this environment — §3.1 | |
+| Router boots, SAM answers | ok — 2.61.0, 2026-07-30 | ok — 2.13.0, 2026-07-30 ◊ (earlier: 2026-07-28 ‡) | ok — 0.4.0, 2026-07-28 |
+| **Public i2psnark swarm: full download** (`download-complete`) | **ok** — 2.61.0, 226s, 4450s, and **38409s for 3.2 GiB** on 2026-07-30 | **ok** — 286s, 4345s, and **22882s for 3.2 GiB** on 2026-07-30 | blocked before the swarm — see below |
+| **PEX acquisition observed** (`pex_peers > 0`) | **ok** — 2.61.0, 68 peers; 13 on 2026-07-30 | **ok** — 2 peers at 76s, 2026-07-28 ‡; **17** on 2026-07-30 | |
+| **Bytes served to a swarm peer** (`bytes-served`) | **ok** — 2.61.0, 95.0 MiB; **7.1 GiB** on 2026-07-30 | **ok** — 54.0 MiB, 2026-07-28 ‡; **2.3 GiB** on 2026-07-30 | |
+| **A remote peer dialed us** (`inbound-peer`, §2.5) | **ok** — 2.61.0, 11, 2 and **90** peers | **ok** — 2 peers at 166s, 2026-07-30, host router ◊. Blank before that, and §3.1 is why | |
 | Announce quirks confirmed (§5.1, §5.4) | | | |
-| Multi-hour seed soak | **ok** — 2.61.0, 2026-07-28, 6 h seeding, 1.3 GiB served | | |
+| Multi-hour seed soak | **ok** — 2.61.0, 2026-07-28, 6 h seeding, 1.3 GiB served; again 2026-07-30, 1.4 GiB | **ok** — 2.13.0, 2026-07-30, 6 h seeding, 1.2 GiB served | |
 | Survives router restart mid-transfer | | | |
 | Cross-router dial (`make cross`) | unfinished at 240s — 2026-07-28 | n/a as listener — §3.1 | n/a as listener — §3.1 |
 | Two-instance loopback download, both directions | | n/a — §3.1 | n/a — §3.1 |
@@ -573,16 +600,106 @@ client works", and because they no longer depend on the loopback rows passing.
 `--router-version`. Left as they are: an undated, unversioned "works" is worth
 little, and rewriting it to look better would be worth less.
 
-‡ **Version approximate.** The Java rows come from a container whose image tag
-is `:latest` (digest `b06b16a5fc4ea3d1853`, log line `Starting I2P
+‡ **Version approximate.** The 2026-07-28 Java rows come from a container whose
+image tag is `:latest` (digest `b06b16a5fc4ea3d1853`, log line `Starting I2P
 2.12.0-17-rc`); the cells stay honest about the difference between a digest and
 a version. `ci/router-version.sh` now also asks a *host-installed* binary, so
 i2pd names itself without `--router-version`.
+
+◊ **Version operator-supplied, and the topology inferred.** The 2026-07-30 Java
+run reports `java-i2p 2.13.0 (0.9.70)`, which can only have arrived through
+`--router-version`: `ci/router-version.sh` prints `Java I2P <label>` for a
+container and deliberately prints *nothing* for a host-installed Java, which
+"installs no binary that answers `--version`". That, plus an `inbound-peer`
+that §3.1 says a container cannot produce, is why these rows read as a host
+router. **It is an inference, and the report should not require one** — the
+header records the router, its version and the SAM address, but never whether
+it is containerized, which is the single fact §3.1 turns a blank cell on. The
+same gap applies to the i2pd rows and their `(host)` label; `inbound-peer` is
+the only witness either of them has. Worth a line in `ci/live-swarm.sh` before
+the next sweep — `podman container exists` already answers it in
+`ci/router-version.sh`; until then, an operator recording a result should say
+which it was.
 
 **`n/a — §3.1`** is not a failure and not "not yet run". Those rows need the
 inbound half, and every containerized router in this environment is
 structurally unable to provide it. They become runnable against a
 host-installed router, or clove inside the router's namespace.
+
+**Java I2P's `n/a` cells are the stalest thing in this table.** They describe
+the container that made `inbound-peer` blank, and the 2026-07-30 run filled
+that cell, which means the same rig now satisfies the condition the sentence
+above names. Those four rows — cross as listener, loopback both directions,
+`sam-stress` at both ladders — are no longer structurally unavailable on Java;
+they are simply **not yet run**, and they are the cheapest results left on this
+page. They keep `n/a` until someone re-runs them, because a cell is not
+promoted by inference.
+
+**A 3.2 GiB torrent on both gating routers — 2026-07-30.** The same magnet
+(`UltiMaker-Cura-5.12.1-linux-X64.AppImage`, 3.2 GiB, 12911 pieces, postman's
+tracker), a full download followed by the full six-hour seed on each. Eleven
+times the largest torrent this table had carried before:
+
+| | connected | metadata | complete | up at completion | soak served | inbound | PEX |
+|---|---|---|---|---|---|---|---|
+| i2pd 2.61.0 (host), `51e7e37` | 15s | 75s | **38409s** (87 KiB/s) | 5.7 GiB | **1.4 GiB** | **90** | 13 |
+| java-i2p 2.13.0 ◊, `b43adb8` | 15s | 45s | **22882s** (147 KiB/s) | 1.1 GiB | **1.2 GiB** | **2** | 17 |
+
+**12911/12911 pieces re-verified against the metainfo on both**, after the
+engine stopped, by the pass that does not consult our own counters. Every
+milestone ticked on both runs, including the two that used to be the argument —
+`bytes-served` at 90s and 60s, `inbound-peer` at 633s and 166s.
+
+**Java I2P's `inbound-peer` row closes, and the cause was the container all
+along.** §3.1 predicted exactly this: a router that does not share clove's
+network namespace accepts the inbound stream and then cannot hand it over, so
+the row stays blank no matter what the client does. Run against a router that
+does, it took two remote dials inside three minutes, first attempt. **Nothing
+in clove was aimed at that cell** — what it wanted was a router move, which is
+the whole reason §3.1 argues for keeping "blocked on the rig" and "failing"
+apart. What the run does *not* establish by itself is the topology; see ◊.
+
+**Do not read the two completion times against each other, and this time not
+even the byte counts.** The Java run started 23804s into the i2pd one, on the
+same host, against the same info hash. For roughly four hours the two clients
+were leeching the same torrent from the same swarm, and nothing here rules out
+their having been each other's peers — with two routers on one box, it is the
+likely reading of an i2pd run that **served 5.7 GiB while still leeching**
+(nearly twice what it took in), or of a Java run that averaged 1.7 times the
+i2pd one beside it. They also ran different commits (`51e7e37`, `b43adb8`).
+Two honest single-router numbers, not a comparison.
+
+**The soak closes on Java I2P, and it closed the hard way.** At 35558s its
+attached peers reached **zero** — not the gentle post-completion decay this
+section worried about below, an outright drain from 10 in under three minutes —
+and clove dialled its way back with no operator: 1 peer at 35799s, 3 at 36056s,
+7 by 36207s, and `known_peers` 37 → 39 and `pex_peers` 15 → 17 taken *during*
+the recovery, i.e. new peers, not old ones re-attached. The 2026-07-28 soak
+argued there was no re-dial defect because peers never approached zero; this
+one reached zero and came back, which is the stronger form of the same claim.
+i2pd, meanwhile, held 5–19 peers for its whole six hours and climbed 68 → 90
+inbound.
+
+**What looks like a stalled download in these reports is the report's own
+formatting.** `human()` switches to GiB at one decimal past a gigabyte — 102
+MiB per digit — so at ~60 KiB/s the DOWN column can hold one figure for half an
+hour with the transfer perfectly healthy. Read literally, 55% of the i2pd
+download phase and 58% of the Java one "made no progress". Both are artifacts;
+the only genuine pause in either run is Java at 8074–8149s, where 911.4 MiB
+held for ~75s as peers fell 14 → 7, then resumed. The same coarseness is why
+the 0.04% transfer overhead measured on the 286 MiB run has no counterpart
+here: at this size the column cannot resolve it. A finer DOWN column, or a rate
+column, would make a multi-hour report readable — worth having before the next
+one.
+
+**Announce failures appear for the first time**: `announces_ok 17 /
+announces_failed 5` on i2pd over 16.6 hours, `13 / 1` on Java over 12.3. The
+only earlier run whose failure counter is recorded here — the seven-hour soak
+below — had `announces_failed 0`, and no run before these two lasted longer
+than that. Twenty-two announces to one tracker across two-thirds of a day is
+mostly more chances to catch postman down, and both runs kept peers and kept
+transferring throughout. Recorded rather than diagnosed. **If a short run
+starts failing announces, this is the entry that says it was not always so.**
 
 **Six-hour seed soak — i2pd 2.61.0, 2026-07-28.** 2.0 GiB in 1025 pieces from
 a swarm with real leechers; downloaded in 4194s (~500 KiB/s, the fastest
