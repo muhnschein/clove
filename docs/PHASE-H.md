@@ -48,12 +48,10 @@ have already measured where the edge is:
 - `SCOPE.md` R2 is closed *negative* up to **200 concurrent streams** on i2pd
   2.61.0 (`PROTOCOL.i2p-bt` §2.6e): connect latency was uncorrelated with
   concurrency across 30 runs. That is the ceiling we have evidence for, and it
-  is the number below which we should stay until someone re-runs `sam-sweep`
-  higher.
+  is the number below which we should stay until someone measures higher.
 - `PROTOCOL.i2p-bt` §2.12 records a session wedging under a stream failure on
-  an unexpected path, and §2.6f keeps SAM-bridge stability under session churn
-  open. Every extra concurrent stream is another draw on the thing already
-  known to be the fragile part.
+  an unexpected path. Every extra concurrent stream is another draw on the
+  thing already known to be the fragile part.
 
 One wedged session takes **every** torrent down, not the one that overspent.
 That asymmetry is the argument for doing the budget first and the comforts

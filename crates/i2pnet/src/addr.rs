@@ -86,8 +86,8 @@ const CERT_HEADER: usize = 3;
 ///   startup, published to peers over PEX, and dialled by the loopback tests
 ///   — was the SHA-256 of the private blob rather than of the destination. It
 ///   named nothing. A router asked to resolve it could only fail, which is
-///   what "leaseSet not found" had been telling us since the first live run
-///   (`PROTOCOL.i2p-bt` §2.8) while we read it as a router's fault.
+///   what "leaseSet not found" had been telling us since the first live run,
+///   while we read it as a router's fault (`PROTOCOL.i2p-bt` §5.1c).
 ///
 /// The length is not fixed: the certificate's own header says how long its
 /// payload is, so a destination is `387 + payload` bytes. Anything shorter

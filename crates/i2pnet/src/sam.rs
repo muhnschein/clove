@@ -1,10 +1,10 @@
 //! `SAMv3` backend — the M1 half of `SCOPE.md` §8.
 //!
-//! This is the *only* code here that talks to a real router. Its runtime
-//! behavior against a live router is verified out-of-CI
-//! (`docs/LIVE-TESTING.md`); everything that does not need a router — address
-//! derivation, the forwarded destination-line parse, and every way a bridge
-//! can misbehave — is unit-tested here over loopback TCP.
+//! This is the *only* code here that talks to a real router, and its runtime
+//! behavior against one is therefore not covered by any test in this repo.
+//! Everything that does not need a router — address derivation, the forwarded
+//! destination-line parse, and every way a bridge can misbehave — is
+//! unit-tested here over loopback TCP.
 //!
 //! - [`SamSession`] implements [`I2pDialer`] and [`I2pNamingLookup`]. It owns
 //!   its control connection: `HELLO VERSION` and `SESSION CREATE` are spoken
@@ -24,7 +24,7 @@
 //! - [`SamListener`] implements [`I2pListener`] for **inbound** streams via
 //!   SAM `STREAM FORWARD` to a loopback [`TcpListener`] we own (an allowed
 //!   Layer-1 IP socket, bound to `127.0.0.1`). This is the topology chosen
-//!   over `STREAM ACCEPT` in `docs/LIVE-TESTING.md` §3: `accept` takes
+//!   over `STREAM ACCEPT`, and the reason is concurrency: `accept` takes
 //!   `&mut self` and serializes every inbound stream on the one session,
 //!   whereas `forward` lets the router fan connections into a plain accept
 //!   loop. With `SILENT=false` (yosemite's default) the router prepends each
@@ -294,13 +294,11 @@ fn expect_stream_ok(status: &str, what: &str) -> io::Result<()> {
 /// A SAM session id unlikely to collide with one already registered.
 ///
 /// SAM session ids are per-router, not per-connection, and a router does not
-/// necessarily free one the instant our control socket closes — emissary
-/// 0.4.0 holds it long enough that a second run seconds later is refused with
-/// `DuplicateId`. Observed as three consecutive `sam-stress` runs failing at
-/// session setup after the first one exited normally
-/// (`docs/PROTOCOL.i2p-bt` §2.9).
+/// necessarily free one the instant our control socket closes: at least one
+/// holds it long enough that a process starting seconds after a clean exit is
+/// refused with `DuplicateId` (`docs/PROTOCOL.i2p-bt` §2.9).
 ///
-/// This matters well beyond the harness: the SCOPE §4 reconnect discipline
+/// This matters beyond a one-off run: the SCOPE §4 reconnect discipline
 /// has the daemon rebuild its session tree after losing the router. If it
 /// reuses a fixed id, the rebuild can be refused by the stale session it is
 /// replacing — the supervisor would then back off and retry into the same
@@ -1047,10 +1045,10 @@ fn map_err(e: yosemite::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    //! Router-free coverage. A *working* SAM session needs a live router
-    //! (`docs/LIVE-TESTING.md`), but everything about a router that is
-    //! **not** working can be tested here, and that is the half that decides
-    //! whether the daemon degrades or wedges.
+    //! Router-free coverage. A *working* SAM session needs a live router and
+    //! so cannot be exercised here, but everything about a router that is
+    //! **not** working can be, and that is the half that decides whether the
+    //! daemon degrades or wedges.
     //!
     //! Three groups:
     //!

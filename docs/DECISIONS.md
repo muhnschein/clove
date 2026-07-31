@@ -12,7 +12,7 @@ not a scope change — but the burden of proof is on the change.
 Tracker announces use the same stream subsession and destination as peer
 traffic. This is what i2psnark does and what trackers expect (announced
 identity must match peer identity), and one subsession is less supervision
-state. Revisit only if live-swarm testing shows tracker streams starving
+state. Revisit only if a live swarm shows tracker streams starving
 under peer load (QoS) — a separate subsession *on the same destination*
 remains possible without engine changes.
 
@@ -77,53 +77,6 @@ Unlike the Q memos above, these change `SCOPE.md` rather than fill in a blank
 it left. Each states what moved, the evidence that moved it, and the condition
 under which it moves back — a deferral with a trigger is a decision; one
 without is a quiet drop.
-
-## S1 — emissary: tracked, not a 0.1 gate (2026-07-28)
-
-`SCOPE.md` §6 required the live sign-off on all three routers for 0.1. It now
-requires i2pd and Java I2P. emissary keeps its quadlet, its address-book
-helper and its column in `LIVE-TESTING.md` §6.3; what it loses is the power to
-block a release.
-
-**The evidence.** Across every live session, emissary 0.4.0 has never reached
-a swarm, and the reason is not clove. Its SAM bridge has been fine since the
-first run — sessions come up in 15–60s. Naming is what fails, in two
-independent places:
-
-- **Hostnames**, from an address book its subscription has not fetched
-  (`PROTOCOL.i2p-bt` §5.5). This is the failure `make router-addressbook`
-  exists to sidestep.
-- **Its own freshly created b32 destinations**, via `NAMING LOOKUP`, which
-  involves no address book at all — a b32 is a hash resolved through the
-  netDb. `sam-stress` reports it plainly: *"neither b32 resolves, including
-  the dialer's own"*. Seeding an address book does not and cannot fix this
-  one, which is why an operator who ran `router-addressbook` before a sweep
-  still saw `KeyNotFound`.
-
-Same-router leaseSet resolution was already documented as broken against a
-demonstrably healthy router (§2.8). Three naming failures, no clove component
-implicated in any of them.
-
-**The ecosystem's own position.** The I2P project lists emissary among
-alternative clients as experimental. Gating our release on a live sign-off
-from a router its own project does not call stable held us to a harder bar
-than upstream holds itself to.
-
-**Consistency.** §2 cut `clove fetch` on exactly this reasoning: *every hour
-spent there is an hour not spent on the live-router sign-off that actually
-gates 0.1*. The same sentence applies here and reaches the same answer.
-
-**Why this is not a deletion.** The infrastructure stays — quadlet,
-`Containerfile.emissary`, `seed-addressbook.sh`, the §6.3 row. So does the
-work emissary paid for: the metadata fetch that names its failing stage, the
-negative-cache countdown in the error text, `sam-stress`'s "this router does
-not answer NAMING LOOKUP for its own destinations" caveat. Every one of those
-came from chasing an emissary failure, all of them make *every* router's
-results legible, and none of them is going anywhere.
-
-**Reversal condition.** emissary reaches a stable release. Re-run `make swarm
-TORRENT=… ROUTER=emissary`; if it carries a download, it returns to the gate
-and this memo is struck. Until then its column is recorded, not required.
 
 ## S2 — A TUI, but no TUI framework (2026-07-30)
 

@@ -1,8 +1,1 @@
 /target
-
-# Reports from ci/live-report.sh and ci/live-swarm.sh — machine-specific, not
-# project state. Their findings belong in docs/LIVE-TESTING.md §6.3 and
-# docs/PROTOCOL.i2p-bt; the raw files do not.
-/live-report-*.txt
-/live-report-*.txt.short
-/live-swarm-*.txt
