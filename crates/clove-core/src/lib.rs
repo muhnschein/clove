@@ -2,6 +2,7 @@
 //! daemon/API above. This crate never touches a socket — peer addressing is
 //! [`i2pnet::DestHash`] only, enforced by the workspace `clippy.toml`.
 
+pub mod base64;
 pub mod bencode;
 pub mod bitfield;
 pub mod budget;

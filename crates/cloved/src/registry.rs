@@ -1584,6 +1584,23 @@ where
     /// The torrents as a JSON array, one object each, in add order.
     /// Live progress is refreshed first.
     pub(crate) fn list(&mut self) -> Value {
+        self.listing(Hosted::to_json)
+    }
+
+    /// The same listing as [`list`](Registry::list), but every hosted torrent
+    /// rendered in full rather than in summary.
+    ///
+    /// It exists because a caller that wants detail for *every* torrent would
+    /// otherwise call `list` and then `detail` once per torrent, and `detail`
+    /// refreshes the whole registry — quadratic work on an interface a GUI
+    /// polls every second. One refresh, one pass.
+    pub(crate) fn list_detailed(&mut self) -> Value {
+        self.listing(Hosted::to_detail_json)
+    }
+
+    /// The listing both of the above share: hosted torrents in add order,
+    /// rendered by `render`, then the magnets still fetching metadata.
+    fn listing(&mut self, render: fn(&Hosted) -> Value) -> Value {
         self.refresh();
         // Add order, not info-hash order. The map is keyed by hash, so the
         // listing used to be sorted by a hash — which is to say shuffled, and
@@ -1594,42 +1611,10 @@ where
         ordered.sort_by_key(|(info_hash, hosted)| (hosted.added, **info_hash));
         let mut items: Vec<Value> = ordered
             .into_iter()
-            .map(|(_, hosted)| hosted.to_json())
+            .map(|(_, hosted)| render(hosted))
             .collect();
         for (info_hash, pending) in &self.pending {
-            let name = pending
-                .magnet
-                .display_name
-                .clone()
-                .unwrap_or_else(|| hex(info_hash));
-            let p = &pending.progress;
-            let mut entry = vec![
-                ("info_hash".to_owned(), Value::from(hex(info_hash))),
-                ("name".to_owned(), Value::from(name)),
-                ("state".to_owned(), Value::from("fetching-metadata")),
-                ("progress".to_owned(), Value::Float(0.0)),
-                ("fetch_rounds".to_owned(), Value::UInt(u64::from(p.rounds))),
-                (
-                    "trackers_ok".to_owned(),
-                    Value::UInt(u64::try_from(p.trackers_ok).unwrap_or(u64::MAX)),
-                ),
-                (
-                    "trackers_failed".to_owned(),
-                    Value::UInt(u64::try_from(p.trackers_failed).unwrap_or(u64::MAX)),
-                ),
-                (
-                    "known_peers".to_owned(),
-                    Value::UInt(u64::try_from(p.peers_known).unwrap_or(u64::MAX)),
-                ),
-                (
-                    "peers_tried".to_owned(),
-                    Value::UInt(u64::try_from(p.peers_tried).unwrap_or(u64::MAX)),
-                ),
-            ];
-            if let Some(err) = &p.last_error {
-                entry.push(("last_error".to_owned(), Value::from(err.clone())));
-            }
-            items.push(Value::Object(entry));
+            items.push(pending_json(info_hash, pending));
         }
         Value::Array(items)
     }
@@ -1952,6 +1937,10 @@ impl Hosted {
             ("name".to_owned(), Value::from(self.meta.name.clone())),
             ("size".to_owned(), Value::UInt(self.meta.total_length)),
             ("pieces".to_owned(), Value::UInt(u64::from(self.have.len()))),
+            (
+                "piece_length".to_owned(),
+                Value::UInt(u64::from(self.meta.piece_length)),
+            ),
             ("have".to_owned(), Value::UInt(u64::from(self.have.count()))),
             ("progress".to_owned(), Value::Float(self.progress())),
             ("uploaded".to_owned(), Value::UInt(self.uploaded)),
@@ -1997,6 +1986,49 @@ impl Hosted {
         }
         Value::Object(fields)
     }
+}
+
+/// A magnet still fetching its metadata, as it appears in a listing.
+///
+/// Deliberately the same object whether the listing is the summary or the
+/// detailed one: there is no detail to add, because until the metadata lands
+/// there is no torrent — no files, no size, no trackers of its own. What it
+/// carries instead is how hard the fetch has tried and why the last round did
+/// not work, which is the only question worth asking about it.
+fn pending_json(info_hash: &[u8; 20], pending: &PendingMagnet) -> Value {
+    let name = pending
+        .magnet
+        .display_name
+        .clone()
+        .unwrap_or_else(|| hex(info_hash));
+    let p = &pending.progress;
+    let mut entry = vec![
+        ("info_hash".to_owned(), Value::from(hex(info_hash))),
+        ("name".to_owned(), Value::from(name)),
+        ("state".to_owned(), Value::from("fetching-metadata")),
+        ("progress".to_owned(), Value::Float(0.0)),
+        ("fetch_rounds".to_owned(), Value::UInt(u64::from(p.rounds))),
+        (
+            "trackers_ok".to_owned(),
+            Value::UInt(u64::try_from(p.trackers_ok).unwrap_or(u64::MAX)),
+        ),
+        (
+            "trackers_failed".to_owned(),
+            Value::UInt(u64::try_from(p.trackers_failed).unwrap_or(u64::MAX)),
+        ),
+        (
+            "known_peers".to_owned(),
+            Value::UInt(u64::try_from(p.peers_known).unwrap_or(u64::MAX)),
+        ),
+        (
+            "peers_tried".to_owned(),
+            Value::UInt(u64::try_from(p.peers_tried).unwrap_or(u64::MAX)),
+        ),
+    ];
+    if let Some(err) = &p.last_error {
+        entry.push(("last_error".to_owned(), Value::from(err.clone())));
+    }
+    Value::Object(entry)
 }
 
 /// Remove a file, treating "already gone" as success but surfacing any other

@@ -9,6 +9,7 @@
 
 mod registry;
 mod sandbox;
+mod transmission;
 
 use std::fs;
 use std::io::Write;
@@ -180,13 +181,16 @@ fn run() -> Result<(), String> {
         })
     );
 
+    let rpc = build_rpc(&config)?;
+
     let daemon = Arc::new(Daemon {
         start: Instant::now(),
         sam_address: config.sam_address.clone(),
         token,
         peer_id: build_peer_id().map_err(|e| e.to_string())?,
         registry: Mutex::new(registry),
-        torrent_peer_limit: config.torrent_peer_limit,
+        config: config.clone(),
+        rpc,
         router: Mutex::new("connecting"),
     });
 
@@ -304,10 +308,20 @@ struct Daemon {
     /// Our wire identity for this run, decided before anything can need it.
     peer_id: [u8; 20],
     registry: Mutex<Registry<Arc<SamSession>>>,
-    /// Per-torrent peer ceiling (`torrent_peer_limit`), applied to the dial
-    /// sweep and the inbound demux when a session comes up. The client-wide
-    /// ceiling is the registry's, since it outlives any one session.
-    torrent_peer_limit: usize,
+    /// The configuration this run was started with, kept whole rather than
+    /// copied out field by field. Two surfaces now report the operator's
+    /// settings back — `clove show` reads some, `session-get` reads most — and
+    /// one value with two homes is how they drift apart.
+    ///
+    /// Note what it is *not*: a live control surface. The daemon applies its
+    /// configuration at start and nothing here rewrites it, which is why
+    /// `session-set` refuses rather than pretending
+    /// (`crates/cloved/src/transmission.rs`).
+    config: Config,
+    /// The Transmission-compatible surface, when `transmission_rpc yes` asked
+    /// for one. `None` is what makes its routing and its second authentication
+    /// scheme unreachable.
+    rpc: Option<transmission::Rpc>,
     /// Router connection state shown in `/v1/status`.
     router: Mutex<&'static str>,
 }
@@ -483,7 +497,7 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str, identity: Ident
             // from the same configured number, so raising it in clove.conf
             // raises it for dialling and accepting alike.
             let swarm_config = SwarmConfig {
-                max_peers: daemon.torrent_peer_limit,
+                max_peers: daemon.config.torrent_peer_limit,
                 ..SwarmConfig::default()
             };
             let demux = InboundDemux::new(swarm_config.max_peers);
@@ -856,6 +870,25 @@ fn handle(mut stream: ApiStream, daemon: &Arc<Daemon>) -> std::io::Result<()> {
         return write_response(&mut stream, &error(400, "malformed request"));
     };
 
+    // Which authentication scheme this path answers to. Two surfaces speak
+    // different dialects — `/v1/` wants clove's token header, Transmission
+    // wants Basic plus a CSRF id — so the choice is made once, here, and
+    // **defaults to `/v1/`**. That default is what matters: an unrecognised
+    // path falls through to the stricter scheme rather than to none, so a path
+    // added later cannot be served unauthenticated by omission.
+    let transmission = daemon
+        .rpc
+        .as_ref()
+        .filter(|_| request.path() == transmission::PATH);
+
+    if let Some(rpc) = transmission {
+        if let Err(refusal) = transmission::authorize(rpc, &request, &daemon.token) {
+            return write_response(&mut stream, &refusal);
+        }
+        let response = transmission::dispatch(daemon, &request);
+        return write_response(&mut stream, &response);
+    }
+
     // Token auth on every request, unix socket included (SCOPE §3).
     //
     // The shape check on our *own* token is the important half: an empty
@@ -902,41 +935,20 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response 
         paused: query_flag(query, "paused"),
         sequential: query_flag(query, "sequential"),
     };
-    if request.body.starts_with(b"magnet:") {
-        let uri = String::from_utf8_lossy(&request.body).into_owned();
-        // Bind first: a `match lock(..)` would hold the registry guard across
-        // the arms, and spawn_metadata_fetch re-locks it (deadlock).
-        let added = lock(&daemon.registry).add_magnet(uri.trim());
-        return match added {
-            Ok(info_hash) => {
-                spawn_metadata_fetch(daemon, info_hash);
-                let body = Value::Object(vec![
-                    (
-                        "info_hash".to_owned(),
-                        Value::from(registry::hex(&info_hash)),
-                    ),
-                    ("state".to_owned(), Value::from("fetching-metadata")),
-                ])
-                .encode()
-                .into_bytes();
-                Response::new(201, "application/json", body)
-            }
-            Err(AddError::Magnet(e)) => error(400, &e.to_string()),
-            Err(AddError::Duplicate) => error(409, "torrent already added"),
-            Err(e) => error(500, &format!("adding magnet: {e}")),
-        };
-    }
-    let added = lock(&daemon.registry).add_torrent(&request.body, options);
-    match added {
-        Ok((info_hash, job)) => {
-            // The initial pass over whatever is already on disk runs with the
-            // registry unlocked: on a re-add over a finished download it hashes
-            // the whole torrent, and every other request would otherwise wait
-            // for it. The torrent is registered and marked "verifying" already,
-            // so it shows up in `clove list` while this happens.
-            // The add already succeeded; a scan that fails only means the
-            // torrent shows nothing on disk, which `clove verify` can retry.
-            let _ = run_scan(daemon, &job);
+    match add_from_body(daemon, &request.body, options) {
+        Ok(Added::Magnet(info_hash)) => {
+            let body = Value::Object(vec![
+                (
+                    "info_hash".to_owned(),
+                    Value::from(registry::hex(&info_hash)),
+                ),
+                ("state".to_owned(), Value::from("fetching-metadata")),
+            ])
+            .encode()
+            .into_bytes();
+            Response::new(201, "application/json", body)
+        }
+        Ok(Added::Torrent(info_hash)) => {
             let body = Value::Object(vec![(
                 "info_hash".to_owned(),
                 Value::from(registry::hex(&info_hash)),
@@ -949,6 +961,72 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response 
         Err(AddError::Duplicate) => error(409, "torrent already added"),
         Err(AddError::Io(e)) => error(500, &format!("adding torrent: {e}")),
     }
+}
+
+/// Build the Transmission surface if the operator asked for one.
+///
+/// Done here rather than lazily on first request because generating the session
+/// id can fail: a machine with no random source should stop the start, where a
+/// lazy one would surface it hours later as an authentication failure nobody
+/// could explain.
+fn build_rpc(config: &Config) -> Result<Option<transmission::Rpc>, String> {
+    if !config.transmission_rpc {
+        return Ok(None);
+    }
+    let downloads = config.data_dir.join("downloads");
+    let rpc = transmission::Rpc::new(&downloads).map_err(|e| e.to_string())?;
+    eprintln!(
+        "cloved: Transmission RPC at {} (username ignored, password is the API token)",
+        transmission::PATH
+    );
+    Ok(Some(rpc))
+}
+
+/// What an add turned out to be.
+pub(crate) enum Added {
+    /// A `.torrent`: hosted, scanned, and started if the queue has room.
+    Torrent([u8; 20]),
+    /// A magnet: registered, with a metadata-fetch thread now running for it.
+    Magnet([u8; 20]),
+}
+
+/// Add a `.torrent` or a `magnet:` URI, doing whichever kind's follow-up work
+/// the daemon owes it.
+///
+/// Shared by `/v1/` and the Transmission surface so that "add" means exactly
+/// one thing however it was asked for — including the two pieces of follow-up
+/// that are easy to forget and silently break a torrent: a magnet needs its
+/// fetch thread spawned, and a `.torrent` needs its initial disk scan run with
+/// the registry *unlocked*.
+///
+/// # Errors
+///
+/// [`AddError`] as the registry reports it.
+pub(crate) fn add_from_body(
+    daemon: &Arc<Daemon>,
+    body: &[u8],
+    options: registry::AddOptions,
+) -> Result<Added, AddError> {
+    if body.starts_with(b"magnet:") {
+        let uri = String::from_utf8_lossy(body).into_owned();
+        // Bind first: a `match lock(..)` would hold the registry guard across
+        // the arms, and spawn_metadata_fetch re-locks it (deadlock).
+        let added = lock(&daemon.registry).add_magnet(uri.trim());
+        let info_hash = added?;
+        spawn_metadata_fetch(daemon, info_hash);
+        return Ok(Added::Magnet(info_hash));
+    }
+    let (info_hash, job) = lock(&daemon.registry).add_torrent(body, options)?;
+    // The initial pass over whatever is already on disk runs with the registry
+    // unlocked: on a re-add over a finished download it hashes the whole
+    // torrent, and every other request would otherwise wait for it. The torrent
+    // is registered and marked "verifying" already, so it shows up in
+    // `clove list` while this happens.
+    //
+    // The add already succeeded; a scan that fails only means the torrent shows
+    // nothing on disk, which `clove verify` can retry.
+    let _ = run_scan(daemon, &job);
+    Ok(Added::Torrent(info_hash))
 }
 
 /// Run a scan with the registry unlocked, then publish it.
@@ -1461,16 +1539,44 @@ mod tests {
         }
     }
 
+    /// A configuration with everything at its default, for tests that care
+    /// about one key and should not have to name the rest.
+    fn test_config(dir: &TempDir, transmission_rpc: bool) -> Config {
+        Config {
+            sam_address: "127.0.0.1:7656".to_owned(),
+            i_know_sam_is_remote: false,
+            data_dir: dir.0.clone(),
+            api_socket: dir.0.join("clove.sock"),
+            ephemeral: false,
+            preallocate: false,
+            peer_limit: clove_core::config::DEFAULT_PEER_LIMIT,
+            torrent_peer_limit: clove_core::config::DEFAULT_TORRENT_PEER_LIMIT,
+            max_active_downloads: clove_core::config::DEFAULT_MAX_ACTIVE_DOWNLOADS,
+            max_active_seeds: clove_core::config::DEFAULT_MAX_ACTIVE_SEEDS,
+            seed_ratio_milli: 0,
+            seed_idle_minutes: 0,
+            watch_dir: None,
+            transmission_rpc,
+        }
+    }
+
     fn daemon(dir: &TempDir) -> Arc<Daemon> {
+        daemon_with(dir, false)
+    }
+
+    fn daemon_with(dir: &TempDir, transmission_rpc: bool) -> Arc<Daemon> {
+        let config = test_config(dir, transmission_rpc);
         Arc::new(Daemon {
             start: Instant::now(),
-            sam_address: "127.0.0.1:7656".to_owned(),
+            sam_address: config.sam_address.clone(),
             token: TOKEN.to_owned(),
             peer_id: *b"-CV0001-testtesttes\0",
             registry: Mutex::new(
                 Registry::open(&dir.0, registry::Limits::default()).expect("registry"),
             ),
-            torrent_peer_limit: clove_core::config::DEFAULT_TORRENT_PEER_LIMIT,
+            rpc: transmission_rpc
+                .then(|| transmission::Rpc::new(&dir.0.join("downloads")).expect("rpc")),
+            config,
             router: Mutex::new("connecting"),
         })
     }
@@ -1981,7 +2087,8 @@ mod tests {
             registry: Mutex::new(
                 Registry::open(&dir.0, registry::Limits::default()).expect("registry"),
             ),
-            torrent_peer_limit: clove_core::config::DEFAULT_TORRENT_PEER_LIMIT,
+            config: test_config(&dir, false),
+            rpc: None,
             router: Mutex::new("connecting"),
         });
         for header in [Some(""), Some(" "), None, Some(TOKEN)] {
@@ -2305,5 +2412,577 @@ mod tests {
         // A second call reads the existing token rather than rotating it —
         // rotating would invalidate every running CLI on restart.
         assert_eq!(load_or_create_token(&dir.0).expect("reuse"), first);
+    }
+
+    /// A small single-file torrent, for tests that need a real `.torrent`
+    /// rather than a real download. Returns its contents and its bytes.
+    fn rpc_fixture(name: &str) -> (Vec<u8>, Vec<u8>) {
+        use clove_core::bencode::{self, Value as Ben};
+        use sha1::{Digest, Sha1};
+        use std::collections::BTreeMap;
+
+        let content: Vec<u8> = (0..(2 * 16 * 1024u32))
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let pieces: Vec<u8> = content
+            .chunks(16 * 1024)
+            .flat_map(|c| <[u8; 20]>::from(Sha1::digest(c)))
+            .collect();
+        let mut info = BTreeMap::new();
+        info.insert(b"name".to_vec(), Ben::Bytes(name.as_bytes().to_vec()));
+        info.insert(b"piece length".to_vec(), Ben::Int(16 * 1024));
+        info.insert(b"pieces".to_vec(), Ben::Bytes(pieces));
+        info.insert(
+            b"length".to_vec(),
+            Ben::Int(i64::try_from(content.len()).expect("fits")),
+        );
+        let mut root = BTreeMap::new();
+        root.insert(b"info".to_vec(), Ben::Dict(info));
+        (content, bencode::encode(&Ben::Dict(root)))
+    }
+
+    /// Standard base64, written out here rather than imported.
+    ///
+    /// `clove_core::base64` only decodes, and a test that encoded with the same
+    /// code it is checking would pass whatever that code did. This is the
+    /// independent half of the round trip.
+    fn base64_encode(raw: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in raw.chunks(3) {
+            let b = |i: usize| u32::from(chunk.get(i).copied().unwrap_or(0));
+            let n = (b(0) << 16) | (b(1) << 8) | b(2);
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize]));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    // ------------------------------------------- Transmission RPC surface
+
+    /// Everything in this section drives the same `handle` the socket does, so
+    /// it exercises the authentication split rather than the dispatch alone —
+    /// which is the half where a mistake is a security bug rather than a
+    /// compatibility one.
+    mod transmission_rpc {
+        use super::*;
+
+        /// `user:password` as HTTP Basic, standard base64 by hand so the test
+        /// does not prove the decoder correct using the decoder.
+        fn basic(password: &str) -> String {
+            const ALPHABET: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let raw = format!("clove:{password}").into_bytes();
+            let mut out = String::new();
+            for chunk in raw.chunks(3) {
+                let b = |i: usize| u32::from(chunk.get(i).copied().unwrap_or(0));
+                let n = (b(0) << 16) | (b(1) << 8) | b(2);
+                for i in 0..4 {
+                    if i <= chunk.len() {
+                        out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize]));
+                    } else {
+                        out.push('=');
+                    }
+                }
+            }
+            out
+        }
+
+        /// A `POST /transmission/rpc` with the given credentials and session id.
+        fn rpc_request(body: &str, auth: Option<&str>, session: Option<&str>) -> Vec<u8> {
+            let mut req = String::from("POST /transmission/rpc HTTP/1.1\r\nHost: localhost\r\n");
+            if let Some(password) = auth {
+                let _ = write!(req, "Authorization: Basic {}\r\n", basic(password));
+            }
+            if let Some(id) = session {
+                let _ = write!(req, "X-Transmission-Session-Id: {id}\r\n");
+            }
+            let _ = write!(req, "Content-Length: {}\r\n\r\n{body}", body.len());
+            req.into_bytes()
+        }
+
+        /// Drive one authenticated call and return its parsed JSON body.
+        fn call(d: &Arc<Daemon>, body: &str) -> Value {
+            let session = d.rpc.as_ref().expect("rpc enabled").session_id().to_owned();
+            let reply = speak(d, &rpc_request(body, Some(TOKEN), Some(&session)));
+            assert_eq!(status_of(&reply), 200, "{reply}");
+            let (_head, json) = reply.split_once("\r\n\r\n").expect("a body");
+            clove_core::json::parse(json).unwrap_or_else(|e| panic!("{e:?} parsing {json:?}"))
+        }
+
+        fn result_of(value: &Value) -> String {
+            value
+                .get("result")
+                .and_then(Value::as_str)
+                .unwrap_or("<none>")
+                .to_owned()
+        }
+
+        /// The header a client is *required* to be handed before it can do
+        /// anything, and must not be handed before it authenticates.
+        #[test]
+        fn the_csrf_id_is_only_given_to_an_authenticated_caller() {
+            let dir = TempDir::new("rpc-csrf");
+            let d = daemon_with(&dir, true);
+
+            // No credentials: 401, a challenge, and crucially no session id to
+            // harvest.
+            let anonymous = speak(&d, &rpc_request("{}", None, None));
+            assert_eq!(status_of(&anonymous), 401, "{anonymous}");
+            assert!(
+                anonymous.to_lowercase().contains("www-authenticate"),
+                "no Basic challenge in {anonymous}"
+            );
+            assert!(
+                !anonymous
+                    .to_lowercase()
+                    .contains("x-transmission-session-id"),
+                "the session id leaked to an unauthenticated caller: {anonymous}"
+            );
+
+            // Wrong password, same length as the real token: still 401.
+            let wrong = speak(&d, &rpc_request("{}", Some(&"f".repeat(TOKEN.len())), None));
+            assert_eq!(status_of(&wrong), 401, "{wrong}");
+
+            // Authenticated but no session id: 409 carrying the id, which is
+            // the handshake every client is built around.
+            let challenge = speak(&d, &rpc_request("{}", Some(TOKEN), None));
+            assert_eq!(status_of(&challenge), 409, "{challenge}");
+            assert!(
+                challenge
+                    .to_lowercase()
+                    .contains("x-transmission-session-id"),
+                "the 409 did not carry the id: {challenge}"
+            );
+
+            // A wrong session id is refused as firmly as a missing one.
+            let stale = speak(&d, &rpc_request("{}", Some(TOKEN), Some("stale")));
+            assert_eq!(status_of(&stale), 409, "{stale}");
+
+            // Both, and it answers.
+            let session = d.rpc.as_ref().expect("rpc").session_id().to_owned();
+            let ok = speak(
+                &d,
+                &rpc_request(r#"{"method":"session-get"}"#, Some(TOKEN), Some(&session)),
+            );
+            assert_eq!(status_of(&ok), 200, "{ok}");
+        }
+
+        /// Off by default, and off means the path is not special at all: it
+        /// falls through to the token scheme like any other unknown path,
+        /// rather than to no scheme.
+        #[test]
+        fn the_surface_is_unreachable_unless_configured() {
+            let dir = TempDir::new("rpc-off");
+            let d = daemon(&dir);
+            assert!(d.rpc.is_none(), "the default should not enable it");
+
+            let session = "whatever";
+            for credentials in [None, Some(TOKEN)] {
+                let reply = speak(&d, &rpc_request("{}", credentials, Some(session)));
+                assert_eq!(
+                    status_of(&reply),
+                    401,
+                    "a disabled surface answered something other than 401: {reply}"
+                );
+            }
+        }
+
+        /// Enabling one surface must not weaken the other.
+        #[test]
+        fn the_v1_surface_is_unchanged_when_rpc_is_enabled() {
+            let dir = TempDir::new("rpc-v1");
+            let d = daemon_with(&dir, true);
+            assert_eq!(status_of(&speak(&d, &get("/v1/status", None))), 401);
+            assert_eq!(status_of(&speak(&d, &get("/v1/status", Some("x")))), 401);
+            assert_eq!(status_of(&speak(&d, &get("/v1/status", Some(TOKEN)))), 200);
+            // And an unknown path still refuses for the token rather than
+            // admitting it does not exist.
+            assert_eq!(status_of(&speak(&d, &get("/v1/nope", None))), 401);
+            // Transmission's Basic credentials are not accepted on `/v1/`.
+            let mut req = String::from("GET /v1/status HTTP/1.1\r\nHost: localhost\r\n");
+            let _ = write!(req, "Authorization: Basic {}\r\n\r\n", basic(TOKEN));
+            assert_eq!(status_of(&speak(&d, req.as_bytes())), 401);
+        }
+
+        /// A malformed request is a *protocol-level* success carrying a failure
+        /// string, because that is where clients look. Answering 400 makes them
+        /// report the server as broken.
+        #[test]
+        fn bad_requests_come_back_as_a_result_string_not_a_status_code() {
+            let dir = TempDir::new("rpc-bad");
+            let d = daemon_with(&dir, true);
+
+            for (body, expect) in [
+                ("not json at all", "valid JSON"),
+                ("{}", "no method named"),
+                (r#"{"method":"no-such-method"}"#, "unsupported method"),
+            ] {
+                let value = call(&d, body);
+                let result = result_of(&value);
+                assert!(
+                    result.contains(expect),
+                    "{body:?} answered {result:?}, wanted something about {expect:?}"
+                );
+            }
+        }
+
+        /// The tag is how a client matches a reply to the request it sent, so
+        /// it has to survive a *failure* as well as a success.
+        #[test]
+        fn the_tag_is_echoed_on_both_outcomes() {
+            let dir = TempDir::new("rpc-tag");
+            let d = daemon_with(&dir, true);
+
+            let ok = call(&d, r#"{"method":"session-get","tag":42}"#);
+            assert_eq!(ok.get("tag").and_then(Value::as_u64), Some(42));
+
+            let bad = call(&d, r#"{"method":"nope","tag":7}"#);
+            assert_eq!(bad.get("tag").and_then(Value::as_u64), Some(7));
+
+            // No tag sent, none echoed: a client keyed on tags must not be
+            // handed one it never used.
+            let none = call(&d, r#"{"method":"session-get"}"#);
+            assert!(none.get("tag").is_none(), "a tag was invented");
+
+            // Some clients send it as a float. Both spellings mean 3.
+            let floaty = call(&d, r#"{"method":"session-get","tag":3.0}"#);
+            assert_eq!(floaty.get("tag").and_then(Value::as_u64), Some(3));
+        }
+
+        #[test]
+        fn session_get_reports_the_configuration_and_the_i2p_constants() {
+            let dir = TempDir::new("rpc-session");
+            let d = daemon_with(&dir, true);
+            let value = call(&d, r#"{"method":"session-get"}"#);
+            assert_eq!(result_of(&value), "success");
+            let args = value.get("arguments").expect("arguments");
+
+            // Real settings, read from the config this daemon was built with.
+            assert_eq!(
+                args.get("peer-limit-global").and_then(Value::as_u64),
+                Some(clove_core::config::DEFAULT_PEER_LIMIT as u64)
+            );
+            assert_eq!(
+                args.get("download-queue-size").and_then(Value::as_u64),
+                Some(clove_core::config::DEFAULT_MAX_ACTIVE_DOWNLOADS as u64)
+            );
+
+            // The constants that are true of every I2P client rather than
+            // stubs. If any of these ever reports `true`, something has been
+            // added that SCOPE §2 or §10 says must not exist.
+            for key in [
+                "dht-enabled",
+                "lpd-enabled",
+                "utp-enabled",
+                "blocklist-enabled",
+            ] {
+                assert_eq!(
+                    args.get(key).and_then(Value::as_bool),
+                    Some(false),
+                    "{key} should be false on an I2P-only client"
+                );
+            }
+            assert_eq!(args.get("pex-enabled").and_then(Value::as_bool), Some(true));
+            assert_eq!(args.get("peer-port").and_then(Value::as_u64), Some(0));
+
+            // The version has to name Transmission for clients, and clove for
+            // whoever reads it.
+            let version = args
+                .get("version")
+                .and_then(Value::as_str)
+                .expect("version");
+            assert!(
+                version.starts_with('4'),
+                "{version} must look like Transmission's"
+            );
+            assert!(
+                version.contains("clove"),
+                "{version} must say what it really is"
+            );
+        }
+
+        /// The round trip a client actually performs: add, list, act, remove.
+        #[test]
+        fn a_torrent_can_be_added_listed_and_removed() {
+            let dir = TempDir::new("rpc-roundtrip");
+            let d = daemon_with(&dir, true);
+            let (_content, bytes) = rpc_fixture("rpc-demo");
+            let encoded = base64_encode(&bytes);
+
+            let added = call(
+                &d,
+                &format!(r#"{{"method":"torrent-add","arguments":{{"metainfo":"{encoded}"}}}}"#),
+            );
+            assert_eq!(result_of(&added), "success");
+            let entry = added
+                .get("arguments")
+                .and_then(|a| a.get("torrent-added"))
+                .expect("torrent-added");
+            let id = entry.get("id").and_then(Value::as_u64).expect("an id");
+            assert_eq!(entry.get("name").and_then(Value::as_str), Some("rpc-demo"));
+            let hash = entry
+                .get("hashString")
+                .and_then(Value::as_str)
+                .expect("a hash")
+                .to_owned();
+            assert_eq!(hash.len(), 40);
+
+            // Adding it again is not an error: it is `torrent-duplicate`, which
+            // is what makes an \*arr client's retry idempotent.
+            let again = call(
+                &d,
+                &format!(r#"{{"method":"torrent-add","arguments":{{"metainfo":"{encoded}"}}}}"#),
+            );
+            assert_eq!(result_of(&again), "success");
+            let dup = again
+                .get("arguments")
+                .and_then(|a| a.get("torrent-duplicate"))
+                .expect("torrent-duplicate");
+            assert_eq!(
+                dup.get("hashString").and_then(Value::as_str),
+                Some(&hash[..])
+            );
+
+            // It lists, with the id it was given and the fields asked for.
+            let listed = call(
+                &d,
+                r#"{"method":"torrent-get","arguments":{"fields":["id","name","hashString","status","percentDone","rateDownload","eta","queuePosition"]}}"#,
+            );
+            let torrents = listed
+                .get("arguments")
+                .and_then(|a| a.get("torrents"))
+                .and_then(Value::as_array)
+                .expect("torrents");
+            assert_eq!(torrents.len(), 1);
+            let t = &torrents[0];
+            assert_eq!(t.get("id").and_then(Value::as_u64), Some(id));
+            assert_eq!(t.get("name").and_then(Value::as_str), Some("rpc-demo"));
+            assert_eq!(t.get("queuePosition").and_then(Value::as_u64), Some(0));
+            // Only what was asked for came back.
+            assert!(t.get("files").is_none(), "an unrequested field was sent");
+
+            // Stopping it is visible in the next poll.
+            let stopped = call(
+                &d,
+                &format!(r#"{{"method":"torrent-stop","arguments":{{"ids":[{id}]}}}}"#),
+            );
+            assert_eq!(result_of(&stopped), "success");
+            let listed = call(
+                &d,
+                r#"{"method":"torrent-get","arguments":{"fields":["status"]}}"#,
+            );
+            let status = listed
+                .get("arguments")
+                .and_then(|a| a.get("torrents"))
+                .and_then(Value::as_array)
+                .and_then(|t| t.first())
+                .and_then(|t| t.get("status"))
+                .and_then(Value::as_u64);
+            assert_eq!(status, Some(0), "a stopped torrent should report STOPPED");
+
+            // And it can be named by hash as well as by id.
+            let removed = call(
+                &d,
+                &format!(r#"{{"method":"torrent-remove","arguments":{{"ids":["{hash}"]}}}}"#),
+            );
+            assert_eq!(result_of(&removed), "success");
+            let empty = call(
+                &d,
+                r#"{"method":"torrent-get","arguments":{"fields":["id"]}}"#,
+            );
+            let torrents = empty
+                .get("arguments")
+                .and_then(|a| a.get("torrents"))
+                .and_then(Value::as_array)
+                .expect("torrents");
+            assert!(torrents.is_empty(), "the torrent survived its removal");
+        }
+
+        /// `recently-active` is the mode a client uses to notice deletions, and
+        /// the `removed` half of it has to be exact or the client shows a
+        /// torrent that is gone for ever.
+        #[test]
+        fn a_removed_torrent_is_reported_to_a_recently_active_poller() {
+            let dir = TempDir::new("rpc-removed");
+            let d = daemon_with(&dir, true);
+            let (_content, bytes) = rpc_fixture("gone-soon");
+            let encoded = base64_encode(&bytes);
+            call(
+                &d,
+                &format!(r#"{{"method":"torrent-add","arguments":{{"metainfo":"{encoded}"}}}}"#),
+            );
+
+            // A first poll, so the surface knows what the client has seen.
+            let first = call(
+                &d,
+                r#"{"method":"torrent-get","arguments":{"ids":"recently-active","fields":["id"]}}"#,
+            );
+            let id = first
+                .get("arguments")
+                .and_then(|a| a.get("torrents"))
+                .and_then(Value::as_array)
+                .and_then(|t| t.first())
+                .and_then(|t| t.get("id"))
+                .and_then(Value::as_u64)
+                .expect("an id");
+            let removed = first
+                .get("arguments")
+                .and_then(|a| a.get("removed"))
+                .and_then(Value::as_array)
+                .expect("removed");
+            assert!(removed.is_empty(), "nothing had gone yet");
+
+            call(
+                &d,
+                &format!(r#"{{"method":"torrent-remove","arguments":{{"ids":[{id}]}}}}"#),
+            );
+
+            let second = call(
+                &d,
+                r#"{"method":"torrent-get","arguments":{"ids":"recently-active","fields":["id"]}}"#,
+            );
+            let removed: Vec<u64> = second
+                .get("arguments")
+                .and_then(|a| a.get("removed"))
+                .and_then(Value::as_array)
+                .expect("removed")
+                .iter()
+                .filter_map(Value::as_u64)
+                .collect();
+            assert_eq!(removed, vec![id], "the removal was not reported");
+        }
+
+        /// The refusal that is about the architecture rather than about
+        /// convenience: a URL add is a clearnet fetch.
+        #[test]
+        fn a_url_add_is_refused_for_the_reason_it_is_refused() {
+            let dir = TempDir::new("rpc-url");
+            let d = daemon_with(&dir, true);
+            let value = call(
+                &d,
+                r#"{"method":"torrent-add","arguments":{"filename":"http://example.com/x.torrent"}}"#,
+            );
+            let result = result_of(&value);
+            assert!(
+                result.contains("clearnet"),
+                "the refusal should say why, not just no: {result}"
+            );
+            // And a magnet through the same argument is accepted, so the
+            // refusal is about the scheme and not about `filename`.
+            let magnet = call(
+                &d,
+                r#"{"method":"torrent-add","arguments":{"filename":"magnet:?xt=urn:btih:3f2a91c0d4e5b6a7889900112233445566778899"}}"#,
+            );
+            assert_eq!(result_of(&magnet), "success", "a magnet should still add");
+        }
+
+        /// Adversarial envelopes, since the daemon now parses JSON from a
+        /// stranger for the first time (`PHASE-F.md` §2 used to say it never
+        /// did). `fuzz/README.md` explains why this is a sweep here rather than
+        /// a fuzz target: it can drive the real `handle`, authentication and
+        /// all, which a target linked against a binary crate cannot.
+        ///
+        /// The contract is the one `tests/hostile.rs` states for every other
+        /// parser: answer or refuse, never panic, never hang, never allocate
+        /// without bound. Nothing here should *succeed*; what matters is that
+        /// each one comes back as an ordinary reply.
+        #[test]
+        fn a_hostile_envelope_is_answered_rather_than_survived() {
+            let dir = TempDir::new("rpc-hostile");
+            let d = daemon_with(&dir, true);
+
+            let deep_array = format!("{}{}", "[".repeat(200), "]".repeat(200));
+            let bodies = vec![
+                String::new(),
+                "null".to_owned(),
+                "[]".to_owned(),
+                "0".to_owned(),
+                "\"a string\"".to_owned(),
+                r#"{"method":null}"#.to_owned(),
+                r#"{"method":[]}"#.to_owned(),
+                r#"{"method":"torrent-get","arguments":"not an object"}"#.to_owned(),
+                r#"{"method":"torrent-get","arguments":{"fields":"not an array"}}"#.to_owned(),
+                r#"{"method":"torrent-get","arguments":{"fields":[null,1,{},[]]}}"#.to_owned(),
+                r#"{"method":"torrent-get","arguments":{"ids":{}}}"#.to_owned(),
+                r#"{"method":"torrent-get","arguments":{"ids":[-1,0,1e308,"zz"]}}"#.to_owned(),
+                // Ids that are the right shape but name nothing.
+                r#"{"method":"torrent-stop","arguments":{"ids":[999999]}}"#.to_owned(),
+                r#"{"method":"torrent-remove","arguments":{"ids":["ff"]}}"#.to_owned(),
+                // A tag that is not a number, and one that cannot be one.
+                r#"{"method":"session-get","tag":"seven"}"#.to_owned(),
+                r#"{"method":"session-get","tag":1e400}"#.to_owned(),
+                // Nesting, which the parser caps rather than recursing on.
+                format!(r#"{{"method":"torrent-get","arguments":{{"ids":{deep_array}}}}}"#),
+                // A base64 payload that is not a torrent, and one that is not
+                // base64 — the two halves of the only new parser here.
+                r#"{"method":"torrent-add","arguments":{"metainfo":"////////"}}"#.to_owned(),
+                r#"{"method":"torrent-add","arguments":{"metainfo":"not base64!!"}}"#.to_owned(),
+                r#"{"method":"torrent-add","arguments":{"metainfo":""}}"#.to_owned(),
+                r#"{"method":"torrent-add","arguments":{"filename":"/etc/passwd"}}"#.to_owned(),
+                r#"{"method":"torrent-add","arguments":{}}"#.to_owned(),
+                // Priorities pointing outside the file list.
+                r#"{"method":"torrent-set","arguments":{"files-wanted":[99999999]}}"#.to_owned(),
+                r#"{"method":"torrent-set","arguments":{"seedRatioLimit":-5}}"#.to_owned(),
+                // A method name that is not ASCII, and one that is enormous.
+                r#"{"method":"\u0000\ud83d\ude00"}"#.to_owned(),
+                format!(r#"{{"method":"{}"}}"#, "x".repeat(10_000)),
+            ];
+
+            for body in bodies {
+                let session = d.rpc.as_ref().expect("rpc").session_id().to_owned();
+                let reply = speak(&d, &rpc_request(&body, Some(TOKEN), Some(&session)));
+                let status = status_of(&reply);
+                assert!(
+                    status == 200 || status == 400,
+                    "{body:.80?} answered {status}, which is neither a reply nor a refusal"
+                );
+                if status == 200 {
+                    let (_head, json) = reply.split_once("\r\n\r\n").expect("a body");
+                    let value = clove_core::json::parse(json)
+                        .unwrap_or_else(|e| panic!("{e:?} parsing our own reply to {body:.80?}"));
+                    assert!(
+                        value.get("result").and_then(Value::as_str).is_some(),
+                        "no result string in the reply to {body:.80?}"
+                    );
+                }
+            }
+
+            // And the daemon is still answering afterwards, which is the part a
+            // panic in a connection thread would not have broken loudly.
+            let after = call(&d, r#"{"method":"session-get"}"#);
+            assert_eq!(result_of(&after), "success");
+        }
+
+        /// `session-set` refuses rather than accepting and dropping the change:
+        /// a setting that silently does not stick is worse than one that says
+        /// where it lives.
+        #[test]
+        fn session_set_says_where_settings_actually_live() {
+            let dir = TempDir::new("rpc-set");
+            let d = daemon_with(&dir, true);
+            let value = call(
+                &d,
+                r#"{"method":"session-set","arguments":{"peer-limit-global":10}}"#,
+            );
+            let result = result_of(&value);
+            assert!(result.contains("clove.conf"), "{result}");
+            // The setting really is unchanged, which is the half a client
+            // could otherwise not tell.
+            let after = call(&d, r#"{"method":"session-get"}"#);
+            assert_eq!(
+                after
+                    .get("arguments")
+                    .and_then(|a| a.get("peer-limit-global"))
+                    .and_then(Value::as_u64),
+                Some(clove_core::config::DEFAULT_PEER_LIMIT as u64)
+            );
+        }
     }
 }

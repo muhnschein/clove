@@ -90,6 +90,7 @@ beyond "did not panic":
 | `extensions` | `i2p_pex`, `ut_metadata`, BEP 10 handshake | the PEX peer cap holds |
 | `magnet` | magnet URIs | non-I2P trackers are filtered out |
 | `keys` | escape sequences from a terminal, for `clove top` | every decode makes progress and stays inside the sequence bound |
+| `base64` | `torrent-add`'s `metainfo` on the Transmission RPC surface | a decode claims no more bytes than the input could carry; the encoding is canonical, so no value has two spellings |
 
 The properties matter as much as the crashes: a parser that accepts a torrent
 whose paths escape the download directory has not crashed, and is still a
@@ -100,6 +101,16 @@ because the failure that matters for a decoder is not an attacker but a stall:
 a sequence that consumes nothing loops its caller forever, and every terminal
 emits sequences nobody planned for. `docs/DECISIONS.md` S2 made the target a
 condition of hand-rolling the decoder rather than importing one.
+
+There is deliberately **no target for the RPC envelope** that `base64` sits
+inside. The envelope is `clove_core::json::parse`, which `json` already covers,
+wrapped in field lookups that return `Option` and cannot fail; fuzzing it would
+mostly re-fuzz the JSON parser through a thinner pipe. What the envelope gets
+instead is an adversarial unit sweep in `crates/cloved/src/main.rs`, which can
+drive the real `handle` — authentication included — where a fuzz target cannot,
+because `cloved` is a binary rather than a library. *Trigger for revisiting:*
+if the dispatch grows parsing of its own, it earns a target and `cloved` earns
+a `lib.rs`, the way `clove` did for `keys`.
 
 ## Dictionaries
 

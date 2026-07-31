@@ -73,6 +73,16 @@ fn nonempty_env(key: &str) -> Option<String> {
 }
 
 /// Validated daemon configuration.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "this struct is the shape of clove.conf(5), which is a flat list of \
+              independent `key value` lines. The lint's advice — a state machine, or \
+              two-variant enums — is right where booleans encode one answer between \
+              them, as it was for the registry's Wanted. These do not: every flag here \
+              is a separate operator decision with no combination that means nothing, \
+              and grouping them would put the config file and its parsed form into \
+              different shapes for no gain."
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     /// SAM bridge address: `host:port` (loopback unless overridden) or an
@@ -110,6 +120,11 @@ pub struct Config {
     /// A directory to watch for `.torrent` files to add, or `None` to watch
     /// none — the default.
     pub watch_dir: Option<PathBuf>,
+    /// Serve the Transmission-compatible RPC surface at `/transmission/rpc`
+    /// alongside `/v1/` (`docs/PHASE-I.md`). Off by default: the sane default
+    /// is that only `clove` talks to `cloved`, and a second authentication
+    /// scheme should not exist on a daemon nobody asked to expose one.
+    pub transmission_rpc: bool,
 }
 
 /// Client-wide peer ceiling when the config does not say otherwise.
@@ -267,6 +282,7 @@ struct Draft {
     seed_ratio_milli: Option<(usize, u64)>,
     seed_idle_minutes: Option<(usize, u64)>,
     watch_dir: Option<(usize, PathBuf)>,
+    transmission_rpc: Option<(usize, bool)>,
 }
 
 impl Draft {
@@ -315,6 +331,10 @@ impl Draft {
                 set(&mut self.seed_ratio_milli, line, milli)?;
             }
             "watch_dir" => set(&mut self.watch_dir, line, absolute(value, line)?)?,
+            "transmission_rpc" => {
+                let flag = parse_bool(value).ok_or_else(|| at(Problem::BadBool))?;
+                set(&mut self.transmission_rpc, line, flag)?;
+            }
             "seed_idle_minutes" => {
                 let minutes = value
                     .parse::<u64>()
@@ -373,6 +393,7 @@ impl Config {
             seed_ratio_milli,
             seed_idle_minutes,
             watch_dir,
+            transmission_rpc,
         } = draft;
 
         let i_know_sam_is_remote = i_know_sam_is_remote.is_some_and(|(_, v)| v);
@@ -422,6 +443,7 @@ impl Config {
             seed_ratio_milli: seed_ratio_milli.map_or(0, |(_, v)| v),
             seed_idle_minutes: seed_idle_minutes.map_or(0, |(_, v)| v),
             watch_dir: watch_dir.map(|(_, v)| v),
+            transmission_rpc: transmission_rpc.is_some_and(|(_, v)| v),
         })
     }
 }
@@ -600,6 +622,9 @@ mod tests {
         assert_eq!(c.seed_ratio_milli, 0);
         assert_eq!(c.seed_idle_minutes, 0);
         assert_eq!(c.watch_dir, None);
+        // Only `clove` talks to `cloved` unless asked otherwise: a second
+        // authentication scheme is a deviation, not basic function.
+        assert!(!c.transmission_rpc);
         assert_eq!(c.data_dir, PathBuf::from("/home/u/.local/share/clove"));
         assert_eq!(c.api_socket, PathBuf::from("/run/user/1000/clove.sock"));
     }
@@ -720,6 +745,23 @@ preallocate yes
         assert_eq!(idle("seed_idle_minutes 0\n").unwrap(), 0);
         assert!(idle("seed_idle_minutes -5\n").is_err());
         assert!(idle("seed_idle_minutes soon\n").is_err());
+    }
+
+    #[test]
+    fn transmission_rpc_is_a_bool_like_every_other_flag() {
+        let d = defaults();
+        assert!(
+            Config::parse("transmission_rpc yes\n", &d)
+                .unwrap()
+                .transmission_rpc
+        );
+        assert!(
+            !Config::parse("transmission_rpc no\n", &d)
+                .unwrap()
+                .transmission_rpc
+        );
+        assert!(Config::parse("transmission_rpc maybe\n", &d).is_err());
+        assert!(Config::parse("transmission_rpc\n", &d).is_err());
     }
 
     #[test]

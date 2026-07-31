@@ -1,0 +1,40 @@
+# Standard base64 as `torrent-add`'s `metainfo` carries it. The target asserts
+# a canonical round trip, so the tokens that matter are the ones where two
+# spellings of one value could both be accepted: padding, the alphabet's edges,
+# and the whitespace a MIME-wrapping encoder inserts.
+"="
+"=="
+"A"
+"AA"
+"AAA"
+"AAAA"
+"+"
+"/"
+"+/+/"
+"////"
+"++++"
+# The two characters the I2P alphabet uses in place of `+` and `/`. A decoder
+# that shared a table with `i2pnet::addr` would accept these.
+"-"
+"~"
+"-~-~"
+# MIME wrapping, which is the one leniency the decoder has.
+"\n"
+"\r\n"
+" "
+"\t"
+"AAAA\nAAAA"
+# Bencode openers, so a corpus entry can grow toward a real .torrent — which is
+# what the decoded bytes are handed to next.
+"ZDg6"
+"ZDQ6aW5mb2Q="
+"d8:announce"
+"d4:infod"
+"ZjE6"
+# Length edges around the four-symbol quantum.
+"Zg=="
+"Zm8="
+"Zm9v"
+"Zm9vYg=="
+"Zm9vYmE="
+"Zm9vYmFy"

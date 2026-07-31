@@ -19,7 +19,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-TARGETS_ALL='bencode metainfo resume json http wire tracker extensions magnet'
+TARGETS_ALL='bencode metainfo resume json http wire tracker extensions magnet keys base64'
 SCALE=1
 QUICK=no
 SEED=no
@@ -90,6 +90,10 @@ budget_for() {
                                                 # empty already reaches the ceiling
         bencode) echo 180 ;;                    # +0 for 7x; untested below 180s
         json|metainfo) echo 240 ;;              # +0, +2
+        # Both provisional, on the 300s default until a sweep prices them.
+        # `keys` reads a keyboard and `base64` a four-character quantum: small
+        # alphabets, shallow state, no reason to expect either to want more.
+        keys|base64) echo 180 ;;
         http|extensions) echo 420 ;;            # +1, +9
         resume) echo 600 ;;                     # +17
         tracker) echo 900 ;;                    # +47, the best margin in the table
