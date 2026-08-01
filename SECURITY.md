@@ -66,7 +66,17 @@ These are enforced in the codebase and checked in CI, not merely intended:
   unless the documented override is set.
 - Announce URLs that are not I2P URLs are dropped when the torrent is parsed —
   never contacted, never logged beyond a count.
-- State files are written temp-then-rename, so a crash cannot corrupt them.
+- State files are written temp-then-rename, so a crash cannot corrupt them. The
+  temporary is created `O_EXCL` under an unpredictable name, so it cannot be
+  pre-placed as a symlink and used to redirect the write.
+- **No destination reaches a log.** Not the client's, not a peer's, whole or
+  in part. A b32 is a hash already, so a truncated one is the same identifier
+  rather than a weaker one, and neither is printed. The daemon's own address is
+  written to `<data_dir>/destination` instead; `ci/smoke.sh` fails the build if
+  anything 52 characters of lowercase base32 appears in a daemon log.
+- A `.torrent` from `watch_dir` is read under the same limits as one posted to
+  the API, and the directory must be private and daemon-owned, because write
+  access to it takes the place of the API token.
 
 If you find a way to violate one of these, that is a vulnerability by
 definition, even without a demonstrated exploit.
