@@ -140,6 +140,17 @@ fn run() -> Result<(), String> {
         // rather than by having the sandbox quietly cover that place too.
         require_private_dir(parent).map_err(|e| format!("socket dir: {e}"))?;
     }
+    // The watch directory stands in for the authenticated API: anything
+    // dropped in it is added as if a token-bearing request had asked. Its
+    // permissions are therefore the whole of its authorization, and until now
+    // nothing checked that they provided any — a group- or world-writable
+    // directory let any local user queue network and storage work without the
+    // token. An operator who asks for an unauthenticated ingress is entitled
+    // to be told when their configuration is not actually providing one, so
+    // this refuses to start rather than watching it anyway.
+    if let Some(dir) = &config.watch_dir {
+        require_private_dir(dir).map_err(|e| format!("watch_dir: {e}"))?;
+    }
     let token = load_or_create_token(&config.data_dir).map_err(|e| e.to_string())?;
 
     let registry = Registry::open(&config.data_dir, registry::Limits::from(&config))
@@ -254,46 +265,144 @@ fn spawn_watch_dir(daemon: &Arc<Daemon>, dir: PathBuf) {
 }
 
 /// One pass over the watch directory.
+///
+/// The watcher is an *alternative to the authenticated API*: dropping a file
+/// in here does what a token-bearing POST does. That makes the directory's
+/// permissions the whole of its authorization, so this path is as careful as
+/// the API path it stands in for, and in the same ways.
+///
+/// - The entry is claimed by rename before it is read. Renaming afterwards
+///   left a window in which the file parsed need not be the file filed, and
+///   let two daemons on one directory both process the same drop.
+/// - It is opened relative to the directory's own descriptor with
+///   `O_NOFOLLOW`, so a `.torrent` that is a symlink is refused by the kernel
+///   rather than followed into somewhere the daemon can read but the writer
+///   cannot. `fs::read` followed it.
+/// - The size is checked on that descriptor with `fstat`, before any bytes are
+///   read, against the cap the API enforces on a request body. There was no
+///   cap at all, so a symlink to a huge file was an out-of-memory switch.
+/// - Only a regular file is accepted: a fifo would have blocked this thread,
+///   and with it every later drop, for as long as nobody wrote to it.
 fn scan_watch_dir(daemon: &Arc<Daemon>, dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    // One descriptor for the directory, and every entry resolved against it.
+    // Reopening by path per entry would reintroduce the window the rest of
+    // this closes.
+    let Ok(dir_fd) = openat(
+        rustix::fs::CWD,
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
         // Not readable, or not there yet. Said once per tick would be noise;
         // an operator who set the key and mistyped it sees nothing added,
         // which is the same information.
         return;
     };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
+        let name = entry.file_name();
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("torrent") {
             continue;
         }
-        let Ok(bytes) = fs::read(&path) else {
+
+        // Claim it first. After this rename the name is ours: whatever else
+        // holds the directory open cannot substitute the contents of the file
+        // we are about to read, and a second daemon's rename fails.
+        let Some(name) = name.to_str() else {
             continue;
         };
-        let added = lock(&daemon.registry).add_torrent(&bytes, registry::AddOptions::default());
-        let suffix = match added {
-            Ok((info_hash, job)) => {
-                // Same as the API path: the initial hash of whatever is
-                // already on disk runs with the registry unlocked.
-                let _ = run_scan(daemon, &job);
-                eprintln!(
-                    "cloved: added {} from {}",
-                    registry::hex(&info_hash),
-                    path.display()
-                );
-                "added"
-            }
-            // A duplicate is not a failure: the operator dropped in something
-            // already hosted, and the file has still been dealt with.
-            Err(AddError::Duplicate) => "added",
-            Err(e) => {
-                eprintln!("cloved: not adding {}: {e}", path.display());
+        let claimed = format!("{name}.claimed");
+        if rustix::fs::renameat(&dir_fd, name, &dir_fd, claimed.as_str()).is_err() {
+            // Somebody else got there first, or it vanished. Either way it is
+            // not ours to process.
+            continue;
+        }
+
+        let outcome = read_claimed_torrent(&dir_fd, &claimed)
+            .and_then(|bytes| ingest_watched_torrent(daemon, &bytes, &path));
+        let suffix = match outcome {
+            Ok(()) => "added",
+            Err(why) => {
+                eprintln!("cloved: not adding {}: {why}", path.display());
                 "rejected"
             }
         };
-        let taken = path.with_extension(format!("torrent.{suffix}"));
-        if let Err(e) = fs::rename(&path, &taken) {
+        let filed = format!("{name}.{suffix}");
+        if let Err(e) = rustix::fs::renameat(&dir_fd, claimed.as_str(), &dir_fd, filed.as_str()) {
             eprintln!("cloved: leaving {} where it is: {e}", path.display());
         }
+    }
+}
+
+/// Read a claimed watch-directory entry, refusing anything that is not a
+/// plain file we can afford to hold.
+fn read_claimed_torrent(dir_fd: &rustix::fd::OwnedFd, name: &str) -> Result<Vec<u8>, String> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+    use std::io::Read as _;
+
+    let file = openat(
+        dir_fd,
+        name,
+        // `O_NOFOLLOW` refuses a symlink; `O_NONBLOCK` means a fifo that
+        // slipped past the type check below cannot block the open itself.
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
+        rustix::io::Errno::LOOP => "it is a symbolic link".to_owned(),
+        other => format!("{}", std::io::Error::from(other)),
+    })?;
+
+    let stat = fstat(&file).map_err(|e| format!("{}", std::io::Error::from(e)))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err("it is not a regular file".to_owned());
+    }
+    // Checked on the descriptor we are about to read, not on the path, so
+    // there is nothing to swap between the check and the read.
+    let len = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
+    if len > MAX_REQUEST_BODY as u64 {
+        return Err(format!(
+            "it is {len} bytes; the limit is {MAX_REQUEST_BODY}, the same one the API applies"
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(MAX_REQUEST_BODY));
+    // `take`, so a file that grew between the fstat and here still cannot
+    // exceed the cap.
+    std::io::Read::take(std::fs::File::from(file), MAX_REQUEST_BODY as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{e}"))?;
+    if bytes.len() > MAX_REQUEST_BODY {
+        return Err(format!("it grew past the {MAX_REQUEST_BODY}-byte limit"));
+    }
+    Ok(bytes)
+}
+
+/// Hand watched bytes to the registry, on the same terms as the API.
+fn ingest_watched_torrent(daemon: &Arc<Daemon>, bytes: &[u8], path: &Path) -> Result<(), String> {
+    let added = lock(&daemon.registry).add_torrent(bytes, registry::AddOptions::default());
+    match added {
+        Ok((info_hash, job)) => {
+            // Same as the API path: the initial hash of whatever is already on
+            // disk runs with the registry unlocked. A scan that fails means
+            // storage could not be laid out, which is not an "added".
+            run_scan(daemon, &job).map_err(|e| format!("preparing its files: {e}"))?;
+            eprintln!(
+                "cloved: added {} from {}",
+                registry::hex(&info_hash),
+                path.display()
+            );
+            Ok(())
+        }
+        // A duplicate is not a failure: the operator dropped in something
+        // already hosted, and the file has still been dealt with.
+        Err(AddError::Duplicate) => Ok(()),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -2370,5 +2479,120 @@ mod tests {
         // A second call reads the existing token rather than rotating it —
         // rotating would invalidate every running CLI on restart.
         assert_eq!(load_or_create_token(&dir.0).expect("reuse"), first);
+    }
+
+    /// Open a directory the way [`scan_watch_dir`] does, so the tests below
+    /// exercise the same descriptor-relative path the daemon uses.
+    fn dir_fd(path: &Path) -> rustix::fd::OwnedFd {
+        rustix::fs::openat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("open watch dir")
+    }
+
+    /// The watch directory is an unauthenticated stand-in for the API, so what
+    /// it will read has to be as narrow as what the API accepts. Before this,
+    /// `fs::read` followed symlinks and had no cap at all: a `.torrent` name
+    /// pointed at a large file the daemon could read and the writer could not
+    /// was both a disclosure primitive and an out-of-memory switch.
+    #[test]
+    fn the_watcher_refuses_anything_that_is_not_a_plain_bounded_file() {
+        let dir = TempDir::new("watch-hostile");
+
+        // A symlink, even to a file that would otherwise be perfectly fine.
+        let real = dir.0.join("real-target");
+        std::fs::write(&real, b"d4:infod").expect("write target");
+        std::os::unix::fs::symlink(&real, dir.0.join("link.torrent")).expect("symlink");
+        let e = read_claimed_torrent(&dir_fd(&dir.0), "link.torrent")
+            .expect_err("a symlink was followed");
+        assert!(e.contains("symbolic link"), "{e}");
+
+        // Too big, by one byte over the API's own limit.
+        let big = vec![b'x'; MAX_REQUEST_BODY + 1];
+        std::fs::write(dir.0.join("big.torrent"), &big).expect("write big");
+        let e =
+            read_claimed_torrent(&dir_fd(&dir.0), "big.torrent").expect_err("an oversized file");
+        assert!(e.contains("limit"), "{e}");
+
+        // A fifo is not a regular file, and reading one would have parked this
+        // thread — and every later drop with it — until somebody wrote to it.
+        let fifo = dir.0.join("pipe.torrent");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            fifo.as_path(),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_bits_truncate(0o600),
+            0,
+        )
+        .expect("mkfifo");
+        let e = read_claimed_torrent(&dir_fd(&dir.0), "pipe.torrent").expect_err("a fifo");
+        assert!(e.contains("regular file"), "{e}");
+
+        // And the ordinary case still works, or the checks above are just
+        // refusing everything.
+        std::fs::write(dir.0.join("ok.torrent"), b"d4:infoe").expect("write ok");
+        assert_eq!(
+            read_claimed_torrent(&dir_fd(&dir.0), "ok.torrent").expect("a plain file"),
+            b"d4:infoe"
+        );
+    }
+
+    /// Startup's ground rules for a directory it will keep secrets in — or,
+    /// for `watch_dir`, accept unauthenticated commands from.
+    #[test]
+    fn a_directory_must_be_ours_and_private_before_the_daemon_will_use_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("private-dir");
+
+        // The ordinary case: create_dir_all then the check, as run() does.
+        let good = dir.0.join("good");
+        std::fs::create_dir(&good).expect("mkdir");
+        require_private_dir(&good).expect("a fresh 0700 directory was refused");
+
+        // A file where a directory belongs.
+        let file = dir.0.join("a-file");
+        std::fs::write(&file, b"").expect("write");
+        let e = require_private_dir(&file).expect_err("a file passed as a directory");
+        assert!(e.contains("not a directory"), "{e}");
+
+        // A symlink to a directory that would itself pass. The target's mode
+        // is not the question: whoever can write the link's parent can point
+        // it somewhere else after this check and before every later use.
+        let link = dir.0.join("a-link");
+        std::os::unix::fs::symlink(&good, &link).expect("symlink");
+        let e = require_private_dir(&link).expect_err("a symlink passed as a directory");
+        assert!(e.contains("symbolic link"), "{e}");
+
+        // A world-writable directory we own is *corrected*, not refused: an
+        // install predating this check, or one made under a permissive umask,
+        // is ours to fix rather than to complain about. What changed is what
+        // happens when it cannot be fixed.
+        let loose = dir.0.join("loose");
+        std::fs::create_dir(&loose).expect("mkdir");
+        std::fs::set_permissions(&loose, PermissionsExt::from_mode(0o777)).expect("chmod");
+        require_private_dir(&loose).expect("a correctable directory was refused");
+        let mode = std::fs::metadata(&loose)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "the mode was not corrected to 0700");
+
+        // Somebody else's directory is the case that cannot be fixed, and the
+        // one that used to produce a warning and a daemon running anyway.
+        // Giving a directory away needs privilege, so this only runs where the
+        // test process has it; asserting otherwise would assert on the
+        // environment rather than on the code.
+        let theirs = dir.0.join("theirs");
+        std::fs::create_dir(&theirs).expect("mkdir");
+        let other = rustix::process::Uid::from_raw(rustix::process::geteuid().as_raw() + 1);
+        if rustix::fs::chown(theirs.as_path(), Some(other), None).is_ok() {
+            let e = require_private_dir(&theirs).expect_err("another uid's directory was accepted");
+            assert!(e.contains("owned by uid"), "{e}");
+        }
     }
 }

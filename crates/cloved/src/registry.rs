@@ -3532,7 +3532,7 @@ mod tests {
             .expect("read dir")
             .filter_map(Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".tmp") && name != "state.tmp")
+            .filter(|name| name.contains(".tmp") && name != "state.tmp")
             .collect();
         assert!(strays.is_empty(), "left temp files behind: {strays:?}");
     }

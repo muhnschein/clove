@@ -237,6 +237,26 @@ torrent about to spend minutes building tunnels.
 .Pp
 This is how other tooling drives clove without an API of its own.
 The daemon needs write access to the directory, since it renames what it takes.
+.Pp
+Because dropping a file here does what an authenticated request does, the
+directory's permissions are the only thing standing in for the API token.
+.Xr cloved 8
+therefore refuses to start unless the directory is owned by the user the
+daemon runs as, and is inaccessible to group and others; a mode it can
+correct, it corrects, and one it cannot is a startup failure rather than a
+warning.
+Anyone who can write here can queue network and storage work without the
+token, so a shared directory such as
+.Pa /tmp
+is not a usable choice.
+.Pp
+Each entry is renamed before it is read, opened without following symbolic
+links, and refused unless it is a regular file no larger than the limit the
+control API applies to a request body.
+A
+.Pa .torrent
+that is a symbolic link is not followed to whatever the daemon could read
+through it.
 .El
 .Sh EXAMPLES
 The recommended configuration is no file at all.
