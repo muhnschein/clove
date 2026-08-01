@@ -120,13 +120,15 @@ fn check_data_dir(dir: &Path) -> Result<(), String> {
             dir.display()
         ));
     }
-    let us = rustix::process::geteuid().as_raw();
-    if meta.uid() != us {
+    // Whose uid it is, not which. `ls -ld` answers "which" and the operator is
+    // standing in front of a shell; the number bought little, and printing
+    // account identifiers to a log is the habit this whole branch is closing.
+    if meta.uid() != rustix::process::geteuid().as_raw() {
         return Err(format!(
-            "data_dir {} is owned by uid {}, not by the daemon's uid {us}; it \
-             holds the destination key and the API token, so it must be ours",
-            dir.display(),
-            meta.uid()
+            "data_dir {} is owned by another user, not by the one the daemon \
+             runs as (ls -ld will say who); it holds the destination key and \
+             the API token, so it must be ours",
+            dir.display()
         ));
     }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
@@ -385,14 +387,13 @@ fn check_watch_dir(dir: &Path) -> Result<(), String> {
     if !meta.is_dir() {
         return Err(format!("watch_dir {} is not a directory", dir.display()));
     }
-    let us = rustix::process::geteuid().as_raw();
-    if meta.uid() != us {
+    if meta.uid() != rustix::process::geteuid().as_raw() {
         return Err(format!(
-            "watch_dir {} is owned by uid {}, not by the daemon's uid {us}; \
-             dropping a torrent in it takes the place of the API token, so it \
-             must not be somebody else's to give away",
-            dir.display(),
-            meta.uid()
+            "watch_dir {} is owned by another user, not by the one the daemon \
+             runs as (ls -ld will say who); dropping a torrent in it takes the \
+             place of the API token, so it must not be somebody else's to give \
+             away",
+            dir.display()
         ));
     }
     if meta.mode() & 0o022 != 0 {
@@ -1671,10 +1672,9 @@ fn read_private_file(path: &Path) -> std::io::Result<Option<String>> {
         return Err(refused("it is not a regular file".to_owned()));
     }
     if meta.uid() != rustix::process::geteuid().as_raw() {
-        return Err(refused(format!(
-            "it is owned by uid {}, not by this daemon",
-            meta.uid()
-        )));
+        return Err(refused(
+            "it is owned by another user, not by this daemon".to_owned(),
+        ));
     }
     let mode = meta.mode() & 0o777;
     if mode & 0o077 != 0 {
