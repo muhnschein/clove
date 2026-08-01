@@ -371,9 +371,13 @@ fn read_claimed_torrent(dir_fd: &rustix::fd::OwnedFd, name: &str) -> Result<Vec<
         ));
     }
 
-    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(MAX_REQUEST_BODY));
-    // `take`, so a file that grew between the fstat and here still cannot
-    // exceed the cap.
+    // Deliberately not `with_capacity(len)`. `len` is the size a file in a
+    // directory somebody else may write to claims to be, and reserving on it
+    // means allocating what the writer asked for rather than what they
+    // actually supplied — a directory of empty files each declaring 2 MiB
+    // costs nothing to make. `read_to_end` grows to what is really there, and
+    // `take` keeps that bounded even if the file grew after the fstat.
+    let mut bytes = Vec::new();
     std::io::Read::take(std::fs::File::from(file), MAX_REQUEST_BODY as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("{e}"))?;

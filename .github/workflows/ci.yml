@@ -103,16 +103,26 @@ jobs:
       # Committed seeds on top of whatever the cache restored: the cache can be
       # evicted or cold, and a run that starts from nothing is a slower run.
       - run: tar xzf fuzz/seed-corpus.tar.gz -C fuzz -k || true
-      - run: |
-          secs=$(./ci/fuzz.sh --budget ${{ matrix.target }})
-          echo "budget: ${{ matrix.target }} ${secs}s"
-          dict=fuzz/dicts/${{ matrix.target }}.dict
+      # The matrix value reaches the script through the environment, never by
+      # being pasted into it. `${{ }}` inside a `run:` block is substituted
+      # before the shell ever sees the text, so the expansion is not a shell
+      # word but part of the program — the injection shape CodeQL flags. This
+      # particular list is hardcoded above and holds nine lowercase words, so
+      # nothing hostile can reach it today; that is an argument about the
+      # current value, not about the construct, and the construct is what
+      # gets copied into the next workflow.
+      - env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          secs=$(./ci/fuzz.sh --budget "$TARGET")
+          echo "budget: $TARGET ${secs}s"
+          dict="fuzz/dicts/$TARGET.dict"
           # Only when it exists. ci/fuzz.sh --check-targets requires one per
           # target, so this should never be taken — but an unconditional
           # -dict turns "a target has no dictionary yet" into a job that fails
           # on a libFuzzer argument, which is a confusing way to be told.
           [ -f "$dict" ] || dict=/dev/null
-          cargo +nightly-2026-07-15 fuzz run ${{ matrix.target }} -- \
+          cargo +nightly-2026-07-15 fuzz run "$TARGET" -- \
             -dict="$dict" \
             -max_total_time="$secs"
       # Minimise before the cache is written, not after it is read. libFuzzer
@@ -122,7 +132,9 @@ jobs:
       # shallower, because startup replays all of it and mutation energy is
       # split across all of it. Left alone this compounds every night.
       - if: success()
-        run: cargo +nightly-2026-07-15 fuzz cmin ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo +nightly-2026-07-15 fuzz cmin "$TARGET"
       # `fuzz/corpus/` is git-ignored and the cache expires, so without this a
       # month of scheduled runs leaves nothing behind. The artifact is what
       # somebody folds into the committed seed with `make fuzz-seed`.
