@@ -2220,14 +2220,48 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 /// Write `bytes` to `path` atomically: a sibling temp file, fsynced, then
 /// renamed over `path` (atomic on the same filesystem).
+///
+/// The temp file is created `O_EXCL` under a name nobody can predict, rather
+/// than the fixed `<path>.tmp` and `File::create` this used. Both halves of
+/// that mattered: the old name was guessable, and `File::create` follows
+/// symlinks — so another local user who could write to the state directory
+/// could pre-place `<path>.tmp` as a link and have the daemon truncate and
+/// overwrite whatever it named. The data directory is `0700` and the supplied
+/// unit normally makes that unreachable, but "normally" is doing real work in
+/// that sentence: the mode is applied best-effort on a directory that may
+/// already exist, and this is the write that runs every thirty seconds
+/// forever.
+///
+/// `O_EXCL` is what actually closes it — it refuses to open an existing path
+/// of any kind, link or not — and the unpredictable name means a loser of the
+/// race cannot simply try again against a known target. The leftover on a
+/// crash is a stray temp file rather than a clobbered one, which is why the
+/// name carries enough to sweep later if it ever matters.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut nonce = [0u8; 8];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|e| io::Error::other(format!("no randomness for a temp name: {e}")))?;
+    let name = path
+        .file_name()
+        .map_or_else(|| "state".to_owned(), |n| n.to_string_lossy().into_owned());
+    let tmp = path.with_file_name(format!("{name}.{}.{}.tmp", std::process::id(), hex(&nonce)));
     {
-        let mut file = fs::File::create(&tmp)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    fs::rename(&tmp, path)?;
+    // From here the temp file must not be left behind on a failure: this runs
+    // every persist tick, and a leaked file per failed tick is its own bug.
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     // The rename is atomic, but it only survives a power cut once the
     // directory entry itself is on the disk. Best-effort: filesystems that
     // refuse to fsync a directory leave us exactly where we were.
@@ -2264,6 +2298,76 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// A state write must not be divertible through a pre-placed temp file.
+    ///
+    /// The old writer used `<path>.tmp` and `File::create`: a predictable name
+    /// opened in a mode that follows symlinks. Another local user who could
+    /// write to the state directory could put a link there and have the daemon
+    /// truncate whatever it pointed at — on a timer, since progress is
+    /// persisted every thirty seconds for as long as the daemon runs.
+    ///
+    /// Two properties now hold, and the test asserts the second because it is
+    /// the one that survives a reader who does not know the first: the name is
+    /// unpredictable, and the open is `O_EXCL`, which refuses an existing path
+    /// of any kind rather than following it.
+    #[test]
+    fn a_state_write_cannot_be_diverted_through_its_temp_file() {
+        let dir = TempDir::new("atomic");
+        let target = dir.0.join("do-not-touch");
+        std::fs::write(&target, b"untouched").expect("write");
+
+        let path = dir.0.join("state.resume");
+        // The name the old writer would have used, pre-placed as a link at the
+        // file the attacker wants overwritten.
+        let predictable = dir.0.join("state.resume.tmp");
+        std::os::unix::fs::symlink(&target, &predictable).expect("symlink");
+
+        atomic_write(&path, b"the real state").expect("write");
+
+        assert_eq!(
+            std::fs::read(&path).expect("state"),
+            b"the real state",
+            "the state did not land where it belongs"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("target"),
+            b"untouched",
+            "the write was diverted through the predictable temp name"
+        );
+        assert!(
+            predictable.symlink_metadata().is_ok(),
+            "the planted link should simply be irrelevant, not consumed"
+        );
+
+        // And nothing is left behind: this runs on a timer, so a leaked temp
+        // per write would fill the directory over a long run.
+        let strays: Vec<_> = std::fs::read_dir(&dir.0)
+            .expect("readdir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                std::path::Path::new(n)
+                    .extension()
+                    .is_some_and(|e| e == "tmp")
+            })
+            .filter(|n| n != "state.resume.tmp")
+            .collect();
+        assert!(strays.is_empty(), "temp files left behind: {strays:?}");
+    }
+
+    /// Successive writes do not collide, and the last one wins.
+    #[test]
+    fn repeated_state_writes_leave_exactly_one_file() {
+        let dir = TempDir::new("atomic-repeat");
+        let path = dir.0.join("state.resume");
+        for i in 0..16u8 {
+            atomic_write(&path, &[i; 4]).expect("write");
+        }
+        assert_eq!(std::fs::read(&path).expect("state"), [15u8; 4]);
+        let count = std::fs::read_dir(&dir.0).expect("readdir").count();
+        assert_eq!(count, 1, "a temp file survived a write");
     }
 
     /// Deterministic multi-piece content and a real single-file `.torrent`.

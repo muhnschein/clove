@@ -85,6 +85,60 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Args, String> 
     Ok(Args { check, config_path })
 }
 
+/// Restrict the data directory to `0700`, and refuse to run if it cannot be.
+///
+/// This used to warn and carry on. Everything clove keeps private lives here
+/// — the destination key, the API token, every torrent's state — and each of
+/// those files defends itself with its own `0600` and its own no-follow
+/// checks, so the warning read as belt-and-braces.
+///
+/// It is not. A data directory another local user can write to lets them
+/// place entries the daemon will later open by name, and the daemon writes
+/// here on a timer for as long as it runs. `atomic_write` is now hardened
+/// against exactly that, but a directory in that state is a misconfiguration
+/// with no good outcome, and a line on stderr at startup is not how anyone
+/// finds out about it. Better to refuse: this is the one moment an operator
+/// is watching.
+///
+/// The mode is *applied* rather than merely checked, because an install that
+/// predates this — or one made under a permissive umask — should be fixed
+/// rather than rejected. Only a directory clove cannot bring to `0700` stops
+/// it, and then the owner is worth naming, since "permission denied" on your
+/// own data directory is not self-explanatory.
+///
+/// # Errors
+///
+/// The path is not a directory, is not ours, or cannot be restricted.
+fn check_data_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let meta = fs::symlink_metadata(dir).map_err(|e| format!("data_dir {}: {e}", dir.display()))?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "data_dir {} is not a directory (a symlink here would let its \
+             target be changed under the daemon)",
+            dir.display()
+        ));
+    }
+    let us = rustix::process::geteuid().as_raw();
+    if meta.uid() != us {
+        return Err(format!(
+            "data_dir {} is owned by uid {}, not by the daemon's uid {us}; it \
+             holds the destination key and the API token, so it must be ours",
+            dir.display(),
+            meta.uid()
+        ));
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        format!(
+            "could not restrict data_dir {} to 0700: {e}. It holds the \
+             destination key and the API token; running on a directory others \
+             can reach would put both within their reach too",
+            dir.display()
+        )
+    })
+}
+
 /// Read the configuration text `-c` names, or the default path's.
 ///
 /// An explicit `-c` must exist and be readable. The default path may simply
@@ -136,15 +190,7 @@ fn run() -> Result<(), String> {
     // created before this, or by a permissive umask, is the case worth fixing.
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|e| format!("creating data dir {}: {e}", config.data_dir.display()))?;
-    if let Err(e) = std::fs::set_permissions(
-        &config.data_dir,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    ) {
-        eprintln!(
-            "cloved: could not restrict {} to 0700: {e}",
-            config.data_dir.display()
-        );
-    }
+    check_data_dir(&config.data_dir)?;
     if let Some(parent) = config.api_socket.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating socket dir {}: {e}", parent.display()))?;
@@ -1717,6 +1763,44 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The data directory holds the destination key and the API token, so a
+    /// directory clove cannot make private is a refusal rather than a warning
+    /// that scrolls past at startup.
+    #[test]
+    fn a_data_dir_that_cannot_be_made_private_stops_the_daemon() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("data-dir");
+
+        // The ordinary case: a loose directory is tightened rather than
+        // rejected, because an install predating this rule should be fixed.
+        let loose = dir.0.join("loose");
+        std::fs::create_dir(&loose).expect("mkdir");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        check_data_dir(&loose).expect("a directory of ours is fixed, not refused");
+        let mode = std::fs::metadata(&loose)
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "the mode was not applied");
+
+        // Not a directory at all, including a symlink to one — whose target
+        // can be repointed after any check.
+        let file = dir.0.join("a-file");
+        std::fs::write(&file, b"x").expect("write");
+        assert!(check_data_dir(&file).is_err(), "a file passed as data_dir");
+
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&loose, &link).expect("symlink");
+        let e = check_data_dir(&link).expect_err("a symlinked data_dir passed");
+        assert!(e.contains("not a directory"), "{e}");
+
+        assert!(
+            check_data_dir(&dir.0.join("absent")).is_err(),
+            "an absent data_dir passed"
+        );
     }
 
     // ------------------------------------------------- the watch boundary

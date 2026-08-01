@@ -80,6 +80,14 @@ Default:
 .Pa $XDG_DATA_HOME/clove ,
 that is
 .Pa ~/.local/share/clove .
+.Pp
+Created if absent, and restricted to mode 0700 on every start — an install
+made under a permissive umask is tightened rather than refused.
+The daemon does not start if the path is not a directory, is a symlink, is
+owned by another user, or cannot be brought to 0700.
+This holds the destination key and the API token, so a directory others can
+reach puts both within their reach; it is refused at startup rather than
+warned about, because startup is the one moment anybody is looking.
 .It Ic api_socket Ar path
 Absolute path of the unix socket serving the local HTTP API.
 Default:
