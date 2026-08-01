@@ -18,7 +18,7 @@ jobs:
     # six-hour ceiling. Tier-1 runs in well under a minute today.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The pinned toolchain comes from rust-toolchain.toml; rustup installs
       # it (with clippy + rustfmt) on the first cargo invocation. Do not
       # `rustup update stable` here — that would defeat the pin.
@@ -32,6 +32,11 @@ jobs:
       # takes seconds and needs no nightly toolchain — only running the fuzzer
       # does.
       - run: cargo check --manifest-path fuzz/Cargo.toml
+      # Compiling a target is not running it. The three lists that decide
+      # which targets are *fuzzed* live in three files, and this asserts they
+      # agree — a target present in the manifest but missing from the matrix
+      # builds green forever and is never fuzzed once.
+      - run: ./ci/fuzz.sh --check-targets
       - run: ./ci/check-net-deps.sh
       # End-to-end: drive the real binaries as an operator does. Unit tests
       # cannot see whole-process faults (the Phase-F registry deadlocks
@@ -49,6 +54,11 @@ jobs:
   fuzz:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    env:
+      # ci/fuzz.sh uses this for every `cargo fuzz` it runs and prints it in
+      # the reproduction line of any crash it reports, so a finding names the
+      # toolchain that found it.
+      FUZZ_TOOLCHAIN: nightly-2026-07-15
     # Headroom over the largest budget, not a number to itself. `tracker` is
     # 1500s = 25 minutes, and the job pays for a nightly install, a
     # `cargo install cargo-fuzz` and a sanitizer build before any of it, then
@@ -76,28 +86,42 @@ jobs:
           - resume
           - magnet
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The committed seed corpus starts each run warm; this carries what the
       # run *discovers* to the next one. Without it every scheduled run spends
       # much of its budget rediscovering that input has to be bencode at all,
       # which is the difference between fuzzing the parser and fuzzing the
       # question of whether the input is a torrent.
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
-      - run: rustup toolchain install nightly
-      - run: cargo install cargo-fuzz --locked
+      # Both pinned, for the same reason the stable toolchain is pinned in
+      # rust-toolchain.toml: an unversioned `nightly` and a floating
+      # `cargo install` are two more inputs that can change under a run
+      # nobody is watching, on the one job that runs unattended at 3am.
+      # A dated nightly also makes a fuzz finding reproducible — "it crashed
+      # on last Tuesday's nightly" is not a bug report anyone can act on.
+      # Bump both deliberately.
+      - run: rustup toolchain install nightly-2026-07-15
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
       # Committed seeds on top of whatever the cache restored: the cache can be
       # evicted or cold, and a run that starts from nothing is a slower run.
       - run: tar xzf fuzz/seed-corpus.tar.gz -C fuzz -k || true
       - run: |
           secs=$(./ci/fuzz.sh --budget ${{ matrix.target }})
           echo "budget: ${{ matrix.target }} ${secs}s"
-          cargo +nightly fuzz run ${{ matrix.target }} -- \
-            -dict=fuzz/dicts/${{ matrix.target }}.dict \
+          # `-dict` only when there is one, matching ci/fuzz.sh and
+          # fuzz/README.md. Passed unconditionally, a target added without a
+          # dictionary makes the command invalid rather than merely
+          # dictionary-less.
+          dict=""
+          [ -f "fuzz/dicts/${{ matrix.target }}.dict" ] \
+            && dict="-dict=fuzz/dicts/${{ matrix.target }}.dict"
+          # shellcheck disable=SC2086
+          cargo +nightly-2026-07-15 fuzz run ${{ matrix.target }} -- $dict \
             -max_total_time="$secs"
       # Minimise before the cache is written, not after it is read. libFuzzer
       # keeps an input for reaching a new execution-count bucket, not a new
@@ -106,18 +130,18 @@ jobs:
       # shallower, because startup replays all of it and mutation energy is
       # split across all of it. Left alone this compounds every night.
       - if: success()
-        run: cargo +nightly fuzz cmin ${{ matrix.target }}
+        run: cargo +nightly-2026-07-15 fuzz cmin ${{ matrix.target }}
       # `fuzz/corpus/` is git-ignored and the cache expires, so without this a
       # month of scheduled runs leaves nothing behind. The artifact is what
       # somebody folds into the committed seed with `make fuzz-seed`.
       - if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}
           retention-days: 30
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/
@@ -126,7 +150,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: sudo apt-get update && sudo apt-get install -y mandoc
       # The manuals are the primary user documentation (SCOPE §9); keep them
       # parsing and conventional so they cannot rot unnoticed.
@@ -138,5 +162,5 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2

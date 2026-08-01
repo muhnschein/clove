@@ -425,12 +425,26 @@ impl Config {
         }
 
         let data_dir = data_dir.map_or_else(|| defaults.data_home.join("clove"), |(_, v)| v);
+        // `$XDG_RUNTIME_DIR/clove/clove.sock`, not `$XDG_RUNTIME_DIR/clove.sock`.
+        //
+        // The daemon's Landlock domain grants write access beneath the socket's
+        // *parent*, because it has to create, bind and unlink the socket there.
+        // With the socket sitting directly in `$XDG_RUNTIME_DIR`, that parent
+        // is the whole runtime directory — so a compromised daemon could write
+        // over every other same-user runtime object (another service's socket,
+        // its pid file, its state) despite the filesystem sandbox being on.
+        //
+        // A directory of its own makes the grant say what it means. The
+        // system-wide unit already did this with `RuntimeDirectory=clove`; this
+        // is the user-session default catching up, and it is why the two are
+        // now the same shape rather than the packaged one being quietly safer
+        // than the one everybody gets by default.
         let api_socket = api_socket.map_or_else(
             || {
-                defaults
-                    .runtime_dir
-                    .as_ref()
-                    .map_or_else(|| data_dir.join("clove.sock"), |dir| dir.join("clove.sock"))
+                defaults.runtime_dir.as_ref().map_or_else(
+                    || data_dir.join("clove.sock"),
+                    |dir| dir.join("clove/clove.sock"),
+                )
             },
             |(_, v)| v,
         );
@@ -710,7 +724,14 @@ mod tests {
         assert_eq!(c.seed_idle_minutes, 0);
         assert_eq!(c.watch_dir, None);
         assert_eq!(c.data_dir, PathBuf::from("/home/u/.local/share/clove"));
-        assert_eq!(c.api_socket, PathBuf::from("/run/user/1000/clove.sock"));
+        // In a directory of clove's own, not loose in `$XDG_RUNTIME_DIR`. The
+        // daemon's Landlock domain grants write access beneath the socket's
+        // parent, so a socket sitting directly in the runtime directory hands
+        // that grant every other same-user runtime object in it.
+        assert_eq!(
+            c.api_socket,
+            PathBuf::from("/run/user/1000/clove/clove.sock")
+        );
     }
 
     #[test]

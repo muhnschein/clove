@@ -161,7 +161,7 @@ Per-torrent state: the original
 resume data, and pending magnet URIs.
 .It Pa ~/.local/share/clove/downloads/
 Downloaded files.
-.It Pa $XDG_RUNTIME_DIR/clove.sock
+.It Pa $XDG_RUNTIME_DIR/clove/clove.sock
 Default control socket.
 .El
 .Sh EXAMPLES
@@ -171,11 +171,11 @@ $ cloved -C
 cloved: configuration OK
   config     /home/u/.config/clove/clove.conf (absent; using defaults)
   data_dir   /home/u/.local/share/clove
-  api_socket /run/user/1000/clove.sock
+  api_socket /run/user/1000/clove/clove.sock
   sam_address 127.0.0.1:7656
 $ cloved
 cloved: 3 torrent(s) loaded
-cloved: listening on /run/user/1000/clove.sock
+cloved: listening on /run/user/1000/clove/clove.sock
 cloved: router connected
 .Ed
 .Pp

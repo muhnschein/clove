@@ -7,7 +7,7 @@
 #   systemctl --user enable --now clove
 #
 # With no clove.conf, this uses ~/.local/share/clove for state and
-# $XDG_RUNTIME_DIR/clove.sock for the control socket, so `clove` finds the
+# $XDG_RUNTIME_DIR/clove/clove.sock for the control socket, so `clove` finds the
 # daemon with no arguments.
 #
 # NOTE ON SANDBOXING. The IPAddressDeny=/IPAddressAllow= filters in the

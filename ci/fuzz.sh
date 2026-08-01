@@ -23,6 +23,7 @@ TARGETS_ALL='bencode metainfo resume json http wire tracker extensions magnet'
 SCALE=1
 QUICK=no
 SEED=no
+CHECK_TARGETS=no
 TARGETS=''
 
 usage() {
@@ -35,6 +36,9 @@ usage: ci/fuzz.sh [options] [target...]
                 seed so the next run starts from what this one found
   --budget T    print target T's budget in seconds and exit; this is how CI
                 gets it, so the table below is the only copy of it
+  --check-targets
+                assert the manifest, this script and the CI matrix name the
+                same targets, then exit; runs on every push
   --out PATH    where to write the report (default fuzz/report-<stamp>.txt)
   -h, --help    this
 
@@ -50,6 +54,7 @@ while [ $# -gt 0 ]; do
         --quick) QUICK=yes; shift ;;
         --seed) SEED=yes; shift ;;
         --budget) BUDGET_OF="${2:?--budget needs a target}"; shift 2 ;;
+        --check-targets) CHECK_TARGETS=yes; shift ;;
         --out) OUT="${2:?--out needs a path}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         -*) echo "fuzz: unknown option $1" >&2; usage >&2; exit 2 ;;
@@ -113,6 +118,13 @@ budget_for() {
 # carries it and every target reports its peak against it.
 RSS_LIMIT=2048
 
+# Which nightly to use. Plain `nightly` locally, because that is what a
+# contributor has installed; CI passes the dated one it pins, so a crash it
+# finds can be reproduced on the toolchain that found it — "it crashed on
+# some nightly" is not a bug report anyone can act on. Every invocation
+# below goes through this.
+NIGHTLY="${FUZZ_TOOLCHAIN:-nightly}"
+
 # CI asks for the budget rather than carrying its own copy of the table. The
 # two used to be duplicated, with a comment in each telling the reader they
 # must agree — which is a rule somebody has to remember, on a file nobody edits
@@ -125,14 +137,54 @@ if [ -n "$BUDGET_OF" ]; then
     esac
 fi
 
+# Three lists have to agree: the binaries in fuzz/Cargo.toml, TARGETS_ALL
+# above, and the scheduled matrix in .github/workflows/ci.yml. They live in
+# three files and nothing made them agree, which is a rule somebody has to
+# remember on files nobody edits often.
+#
+# The cost of forgetting is silent and specific. A `keys` target was added,
+# built by CI on every push, and never fuzzed once — absent from both lists,
+# so `cargo check` compiled it and the scheduled job never ran it. It was
+# documented as the condition for keeping the code it covered. Nothing said
+# otherwise until somebody read all three files side by side.
+#
+# So: check it, cheaply, on every push.
+if [ "$CHECK_TARGETS" = yes ]; then
+    manifest=$(sed -n 's/^name = "\(.*\)"$/\1/p' fuzz/Cargo.toml | grep -v '^clove-fuzz$' | sort | tr '\n' ' ')
+    declared=$(echo "$TARGETS_ALL" | tr ' ' '\n' | sort | tr '\n' ' ')
+    matrix=$(sed -n '/^        target:$/,/^    steps:$/p' .github/workflows/ci.yml |
+        sed -n 's/^          - \(.*\)$/\1/p' | sort | tr '\n' ' ')
+    status=0
+    [ "$manifest" = "$declared" ] || {
+        echo "fuzz: fuzz/Cargo.toml and TARGETS_ALL disagree" >&2
+        echo "  manifest:    $manifest" >&2
+        echo "  TARGETS_ALL: $declared" >&2
+        status=1
+    }
+    [ "$matrix" = "$declared" ] || {
+        echo "fuzz: the scheduled matrix and TARGETS_ALL disagree" >&2
+        echo "  ci.yml:      $matrix" >&2
+        echo "  TARGETS_ALL: $declared" >&2
+        status=1
+    }
+    # A target with no dictionary is allowed — the run passes `-dict` only
+    # when the file exists — but it is worth saying, because a missing
+    # dictionary is usually an oversight rather than a decision.
+    for t in $TARGETS_ALL; do
+        [ -f "fuzz/dicts/$t.dict" ] || echo "fuzz: note: no dictionary for $t" >&2
+    done
+    [ "$status" -eq 0 ] && echo "fuzz: targets agree across the manifest, the script and CI"
+    exit "$status"
+fi
+
 for tool in cargo rustc; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "fuzz: $tool is not installed" >&2
         exit 1
     }
 done
-if ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
-    echo "fuzz: needs a nightly toolchain: rustup toolchain install nightly" >&2
+if ! rustup toolchain list 2>/dev/null | grep -q "^$NIGHTLY"; then
+    echo "fuzz: needs the $NIGHTLY toolchain: rustup toolchain install $NIGHTLY" >&2
     exit 1
 fi
 if ! command -v cargo-fuzz >/dev/null 2>&1; then
@@ -181,7 +233,7 @@ note "seeded    $(find fuzz/corpus -type f 2>/dev/null | wc -l | tr -d ' ') corp
 note ""
 
 say "fuzz: building targets"
-if ! cargo +nightly fuzz build >"$logs/build.log" 2>&1; then
+if ! cargo +"$NIGHTLY" fuzz build >"$logs/build.log" 2>&1; then
     say "fuzz: BUILD FAILED"
     note ""
     note "--- build output ---"
@@ -246,7 +298,7 @@ for t in $sched; do
     say "fuzz: $t (${secs}s)"
     (
         # shellcheck disable=SC2086  # $dict is one flag or nothing
-        cargo +nightly fuzz run "$t" -- $dict \
+        cargo +"$NIGHTLY" fuzz run "$t" -- $dict \
             -max_total_time="$secs" -rss_limit_mb="$RSS_LIMIT" -print_final_stats=1 \
             >"$logs/$t.log" 2>&1
         echo "$?" > "$logs/$t.status"
@@ -379,8 +431,8 @@ else
         note "target    $t"
         note "artifact  $a"
         note "size      $(wc -c < "$a" | tr -d ' ') bytes"
-        note "reproduce cargo +nightly fuzz run $t $a"
-        note "minimise  cargo +nightly fuzz tmin $t $a"
+        note "reproduce cargo +$NIGHTLY fuzz run $t $a"
+        note "minimise  cargo +$NIGHTLY fuzz tmin $t $a"
         note ""
         note "input (base64, so the report is enough to reconstruct it):"
         base64 < "$a" >> "$OUT"

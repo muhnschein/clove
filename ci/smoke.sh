@@ -25,7 +25,7 @@ XDG_DATA_HOME="$work/data"
 XDG_RUNTIME_DIR="$work/run"
 export XDG_DATA_HOME XDG_RUNTIME_DIR
 mkdir -p "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"
-sock="$XDG_RUNTIME_DIR/clove.sock"
+sock="$XDG_RUNTIME_DIR/clove/clove.sock"
 daemon_pid=""
 
 cleanup() {

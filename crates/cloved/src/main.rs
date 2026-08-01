@@ -194,6 +194,24 @@ fn run() -> Result<(), String> {
     if let Some(parent) = config.api_socket.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating socket dir {}: {e}", parent.display()))?;
+        // 0700 where clove made the directory itself. The Landlock domain
+        // grants write access beneath this path — it has to, since the socket
+        // is created, bound and unlinked here — so the directory's own
+        // permissions are what stop anyone else using that grant's blast
+        // radius. Best-effort, because an operator who pointed `api_socket` at
+        // a shared directory has said something deliberate, and the socket
+        // itself is still the thing the token protects.
+        if parent != config.data_dir
+            && let Err(e) = std::fs::set_permissions(
+                parent,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+        {
+            eprintln!(
+                "cloved: could not restrict the socket directory {} to 0700: {e}",
+                parent.display()
+            );
+        }
     }
     let token = load_or_create_token(&config.data_dir).map_err(|e| e.to_string())?;
 

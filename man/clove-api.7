@@ -279,7 +279,7 @@ Query status with
 .Xr curl 1 :
 .Bd -literal -offset indent
 $ tok=$(cat ~/.local/share/clove/token)
-$ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
+$ curl -s --unix-socket $XDG_RUNTIME_DIR/clove/clove.sock \e
     -H "X-Clove-Token: $tok" http://clove/v1/status
 {"version":"0.1.0","uptime_secs":842,"sam_address":"127.0.0.1:7656",
  "torrents":3,"router":"connected"}
@@ -287,7 +287,7 @@ $ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
 .Pp
 Add a torrent file:
 .Bd -literal -offset indent
-$ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
+$ curl -s --unix-socket $XDG_RUNTIME_DIR/clove/clove.sock \e
     -H "X-Clove-Token: $tok" --data-binary @release.torrent \e
     http://clove/v1/torrents
 {"info_hash":"58e2fc46a8dc57c78191f079648750b0644d03a2"}
@@ -295,7 +295,7 @@ $ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
 .Pp
 Add a magnet:
 .Bd -literal -offset indent
-$ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
+$ curl -s --unix-socket $XDG_RUNTIME_DIR/clove/clove.sock \e
     -H "X-Clove-Token: $tok" \e
     --data-binary 'magnet:?xt=urn:btih:58e2fc46a8dc57c78191f079648750b0644d03a2' \e
     http://clove/v1/torrents
@@ -305,7 +305,7 @@ $ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
 .Pp
 Skip the first file of a three-file torrent:
 .Bd -literal -offset indent
-$ curl -s -X PUT --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
+$ curl -s -X PUT --unix-socket $XDG_RUNTIME_DIR/clove/clove.sock \e
     -H "X-Clove-Token: $tok" --data-binary '0,1,1' \e
     http://clove/v1/torrents/58e2fc46a8dc57c78191f079648750b0644d03a2/priorities
 {"ok":true}
@@ -313,7 +313,7 @@ $ curl -s -X PUT --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
 .Pp
 Remove a torrent and its data:
 .Bd -literal -offset indent
-$ curl -s -X DELETE --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
+$ curl -s -X DELETE --unix-socket $XDG_RUNTIME_DIR/clove/clove.sock \e
     -H "X-Clove-Token: $tok" \e
     'http://clove/v1/torrents/58e2fc46a8dc57c78191f079648750b0644d03a2?data=1'
 {"ok":true}
@@ -321,7 +321,7 @@ $ curl -s -X DELETE --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
 .Pp
 A missing token is refused:
 .Bd -literal -offset indent
-$ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock http://clove/v1/status
+$ curl -s --unix-socket $XDG_RUNTIME_DIR/clove/clove.sock http://clove/v1/status
 {"error":"missing or invalid API token"}
 .Ed
 .Sh SEE ALSO
