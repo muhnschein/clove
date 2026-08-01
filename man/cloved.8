@@ -166,8 +166,21 @@ cloved: configuration OK
 $ cloved
 cloved: 3 torrent(s) loaded
 cloved: listening on /run/user/1000/clove.sock
-cloved: router connected; we are asubu6d7wsbj7x7b7agamhimpmnlr3ezb7qu5zh2jllyalblxdpq.b32.i2p
+cloved: router connected
 .Ed
+.Pp
+No destination appears in that output, and none appears later: neither
+.Nm
+nor
+.Xr clove 1
+writes its own destination or a peer's to a log, an error or the control
+API.
+A destination in a journal is a stable handle that links every line
+carrying it to one identity, and shortening or hashing one does not help
+— a
+.Pa .b32.i2p
+address already is a hash of the destination behind it.
+Ask the router for the identity it holds if you need it.
 .Pp
 Run under a user service manager:
 .Bd -literal -offset indent

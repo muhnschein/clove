@@ -472,9 +472,19 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str, identity: Ident
                     }
                 }
             };
-            let dest = session.local_dest();
             let forward_port = listener.local_port();
-            eprintln!("cloved: router connected; we are {}", dest.to_b32());
+            // Not "we are <b32>". Our destination is persistent by default, so
+            // that line put a stable correlation identifier into stderr — and
+            // from there into journals, log shippers, backups and any support
+            // bundle built from them. `SECURITY.md` calls the client's
+            // destination reaching a log leak-class, the highest severity here.
+            //
+            // Truncating or hashing it is not a fix: a b32 address already *is*
+            // base32(SHA-256(destination)), so any shortening of it is still a
+            // stable handle that links every line carrying it to one identity.
+            // The only version of this line that does not leak is one that does
+            // not carry the destination at all.
+            eprintln!("cloved: router connected");
             // Only now, with the router having accepted it: a key that failed
             // SESSION CREATE is not one worth keeping.
             identity.remember(session.private_key_b64());

@@ -378,18 +378,15 @@ $ curl --unix-socket ~/.local/share/clove/clove.sock \e
 .Ed
 .Pp
 The second connects two instances directly, without a tracker.
-The first host's destination is the one
-.Xr cloved 8
-prints when it connects to the router
-.Pq Dq we are ... .b32.i2p ;
-it is deliberately not served by
-.Cm status ,
-so that reading a torrent listing never hands out an identity.
-On the second host:
+clove never prints, serves or logs a destination — neither its own nor a
+peer's — so the first host's address does not come from clove.
+It comes from the router that owns the identity: both i2pd and Java I2P
+list the destination of each SAM session in their console.
+Paste that into the second host:
 .Bd -literal -offset indent
 $ curl --unix-socket ~/.local/share/clove/clove.sock \e
     -H "X-Clove-Token: $(cat ~/.local/share/clove/token)" \e
-    -X POST --data asubu6d7wsbj7x7b7agamhimpmnlr3ezb7qu5zh2jllyalblxdpq.b32.i2p \e
+    -X POST --data "$FIRST_HOST_DESTINATION" \e
     http://clove/v1/torrents/58e2.../peers
 .Ed
 .Pp

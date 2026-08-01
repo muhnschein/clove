@@ -422,13 +422,20 @@ where
     // a tracker that accepted the stream and then went quiet held this thread
     // — and with it this torrent's announces — for the life of the process.
     let _ = stream.set_timeouts(Some(tracker::ANNOUNCE_IO_TIMEOUT));
-    // Which destination the host resolved to, on every announce that then
-    // goes wrong. A tracker answering 200 with somebody else's web page is
-    // indistinguishable from a tracker that is broken, unless you can see
-    // that the name resolved somewhere unexpected — and an address book is a
-    // file of assertions, not a fact.
+    // This used to also print which destination `host` resolved to, so that a
+    // tracker answering 200 with somebody else's page could be told apart from
+    // a tracker that is simply broken. The diagnosis was real; the price was
+    // not worth paying. A tracker chooses whether an announce fails — it can
+    // accept one and refuse it at will — so it chose when that line ran, and
+    // therefore which destinations were written to our log. That is the
+    // leak-class pattern `SECURITY.md` names, with a remote party holding the
+    // trigger.
+    //
+    // The failed URL stays, because it is ours and it is already redacted of
+    // the one field that is an identity (`ip`, our full destination — see
+    // `tracker::announced_url`). Which name misresolved is answerable without
+    // us logging it, by asking the router to resolve it again.
     let response = tracker::announce_over(&mut stream, &request).inspect_err(|_| {
-        eprintln!("clove: {host} resolved to {}", dest.to_b32());
         eprintln!(
             "clove: the announce that failed was {}",
             tracker::announced_url(&host, &request)

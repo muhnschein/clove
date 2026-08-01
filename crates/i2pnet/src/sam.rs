@@ -250,7 +250,18 @@ fn dial_stream(
         Some(deadline),
         "STREAM CONNECT",
     )?;
-    expect_stream_ok(&status, &format!("the stream to {}", peer.to_b32()))?;
+    // Not `the stream to <peer b32>`. This error is returned to the engine,
+    // which prints it and persists it in a torrent's `last_error`, which the
+    // control API then serves — so naming the peer here put a destination into
+    // all three places `SECURITY.md` lists. Worse, a tracker chooses which
+    // peers we dial, so a tracker chose which destinations were recorded.
+    //
+    // Removing it at the consumer is not enough and was tried: the address is
+    // created here, so anything downstream that formats this error re-leaks it.
+    // The router's own RESULT= word and MESSAGE survive below, which is the
+    // part that says what happened; which peer it happened to is not something
+    // an operator can act on anyway.
+    expect_stream_ok(&status, "the peer stream")?;
 
     // Handshake done; the socket is now the peer stream. Clear the deadlines
     // the handshake needed — the engine sets its own per-peer timeouts, and a
@@ -1444,13 +1455,25 @@ mod hostile_bridge_tests {
     /// A router refusing one peer is ordinary on I2P. It must read as "this
     /// peer, this time", carry the router's own words, and leave nothing
     /// behind — the failure that used to poison the whole session.
+    ///
+    /// And it must not name the peer. This test used to assert the opposite,
+    /// which is how the leak survived: `dial_stream`'s error is printed and
+    /// persisted by the daemon, so requiring the address here required it in a
+    /// log and in the control API's `last_error` too.
     #[test]
     fn a_refused_dial_reports_the_routers_own_words_and_costs_nothing_else() {
         let port = dial_bridge("STREAM STATUS RESULT=CANT_REACH_PEER\n", false);
         let e = dial_stream(port, "clove-test", PEER, PROBE).expect_err("refused");
         assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
         assert!(e.to_string().contains("CANT_REACH_PEER"), "{e}");
-        assert!(e.to_string().contains(&PEER.to_b32()), "{e}");
+
+        let addr = PEER.to_b32();
+        let label = addr.trim_end_matches(".b32.i2p");
+        assert!(!e.to_string().contains(&addr), "the peer's address is in: {e}");
+        assert!(
+            !e.to_string().contains(label),
+            "the peer's b32 label is in: {e}"
+        );
 
         // And the next dial on the same session id works, because the two
         // share no state at all.
