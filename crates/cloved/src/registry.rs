@@ -2220,14 +2220,50 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 /// Write `bytes` to `path` atomically: a sibling temp file, fsynced, then
 /// renamed over `path` (atomic on the same filesystem).
+///
+/// The temp file is created, never opened: `File::create` truncates whatever
+/// it finds and follows a symlink to do it, so a pre-placed link at a
+/// predictable `<path>.tmp` would have been written *through*, letting another
+/// local user pick a file for the daemon to overwrite. `create_new` refuses to
+/// open anything that already exists, symlink included, which is the property
+/// that matters; the random suffix means an attacker cannot even reserve the
+/// name to turn every save into an error. Same discipline as
+/// `write_private_file` in main.rs, which the token and the destination key
+/// already used — this is the file written most often, and it had the weaker
+/// of the two.
+///
+/// 0600 because the mode survives the rename, and nothing outside this process
+/// reads a state file.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-    {
-        let mut file = fs::File::create(&tmp)?;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut suffix = [0u8; 8];
+    getrandom::getrandom(&mut suffix)
+        .map_err(|e| io::Error::other(format!("getrandom for a temp file name: {e}")))?;
+    let tmp = PathBuf::from(format!(
+        "{}.{:016x}.tmp",
+        path.display(),
+        u64::from_le_bytes(suffix)
+    ));
+    // A random name cannot be reused by the next attempt, so a failure partway
+    // through would leave the temp file behind for ever rather than being
+    // overwritten next time. Cleaned up on every path out but the successful
+    // one, where the rename consumed it.
+    let write = |tmp: &Path| -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        drop(file);
+        fs::rename(tmp, path)
+    };
+    if let Err(e) = write(&tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::rename(&tmp, path)?;
     // The rename is atomic, but it only survives a power cut once the
     // directory entry itself is on the disk. Best-effort: filesystems that
     // refuse to fsync a directory leave us exactly where we were.
@@ -3443,5 +3479,61 @@ mod tests {
             registry.resolve(prefix),
             Err(ResolveError::NotFound)
         ));
+    }
+
+    /// State was written through a sibling `<path>.tmp` opened with
+    /// `File::create`, which truncates what it finds and follows a symlink to
+    /// do it. The name was derivable from the state path, so another local
+    /// user who could write to the directory could choose a file for the
+    /// daemon to destroy — and the data directory is only reliably ours
+    /// because startup now insists on it, which is a second lock, not a
+    /// reason to leave this one open.
+    #[test]
+    fn a_state_write_does_not_truncate_a_file_planted_at_the_temp_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("atomic-write");
+        let target = dir.0.join("precious");
+        std::fs::write(&target, b"do not truncate me").expect("write target");
+
+        let state = dir.0.join("state");
+        // Exactly the name the old writer used, and the only one it ever used.
+        std::os::unix::fs::symlink(&target, dir.0.join("state.tmp")).expect("symlink");
+
+        atomic_write(&state, b"new state").expect("write");
+
+        assert_eq!(
+            std::fs::read(&target).expect("re-read"),
+            b"do not truncate me",
+            "the planted symlink's target was written through"
+        );
+        assert_eq!(std::fs::read(&state).expect("state"), b"new state");
+
+        let mode = std::fs::metadata(&state)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the state file is not private");
+
+        // The planted link is still a link: nothing followed it, and nothing
+        // replaced it either.
+        assert!(
+            std::fs::symlink_metadata(dir.0.join("state.tmp"))
+                .expect("stat link")
+                .file_type()
+                .is_symlink()
+        );
+
+        // A successful write consumes its own temp file. The random suffix
+        // means a stray one would never be reused, so leaving one behind
+        // accumulates rather than being overwritten next time.
+        let strays: Vec<_> = std::fs::read_dir(&dir.0)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp") && name != "state.tmp")
+            .collect();
+        assert!(strays.is_empty(), "left temp files behind: {strays:?}");
     }
 }
