@@ -310,12 +310,20 @@ fn scan_watch_dir(daemon: &Arc<Daemon>, dir: &Path) {
             continue;
         }
 
+        // Every name below is used with `*at` calls against `dir_fd`, so it
+        // must be a single path component and nothing else. `read_dir` cannot
+        // hand back a name containing a separator, and `.`/`.` do not end in
+        // `.torrent` — so this is an invariant being stated rather than a hole
+        // being closed. Stated anyway: the alternative is three syscalls whose
+        // safety rests on a property of `readdir` that a reader has to know,
+        // and the check costs one pass over a short string.
+        let Some(name) = name.to_str().filter(|n| is_one_path_component(n)) else {
+            continue;
+        };
+
         // Claim it first. After this rename the name is ours: whatever else
         // holds the directory open cannot substitute the contents of the file
         // we are about to read, and a second daemon's rename fails.
-        let Some(name) = name.to_str() else {
-            continue;
-        };
         let claimed = format!("{name}.claimed");
         if rustix::fs::renameat(&dir_fd, name, &dir_fd, claimed.as_str()).is_err() {
             // Somebody else got there first, or it vanished. Either way it is
@@ -337,6 +345,23 @@ fn scan_watch_dir(daemon: &Arc<Daemon>, dir: &Path) {
             eprintln!("cloved: leaving {} where it is: {e}", path.display());
         }
     }
+}
+
+/// True when `name` can only ever name something *directly inside* the
+/// directory it is resolved against.
+///
+/// The watcher resolves names with `openat` and `renameat` relative to the
+/// watch directory's own descriptor, which confines them there — but only for
+/// names that are a single component. This is what makes that true rather than
+/// assumed, and it is the same rule `metainfo::check_component` applies to
+/// paths out of a `.torrent`, for the same reason.
+fn is_one_path_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
 }
 
 /// Read a claimed watch-directory entry, refusing anything that is not a
