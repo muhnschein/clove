@@ -1,0 +1,32 @@
+# Pins that nobody updates are their own hazard: an action frozen at a commit
+# is frozen at that commit's bugs too. Every execution input in ci.yml is
+# pinned to an exact SHA or version, so the only sustainable way to keep them
+# current is to have the updates arrive as reviewable pull requests rather
+# than as a tag someone else moved under us.
+#
+# Cargo is here for the same reason and a different risk: Cargo.lock is
+# committed and cargo-deny checks it against the RustSec advisory database on
+# every push, so an advisory published against a locked version should turn
+# into a pull request rather than into a red build nobody expected.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # The dependency budget (docs/SCOPE.md §9) is a deliberate constraint, so
+    # a new transitive dependency is a decision and not a chore. Version bumps
+    # of what is already here are the useful half.
+    open-pull-requests-limit: 5
+  # The fuzz crate has its own lockfile and is outside the workspace.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2

@@ -35,6 +35,9 @@ usage: ci/fuzz.sh [options] [target...]
                 seed so the next run starts from what this one found
   --budget T    print target T's budget in seconds and exit; this is how CI
                 gets it, so the table below is the only copy of it
+  --check-targets
+                check that the four places a target has to be listed agree,
+                and exit
   --out PATH    where to write the report (default fuzz/report-<stamp>.txt)
   -h, --help    this
 
@@ -44,12 +47,14 @@ USAGE
 
 OUT=''
 BUDGET_OF=''
+CHECK_TARGETS=no
 while [ $# -gt 0 ]; do
     case "$1" in
         --scale) SCALE="${2:?--scale needs a number}"; shift 2 ;;
         --quick) QUICK=yes; shift ;;
         --seed) SEED=yes; shift ;;
         --budget) BUDGET_OF="${2:?--budget needs a target}"; shift 2 ;;
+        --check-targets) CHECK_TARGETS=yes; shift ;;
         --out) OUT="${2:?--out needs a path}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         -*) echo "fuzz: unknown option $1" >&2; usage >&2; exit 2 ;;
@@ -112,6 +117,45 @@ budget_for() {
 # here, and nothing in the report said what the ceiling was. Now the header
 # carries it and every target reports its peak against it.
 RSS_LIMIT=2048
+
+# The four places a fuzz target has to be named, checked against each other.
+#
+# `keys` was defined in fuzz/Cargo.toml, documented as the reason a
+# hand-written decoder could stay, compiled by CI on every push — and absent
+# from TARGETS_ALL and from the scheduled matrix, so it was never actually
+# fuzzed. Nothing was wrong with any one file; they had simply drifted, and
+# noticing required reading four of them together. That target has since gone
+# with the code it covered, but the way it went unnoticed has not.
+#
+# So: the manifest is the source of truth, and everything else must match it.
+# A target that is built but never run is the failure this catches; a
+# dictionary that is missing is the other, since the scheduled command passes
+# -dict unconditionally and would simply fail.
+check_targets() {
+    manifest=$(sed -n 's/^name = "\(.*\)"$/\1/p' fuzz/Cargo.toml | sed 1d | sort | tr '\n' ' ')
+    listed=$(echo "$TARGETS_ALL" | tr ' ' '\n' | sort | tr '\n' ' ')
+    matrix=$(sed -n '/^ *target:$/,/^ *steps:$/p' .github/workflows/ci.yml \
+        | sed -n 's/^ *- \([a-z_]*\)$/\1/p' | sort | tr '\n' ' ')
+    dicts=$(ls fuzz/dicts/*.dict 2>/dev/null | sed 's|.*/||; s|\.dict$||' | sort | tr '\n' ' ')
+
+    status=0
+    for what in listed matrix dicts; do
+        eval "have=\$$what"
+        if [ "$have" != "$manifest" ]; then
+            echo "fuzz: $what does not match fuzz/Cargo.toml" >&2
+            echo "  manifest: $manifest" >&2
+            echo "  $what: $have" >&2
+            status=1
+        fi
+    done
+    [ "$status" -eq 0 ] && echo "fuzz: targets agree ($manifest)"
+    return "$status"
+}
+
+if [ "$CHECK_TARGETS" = yes ]; then
+    check_targets
+    exit $?
+fi
 
 # CI asks for the budget rather than carrying its own copy of the table. The
 # two used to be duplicated, with a comment in each telling the reader they

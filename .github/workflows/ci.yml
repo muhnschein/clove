@@ -18,7 +18,7 @@ jobs:
     # six-hour ceiling. Tier-1 runs in well under a minute today.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The pinned toolchain comes from rust-toolchain.toml; rustup installs
       # it (with clippy + rustfmt) on the first cargo invocation. Do not
       # `rustup update stable` here — that would defeat the pin.
@@ -32,6 +32,12 @@ jobs:
       # takes seconds and needs no nightly toolchain — only running the fuzzer
       # does.
       - run: cargo check --manifest-path fuzz/Cargo.toml
+      # A target can be defined, documented and compiled while never actually
+      # being fuzzed, because the four places it has to be named are four
+      # files nobody reads together. That is how `keys` went a release without
+      # a single coverage-guided run. Checked here rather than in the
+      # scheduled job, so the answer arrives on the push that breaks it.
+      - run: ./ci/fuzz.sh --check-targets
       - run: ./ci/check-net-deps.sh
       # End-to-end: drive the real binaries as an operator does. Unit tests
       # cannot see whole-process faults (the Phase-F registry deadlocks
@@ -76,28 +82,38 @@ jobs:
           - resume
           - magnet
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The committed seed corpus starts each run warm; this carries what the
       # run *discovers* to the next one. Without it every scheduled run spends
       # much of its budget rediscovering that input has to be bencode at all,
       # which is the difference between fuzzing the parser and fuzzing the
       # question of whether the input is a torrent.
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
-      - run: rustup toolchain install nightly
-      - run: cargo install cargo-fuzz --locked
+      # Dated, not bare `nightly`: a scheduled job that installs whatever
+      # nightly exists tonight is a job whose compiler is a moving input, so a
+      # new crash cannot be told apart from a new compiler. Bumped as a
+      # reviewed change, like every other pin here.
+      - run: rustup toolchain install nightly-2026-07-15
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
       # Committed seeds on top of whatever the cache restored: the cache can be
       # evicted or cold, and a run that starts from nothing is a slower run.
       - run: tar xzf fuzz/seed-corpus.tar.gz -C fuzz -k || true
       - run: |
           secs=$(./ci/fuzz.sh --budget ${{ matrix.target }})
           echo "budget: ${{ matrix.target }} ${secs}s"
-          cargo +nightly fuzz run ${{ matrix.target }} -- \
-            -dict=fuzz/dicts/${{ matrix.target }}.dict \
+          dict=fuzz/dicts/${{ matrix.target }}.dict
+          # Only when it exists. ci/fuzz.sh --check-targets requires one per
+          # target, so this should never be taken — but an unconditional
+          # -dict turns "a target has no dictionary yet" into a job that fails
+          # on a libFuzzer argument, which is a confusing way to be told.
+          [ -f "$dict" ] || dict=/dev/null
+          cargo +nightly-2026-07-15 fuzz run ${{ matrix.target }} -- \
+            -dict="$dict" \
             -max_total_time="$secs"
       # Minimise before the cache is written, not after it is read. libFuzzer
       # keeps an input for reaching a new execution-count bucket, not a new
@@ -106,18 +122,18 @@ jobs:
       # shallower, because startup replays all of it and mutation energy is
       # split across all of it. Left alone this compounds every night.
       - if: success()
-        run: cargo +nightly fuzz cmin ${{ matrix.target }}
+        run: cargo +nightly-2026-07-15 fuzz cmin ${{ matrix.target }}
       # `fuzz/corpus/` is git-ignored and the cache expires, so without this a
       # month of scheduled runs leaves nothing behind. The artifact is what
       # somebody folds into the committed seed with `make fuzz-seed`.
       - if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}
           retention-days: 30
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/
@@ -126,7 +142,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: sudo apt-get update && sudo apt-get install -y mandoc
       # The manuals are the primary user documentation (SCOPE §9); keep them
       # parsing and conventional so they cannot rot unnoticed.
@@ -138,5 +154,5 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2

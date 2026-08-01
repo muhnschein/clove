@@ -39,6 +39,32 @@ for crate in $DENY; do
     fi
 done
 
+# Every crate in the lockfile must be one somebody has looked at.
+#
+# The denylist above can only catch crates we already knew to name. This
+# catches the rest: any crate name in Cargo.lock that is not in
+# ci/deps-allowed.txt fails, so a new dependency cannot enter the tree —
+# directly or three levels down — without a commit that says so. That is the
+# check that would have had to be passed by a *renamed* or newly published
+# networking crate, which is exactly the gap the denylist leaves.
+allowlist="$(dirname "$0")/deps-allowed.txt"
+if [ -f "$allowlist" ]; then
+    known=$(sed 's/#.*//' "$allowlist" | tr -d '\r' | awk 'NF')
+    for crate in $(sed -n 's/^name = "\(.*\)"$/\1/p' "$lock" | sort -u); do
+        found=no
+        for ok in $known; do
+            [ "$crate" = "$ok" ] && { found=yes; break; }
+        done
+        if [ "$found" = no ]; then
+            echo "FAIL: '$crate' is in $lock but not in ci/deps-allowed.txt; add it there with a DEPENDENCIES.md entry in the same commit" >&2
+            status=1
+        fi
+    done
+else
+    echo "check-net-deps: $allowlist not found" >&2
+    status=1
+fi
+
 # Allowlisting a crate says "we reviewed its presence", which is not the same
 # as "it cannot open a socket here". `rustix` is the case that makes the
 # difference visible: it is in the tree for `openat`, and its networking is one

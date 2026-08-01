@@ -6,6 +6,14 @@ Adding one requires a PR that updates this file; if it has any socket
 capability it must also be added to `ci/check-net-deps.sh` in the same
 commit. Closure sizes are recorded when the dependency is actually added.
 
+Every crate name in `Cargo.lock` — transitive ones included — must also
+appear in `ci/deps-allowed.txt`, which CI enforces. The socket denylist in
+`ci/check-net-deps.sh` can only recognise crates somebody already thought to
+name, so a new or renamed networking crate walks past it; the lockfile
+allowlist asks the question that is actually answerable, which is whether a
+human looked at this crate at all. Regenerate it deliberately, as part of
+reviewing what changed, never as a reflex to make the build pass.
+
 ## Current
 
 - **`sha1` 0.11** (RustCrypto, `clove-core`) — entered Phase A (info-hash

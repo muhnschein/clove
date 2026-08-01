@@ -1,0 +1,67 @@
+# Every crate name that may appear in Cargo.lock.
+#
+# The denylist in ci/check-net-deps.sh asks "is this one of the crates we know
+# opens sockets?", which is a question only answerable about crates somebody
+# already thought of. A crate that is new, renamed, or simply never considered
+# passes it — and the script's own comment concedes as much.
+#
+# This asks the answerable question instead: did a human look at this crate at
+# all? Anything in the lockfile that is not named here fails the build, so a
+# new dependency — direct or transitive, socket-capable or not — cannot arrive
+# without an edit to this file in the same commit, next to the DEPENDENCIES.md
+# entry that says why it is here. The denylist stays as the fast, specific
+# check it is; this is the one that holds for crates nobody thought to name.
+#
+# Regenerate deliberately, never reflexively:
+#   sed -n 's/^name = "\(.*\)"$/\1/p' Cargo.lock | sort -u
+#
+# One name per line. Blank lines and # comments are ignored.
+bitflags
+block-buffer
+cfg-if
+clove
+clove-core
+cloved
+const-oid
+cpufeatures
+crypto-common
+digest
+enumflags2
+enumflags2_derive
+errno
+getrandom
+hybrid-array
+i2pnet
+landlock
+libc
+linux-raw-sys
+log
+memchr
+minimal-lexical
+nom
+once_cell
+pin-project-lite
+ppv-lite86
+proc-macro2
+quote
+rand
+rand_chacha
+rand_core
+rustix
+seccompiler
+sha1
+sha2
+syn
+thiserror
+thiserror-impl
+tracing
+tracing-attributes
+tracing-core
+typenum
+unicode-ident
+wasi
+windows-link
+windows-sys
+yosemite
+zerocopy
+zerocopy-derive
