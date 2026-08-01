@@ -382,6 +382,20 @@ done
 # otherwise disagree with no error either way.
 cp "$work/demo.torrent" "$wdir/dropped.torrent"
 printf 'not a torrent at all' >"$wdir/junk.torrent"
+
+# Dropping a torrent here takes the place of the API token, so the watcher
+# has to be as careful with what it finds as the API is with what it is sent.
+# Two entries nothing should ever read:
+#
+#   - a symlink at a .torrent name, pointed at a file the daemon can read.
+#     Followed, this is an arbitrary-file read bounded only by the file's
+#     size, requested by whoever can write to this directory.
+#   - a file over the API's own body limit. The watcher used to have no limit
+#     at all, so this was read into memory whole.
+ln -s "$work/demo.torrent" "$wdir/symlinked.torrent"
+head -c 3000000 /dev/zero >"$wdir/huge.torrent" 2>/dev/null \
+    || dd if=/dev/zero of="$wdir/huge.torrent" bs=1024 count=3000 2>/dev/null
+
 i=0
 until [ -f "$wdir/dropped.torrent.added" ] && [ -f "$wdir/junk.torrent.rejected" ]; do
     i=$((i + 1))
@@ -392,6 +406,13 @@ expect_contains "$(timeout 5 "$clove" -c "$work/watch.conf" list)" "smoke.txt" \
     "the dropped torrent was added"
 # Renamed, so it is offered once rather than every few seconds forever.
 [ ! -f "$wdir/dropped.torrent" ] || fail "the taken file was left in place"
+
+# Neither refused entry may end up added. Both are claimed (renamed to
+# .taken) so they are not retried every tick, and neither becomes .added.
+[ ! -f "$wdir/symlinked.torrent.added" ] || fail "the watcher followed a symlink"
+[ ! -f "$wdir/huge.torrent.added" ] || fail "the watcher read past its size limit"
+expect_contains "$(cat "$work/daemon-watch.log")" "symlink" \
+    "the symlinked entry was refused for being one"
 
 echo "smoke: add --paused and --sequential apply at add time"
 flagged=$(run add --paused --sequential "$work/second.torrent") || fail "add with flags failed"

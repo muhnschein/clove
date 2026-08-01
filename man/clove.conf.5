@@ -237,6 +237,27 @@ torrent about to spend minutes building tunnels.
 .Pp
 This is how other tooling drives clove without an API of its own.
 The daemon needs write access to the directory, since it renames what it takes.
+.Pp
+Because it is an alternative to the API, write access to this directory
+.Em is
+the authorisation: anything dropped here is added without the API token.
+The daemon therefore refuses to start unless the directory is a real
+directory (not a symlink), owned by the user the daemon runs as, and not
+writable by group or others.
+A directory anyone else can write to would let them add torrents, and no
+warning in a log would be read in time.
+.Pp
+Each entry is claimed by renaming it to
+.Pa .torrent.taken
+before it is opened, so a file still being written is not read half-finished
+and no entry is taken twice.
+It is then opened relative to the directory with
+.Dv O_NOFOLLOW ,
+must be a regular file, and must be no larger than the 2 MiB limit the API
+applies to a posted
+.Pa .torrent .
+A symlink, a device node, or an oversized file is refused and left as
+.Pa .torrent.taken .
 .El
 .Sh EXAMPLES
 The recommended configuration is no file at all.
