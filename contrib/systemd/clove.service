@@ -91,9 +91,18 @@ SystemCallErrorNumber=EPERM
 # Layer 1 are unaffected.
 
 # --- Resources ---
-# clove is thread-per-peer; the default file limit is ample for I2P swarm
-# sizes, but pin something explicit rather than inherit a surprise.
-LimitNOFILE=8192
+# clove is thread-per-peer; pin something explicit rather than inherit a
+# surprise. The number is the product the daemon can actually reach, not a
+# round one: `max_active_downloads` + `max_active_seeds` torrents open at
+# once (3 + 5 by default), each holding one descriptor per *non-empty* file
+# up to `metainfo::MAX_FILES` (4096), plus `peer_limit` peer sockets (200)
+# and the handful for the API socket, state and the SAM session.
+#
+# 8 * 4096 + 200 is a shade over 32k, so 65536 leaves the headroom this used
+# to lack: at 8192 a single torrent of 8,192 files reached the limit on its
+# own, which is what made the metainfo fan-out worth bounding in the first
+# place. Both halves matter — raise this and the fan-out cap still holds.
+LimitNOFILE=65536
 TasksMax=1024
 
 [Install]

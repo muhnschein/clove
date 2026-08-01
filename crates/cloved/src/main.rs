@@ -85,17 +85,27 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Args, String> 
     Ok(Args { check, config_path })
 }
 
+/// Read the configuration text `-c` names, or the default path's.
+///
+/// An explicit `-c` must exist and be readable. The default path may simply
+/// be absent, in which case the built-in defaults are the whole
+/// configuration — but *only* absent: every other failure is fatal, because
+/// treating an unreadable `clove.conf` as an empty one silently discards
+/// whatever the operator put in it (`config::read_default_config`).
+fn read_config(config_path: Option<&Path>, defaults: &Defaults) -> Result<String, String> {
+    if let Some(path) = config_path {
+        return std::fs::read_to_string(path)
+            .map_err(|e| format!("reading {}: {e}", path.display()));
+    }
+    let path = defaults.config_path();
+    clove_core::config::read_default_config(&path)
+        .map_err(|e| format!("reading {}: {e}", path.display()))
+}
+
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     let defaults = Defaults::from_env().map_err(|e| e.to_string())?;
-    // An explicit -c must exist; the default path may simply be absent, in
-    // which case the built-in defaults are the whole configuration.
-    let text = match &args.config_path {
-        Some(path) => {
-            std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?
-        }
-        None => std::fs::read_to_string(defaults.config_path()).unwrap_or_default(),
-    };
+    let text = read_config(args.config_path.as_deref(), &defaults)?;
     let config = Config::parse(&text, &defaults).map_err(|e| e.to_string())?;
 
     if args.check {
@@ -980,9 +990,25 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response 
             // the whole torrent, and every other request would otherwise wait
             // for it. The torrent is registered and marked "verifying" already,
             // so it shows up in `clove list` while this happens.
-            // The add already succeeded; a scan that fails only means the
-            // torrent shows nothing on disk, which `clove verify` can retry.
-            let _ = run_scan(daemon, &job);
+            //
+            // A failed scan used to be discarded here, and the answer was 201
+            // regardless. That reported success for an add that had laid down
+            // no files and could lay down none — a full disk, a read-only
+            // downloads directory, a descriptor limit reached — and the caller
+            // had no way to tell that from an add that worked. The torrent is
+            // deliberately left registered either way, because it is
+            // recoverable: `clove verify` retries the pass once the cause is
+            // fixed. What changes is that the operator is told.
+            if let Err(e) = run_scan(daemon, &job) {
+                eprintln!(
+                    "cloved: {} added, but its files could not be laid out: {e}",
+                    registry::hex(&info_hash)
+                );
+                return error(
+                    500,
+                    &format!("torrent added, but its files could not be laid out: {e}"),
+                );
+            }
             let body = Value::Object(vec![(
                 "info_hash".to_owned(),
                 Value::from(registry::hex(&info_hash)),

@@ -22,7 +22,20 @@ use crate::metainfo::MetaInfo;
 
 /// One file's placement in the torrent's global byte space.
 struct Region {
-    file: File,
+    /// `None` for a zero-length file.
+    ///
+    /// A zero-length entry occupies no bytes, so no piece ever intersects it
+    /// and `for_each_segment` skips it unconditionally — the descriptor was
+    /// opened, kept for the life of the torrent, and never read or written
+    /// through. Keeping it cost the one resource this module is stingy with.
+    ///
+    /// It is not a theoretical saving. Zero-length files are legal, and a
+    /// torrent is free to be almost entirely made of them: the fan-out
+    /// proof-of-concept behind `MAX_FILES` was one 1-byte file and 8,191 empty
+    /// ones, which is to say 8,191 descriptors that could never be used for
+    /// anything. The file is still *created* — it is part of the torrent and
+    /// the operator expects it on disk — it is simply closed again.
+    file: Option<File>,
     /// Global offset of this file's first byte.
     global_start: u64,
     /// File length in bytes.
@@ -54,9 +67,17 @@ impl Storage {
             // symlinked component is refused by the kernel rather than by a
             // check that could be stale by the time we act on it.
             let file = open_beneath(root, &entry.path)?;
-            if preallocate && entry.length > 0 {
-                file.set_len(entry.length)?;
-            }
+            let file = if entry.length == 0 {
+                // Created, then closed: nothing will ever be read or written
+                // through it. See `Region::file`.
+                drop(file);
+                None
+            } else {
+                if preallocate {
+                    file.set_len(entry.length)?;
+                }
+                Some(file)
+            };
             regions.push(Region {
                 file,
                 global_start: global,
@@ -173,7 +194,9 @@ impl Storage {
     /// Any underlying sync error.
     pub fn sync_all(&self) -> io::Result<()> {
         for region in &self.regions {
-            region.file.sync_all()?;
+            if let Some(file) = &region.file {
+                file.sync_all()?;
+            }
         }
         Ok(())
     }
@@ -207,9 +230,11 @@ impl Storage {
             return Ok(());
         }
         for region in &self.regions {
-            if region.length == 0 {
+            // A zero-length region intersects nothing, and holds no descriptor
+            // to intersect it with.
+            let Some(file) = &region.file else {
                 continue;
-            }
+            };
             let region_end = region.global_start + region.length;
             let lo = global_start.max(region.global_start);
             let hi = end.min(region_end);
@@ -218,7 +243,7 @@ impl Storage {
             }
             let file_off = lo - region.global_start;
             let buf_range = (lo - global_start)..(hi - global_start);
-            op(&region.file, file_off, buf_range)?;
+            op(file, file_off, buf_range)?;
         }
         Ok(())
     }
@@ -417,6 +442,46 @@ mod tests {
             skipped_trackers: 0,
             raw_info: Vec::new(),
         }
+    }
+
+    /// A zero-length file is created on disk and costs no descriptor.
+    ///
+    /// Both halves matter. The file is part of the torrent, so it has to
+    /// exist; and no piece can ever intersect it, so the descriptor that used
+    /// to be held open for it was pure cost. A torrent is free to be almost
+    /// entirely empty files — that is the shape of the fan-out
+    /// proof-of-concept `MAX_FILES` bounds — so "pure cost" was thousands of
+    /// descriptors held for the life of the torrent.
+    #[test]
+    fn empty_files_are_created_but_hold_no_descriptor() {
+        let dir = TempDir::new();
+        let content: Vec<u8> = (0..8u8).collect();
+        let mut files = vec![FileEntry {
+            path: vec!["real.bin".into()],
+            length: 8,
+        }];
+        files.extend((0..64).map(|i| FileEntry {
+            path: vec![format!("empty{i}.bin")],
+            length: 0,
+        }));
+        let meta = meta_for(files, 8, &content);
+        let st = Storage::create(&meta, &dir.0, false).unwrap();
+
+        assert_eq!(
+            st.regions.iter().filter(|r| r.file.is_some()).count(),
+            1,
+            "an empty file is holding a descriptor"
+        );
+        for i in 0..64 {
+            let path = dir.0.join(format!("empty{i}.bin"));
+            assert!(path.is_file(), "{} was not created", path.display());
+        }
+
+        // And the one real file still works, which is the part the skipping
+        // must not have broken.
+        st.write_block(0, 0, &content).unwrap();
+        assert!(st.verify_piece(0).unwrap());
+        st.sync_all().unwrap();
     }
 
     #[test]

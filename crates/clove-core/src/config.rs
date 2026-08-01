@@ -68,6 +68,34 @@ impl Defaults {
     }
 }
 
+/// Read the default config file: its text, or an empty string when there is
+/// genuinely no file there.
+///
+/// **Only `NotFound` is an empty config.** Both binaries used to reach for
+/// `unwrap_or_default()` here, which turned *every* failure into "no
+/// configuration" — a file that exists but cannot be read for permissions, a
+/// directory given where a file belongs, an I/O error, invalid UTF-8. Each of
+/// those is a configuration the operator wrote and clove then did not apply,
+/// silently, while `cloved -C` reported the configuration was fine.
+///
+/// The privacy case is the one that decides it. An unreadable file containing
+/// `ephemeral yes` becomes the default `ephemeral false`, so clove creates or
+/// reuses a *persistent* destination for an operator who asked for a transient
+/// one — and says nothing. Failing closed turns that into a startup error,
+/// which is the only outcome that cannot be missed.
+///
+/// # Errors
+///
+/// Any read error other than [`std::io::ErrorKind::NotFound`], including
+/// invalid UTF-8 in a file that is present and readable.
+pub fn read_default_config(path: &std::path::Path) -> std::io::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
 fn nonempty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
@@ -579,6 +607,87 @@ mod tests {
             data_home: PathBuf::from("/home/u/.local/share"),
             runtime_dir: Some(PathBuf::from("/run/user/1000")),
             config_home: PathBuf::from("/home/u/.config"),
+        }
+    }
+
+    /// A scratch directory that removes itself.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> TempDir {
+            let path = std::env::temp_dir().join(format!(
+                "clove-config-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("temp dir");
+            TempDir(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The one case that is genuinely "no configuration": nothing is there.
+    #[test]
+    fn an_absent_default_config_reads_as_empty() {
+        let dir = TempDir::new("absent");
+        let text = read_default_config(&dir.0.join("clove.conf")).expect("absent is not an error");
+        assert_eq!(text, "");
+        Config::parse(&text, &defaults()).expect("and parses as the defaults");
+    }
+
+    /// A file that is there and readable is read, obviously — the test is
+    /// that the fail-closed rule did not break the working path.
+    #[test]
+    fn a_present_default_config_is_read() {
+        let dir = TempDir::new("present");
+        let path = dir.0.join("clove.conf");
+        std::fs::write(&path, "ephemeral yes\n").expect("write");
+        let text = read_default_config(&path).expect("readable");
+        assert!(Config::parse(&text, &defaults()).expect("parses").ephemeral);
+    }
+
+    /// Everything else fails closed.
+    ///
+    /// `unwrap_or_default()` treated each of these as "no configuration", so
+    /// an `ephemeral yes` clove could not read became the default `ephemeral
+    /// false` — a persistent identity created for somebody who asked for a
+    /// transient one, with `cloved -C` reporting the configuration was fine.
+    #[test]
+    fn an_unreadable_default_config_is_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("unreadable");
+
+        // A directory where a file belongs: a plausible typo, and a read that
+        // fails with something that is not NotFound.
+        let as_dir = dir.0.join("is-a-directory");
+        std::fs::create_dir(&as_dir).expect("mkdir");
+        assert!(read_default_config(&as_dir).is_err(), "a directory parsed");
+
+        // Not valid UTF-8: the file is present and readable, and its contents
+        // are not a configuration.
+        let binary = dir.0.join("binary.conf");
+        std::fs::write(&binary, [0xFF, 0xFE, 0x00, 0x80]).expect("write");
+        assert!(read_default_config(&binary).is_err(), "binary parsed");
+
+        // Present but not readable. Skipped as root, for whom mode 0000 is
+        // not a barrier and the assertion would be about the test's uid
+        // rather than about clove.
+        let secret = dir.0.join("secret.conf");
+        std::fs::write(&secret, "ephemeral yes\n").expect("write");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::read_to_string(&secret).is_err() {
+            assert!(
+                read_default_config(&secret).is_err(),
+                "an unreadable config read as no configuration, and `ephemeral \
+                 yes` with it"
+            );
         }
     }
 

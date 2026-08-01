@@ -30,6 +30,36 @@ pub const MIN_PIECE_LENGTH: u32 = 16 * 1024;
 /// Largest piece length clove accepts (128 MiB).
 pub const MAX_PIECE_LENGTH: u32 = 128 * 1024 * 1024;
 
+/// Most files clove will accept in one torrent.
+///
+/// A `.torrent` is small and its file list is not: a 221 KiB canonical torrent
+/// describes 8,192 files comfortably, which is under every byte cap clove had
+/// — the 2 MiB API body and the 8 MiB metadata ceiling both — while asking the
+/// daemon to create 8,192 filesystem entries and hold a descriptor for each.
+/// Bytes were never the right unit for this; the fan-out is.
+///
+/// 4,096 is chosen against the descriptor budget rather than picked as a round
+/// number. `Storage` holds one descriptor per *non-empty* file for as long as
+/// the torrent runs, the default queue runs 3 downloads and 5 seeds at once,
+/// and the supplied unit's `LimitNOFILE` is sized for that product plus the
+/// peer limit. Any torrent a person actually seeds is orders of magnitude
+/// under it; anything over it is a fan-out attack rather than a release.
+pub const MAX_FILES: usize = 4096;
+
+/// Most path components in one file's path, including the torrent name.
+///
+/// Each component is a directory clove creates and a level `open_beneath`
+/// walks with `O_NOFOLLOW`, so depth is work as well as structure. Nothing
+/// legitimate nests this far.
+pub const MAX_PATH_COMPONENTS: usize = 64;
+
+/// Most decoded path bytes across every file in a torrent.
+///
+/// The file *count* alone does not bound the cost: 4,096 paths of 4,096
+/// components' worth of long names is a small bencode string and a large
+/// amount of allocation and directory creation. This bounds the total.
+pub const MAX_TOTAL_PATH_BYTES: usize = 1024 * 1024;
+
 /// One file within a torrent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
@@ -413,8 +443,16 @@ fn parse_files(info: &Value, name: &str) -> Result<(Vec<FileEntry>, u64), Error>
             if list.is_empty() {
                 return Err(Error::Invalid("files list is empty"));
             }
+            // Before anything is allocated per file, let alone created on
+            // disk. The count is known from the bencode list itself, so the
+            // cheapest possible check comes first and the `with_capacity`
+            // below is then bounded by a number clove chose.
+            if list.len() > MAX_FILES {
+                return Err(Error::Invalid("too many files"));
+            }
             let mut entries = Vec::with_capacity(list.len());
             let mut total: u64 = 0;
+            let mut path_bytes: usize = 0;
             for file in list {
                 let length = file
                     .get(b"length")
@@ -427,13 +465,23 @@ fn parse_files(info: &Value, name: &str) -> Result<(Vec<FileEntry>, u64), Error>
                 if raw_path.is_empty() {
                     return Err(Error::Invalid("bad file path"));
                 }
+                // `+ 1` for the torrent name, which is prepended below and is
+                // a component clove has to create like any other.
+                if raw_path.len() + 1 > MAX_PATH_COMPONENTS {
+                    return Err(Error::Invalid("file path is too deep"));
+                }
                 let mut path = Vec::with_capacity(raw_path.len() + 1);
                 path.push(name.to_owned());
+                path_bytes = path_bytes.saturating_add(name.len());
                 for part in raw_path {
                     let part = part
                         .as_str()
                         .ok_or(Error::Invalid("non-UTF-8 path component"))?;
                     check_component(part)?;
+                    path_bytes = path_bytes.saturating_add(part.len());
+                    if path_bytes > MAX_TOTAL_PATH_BYTES {
+                        return Err(Error::Invalid("file paths are too large in total"));
+                    }
                     path.push(part.to_owned());
                 }
                 total = total
@@ -626,6 +674,106 @@ mod tests {
         assert_eq!(t.total_length, u64::from(MIN_PIECE_LENGTH) + 3);
         assert_eq!(t.files[0].path, vec!["album", "sub", "a.bin"]);
         assert_eq!(t.files[1].path, vec!["album", "b.bin"]);
+    }
+
+    /// Build a multi-file torrent from a list of `(length, path)` entries.
+    fn multi_file(files: Vec<(i64, Vec<&str>)>) -> Vec<u8> {
+        let entries: Vec<Value> = files
+            .into_iter()
+            .map(|(len, path)| {
+                dict(vec![
+                    ("length", Value::Int(len)),
+                    (
+                        "path",
+                        Value::List(path.into_iter().map(bval).collect::<Vec<_>>()),
+                    ),
+                ])
+            })
+            .collect();
+        let info = dict(vec![
+            ("name", bval("album")),
+            ("piece length", Value::Int(i64::from(MIN_PIECE_LENGTH))),
+            ("pieces", Value::Bytes(vec![0u8; 20])),
+            ("files", Value::List(entries)),
+        ]);
+        encode(&dict(vec![("info", info)]))
+    }
+
+    /// The fan-out proof of concept, in the shape the review used: one 1-byte
+    /// file and thousands of empty ones, in a torrent small enough to sail
+    /// through every byte cap clove has.
+    ///
+    /// It has to be refused at *parse* time. Anything later is too late — by
+    /// then the entry is persisted and the daemon is creating directories.
+    #[test]
+    fn a_torrent_cannot_fan_out_into_thousands_of_files() {
+        let mut files = vec![(1i64, vec!["real.bin"])];
+        let names: Vec<String> = (0..MAX_FILES).map(|i| format!("f{i}")).collect();
+        files.extend(names.iter().map(|n| (0i64, vec![n.as_str()])));
+
+        let input = multi_file(files);
+        assert!(
+            input.len() < 2 * 1024 * 1024,
+            "the point is that it is small: {} bytes",
+            input.len()
+        );
+        let e = MetaInfo::parse(&input).expect_err("the fan-out was accepted");
+        assert!(e.to_string().contains("too many files"), "{e}");
+    }
+
+    /// The cap is a ceiling, not a nudge: exactly `MAX_FILES` is still a
+    /// torrent, and one more is not.
+    #[test]
+    fn the_file_cap_is_exact() {
+        let names: Vec<String> = (0..=MAX_FILES).map(|i| format!("f{i}")).collect();
+        let at: Vec<(i64, Vec<&str>)> = names[..MAX_FILES]
+            .iter()
+            .map(|n| (1i64, vec![n.as_str()]))
+            .collect();
+        assert_eq!(
+            MetaInfo::parse(&multi_file(at))
+                .expect("at the cap")
+                .files
+                .len(),
+            MAX_FILES
+        );
+
+        let over: Vec<(i64, Vec<&str>)> = names.iter().map(|n| (1i64, vec![n.as_str()])).collect();
+        assert!(
+            MetaInfo::parse(&multi_file(over)).is_err(),
+            "one over passed"
+        );
+    }
+
+    /// Depth is directories to create and levels for `open_beneath` to walk,
+    /// so it is bounded too. The torrent name counts as a component, because
+    /// clove creates it like any other.
+    #[test]
+    fn a_file_path_cannot_nest_without_limit() {
+        let deep: Vec<String> = (0..MAX_PATH_COMPONENTS).map(|i| format!("d{i}")).collect();
+        let path: Vec<&str> = deep.iter().map(String::as_str).collect();
+        let e = MetaInfo::parse(&multi_file(vec![(1, path)])).expect_err("deep path accepted");
+        assert!(e.to_string().contains("too deep"), "{e}");
+
+        let ok: Vec<&str> = deep[..MAX_PATH_COMPONENTS - 1]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert!(
+            MetaInfo::parse(&multi_file(vec![(1, ok)])).is_ok(),
+            "a path exactly at the cap was refused"
+        );
+    }
+
+    /// Count and depth together still leave the aggregate unbounded: few
+    /// files, shallow paths, enormous names. Bencode makes that cheap to
+    /// write and expensive to receive.
+    #[test]
+    fn file_paths_are_bounded_in_total() {
+        let long = "n".repeat(64 * 1024);
+        let files: Vec<(i64, Vec<&str>)> = (0..32).map(|_| (1i64, vec![long.as_str()])).collect();
+        let e = MetaInfo::parse(&multi_file(files)).expect_err("huge paths accepted");
+        assert!(e.to_string().contains("too large in total"), "{e}");
     }
 
     #[test]
