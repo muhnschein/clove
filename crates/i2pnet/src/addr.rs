@@ -245,6 +245,137 @@ pub fn i2p_base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Characters in a b32 label: the lowercase base32 alphabet, `a`–`z` and
+/// `2`–`7`.
+const fn is_b32_char(c: char) -> bool {
+    c.is_ascii_lowercase() || matches!(c, '2'..='7')
+}
+
+/// Length of a b32 destination label: 32 hash bytes at 5 bits per character.
+const B32_LABEL_LEN: usize = 52;
+
+/// Replace every b32 destination in `text` with `<redacted>`.
+///
+/// `SECURITY.md` puts a destination — ours or a peer's — reaching "logs, error
+/// messages, or the local API" in the leak class, and a b32 label is a
+/// destination: it is the base32 of its SHA-256, which is exactly what a
+/// router resolves and what a tracker correlates on. It is already a hash, so
+/// hashing it again buys nothing, and truncating it leaves a prefix that is
+/// still linkable across every log it appears in. The only safe amount to keep
+/// is none.
+///
+/// This is the second line, not the first. Every site clove *knows* prints a
+/// destination has had it removed at the source; this catches the text clove
+/// does not author — a router's `MESSAGE=`, a bridge's malformed reply — where
+/// the address arrives inside somebody else's words.
+///
+/// A label is 52 characters of lowercase base32, optionally followed by
+/// `.b32.i2p`. Runs are matched at 52 or longer so a label that abuts other
+/// text is still caught; no diagnostic English reaches that length without a
+/// space, and a hex info-hash is 40 characters of an alphabet this one does
+/// not share, so neither is redacted by accident.
+#[must_use]
+pub fn redact_b32(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let run = rest.find(|c| !is_b32_char(c)).unwrap_or(rest.len());
+        if run >= B32_LABEL_LEN {
+            out.push_str("<redacted>");
+            rest = &rest[run..];
+            rest = rest.strip_prefix(".b32.i2p").unwrap_or(rest);
+        } else if run > 0 {
+            out.push_str(&rest[..run]);
+            rest = &rest[run..];
+        } else {
+            // A non-label character: copy it and resume scanning after it.
+            let mut chars = rest.chars();
+            let c = chars.next().unwrap_or_default();
+            out.push(c);
+            rest = chars.as_str();
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    const PEER: DestHash = DestHash([0x11; 32]);
+
+    /// The address, the bare label, and any prefix of either. A b32 is
+    /// already a hash, so "just the first few characters" is not a weaker
+    /// identifier — it is the same one, and it still joins two log lines
+    /// into one peer.
+    #[test]
+    fn a_destination_leaves_nothing_linkable_behind() {
+        let b32 = PEER.to_b32();
+        let label = b32.trim_end_matches(".b32.i2p");
+        assert_eq!(label.len(), B32_LABEL_LEN);
+
+        for text in [
+            b32.clone(),
+            label.to_owned(),
+            format!("router refused the stream to {b32}: CANT_REACH_PEER"),
+            format!("no leaseSet for {label}"),
+            format!("dialling {b32} and {b32} at once"),
+        ] {
+            let out = redact_b32(&text);
+            assert!(!out.contains(label), "the label survived in {out:?}");
+            assert!(!out.contains(&label[..16]), "a prefix survived in {out:?}");
+            assert!(out.contains("<redacted>"), "nothing was redacted: {out:?}");
+        }
+    }
+
+    /// The words around the address are the reason the line is kept at all.
+    #[test]
+    fn the_diagnosis_survives_the_redaction() {
+        let text = format!(
+            "router refused the stream to {}: CANT_REACH_PEER",
+            PEER.to_b32()
+        );
+        let out = redact_b32(&text);
+        assert_eq!(
+            out,
+            "router refused the stream to <redacted>: CANT_REACH_PEER"
+        );
+    }
+
+    /// Redaction that ate ordinary diagnostics would be quietly turned off by
+    /// the first person it annoyed. Nothing short of a label goes, and a hex
+    /// info-hash — 40 characters of an alphabet this one only half shares —
+    /// is not a destination and must stay readable.
+    #[test]
+    fn ordinary_text_is_left_alone() {
+        for text in [
+            "router refused the peer stream: CANT_REACH_PEER",
+            "cloved: 3 torrent(s) loaded",
+            "adding torrent 0123456789abcdef0123456789abcdef01234567",
+            "abcdefghijklmnopqrstuvwxyz234567", // 32 chars: too short to be one
+        ] {
+            assert_eq!(redact_b32(text), text, "{text:?} was altered");
+        }
+    }
+
+    /// Whatever the router appended to the label goes with it, so a `.b32.i2p`
+    /// suffix cannot be left dangling as a hint that one was there.
+    #[test]
+    fn the_suffix_goes_with_the_label() {
+        let out = redact_b32(&format!("peer {} timed out", PEER.to_b32()));
+        assert_eq!(out, "peer <redacted> timed out");
+    }
+
+    /// Multi-byte input must not panic or split a character: this runs over
+    /// text a router chose.
+    #[test]
+    fn non_ascii_is_carried_through_intact() {
+        let text = format!("нет leaseSet — {} ✗", PEER.to_b32());
+        let out = redact_b32(&text);
+        assert_eq!(out, "нет leaseSet — <redacted> ✗");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

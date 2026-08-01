@@ -496,4 +496,37 @@ echo "smoke: token file is 0600"
 mode=$(stat -c '%a' "$XDG_DATA_HOME/clove/token")
 [ "$mode" = "600" ] || fail "token mode is $mode, expected 600"
 
+# The last line of defence for the leak class, and the only one that sees what
+# the process actually wrote rather than what one function returned. A b32 is
+# 52 characters of lowercase base32, so anything that shape in a log is an
+# identity — ours or a peer's — and `SECURITY.md` allows neither there.
+#
+# This checks every log the run produced, including the ones from daemons that
+# failed to reach a router, because the reconnect path is where the client's
+# own destination used to be printed. It is deliberately a shape match rather
+# than a search for one known address: the point is to catch the *next* line
+# somebody adds, not the one already removed.
+echo "smoke: no destination reached any log"
+for log in "$work"/daemon*.log; do
+    [ -f "$log" ] || continue
+    if leaked=$(grep -Eo '[a-z2-7]{52}' "$log" | head -1) && [ -n "$leaked" ]; then
+        fail "a b32 destination is in $(basename "$log"): $leaked"
+    fi
+done
+
+# And the address is still reachable where it was moved to, so removing it
+# from the log did not simply lose it.
+echo "smoke: the destination is published to the data directory"
+dest_file="$conf_dir/data/destination"
+if [ -f "$dest_file" ]; then
+    mode=$(stat -c '%a' "$dest_file")
+    [ "$mode" = "600" ] || fail "destination mode is $mode, expected 600"
+    grep -Eq '^[a-z2-7]{52}\.b32\.i2p$' "$dest_file" \
+        || fail "destination file is not a b32 address: $(cat "$dest_file")"
+else
+    # No router in tier 1, so no session, so nothing to publish. The file is
+    # written when the router accepts a session; its absence here is correct.
+    echo "smoke:   (no session without a router; nothing to publish)"
+fi
+
 echo "smoke: ok"

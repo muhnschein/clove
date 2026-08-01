@@ -250,7 +250,14 @@ fn dial_stream(
         Some(deadline),
         "STREAM CONNECT",
     )?;
-    expect_stream_ok(&status, &format!("the stream to {}", peer.to_b32()))?;
+    // Not `the stream to <b32>`, which is what this named. The error travels:
+    // `FetchRound` writes it to stderr and keeps it in `last_error`, which
+    // `clove list` then serves over the API — so a peer's destination reached
+    // all three places `SECURITY.md` names, and a tracker chooses which peers
+    // we dial, so a tracker chose which destinations were recorded. The peer
+    // is not named at all; the router's own result word is what says what to
+    // do next, and the caller already knows which peer it asked for.
+    expect_stream_ok(&status, "the peer stream")?;
 
     // Handshake done; the socket is now the peer stream. Clear the deadlines
     // the handshake needed — the engine sets its own per-peer timeouts, and a
@@ -265,11 +272,20 @@ fn dial_stream(
 /// The router's own result word, and its `MESSAGE` when it sent one.
 /// `CANT_REACH_PEER` and friends are ordinary on I2P and must read as "this
 /// peer, this time" rather than as a fault in the session.
+///
+/// Everything quoted from the router is scrubbed on the way out. We just sent
+/// it a `DESTINATION=` and it is free to say anything back — including our
+/// b32 in its `MESSAGE=`, or a whole key blob in a reply that is not a
+/// `STREAM STATUS` at all. Neither line is ours to author, and both end up in
+/// a log.
 fn expect_stream_ok(status: &str, what: &str) -> io::Result<()> {
     if !status.starts_with("STREAM STATUS") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("SAM bridge answered with {status:?} where a STREAM STATUS belongs"),
+            format!(
+                "SAM bridge answered with {:?} where a STREAM STATUS belongs",
+                scrub_control_line(status)
+            ),
         ));
     }
     let result = status
@@ -280,10 +296,11 @@ fn expect_stream_ok(status: &str, what: &str) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
             format!(
-                "router refused {what}: {result}{}",
+                "router refused {what}: {}{}",
+                result.chars().map(scrub_char).collect::<String>(),
                 status
                     .split_once("MESSAGE=")
-                    .map(|(_, m)| format!(" ({})", m.trim_matches('"')))
+                    .map(|(_, m)| format!(" ({})", scrub_control_line(m.trim_matches('"'))))
                     .unwrap_or_default()
             ),
         ));
@@ -676,6 +693,13 @@ impl Drop for SamSession {
 /// `RESULT` and `MESSAGE` survive: they are the router explaining why a session
 /// died, which is the entire reason this text is kept, and neither is a place a
 /// key belongs. Control characters go regardless — this reaches a terminal.
+///
+/// A third rule covers the *public* half. Rules 1 and 2 look for key material,
+/// which is base64 and long; a b32 destination is base32 and 52 characters, so
+/// it passed both. It is still an identity — ours in a `STREAM CONNECT`
+/// refusal, a peer's in anything the router chooses to echo — and
+/// `SECURITY.md` draws no distinction between leaking ours and leaking
+/// theirs. So b32 labels go too, wherever in the line they turn up.
 fn scrub_control_line(line: &str) -> String {
     /// Field names whose values are, or may contain, private key material.
     const SECRET_FIELDS: &[&str] = &["DESTINATION", "PRIVKEY", "PRIVATEKEY", "KEY"];
@@ -694,7 +718,10 @@ fn scrub_control_line(line: &str) -> String {
                 out.push_str("=<redacted>");
             }
             _ if looks_like_key_material(field, BLOB) => out.push_str("<redacted>"),
-            _ => out.extend(field.chars().map(scrub_char)),
+            _ => {
+                let scrubbed: String = field.chars().map(scrub_char).collect();
+                out.push_str(&crate::addr::redact_b32(&scrubbed));
+            }
         }
     }
     out
@@ -1384,11 +1411,15 @@ mod hostile_bridge_tests {
     /// Enough to test the whole dial path without a router, which is the
     /// point: this code is the reason clove no longer needs a live router to
     /// know whether a failed dial is reportable.
-    fn dial_bridge(status: &'static str, echo: bool) -> u16 {
+    fn dial_bridge(status: &str, echo: bool) -> u16 {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        // Owned, so a caller can build the status line rather than only pick a
+        // literal — the redaction tests need a destination inside it.
+        let status = Arc::new(status.to_owned());
         std::thread::spawn(move || {
             while let Ok((mut sock, _)) = listener.accept() {
+                let status = Arc::clone(&status);
                 std::thread::spawn(move || {
                     let mut line = Vec::new();
                     let mut byte = [0u8; 1];
@@ -1444,18 +1475,63 @@ mod hostile_bridge_tests {
     /// A router refusing one peer is ordinary on I2P. It must read as "this
     /// peer, this time", carry the router's own words, and leave nothing
     /// behind — the failure that used to poison the whole session.
+    ///
+    /// And it must not say *which* peer. This error is not a local one: the
+    /// daemon prints it and keeps it in `last_error`, which `clove list`
+    /// serves, so naming the peer here put a destination into a log, an error
+    /// and the API at once. The b32 that used to be asserted present is now
+    /// asserted absent.
     #[test]
     fn a_refused_dial_reports_the_routers_own_words_and_costs_nothing_else() {
         let port = dial_bridge("STREAM STATUS RESULT=CANT_REACH_PEER\n", false);
         let e = dial_stream(port, "clove-test", PEER, PROBE).expect_err("refused");
         assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
         assert!(e.to_string().contains("CANT_REACH_PEER"), "{e}");
-        assert!(e.to_string().contains(&PEER.to_b32()), "{e}");
+        assert_no_destination(&e.to_string(), PEER);
 
         // And the next dial on the same session id works, because the two
         // share no state at all.
         let ok = dial_bridge("STREAM STATUS RESULT=OK\n", true);
         assert!(dial_stream(ok, "clove-test", PEER, PROBE).is_ok());
+    }
+
+    /// Assert `text` names neither `peer` nor any part of it that stays
+    /// linkable. A b32 is a hash already, so a prefix of one is not a
+    /// safer thing to print — it is the same identifier, shortened.
+    #[track_caller]
+    fn assert_no_destination(text: &str, peer: DestHash) {
+        let b32 = peer.to_b32();
+        let label = b32.trim_end_matches(".b32.i2p");
+        assert!(!text.contains(&b32), "the peer's address is in: {text}");
+        assert!(!text.contains(label), "the peer's b32 label is in: {text}");
+        assert!(
+            !text.contains(&label[..16]),
+            "a prefix of the peer's b32 is in: {text}"
+        );
+    }
+
+    /// The router chooses the words in `MESSAGE=`, and we have just handed it
+    /// our `DESTINATION=`. A bridge that echoes it back — because it is
+    /// hostile, or merely verbose — must not thereby get it into our log.
+    #[test]
+    fn a_router_cannot_echo_a_destination_back_into_the_error() {
+        let echoed = format!(
+            "STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=\"no leaseSet for {}\"\n",
+            PEER.to_b32()
+        );
+        let port = dial_bridge(&echoed, false);
+        let e = dial_stream(port, "clove-test", PEER, PROBE).expect_err("refused");
+        assert!(e.to_string().contains("no leaseSet"), "{e}");
+        assert_no_destination(&e.to_string(), PEER);
+    }
+
+    /// The same, for a reply that is not a `STREAM STATUS` at all: the whole
+    /// line goes into the error, so the whole line is scrubbed.
+    #[test]
+    fn a_destination_in_a_malformed_reply_is_scrubbed_too() {
+        let port = dial_bridge(&format!("HELLO REPLY DEST={}\n", PEER.to_b32()), false);
+        let e = dial_stream(port, "clove-test", PEER, PROBE).expect_err("not a status");
+        assert_no_destination(&e.to_string(), PEER);
     }
 
     /// A `MESSAGE=` is the router explaining itself; it belongs in the error.

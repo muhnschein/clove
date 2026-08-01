@@ -145,6 +145,16 @@ Absent when
 is set; see
 .Xr clove.conf 5 .
 Anyone holding this file can be you on the network.
+.It Pa ~/.local/share/clove/destination
+The client's I2P address in
+.Pa .b32.i2p
+form, mode 0600: the public half of the key above, and the only place the
+daemon records it.
+Rewritten each time the router accepts a session, including under
+.Ic ephemeral ,
+where it is the only way to learn what this run's address turned out to be.
+This is not a secret in the way the key is, but it is an identity, so it is
+kept to the data directory rather than printed.
 .It Pa ~/.local/share/clove/state/
 Per-torrent state: the original
 .Pa .torrent ,
@@ -166,7 +176,19 @@ cloved: configuration OK
 $ cloved
 cloved: 3 torrent(s) loaded
 cloved: listening on /run/user/1000/clove.sock
-cloved: router connected; we are asubu6d7wsbj7x7b7agamhimpmnlr3ezb7qu5zh2jllyalblxdpq.b32.i2p
+cloved: router connected
+.Ed
+.Pp
+The daemon does not print its own destination.
+It is persistent by default, so a log line naming it is a stable identifier
+in the journal, in log exports, in backups, and in any bug report cut from
+them.
+The address is written to
+.Pa destination
+in the data directory instead, and read from there when it is wanted:
+.Bd -literal -offset indent
+$ cat ~/.local/share/clove/destination
+asubu6d7wsbj7x7b7agamhimpmnlr3ezb7qu5zh2jllyalblxdpq.b32.i2p
 .Ed
 .Pp
 Run under a user service manager:

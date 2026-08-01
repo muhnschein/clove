@@ -380,11 +380,13 @@ $ curl --unix-socket ~/.local/share/clove/clove.sock \e
 The second connects two instances directly, without a tracker.
 The first host's destination is the one
 .Xr cloved 8
-prints when it connects to the router
-.Pq Dq we are ... .b32.i2p ;
-it is deliberately not served by
+writes to
+.Pa destination
+in its data directory.
+It is deliberately not printed to the log and not served by
 .Cm status ,
-so that reading a torrent listing never hands out an identity.
+so that neither reading a torrent listing nor reading a journal ever hands
+out an identity.
 On the second host:
 .Bd -literal -offset indent
 $ curl --unix-socket ~/.local/share/clove/clove.sock \e

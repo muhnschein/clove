@@ -338,12 +338,44 @@ fn sam_tcp_port(sam_address: &str) -> Option<u16> {
 struct Identity {
     /// `None` under `ephemeral yes` — nothing is read and nothing is written.
     path: Option<PathBuf>,
+    /// Where this run's b32 address is published for the operator. Always
+    /// set, including under `ephemeral yes`: a transient identity is the case
+    /// where you *most* need to be told what it turned out to be.
+    address_path: PathBuf,
 }
 
 impl Identity {
     fn new(data_dir: &Path, ephemeral: bool) -> Identity {
         Identity {
             path: (!ephemeral).then(|| data_dir.join("destination.key")),
+            address_path: data_dir.join("destination"),
+        }
+    }
+
+    /// Publish this run's b32 address to `<data_dir>/destination`.
+    ///
+    /// The destination used to be printed at startup, and that is where the
+    /// documented "connect two instances directly" recipe told operators to
+    /// read it from. It cannot be a log line: the identity is persistent by
+    /// default, and stderr becomes the journal, log exports, backups and
+    /// support bundles, none of which anybody audits before sharing. So it
+    /// goes to a file instead — `0600`, inside the `0700` data directory,
+    /// next to the key it is the public half of.
+    ///
+    /// That is not a weaker boundary than the log was, it is a much stronger
+    /// one: this directory already holds `destination.key`, and `SECURITY.md`
+    /// puts anyone who can read it outside the threat model already. The
+    /// difference is that a file is asked for and a log is copied around.
+    ///
+    /// Rewritten on every session, because under `ephemeral yes` it is a
+    /// different address each time and a stale one is worse than none.
+    fn publish_address(&self, dest: &DestHash) {
+        if let Err(e) = write_private_file(&self.address_path, dest.to_b32().as_bytes()) {
+            eprintln!(
+                "cloved: could not write {}: {e}; this run's address is not \
+                 recorded anywhere",
+                self.address_path.display()
+            );
         }
     }
 
@@ -472,9 +504,23 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str, identity: Ident
                     }
                 }
             };
-            let dest = session.local_dest();
             let forward_port = listener.local_port();
-            eprintln!("cloved: router connected; we are {}", dest.to_b32());
+            // Not "we are <b32>", which is what this said. The destination is
+            // persistent by default, so that line put a stable correlation
+            // identifier into stderr — and from there into the journal, log
+            // exports, backups, and every support bundle and bug report cut
+            // from them. `SECURITY.md` puts the client's destination reaching
+            // a log in the leak class, and a log is exactly where it went.
+            //
+            // Hashing or truncating it instead would not have helped. A b32
+            // *is* the hash of the destination, and a shortened one is still
+            // stable, so either would leave the same correlation identifier
+            // in the same places, only harder to notice. What the line is
+            // actually read for — did the router accept us — survives whole.
+            eprintln!("cloved: router connected");
+            // Where it goes instead. The operator who needs it asks the file;
+            // everyone downstream of a log does not get it by default.
+            identity.publish_address(&session.local_dest());
             // Only now, with the router having accepted it: a key that failed
             // SESSION CREATE is not one worth keeping.
             identity.remember(session.private_key_b64());
