@@ -385,13 +385,8 @@ fn read_claimed_torrent(dir_fd: &rustix::fd::OwnedFd, name: &str) -> Result<Vec<
 
 /// Hand watched bytes to the registry, on the same terms as the API.
 fn ingest_watched_torrent(daemon: &Arc<Daemon>, bytes: &[u8], path: &Path) -> Result<(), String> {
-    let added = lock(&daemon.registry).add_torrent(bytes, registry::AddOptions::default());
-    match added {
-        Ok((info_hash, job)) => {
-            // Same as the API path: the initial hash of whatever is already on
-            // disk runs with the registry unlocked. A scan that fails means
-            // storage could not be laid out, which is not an "added".
-            run_scan(daemon, &job).map_err(|e| format!("preparing its files: {e}"))?;
+    match add_and_scan(daemon, bytes, registry::AddOptions::default()) {
+        Ok(info_hash) => {
             eprintln!(
                 "cloved: added {} from {}",
                 registry::hex(&info_hash),
@@ -1046,17 +1041,8 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response 
             Err(e) => error(500, &format!("adding magnet: {e}")),
         };
     }
-    let added = lock(&daemon.registry).add_torrent(&request.body, options);
-    match added {
-        Ok((info_hash, job)) => {
-            // The initial pass over whatever is already on disk runs with the
-            // registry unlocked: on a re-add over a finished download it hashes
-            // the whole torrent, and every other request would otherwise wait
-            // for it. The torrent is registered and marked "verifying" already,
-            // so it shows up in `clove list` while this happens.
-            // The add already succeeded; a scan that fails only means the
-            // torrent shows nothing on disk, which `clove verify` can retry.
-            let _ = run_scan(daemon, &job);
+    match add_and_scan(daemon, &request.body, options) {
+        Ok(info_hash) => {
             let body = Value::Object(vec![(
                 "info_hash".to_owned(),
                 Value::from(registry::hex(&info_hash)),
@@ -1079,6 +1065,45 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response 
 fn run_scan(daemon: &Daemon, job: &registry::ScanJob) -> Result<u32, ActionError> {
     let scanned = job.run();
     lock(&daemon.registry).finish_scan(job, scanned)
+}
+
+/// Add a torrent and lay its files out, backing the registration out again if
+/// that fails.
+///
+/// The scan is where `Storage::create` runs, so it is where "this torrent's
+/// files cannot be created" is discovered — and its result used to be
+/// discarded with `let _ =`, leaving both entry points answering "added" for a
+/// torrent that had no files and never would. A registered torrent that shows
+/// nothing on disk, reported as a success, is a worse outcome than a plain
+/// failure the operator can retry: it looks finished to every later command.
+///
+/// Rolling back rather than reporting-and-keeping is what makes the two
+/// answers mean something: added and ready, or not added. `delete_data` is
+/// false because there is nothing of the operator's to delete — this is a
+/// fresh registration whose layout is exactly what just failed.
+fn add_and_scan(
+    daemon: &Arc<Daemon>,
+    bytes: &[u8],
+    options: registry::AddOptions,
+) -> Result<[u8; 20], AddError> {
+    let (info_hash, job) = lock(&daemon.registry).add_torrent(bytes, options)?;
+    // The initial pass over whatever is already on disk runs with the registry
+    // unlocked: on a re-add over a finished download it hashes the whole
+    // torrent, and every other request would otherwise wait for it. The
+    // torrent is registered and marked "verifying" already, so it shows up in
+    // `clove list` while this happens.
+    if let Err(e) = run_scan(daemon, &job) {
+        // NotFound means it was removed while we hashed, which is somebody
+        // else's decision already carried out, not a failure to report.
+        let failed = match e {
+            ActionError::NotFound => return Ok(info_hash),
+            ActionError::Io(e) => e,
+            other @ ActionError::BadInput(_) => std::io::Error::other(other.to_string()),
+        };
+        let _ = lock(&daemon.registry).remove(&info_hash, false);
+        return Err(AddError::Io(failed));
+    }
+    Ok(info_hash)
 }
 
 /// Route a request against a specific torrent: `<info-hash>` or

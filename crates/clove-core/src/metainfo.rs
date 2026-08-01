@@ -30,6 +30,35 @@ pub const MIN_PIECE_LENGTH: u32 = 16 * 1024;
 /// Largest piece length clove accepts (128 MiB).
 pub const MAX_PIECE_LENGTH: u32 = 128 * 1024 * 1024;
 
+/// Most files a multi-file torrent may declare.
+///
+/// A metainfo is small compared to what it can describe, and nothing bounded
+/// that gap: a valid 221 KB torrent declaring 8,192 files — one of one byte
+/// and 8,191 of zero — sat well under every byte cap here and under the API's
+/// request limit, and still made the daemon create thousands of filesystem
+/// entries. Descriptors are no longer proportional to this (see
+/// `storage::Storage`), but directory entries and per-file bookkeeping still
+/// are, and a torrent nobody chose to receive should not be able to set that
+/// number.
+///
+/// 4,096 is comfortably above real torrents — a linux distribution's source
+/// tree torrent runs to a few thousand — and far below what an attacker would
+/// want. It is a ceiling on absurdity, not a tuning knob.
+pub const MAX_FILES: usize = 4096;
+
+/// Most path components one file may have, including the torrent's own name.
+///
+/// Deep paths cost a directory level each, and every level is a `mkdirat` and
+/// an `openat` on the way to the file. Real torrents are two or three deep.
+pub const MAX_PATH_COMPONENTS: usize = 16;
+
+/// Most bytes all decoded paths in one torrent may occupy together.
+///
+/// The per-component and per-file caps do not bound this on their own:
+/// `MAX_FILES` files of `MAX_PATH_COMPONENTS` components could each be
+/// enormous, and the strings are held for the torrent's lifetime.
+pub const MAX_TOTAL_PATH_BYTES: usize = 1024 * 1024;
+
 /// One file within a torrent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
@@ -413,8 +442,16 @@ fn parse_files(info: &Value, name: &str) -> Result<(Vec<FileEntry>, u64), Error>
             if list.is_empty() {
                 return Err(Error::Invalid("files list is empty"));
             }
+            // Before the allocation, not after it. `Vec::with_capacity` on a
+            // list length taken from the input is the input choosing how much
+            // memory to reserve, and a bencode list of empty dictionaries is
+            // cheap to write and expensive to believe.
+            if list.len() > MAX_FILES {
+                return Err(Error::Invalid("too many files"));
+            }
             let mut entries = Vec::with_capacity(list.len());
             let mut total: u64 = 0;
+            let mut path_bytes: usize = 0;
             for file in list {
                 let length = file
                     .get(b"length")
@@ -427,13 +464,23 @@ fn parse_files(info: &Value, name: &str) -> Result<(Vec<FileEntry>, u64), Error>
                 if raw_path.is_empty() {
                     return Err(Error::Invalid("bad file path"));
                 }
+                // `+ 1` for the torrent's own name, which storage prepends and
+                // which is a directory level like any other.
+                if raw_path.len() + 1 > MAX_PATH_COMPONENTS {
+                    return Err(Error::Invalid("file path is too deep"));
+                }
                 let mut path = Vec::with_capacity(raw_path.len() + 1);
                 path.push(name.to_owned());
+                path_bytes = path_bytes.saturating_add(name.len());
                 for part in raw_path {
                     let part = part
                         .as_str()
                         .ok_or(Error::Invalid("non-UTF-8 path component"))?;
                     check_component(part)?;
+                    path_bytes = path_bytes.saturating_add(part.len());
+                    if path_bytes > MAX_TOTAL_PATH_BYTES {
+                        return Err(Error::Invalid("file paths are too large in total"));
+                    }
                     path.push(part.to_owned());
                 }
                 total = total

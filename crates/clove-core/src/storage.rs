@@ -14,27 +14,67 @@
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use sha1::{Digest, Sha1};
 
 use crate::metainfo::MetaInfo;
 
+/// How many of a torrent's files may be open at once.
+///
+/// Storage used to hold one descriptor per file for the torrent's whole life,
+/// so a torrent's file count was a descriptor count — and a metainfo is small
+/// compared to what it can describe. A valid 221 KB torrent declaring 8,192
+/// files reached the shipped systemd unit's `LimitNOFILE=8192` on its own,
+/// which is a remotely-supplied number choosing when the daemon runs out of
+/// descriptors for everything else: peer streams, the control socket, the SAM
+/// connection.
+///
+/// `metainfo::MAX_FILES` now caps the file count too, but a cap alone would
+/// still mean thousands of descriptors held for a torrent nobody chose to
+/// receive. This is the half that decouples the two: what a torrent declares
+/// no longer decides what clove holds.
+///
+/// 64 is well above the working set of a sequential or rarest-first download —
+/// pieces touch one or two files at a time, a few more when a piece straddles
+/// a boundary — so the cache does its job without a reopen per block.
+const OPEN_FILE_LIMIT: usize = 64;
+
 /// One file's placement in the torrent's global byte space.
 struct Region {
-    file: File,
+    /// Validated components, relative to `root`. Held instead of a descriptor
+    /// so the file can be opened on demand and closed under pressure.
+    path: Vec<String>,
     /// Global offset of this file's first byte.
     global_start: u64,
     /// File length in bytes.
     length: u64,
 }
 
+/// Most-recently-used first. A `Vec` rather than a map because
+/// [`OPEN_FILE_LIMIT`] entries is a scan of a few dozen machine words, against
+/// a hash of the key on every block read.
+type OpenFiles = Vec<(usize, Arc<File>)>;
+
 /// The on-disk backing for one torrent.
 pub struct Storage {
+    root: PathBuf,
     regions: Vec<Region>,
+    /// Bounded cache of open descriptors, keyed by region index.
+    ///
+    /// The lock is held for the lookup and the bookkeeping, never across the
+    /// read or write itself — those take an `Arc<File>` clone and run outside
+    /// it, so the positioned-I/O property this module is built on (disjoint
+    /// regions need no lock) survives.
+    open: Mutex<OpenFiles>,
     piece_length: u64,
     total_length: u64,
     piece_hashes: Vec<[u8; 20]>,
+}
+
+fn lock_open(m: &Mutex<OpenFiles>) -> MutexGuard<'_, OpenFiles> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Storage {
@@ -50,6 +90,13 @@ impl Storage {
         let mut regions = Vec::with_capacity(meta.files.len());
         let mut global = 0u64;
         for entry in &meta.files {
+            // Every file is still created up front: `clove verify` and the
+            // initial scan both expect the layout to exist the moment a
+            // torrent is added, and `preallocate` has nowhere else to happen.
+            // The descriptor is dropped at the end of the iteration — creating
+            // a file and holding it open are separate decisions, and only the
+            // first is needed here.
+            //
             // Walks and opens by directory descriptor with `O_NOFOLLOW`, so a
             // symlinked component is refused by the kernel rather than by a
             // check that could be stale by the time we act on it.
@@ -58,18 +105,67 @@ impl Storage {
                 file.set_len(entry.length)?;
             }
             regions.push(Region {
-                file,
+                path: entry.path.clone(),
                 global_start: global,
                 length: entry.length,
             });
             global += entry.length;
         }
         Ok(Storage {
+            root: root.to_path_buf(),
             regions,
+            open: Mutex::new(Vec::new()),
             piece_length: u64::from(meta.piece_length),
             total_length: meta.total_length,
             piece_hashes: meta.pieces.clone(),
         })
+    }
+
+    /// The open descriptor for region `index`, opening it if the cache does
+    /// not have it and evicting the least recently used one if that fills it.
+    ///
+    /// Reopening goes through [`open_beneath`] again, so the `O_NOFOLLOW`
+    /// walk is repeated on every cache miss rather than trusted once at
+    /// creation — a component that becomes a symlink later is refused then
+    /// too, which the old open-once-and-hold arrangement could not do.
+    fn file_for(&self, index: usize) -> io::Result<Arc<File>> {
+        {
+            let mut open = lock_open(&self.open);
+            if let Some(pos) = open.iter().position(|(i, _)| *i == index) {
+                let entry = open.remove(pos);
+                let file = Arc::clone(&entry.1);
+                open.insert(0, entry);
+                return Ok(file);
+            }
+        }
+
+        // Opened without the lock held: a slow open on a cold cache must not
+        // stop other threads reading files that are already in it.
+        let region = self
+            .regions
+            .get(index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "storage: no such region"))?;
+        let file = Arc::new(open_beneath(&self.root, &region.path)?);
+
+        let mut open = lock_open(&self.open);
+        // Another thread may have raced us to the same region. Either handle
+        // works — positioned I/O carries its own offset — so keep one and let
+        // the other drop.
+        open.retain(|(i, _)| *i != index);
+        open.insert(0, (index, Arc::clone(&file)));
+        while open.len() > OPEN_FILE_LIMIT {
+            if let Some((_, evicted)) = open.pop() {
+                // Flushed before we lose our handle to it. Dropping a `File`
+                // does not sync, so an evicted file's writes would otherwise
+                // sit in the page cache with nothing left to sync them —
+                // `Storage::sync_all` can only reach what is still open. A
+                // resume record that says "verified" over data a power cut can
+                // still take back is precisely the state-corruption case
+                // SECURITY.md names.
+                evicted.sync_all()?;
+            }
+        }
+        Ok(file)
     }
 
     /// Number of pieces.
@@ -171,9 +267,20 @@ impl Storage {
     /// # Errors
     ///
     /// Any underlying sync error.
+    /// Only the files currently open are synced, which is all of them that
+    /// can need it: a file leaves the cache only through eviction, and
+    /// eviction syncs it on the way out. Opening every file to sync it would
+    /// reintroduce the descriptor fan-out this cache exists to remove.
     pub fn sync_all(&self) -> io::Result<()> {
-        for region in &self.regions {
-            region.file.sync_all()?;
+        // Cloned out under the lock and synced outside it: an fsync is slow,
+        // and holding the cache lock across all of them would stall every
+        // reader for the duration.
+        let files: Vec<Arc<File>> = lock_open(&self.open)
+            .iter()
+            .map(|(_, f)| Arc::clone(f))
+            .collect();
+        for file in files {
+            file.sync_all()?;
         }
         Ok(())
     }
@@ -206,7 +313,7 @@ impl Storage {
         if len == 0 {
             return Ok(());
         }
-        for region in &self.regions {
+        for (index, region) in self.regions.iter().enumerate() {
             if region.length == 0 {
                 continue;
             }
@@ -218,7 +325,11 @@ impl Storage {
             }
             let file_off = lo - region.global_start;
             let buf_range = (lo - global_start)..(hi - global_start);
-            op(&region.file, file_off, buf_range)?;
+            // Opened here rather than at creation, and only for the files this
+            // range actually touches — which is one or two per block, however
+            // many the torrent declares.
+            let file = self.file_for(index)?;
+            op(&file, file_off, buf_range)?;
         }
         Ok(())
     }
@@ -681,5 +792,88 @@ mod tests {
         remove_beneath(&root, &["demo".into(), "link.bin".into()]).expect("unlink the link itself");
         assert!(target.exists(), "unlinkat followed the link");
         assert!(!root.join("demo").join("link.bin").exists());
+    }
+
+    /// Count this process's open descriptors that point somewhere under
+    /// `root`. Scoped to the directory rather than counting every descriptor,
+    /// so the number is this torrent's and not whatever else the test binary
+    /// has open on its other threads. Linux-only, which every supported target
+    /// is.
+    fn open_fds_under(root: &Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("/proc/self/fd")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                std::fs::read_link(e.path()).is_ok_and(|target| target.starts_with(root))
+            })
+            .count()
+    }
+
+    /// A torrent's file count used to be a descriptor count, held for the
+    /// torrent's whole life. Since a metainfo can describe far more files than
+    /// it costs bytes to write, that made a remote party's number decide when
+    /// the daemon ran out of descriptors for peer streams, the control socket
+    /// and the SAM connection.
+    ///
+    /// `MAX_FILES` caps the count; this is the half that makes the count stop
+    /// mattering. Correctness across the eviction boundary is the risk the
+    /// cache introduces, so it is checked at the same time.
+    #[test]
+    fn descriptors_are_bounded_however_many_files_a_torrent_declares() {
+        let dir = TempDir::new();
+
+        // Comfortably more files than the cache holds, so eviction runs many
+        // times over during a single pass.
+        let count = OPEN_FILE_LIMIT * 4;
+        let piece_length = 16u32;
+        let per_file = 16u64;
+        let content: Vec<u8> = (0..count as u64 * per_file)
+            .map(|i| u8::try_from(i % 251).expect("byte"))
+            .collect();
+        let files: Vec<FileEntry> = (0..count)
+            .map(|i| FileEntry {
+                path: vec!["many".into(), format!("f{i:04}.bin")],
+                length: per_file,
+            })
+            .collect();
+        let meta = meta_for(files, piece_length, &content);
+
+        let storage = Storage::create(&meta, &dir.0, false).expect("create");
+
+        // Creating the layout must not leave a descriptor per file behind.
+        let after_create = open_fds_under(&dir.0);
+        assert!(
+            after_create <= OPEN_FILE_LIMIT,
+            "creation held {after_create} descriptors for {count} files"
+        );
+
+        // Write every piece, which walks the whole file set and forces the
+        // cache to turn over.
+        for (index, chunk) in content.chunks(piece_length as usize).enumerate() {
+            let index = u32::try_from(index).expect("piece index");
+            storage.write_block(index, 0, chunk).expect("write block");
+        }
+        let after_write = open_fds_under(&dir.0);
+        assert!(
+            after_write <= OPEN_FILE_LIMIT,
+            "writing held {after_write} descriptors for {count} files"
+        );
+
+        // And the data is right, across every eviction that happened on the
+        // way — the failure a cache like this introduces is a read served
+        // from the wrong file, not a descriptor count.
+        storage.sync_all().expect("sync");
+        for (index, chunk) in content.chunks(piece_length as usize).enumerate() {
+            let len = u32::try_from(chunk.len()).expect("piece length");
+            let got = storage
+                .read_block(u32::try_from(index).expect("piece index"), 0, len)
+                .expect("read block");
+            assert_eq!(got, chunk, "piece {index} came back wrong");
+        }
+        assert_eq!(
+            storage.verify_all().expect("verify").count(),
+            u32::try_from(meta.pieces.len()).expect("piece count"),
+            "not every piece verified after eviction"
+        );
     }
 }

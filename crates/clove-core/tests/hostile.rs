@@ -372,3 +372,100 @@ fn magnet_uris_survive_hostile_input() {
         }
     });
 }
+
+/// The review's proof of reachability, as a test: a *valid, canonical*
+/// `.torrent` of 221 KB describing 8,192 files — one of one byte, the rest
+/// empty. Nothing about it is malformed, which is the point. It passes every
+/// byte cap, every path check and the distinctness check, and before the
+/// fan-out limits it made the daemon create 8,192 filesystem entries and hold
+/// 8,192 descriptors, reaching the shipped unit's `LimitNOFILE` on its own.
+///
+/// A metainfo is small compared to what it can describe. That asymmetry is
+/// what has to be bounded, and it cannot be bounded by looking at byte counts.
+#[test]
+fn a_small_torrent_cannot_describe_an_unbounded_number_of_files() {
+    fn torrent_with_files(count: usize) -> Vec<u8> {
+        let mut files = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut f = BTreeMap::new();
+            // One byte in the first file, so the torrent is not zero-length
+            // overall — which is the only size check that existed.
+            f.insert(b"length".to_vec(), Ben::Int(i64::from(i == 0)));
+            f.insert(
+                b"path".to_vec(),
+                Ben::List(vec![Ben::Bytes(format!("f{i}").into_bytes())]),
+            );
+            files.push(Ben::Dict(f));
+        }
+        let mut info = BTreeMap::new();
+        info.insert(b"files".to_vec(), Ben::List(files));
+        info.insert(b"name".to_vec(), Ben::Bytes(b"fanout".to_vec()));
+        info.insert(b"piece length".to_vec(), Ben::Int(16_384));
+        info.insert(b"pieces".to_vec(), Ben::Bytes(vec![0x5A; 20]));
+        let mut root = BTreeMap::new();
+        root.insert(b"info".to_vec(), Ben::Dict(info));
+        bencode::encode(&Ben::Dict(root))
+    }
+
+    let hostile = torrent_with_files(8_192);
+    assert!(
+        hostile.len() < 400_000,
+        "the point is that this is a small file: {} bytes",
+        hostile.len()
+    );
+    assert!(
+        metainfo::MetaInfo::parse(&hostile).is_err(),
+        "8,192 files were accepted"
+    );
+
+    // Not merely refusing everything multi-file: a torrent at the limit is
+    // still a torrent, and real ones do have thousands of files.
+    let fine = torrent_with_files(metainfo::MAX_FILES);
+    let meta = metainfo::MetaInfo::parse(&fine).expect("a torrent at the limit was refused");
+    assert_eq!(meta.files.len(), metainfo::MAX_FILES);
+}
+
+/// Path depth and total path bytes are separate budgets from the file count:
+/// a few files can still carry a great many components, or enormous ones.
+#[test]
+fn path_depth_and_total_path_bytes_are_bounded_too() {
+    fn torrent_with_path(parts: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut f = BTreeMap::new();
+        f.insert(b"length".to_vec(), Ben::Int(1));
+        f.insert(
+            b"path".to_vec(),
+            Ben::List(parts.into_iter().map(Ben::Bytes).collect()),
+        );
+        let mut info = BTreeMap::new();
+        info.insert(b"files".to_vec(), Ben::List(vec![Ben::Dict(f)]));
+        info.insert(b"name".to_vec(), Ben::Bytes(b"deep".to_vec()));
+        info.insert(b"piece length".to_vec(), Ben::Int(16_384));
+        info.insert(b"pieces".to_vec(), Ben::Bytes(vec![0x5A; 20]));
+        let mut root = BTreeMap::new();
+        root.insert(b"info".to_vec(), Ben::Dict(info));
+        bencode::encode(&Ben::Dict(root))
+    }
+
+    // Every level is a mkdirat and an openat on the way to the file.
+    let deep: Vec<Vec<u8>> = (0..=metainfo::MAX_PATH_COMPONENTS)
+        .map(|i| format!("d{i}").into_bytes())
+        .collect();
+    assert!(
+        metainfo::MetaInfo::parse(&torrent_with_path(deep)).is_err(),
+        "an over-deep path was accepted"
+    );
+
+    // One file, one component, but a component large enough to matter — the
+    // strings are held for the torrent's lifetime.
+    let huge = vec![vec![b'x'; metainfo::MAX_TOTAL_PATH_BYTES + 1]];
+    assert!(
+        metainfo::MetaInfo::parse(&torrent_with_path(huge)).is_err(),
+        "an oversized path was accepted"
+    );
+
+    // An ordinary nested path still works.
+    let ordinary = vec![b"sub".to_vec(), b"dir".to_vec(), b"file.bin".to_vec()];
+    let meta =
+        metainfo::MetaInfo::parse(&torrent_with_path(ordinary)).expect("a normal path was refused");
+    assert_eq!(meta.files[0].path, ["deep", "sub", "dir", "file.bin"]);
+}
