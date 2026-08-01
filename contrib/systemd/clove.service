@@ -37,7 +37,12 @@ DynamicUser=yes
 StateDirectory=clove
 StateDirectoryMode=0700
 RuntimeDirectory=clove
-RuntimeDirectoryMode=0755
+# 0700, like StateDirectory above. The control socket lives here and is the
+# daemon's whole authentication surface; the token file that guards it is
+# 0600, and a directory anyone can list is one chmod away from mattering.
+# cloved also refuses to start if this directory is group- or world-accessible,
+# so loosening it here does not quietly widen anything — it stops the service.
+RuntimeDirectoryMode=0700
 
 # --- The clearnet lock ---
 # clove may speak to loopback (the SAM bridge) and nothing else. If a leak-class

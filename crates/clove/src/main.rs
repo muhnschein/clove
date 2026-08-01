@@ -1179,11 +1179,16 @@ fn resolve(where_: &Where) -> Result<(PathBuf, String), Fail> {
     let defaults = Defaults::from_env().map_err(|e| Fail::Failed(e.to_string()))?;
     // An explicit -c must exist; the default path may simply be absent, in
     // which case the built-in defaults are the whole configuration. Same rule
-    // as cloved, so the two agree on what "no config" means.
-    let text = match &where_.config {
-        Some(path) => std::fs::read_to_string(path)
-            .map_err(|e| Fail::Usage(format!("reading {}: {e}", path.display())))?,
-        None => std::fs::read_to_string(defaults.config_path()).unwrap_or_default(),
+    // as cloved, so the two agree on what "no config" means — including that
+    // an unreadable config is an error rather than an empty one.
+    let text = if let Some(path) = &where_.config {
+        std::fs::read_to_string(path)
+            .map_err(|e| Fail::Usage(format!("reading {}: {e}", path.display())))?
+    } else {
+        let path = defaults.config_path();
+        clove_core::config::read_optional(&path)
+            .map_err(|e| Fail::Failed(format!("reading {}: {e}", path.display())))?
+            .unwrap_or_default()
     };
     let config = Config::parse(&text, &defaults).map_err(|e| Fail::Failed(e.to_string()))?;
     let socket = where_.socket.clone().unwrap_or(config.api_socket);

@@ -89,12 +89,15 @@ fn run() -> Result<(), String> {
     let args = parse_args()?;
     let defaults = Defaults::from_env().map_err(|e| e.to_string())?;
     // An explicit -c must exist; the default path may simply be absent, in
-    // which case the built-in defaults are the whole configuration.
-    let text = match &args.config_path {
-        Some(path) => {
-            std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?
-        }
-        None => std::fs::read_to_string(defaults.config_path()).unwrap_or_default(),
+    // which case the built-in defaults are the whole configuration. Absent is
+    // the *only* forgiven error — see `config::read_optional`.
+    let text = if let Some(path) = &args.config_path {
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?
+    } else {
+        let path = defaults.config_path();
+        clove_core::config::read_optional(&path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?
+            .unwrap_or_default()
     };
     let config = Config::parse(&text, &defaults).map_err(|e| e.to_string())?;
 
@@ -126,18 +129,16 @@ fn run() -> Result<(), String> {
     // created before this, or by a permissive umask, is the case worth fixing.
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|e| format!("creating data dir {}: {e}", config.data_dir.display()))?;
-    if let Err(e) = std::fs::set_permissions(
-        &config.data_dir,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    ) {
-        eprintln!(
-            "cloved: could not restrict {} to 0700: {e}",
-            config.data_dir.display()
-        );
-    }
+    require_private_dir(&config.data_dir).map_err(|e| format!("data dir: {e}"))?;
     if let Some(parent) = config.api_socket.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating socket dir {}: {e}", parent.display()))?;
+        // The socket's directory is what Landlock will grant write access to,
+        // so it gets the same treatment as the data directory. On the default
+        // path this is a `clove/` of our own inside `$XDG_RUNTIME_DIR`; an
+        // operator who pointed `api_socket` somewhere shared finds out here
+        // rather than by having the sandbox quietly cover that place too.
+        require_private_dir(parent).map_err(|e| format!("socket dir: {e}"))?;
     }
     let token = load_or_create_token(&config.data_dir).map_err(|e| e.to_string())?;
 
@@ -1375,6 +1376,60 @@ fn read_private_file(path: &Path) -> std::io::Result<Option<String>> {
     let mut text = String::new();
     file.read_to_string(&mut text)?;
     Ok(Some(text))
+}
+
+/// Require `dir` to be a real directory, owned by this user, that no one else
+/// can read or write. Corrects the mode where it can; fails startup where it
+/// cannot.
+///
+/// The mode is applied first and checked second, because an install made
+/// before this check existed — or under a permissive umask — is the common
+/// case and is ours to fix rather than to complain about.
+///
+/// It is the *failure* that changed. This used to print "could not restrict
+/// ... to 0700" and carry on into a directory it had just established it does
+/// not control. Everything else here assumes that directory is private: the
+/// API token is 0600 but a readable directory is one accident from mattering,
+/// the destination key lives beside it, and the state files below are written
+/// by create-and-rename, which is only safe if nobody else can put something
+/// in the way. A warning is the wrong shape for a broken assumption — startup
+/// either has the ground it needs or it does not.
+fn require_private_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let _ = std::fs::set_permissions(dir, PermissionsExt::from_mode(0o700));
+
+    // `symlink_metadata`: a symlink must be seen as a symlink. Following it
+    // would approve the *target's* ownership and mode while the link itself
+    // stays whatever its own directory allows — including replaceable by
+    // whoever can write there, between this check and every later use of it.
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| format!("cannot stat {}: {e}", dir.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "{} is a symbolic link; it must be a directory",
+            dir.display()
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(format!("{} is not a directory", dir.display()));
+    }
+    let euid = rustix::process::geteuid().as_raw();
+    if meta.uid() != euid {
+        return Err(format!(
+            "{} is owned by uid {}, but this process runs as uid {euid}",
+            dir.display(),
+            meta.uid()
+        ));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "{} is mode {mode:04o}; group and other must have no access (0700)",
+            dir.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Write `contents` to `path` atomically and privately: a `0600` temp file,

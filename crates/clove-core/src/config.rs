@@ -68,6 +68,35 @@ impl Defaults {
     }
 }
 
+/// Read a configuration file that is allowed not to exist.
+///
+/// `Ok(None)` means the file genuinely is not there, which is the one case
+/// where built-in defaults are the whole configuration. Every other error —
+/// permissions, a directory where a file belongs, an I/O fault, bytes that are
+/// not UTF-8 — is returned.
+///
+/// Both binaries used `unwrap_or_default()` here, which folded all of those
+/// into "empty configuration" without a word. That is a privacy failure and
+/// not merely untidy: a config that says `ephemeral yes` and cannot be read
+/// becomes the default `ephemeral false`, so the daemon creates or reuses a
+/// persistent destination when the operator asked for a transient one — and
+/// `cloved -C` reports the configuration as OK while it happens. A config that
+/// exists and cannot be read is an error; only an absent one is a default.
+///
+/// # Errors
+///
+/// Any [`std::io::Error`] from reading `path` other than
+/// [`NotFound`](std::io::ErrorKind::NotFound). Note that invalid UTF-8 arrives
+/// as [`InvalidData`](std::io::ErrorKind::InvalidData) and is therefore fatal
+/// too, which is correct: a `clove.conf` that is not text is not a `clove.conf`.
+pub fn read_optional(path: &std::path::Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 fn nonempty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
@@ -397,12 +426,23 @@ impl Config {
         }
 
         let data_dir = data_dir.map_or_else(|| defaults.data_home.join("clove"), |(_, v)| v);
+        // `<runtime_dir>/clove/clove.sock`, not `<runtime_dir>/clove.sock`.
+        // The sandbox grants Landlock write access to the socket's *parent*,
+        // because the daemon must create, replace and unlink the socket there.
+        // With the socket directly in `$XDG_RUNTIME_DIR` that parent was the
+        // whole of `$XDG_RUNTIME_DIR`, so a compromised daemon could rewrite
+        // every other same-user runtime object — pipes, other sockets, other
+        // programs' state — while nominally confined. A directory of our own
+        // costs one `mkdir` and makes the grant as narrow as the need.
+        //
+        // The system-wide unit already had this shape via `RuntimeDirectory=`
+        // (`/run/clove`); this brings the user-session default in line with it.
         let api_socket = api_socket.map_or_else(
             || {
-                defaults
-                    .runtime_dir
-                    .as_ref()
-                    .map_or_else(|| data_dir.join("clove.sock"), |dir| dir.join("clove.sock"))
+                defaults.runtime_dir.as_ref().map_or_else(
+                    || data_dir.join("clove.sock"),
+                    |dir| dir.join("clove/clove.sock"),
+                )
             },
             |(_, v)| v,
         );
@@ -573,6 +613,7 @@ fn is_loopback_sam(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn defaults() -> Defaults {
         Defaults {
@@ -580,6 +621,83 @@ mod tests {
             runtime_dir: Some(PathBuf::from("/run/user/1000")),
             config_home: PathBuf::from("/home/u/.config"),
         }
+    }
+
+    /// A throwaway directory under the system temp dir; removed on drop.
+    /// Avoids a `tempfile` dependency (SCOPE §9 frugality).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("clove-config-test-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The one forgiven error. Nothing there is a configuration decision an
+    /// operator made by not making one.
+    #[test]
+    fn an_absent_config_is_not_an_error() {
+        let dir = TempDir::new();
+        let missing = dir.0.join("nope/clove.conf");
+        assert!(read_optional(&missing).unwrap().is_none());
+        // And it is genuinely the *absent* case that is forgiven, not "any
+        // error on a path that does not resolve".
+        let present = dir.0.join("clove.conf");
+        std::fs::write(&present, "ephemeral yes\n").unwrap();
+        assert_eq!(
+            read_optional(&present).unwrap().as_deref(),
+            Some("ephemeral yes\n")
+        );
+    }
+
+    /// A config that exists and cannot be read must stop the program, because
+    /// the alternative is running under a configuration nobody wrote. The
+    /// case that makes this leak-class rather than untidy: `ephemeral yes`
+    /// silently becoming `ephemeral false` means a persistent identity where
+    /// the operator asked for a transient one.
+    #[test]
+    fn an_unreadable_config_is_fatal_rather_than_empty() {
+        let dir = TempDir::new();
+
+        // A directory where a file belongs — a plausible typo, and one that
+        // `unwrap_or_default()` turned into "no configuration at all".
+        let as_dir = dir.0.join("clove.conf.d");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(read_optional(&as_dir).is_err(), "a directory read as config");
+
+        // Bytes that are not UTF-8: a truncated or half-written file. This
+        // arrives as InvalidData rather than as a read failure, which is
+        // precisely the shape `unwrap_or_default()` swallowed.
+        let binary = dir.0.join("binary.conf");
+        std::fs::write(&binary, [0xff, 0xfe, b'e', b'p', 0x80]).unwrap();
+        let e = read_optional(&binary).expect_err("invalid UTF-8 accepted");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+
+        // Unreadable by mode. Root ignores the mode, so under root there is
+        // no such thing as this case and asserting on it would be asserting
+        // on the test environment.
+        let locked = dir.0.join("locked.conf");
+        std::fs::write(&locked, "ephemeral yes\n").unwrap();
+        std::fs::set_permissions(&locked, PermissionsExt::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&locked).is_ok() {
+            return;
+        }
+        assert!(
+            read_optional(&locked).is_err(),
+            "a mode-0000 config read as empty"
+        );
     }
 
     #[test]
@@ -601,7 +719,12 @@ mod tests {
         assert_eq!(c.seed_idle_minutes, 0);
         assert_eq!(c.watch_dir, None);
         assert_eq!(c.data_dir, PathBuf::from("/home/u/.local/share/clove"));
-        assert_eq!(c.api_socket, PathBuf::from("/run/user/1000/clove.sock"));
+        // In a subdirectory of its own, so that the Landlock grant covering
+        // the socket's parent does not cover the whole runtime directory.
+        assert_eq!(
+            c.api_socket,
+            PathBuf::from("/run/user/1000/clove/clove.sock")
+        );
     }
 
     #[test]
