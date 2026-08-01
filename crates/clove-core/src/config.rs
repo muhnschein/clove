@@ -675,7 +675,10 @@ mod tests {
         // `unwrap_or_default()` turned into "no configuration at all".
         let as_dir = dir.0.join("clove.conf.d");
         std::fs::create_dir(&as_dir).unwrap();
-        assert!(read_optional(&as_dir).is_err(), "a directory read as config");
+        assert!(
+            read_optional(&as_dir).is_err(),
+            "a directory read as config"
+        );
 
         // Bytes that are not UTF-8: a truncated or half-written file. This
         // arrives as InvalidData rather than as a read failure, which is

@@ -141,10 +141,9 @@ impl Storage {
 
         // Opened without the lock held: a slow open on a cold cache must not
         // stop other threads reading files that are already in it.
-        let region = self
-            .regions
-            .get(index)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "storage: no such region"))?;
+        let region = self.regions.get(index).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "storage: no such region")
+        })?;
         let file = Arc::new(open_beneath(&self.root, &region.path)?);
 
         let mut open = lock_open(&self.open);
@@ -803,9 +802,7 @@ mod tests {
         std::fs::read_dir("/proc/self/fd")
             .expect("/proc/self/fd")
             .filter_map(Result::ok)
-            .filter(|e| {
-                std::fs::read_link(e.path()).is_ok_and(|target| target.starts_with(root))
-            })
+            .filter(|e| std::fs::read_link(e.path()).is_ok_and(|target| target.starts_with(root)))
             .count()
     }
 

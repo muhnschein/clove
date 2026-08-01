@@ -2512,7 +2512,9 @@ mod tests {
         rustix::fs::openat(
             rustix::fs::CWD,
             path,
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC,
             rustix::fs::Mode::empty(),
         )
         .expect("open watch dir")

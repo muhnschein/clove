@@ -1469,7 +1469,10 @@ mod hostile_bridge_tests {
 
         let addr = PEER.to_b32();
         let label = addr.trim_end_matches(".b32.i2p");
-        assert!(!e.to_string().contains(&addr), "the peer's address is in: {e}");
+        assert!(
+            !e.to_string().contains(&addr),
+            "the peer's address is in: {e}"
+        );
         assert!(
             !e.to_string().contains(label),
             "the peer's b32 label is in: {e}"
