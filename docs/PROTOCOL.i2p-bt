@@ -469,6 +469,70 @@ describing anything clove does.
     yosemite is left with `NAMING LOOKUP` alone.
 
 
+2.13a [decided] **Reading the router's account of a dead session is not the
+    same as believing it.** Found 2026-07-31, from a live report: every
+    torrent, new and existing, failing to announce with
+
+        tracker: router refused the stream to <b32>: INVALID_ID
+
+    indefinitely, while `clove status` reported `connected` the whole time.
+    Only restarting `cloved` cleared it.
+
+    (That line is quoted as it was seen. It no longer names the peer — a
+    destination in an error reaches a log and the control API, which
+    `SECURITY.md` does not allow — so the same failure now reads
+    `router refused the peer stream: INVALID_ID`. The result word, which
+    is the part this entry is about, is unchanged.)
+
+    `INVALID_ID` is the `STREAM STATUS` result for *no session has this id*.
+    A dial attaches to its session by id, so this is the router saying the
+    session is gone — not that a peer was unreachable. Every dial, every
+    announce and every inbound attach on that session was therefore doomed,
+    and clove retried into it forever.
+
+    The reason it never recovered is the shape of §2.13's fix. That work
+    correctly stopped clove *discarding* the router's last words, and stored
+    them — but stored them as **text for a future log line**, in
+    `Life::last_line`, to be quoted whenever something else eventually
+    declared the session dead. The only thing that ever did was an I/O error
+    on the control connection. So a router that ends a session by **saying
+    so and leaving the connection open** hit exactly the gap between the two:
+    the line was read, scrubbed, filed, and then the session was handed the
+    next dial as though nothing had been said. `wait_until_lost()` blocked on
+    a condvar nobody would signal, the supervisor never rebuilt, and the
+    "router lost" line the watchdog exists to print was never reached.
+
+    Two changes, because the two cases are genuinely different:
+
+      - **The watchdog acts on what it reads.** A `SESSION STATUS` after
+        setup is the router reporting on the session itself; a non-OK one
+        ends it, with the router's own words attached, exactly as an
+        end-of-file does. A `SESSION STATUS` carrying no `RESULT=` is treated
+        as malformed rather than fatal — it is not evidence, and the dial
+        path below will catch a session that is genuinely gone anyway.
+      - **A dial may condemn its own session.** `INVALID_ID` is separated
+        from every other refusal at the point it is classified, so it cannot
+        be mistaken for `CANT_REACH_PEER` and friends, and it ends the
+        session. This is the backstop for a router that destroys a session
+        **silently** — no line, no close — where the refused dial is the only
+        evidence that exists anywhere. Every other result stays "this peer,
+        this time": one unreachable peer must never tear down a working
+        session, which is the opposite failure and the worse one.
+
+    Either path now leaves the supervisor to do what it was always written to
+    do — detach, tear down, rebuild on the backoff — so the visible symptom
+    becomes a `waiting-for-router` pause and a reconnect instead of a daemon
+    that must be restarted by hand.
+
+    **This is not the ~90-second cycle of §2.12/§2.13, and does not close
+    it.** That was a session rebuilt too often; this is one never rebuilt at
+    all. They are opposite failures and the cycle remains unexplained. What
+    is worth carrying forward is narrower and applies to both: a diagnostic
+    that is *recorded* but not *acted on* is one the code cannot use. §2.13
+    made the router's words visible to an operator reading a log; it did not
+    make them visible to clove, and that distinction cost this outage.
+
+
 2.14 [decided] **A split stream is not closed by dropping one half**, and the
     engine's peer model splits every stream. Found 2026-07-27 while removing
     the last of §2.7a.

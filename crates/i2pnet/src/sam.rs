@@ -226,7 +226,7 @@ fn dial_stream(
     nickname: &str,
     peer: DestHash,
     timeout: Duration,
-) -> io::Result<ForwardedStream> {
+) -> Result<ForwardedStream, DialFailed> {
     let (mut stream, _) = sam_hello(port, timeout, "HELLO (for STREAM CONNECT)")?;
 
     // SILENT=false: the router answers with a STREAM STATUS line before any
@@ -267,33 +267,76 @@ fn dial_stream(
     Ok(ForwardedStream::from_socket(stream))
 }
 
+/// The `STREAM STATUS` result word for "no session has this id".
+const INVALID_ID: &str = "INVALID_ID";
+
+/// Why a dial produced no stream, and — the part that matters — whether the
+/// blame lies with the peer or with the session itself.
+///
+/// The distinction is not cosmetic. A dial attaches to a session by id, so
+/// exactly one refusal means every future dial is doomed too, and treating it
+/// as "this peer, this time" is how a daemon spends hours announcing into a
+/// session the router destroyed (see [`DialFailed::SessionGone`]).
+enum DialFailed {
+    /// `RESULT=INVALID_ID`: the router has no session under this id.
+    ///
+    /// Not a peer failure and not retryable — the session is gone, and no
+    /// dial, announce or lookup attached to it can succeed again. The router
+    /// is under no obligation to have told us first: it may have destroyed
+    /// the session without a word and without closing the control
+    /// connection, in which case this refusal is the only evidence there is.
+    SessionGone(io::Error),
+    /// Anything else: an unreachable peer, a timeout, a bridge that misbehaved
+    /// on the way. Ordinary on I2P, and says nothing about the session.
+    Peer(io::Error),
+}
+
+impl From<io::Error> for DialFailed {
+    /// Transport failures on the way to a `STREAM STATUS` are the dial's, not
+    /// the session's: a bridge answering badly is not the router telling us
+    /// our session is gone.
+    fn from(e: io::Error) -> DialFailed {
+        DialFailed::Peer(e)
+    }
+}
+
+impl From<DialFailed> for io::Error {
+    fn from(failed: DialFailed) -> io::Error {
+        match failed {
+            DialFailed::SessionGone(e) | DialFailed::Peer(e) => e,
+        }
+    }
+}
+
 /// Require a `STREAM STATUS RESULT=OK`, naming `what` was refused otherwise.
 ///
 /// The router's own result word, and its `MESSAGE` when it sent one.
 /// `CANT_REACH_PEER` and friends are ordinary on I2P and must read as "this
-/// peer, this time" rather than as a fault in the session.
+/// peer, this time" rather than as a fault in the session — with the single
+/// exception of `INVALID_ID`, which is the opposite, and is separated out
+/// here so that no caller can accidentally treat it as ordinary.
 ///
 /// Everything quoted from the router is scrubbed on the way out. We just sent
 /// it a `DESTINATION=` and it is free to say anything back — including our
 /// b32 in its `MESSAGE=`, or a whole key blob in a reply that is not a
 /// `STREAM STATUS` at all. Neither line is ours to author, and both end up in
 /// a log.
-fn expect_stream_ok(status: &str, what: &str) -> io::Result<()> {
+fn expect_stream_ok(status: &str, what: &str) -> Result<(), DialFailed> {
     if !status.starts_with("STREAM STATUS") {
-        return Err(io::Error::new(
+        return Err(DialFailed::Peer(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "SAM bridge answered with {:?} where a STREAM STATUS belongs",
                 scrub_control_line(status)
             ),
-        ));
+        )));
     }
     let result = status
         .split_whitespace()
         .find_map(|f| f.strip_prefix("RESULT="))
         .unwrap_or("MISSING");
     if result != "OK" {
-        return Err(io::Error::new(
+        let error = io::Error::new(
             io::ErrorKind::ConnectionRefused,
             format!(
                 "router refused {what}: {}{}",
@@ -303,7 +346,12 @@ fn expect_stream_ok(status: &str, what: &str) -> io::Result<()> {
                     .map(|(_, m)| format!(" ({})", scrub_control_line(m.trim_matches('"'))))
                     .unwrap_or_default()
             ),
-        ));
+        );
+        return Err(if result == INVALID_ID {
+            DialFailed::SessionGone(error)
+        } else {
+            DialFailed::Peer(error)
+        });
     }
     Ok(())
 }
@@ -486,8 +534,52 @@ fn watch_control(mut socket: TcpStream, port: u16, alive: &SessionLife) {
             }
             continue;
         }
+        // A `SESSION STATUS` *after* setup is the router reporting on the
+        // session itself, and a non-OK one is it announcing the session is
+        // over. Ending here rather than merely remembering the line is the
+        // difference between a rebuild and a wedge: the router is not
+        // required to close the control connection when it does this, and
+        // when it does not, nothing else will ever notice.
+        //
+        // This is one step past the fix that installed this thread. That one
+        // stopped clove throwing the router's account away — but it kept the
+        // account as *text for a future log line*, so a session could be
+        // pronounced dead by the router, filed away as a souvenir, and still
+        // be handed every dial the daemon made.
+        if let Some(result) = session_status_result(&said)
+            && result != "OK"
+            && result != "MISSING"
+        {
+            alive.note(&said);
+            alive.end("the router ended the session");
+            return;
+        }
         alive.note(&said);
     }
+}
+
+/// The `RESULT=` word of a `SESSION STATUS` line, or `None` when the line is
+/// not one.
+///
+/// Deliberately strict about the prefix, in both directions: `SESSION STATUS`
+/// and `SESSION STATUS RESULT=…` are the router talking about our session,
+/// while a hypothetical `SESSION STATUSES` is not, and acting on it would be
+/// acting on something we did not understand.
+///
+/// A `SESSION STATUS` carrying no `RESULT=` at all reports `MISSING`, which
+/// the caller treats as *not* a death: it is malformed rather than fatal, and
+/// a session that is genuinely gone will prove it on the next dial
+/// ([`DialFailed::SessionGone`]) rather than having to be guessed at here.
+fn session_status_result(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("SESSION STATUS")?;
+    if !(rest.is_empty() || rest.starts_with(' ')) {
+        return None;
+    }
+    Some(
+        rest.split_whitespace()
+            .find_map(|f| f.strip_prefix("RESULT="))
+            .unwrap_or("MISSING"),
+    )
 }
 
 /// The echo-back part of a router `PING`, or `None` when the line is not one.
@@ -1039,7 +1131,25 @@ impl I2pDialer for SamSession {
     /// is consulted for exactly one thing, its nickname, which SAM needs to
     /// attach the new stream to the right session.
     fn dial(&self, peer: DestHash, timeout: Duration) -> io::Result<ForwardedStream> {
-        dial_stream(self.samv3_tcp_port, &self.nickname, peer, timeout)
+        dial_stream(self.samv3_tcp_port, &self.nickname, peer, timeout).map_err(|failed| {
+            // `INVALID_ID` is the router saying this session no longer
+            // exists, and it is frequently the only way it says so: the
+            // control connection can stay open and silent over a session the
+            // router has already destroyed, leaving the watchdog nothing to
+            // read and nothing to report.
+            //
+            // Ending the session here is what turns that from permanent into
+            // a reconnect. Without it every announce and every peer dial
+            // fails identically and forever, `clove status` still reports
+            // `connected`, and the only cure is restarting the daemon —
+            // which is exactly the XD-style flakiness SCOPE §4 exists to
+            // rule out.
+            if let DialFailed::SessionGone(e) = &failed {
+                self.life
+                    .end(&format!("the router no longer has our session ({e})"));
+            }
+            failed.into()
+        })
     }
 
     /// A dial attaches to the session by nickname, so a session the router has
@@ -1411,6 +1521,17 @@ mod hostile_bridge_tests {
     /// Enough to test the whole dial path without a router, which is the
     /// point: this code is the reason clove no longer needs a live router to
     /// know whether a failed dial is reportable.
+    /// [`dial_stream`] with its failure flattened back to an `io::Error`.
+    ///
+    /// The tests below care what an operator is told, which is the error; the
+    /// one test that cares *which kind* of failure it was classifies it
+    /// through `expect_stream_ok` directly.
+    fn dialed(port: u16, peer: DestHash, timeout: Duration) -> io::Result<ForwardedStream> {
+        dial_stream(port, "clove-test", peer, timeout).map_err(io::Error::from)
+    }
+
+    // `&str` rather than `&'static str`: the redaction tests build a status
+    // line with a destination in it rather than picking a literal.
     fn dial_bridge(status: &str, echo: bool) -> u16 {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1461,7 +1582,7 @@ mod hostile_bridge_tests {
     #[test]
     fn a_dialled_stream_hands_back_the_socket_with_the_status_line_eaten() {
         let port = dial_bridge("STREAM STATUS RESULT=OK\n", true);
-        let mut stream = dial_stream(port, "clove-test", PEER, PROBE).expect("dial");
+        let mut stream = dialed(port, PEER, PROBE).expect("dial");
         stream.write_all(b"the-bittorrent-handshake").unwrap();
         let mut back = [0u8; 24];
         stream.read_exact(&mut back).unwrap();
@@ -1484,7 +1605,7 @@ mod hostile_bridge_tests {
     #[test]
     fn a_refused_dial_reports_the_routers_own_words_and_costs_nothing_else() {
         let port = dial_bridge("STREAM STATUS RESULT=CANT_REACH_PEER\n", false);
-        let e = dial_stream(port, "clove-test", PEER, PROBE).expect_err("refused");
+        let e = dialed(port, PEER, PROBE).expect_err("refused");
         assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
         assert!(e.to_string().contains("CANT_REACH_PEER"), "{e}");
         assert_no_destination(&e.to_string(), PEER);
@@ -1492,7 +1613,7 @@ mod hostile_bridge_tests {
         // And the next dial on the same session id works, because the two
         // share no state at all.
         let ok = dial_bridge("STREAM STATUS RESULT=OK\n", true);
-        assert!(dial_stream(ok, "clove-test", PEER, PROBE).is_ok());
+        assert!(dialed(ok, PEER, PROBE).is_ok());
     }
 
     /// Assert `text` names neither `peer` nor any part of it that stays
@@ -1520,7 +1641,7 @@ mod hostile_bridge_tests {
             PEER.to_b32()
         );
         let port = dial_bridge(&echoed, false);
-        let e = dial_stream(port, "clove-test", PEER, PROBE).expect_err("refused");
+        let e = dialed(port, PEER, PROBE).expect_err("refused");
         assert!(e.to_string().contains("no leaseSet"), "{e}");
         assert_no_destination(&e.to_string(), PEER);
     }
@@ -1530,7 +1651,7 @@ mod hostile_bridge_tests {
     #[test]
     fn a_destination_in_a_malformed_reply_is_scrubbed_too() {
         let port = dial_bridge(&format!("HELLO REPLY DEST={}\n", PEER.to_b32()), false);
-        let e = dial_stream(port, "clove-test", PEER, PROBE).expect_err("not a status");
+        let e = dialed(port, PEER, PROBE).expect_err("not a status");
         assert_no_destination(&e.to_string(), PEER);
     }
 
@@ -1541,7 +1662,7 @@ mod hostile_bridge_tests {
             "STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"session not found\"\n",
             false,
         );
-        let e = dial_stream(port, "clove-test", PEER, PROBE).expect_err("refused");
+        let e = dialed(port, PEER, PROBE).expect_err("refused");
         assert!(e.to_string().contains("session not found"), "{e}");
     }
 
@@ -1562,8 +1683,7 @@ mod hostile_bridge_tests {
         ] {
             let port = fake_bridge(how);
             let (result, took) =
-                within(LIMIT, move || dial_stream(port, "clove-test", PEER, PROBE))
-                    .expect("dial returned");
+                within(LIMIT, move || dialed(port, PEER, PROBE)).expect("dial returned");
             assert!(result.is_err(), "{how:?} was accepted as a stream");
             assert!(took < LIMIT, "{how:?} took {took:?}");
         }
@@ -1580,7 +1700,7 @@ mod hostile_bridge_tests {
     #[test]
     fn an_unterminated_status_line_is_never_a_stream() {
         let port = dial_bridge("STREAM STATUS RESULT=OK", false); // no newline
-        let e = dial_stream(port, "clove-test", PEER, PROBE).expect_err("no newline");
+        let e = dialed(port, PEER, PROBE).expect_err("no newline");
         assert!(
             e.to_string().contains("STREAM CONNECT"),
             "the error must name the exchange it failed in: {e}"
@@ -1644,6 +1764,10 @@ mod session_tests {
         Ping,
         /// Explain itself and hang up, the way a router ending a session does.
         ExplainAndClose,
+        /// Explain itself and **hold the connection open** — a router that
+        /// destroys the session without hanging up, which is the case that
+        /// wedged clove: nothing closes, so nothing detected it.
+        ExplainAndHold,
     }
 
     /// A fake SAM bridge that can carry a whole session.
@@ -1684,6 +1808,12 @@ mod session_tests {
                                 b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"tunnel build failed\"\n",
                             );
                             // and drop, which closes it
+                        }
+                        AfterSession::ExplainAndHold => {
+                            let _ = socket.write_all(
+                                b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"tunnel build failed\"\n",
+                            );
+                            std::thread::sleep(Duration::from_secs(120));
                         }
                     }
                 });
@@ -1915,5 +2045,92 @@ mod session_tests {
         assert_eq!(ping_token("PONG 12345"), None);
         assert_eq!(ping_token("SESSION STATUS RESULT=OK"), None);
         assert_eq!(ping_token(""), None);
+    }
+
+    #[test]
+    fn session_status_lines_are_recognised_exactly() {
+        assert_eq!(
+            session_status_result("SESSION STATUS RESULT=I2P_ERROR"),
+            Some("I2P_ERROR")
+        );
+        assert_eq!(
+            session_status_result("SESSION STATUS RESULT=OK"),
+            Some("OK")
+        );
+        // Malformed rather than fatal: reported, but not acted on. A session
+        // that is really gone proves it on the next dial.
+        assert_eq!(session_status_result("SESSION STATUS"), Some("MISSING"));
+        // Not a SESSION STATUS at all, and acting on one would be acting on
+        // something we did not understand.
+        assert_eq!(session_status_result("SESSION STATUSES RESULT=OK"), None);
+        assert_eq!(session_status_result("STREAM STATUS RESULT=OK"), None);
+        assert_eq!(session_status_result("PING"), None);
+        assert_eq!(session_status_result(""), None);
+    }
+
+    /// The wedge this fix exists for.
+    ///
+    /// A router may destroy a session and say so on the control connection
+    /// **without closing it**. The previous version of this code read that
+    /// line, filed it away as a souvenir for a future log message, and went
+    /// on believing the session was alive — so `wait_until_lost` never
+    /// returned, the daemon reported `connected` indefinitely, and every dial
+    /// and announce failed with `INVALID_ID` until somebody restarted it.
+    #[test]
+    fn a_session_the_router_ended_is_lost_even_if_nothing_hangs_up() {
+        let (port, _sent) = session_bridge(ok_status(), AfterSession::ExplainAndHold);
+        let session = Arc::new(SamSession::connect(&config(port)).expect("session"));
+
+        // Bounded, because the regression is a *hang*: before this fix
+        // `wait_until_lost` simply never returned.
+        let (tx, rx) = mpsc::channel();
+        let waiting = Arc::clone(&session);
+        std::thread::spawn(move || {
+            let _ = tx.send(waiting.wait_until_lost());
+        });
+        let lost = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a session the router ended must be reported lost, not held open");
+
+        assert!(lost.contains("the router ended the session"), "{lost}");
+        // And it must carry what the router actually said, which is the whole
+        // reason the watchdog reads this connection at all.
+        assert!(lost.contains("I2P_ERROR"), "{lost}");
+        assert!(lost.contains("tunnel build failed"), "{lost}");
+        assert!(!session.healthy(), "and nothing may be handed to it after");
+    }
+
+    /// The backstop, for a router that destroys a session and says nothing.
+    ///
+    /// Then a refused dial is the only evidence there is, and treating
+    /// `INVALID_ID` as "this peer, this time" means retrying into it forever.
+    #[test]
+    fn a_dial_refused_with_invalid_id_condemns_the_session() {
+        let refused = expect_stream_ok("STREAM STATUS RESULT=INVALID_ID", "the stream to a peer")
+            .expect_err("INVALID_ID is a refusal");
+        assert!(
+            matches!(refused, DialFailed::SessionGone(_)),
+            "INVALID_ID is the session's death, not a peer's"
+        );
+        // Every other refusal stays the peer's problem, or one bad peer would
+        // tear down a healthy session — the opposite failure, and worse.
+        for ordinary in ["CANT_REACH_PEER", "I2P_ERROR", "TIMEOUT", "MISSING"] {
+            let status = format!("STREAM STATUS RESULT={ordinary}");
+            let e = expect_stream_ok(&status, "the stream to a peer").expect_err("refusal");
+            assert!(
+                matches!(e, DialFailed::Peer(_)),
+                "{ordinary} must not end the session"
+            );
+        }
+
+        // And a session told this is no longer offered work.
+        let (port, _sent) = session_bridge(ok_status(), AfterSession::Hold);
+        let session = SamSession::connect(&config(port)).expect("session");
+        assert!(session.healthy(), "a fresh session is alive");
+        session
+            .life
+            .end("the router no longer has our session (test)");
+        assert!(!session.healthy(), "a dial may condemn its own session");
+        assert!(!session.usable(), "and nothing may be handed to it after");
     }
 }
