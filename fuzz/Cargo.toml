@@ -12,6 +12,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 clove-core = { path = "../crates/clove-core" }
+i2pnet = { path = "../crates/i2pnet" }
 
 [[bin]]
 name = "bencode"
@@ -64,5 +65,11 @@ doc = false
 [[bin]]
 name = "magnet"
 path = "fuzz_targets/magnet.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "dest"
+path = "fuzz_targets/dest.rs"
 test = false
 doc = false
