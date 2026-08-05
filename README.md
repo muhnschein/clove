@@ -1,13 +1,14 @@
 # clove 🧄
 
-clove is an I2P-only BitTorrent client.
+A modern I2P-only BitTorrent client designed to have no clearnet path.
 
-> ⚠️ **Work in progress:** clove is currently under active development.
-> If your personal safety depends on its anonymity, do not use it.
+> ⚠️ **Work in progress:** clove is pre-alpha and under active development. If
+> your personal safety depends on its anonymity, do not use it.
 
 > 🤖 **Vibe-coded:** Much of this project was developed using AI.
->If you have any ethical or security concerns because of this,
-> use something else.
+> Treat its security properties as claims to verify, not a substitute for
+> independent review. If that provenance conflicts with your requirements, use
+> something else.
 
 ## Overview
 
@@ -21,58 +22,163 @@ engine, non-I2P trackers are discarded, and the only component allowed to open
 an IP socket is the small `i2pnet` boundary that connects to a loopback SAM
 bridge.
 
-## Documents
+The initial feature set is present and clove has downloaded and seeded on public I2P swarms through both i2pd and Java I2P. Interfaces may still change,
+real-network testing remains limited, and the project should be treated as
+unaudited.
 
-- [`docs/SCOPE.md`](docs/SCOPE.md) — the spec: what clove is and is not
-- [`docs/DECISIONS.md`](docs/DECISIONS.md) — resolved design questions Q1–Q7
-- [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt) — the I2P-BitTorrent dialect, and every live finding
-- [`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md) — the data directory and the resume file
-- [`DEPENDENCIES.md`](DEPENDENCIES.md) — the dependency allowlist
-- [`SECURITY.md`](SECURITY.md) — how to report a vulnerability, and what counts as one
+## TL;DR
 
-Man pages are the primary user documentation and live in [`man/`](man):
-`clove(1)`, `clove.conf(5)`, `clove-api(7)`, `cloved(8)`. Read them before
-installing with `mandoc man/clove.1`, or after with `man clove`. This README
-stays short on purpose.
+You need an I2P router exposing SAMv3 on loopback (by default
+`127.0.0.1:7656`) and the Rust toolchain pinned by this repository.
 
-## Confinement
-
-Aspires to be leak-proof by construction, based on three independent layers (`docs/SCOPE.md` §5). No layer assumes that another is present:
-
-1. **By construction** — the engine has no IP vocabulary and cannot open a
-   socket; only `i2pnet` can, and only to a loopback SAM bridge. Enforced by
-   `clippy.toml` and `ci/check-net-deps.sh`.
-2. **Self-restriction** — after initialisation `cloved` confines itself with
-   Landlock (filesystem down to the data directory; on ABI 4+, outbound TCP
-   down to the SAM port) and a seccomp filter refusing exec, ptrace, module and
-   BPF loading, mount, and unfamiliar address families. Best-effort: a kernel
-   without them gets one log line, not a failed start.
-3. **OS sandbox** — `contrib/systemd/` has a system unit and a per-user unit;
-   the system one carries the `IPAddressDeny=any` clearnet lock.
-   `contrib/netns/` documents the same lock for non-systemd hosts.
-
-clove talks to any router exposing SAMv3. It is developed against i2pd and
-Java I2P, and both have carried full downloads from public i2psnark swarms.
-
-## Building and testing
-
-```
-cargo build                 # or: make install PREFIX=/usr DESTDIR=pkg
-make test                   # units, the hostile-input parser sweep, the evil-peer suite
-make smoke                  # the daemon end to end, no router needed
-make chaos                  # SIGKILL storms and failed state writes
-make man-lint               # the manuals still parse
+```console
+# Build and install clove for the current user.
+$ git clone https://github.com/vittuusaatanaperkele/clove.git
+$ cd clove
+$ make install PREFIX="$HOME/.local"
+$ export PATH="$HOME/.local/bin:$PATH"
+$ cloved
 ```
 
-Everything above runs from a clean checkout with no infrastructure, and
-nothing in this repo needs a router. `make fuzz` wants a nightly toolchain
-(see [`fuzz/README.md`](fuzz/README.md)).
+In another terminal:
 
-To exercise clove against a real router, run the daemon against one: point
-`cloved` at your router's SAM port, add a torrent, and watch it.
+```console
+# Add a torrent file or magnet link.
+$ clove add ~/Downloads/release.torrent
 
-CI runs all of the above plus rustfmt, `clippy::pedantic` denied,
-`cargo deny`, and `ci/check-net-deps.sh` — the gate that fails the build if a
-socket-capable crate reaches the dependency tree without being allowlisted.
-Debug builds additionally carry invariant assertions over the piece
-accounting, the choke scheduler and the peer table; release builds do not.
+# See the client and all hosted torrents.
+$ clove list
+
+# Refresh the same stable table every two seconds.
+$ watch clove list
+```
+
+`cloved` runs in the foreground and logs to standard error. For regular use,
+see [Running as a service](#running-as-a-service).
+
+## Installation
+
+clove is currently built from source.
+
+### Requirements
+
+- Rust 1.94.1 with `cargo`, `clippy`, and `rustfmt` (pinned in
+  [`rust-toolchain.toml`](rust-toolchain.toml));
+- an external i2pd or Java I2P router exposing SAMv3 over loopback; and
+- Linux for Landlock/seccomp self-confinement and the bundled sandboxing
+  recipes. Other platforms fall back without those Linux-specific layers and
+  are not the primary deployment target.
+
+### Install binaries and man pages
+
+```console
+# Current user
+$ make install PREFIX="$HOME/.local"
+
+# Or system-wide
+$ sudo make install PREFIX=/usr/local
+```
+
+The installed manuals are `clove(1)`, `clove.conf(5)`, `clove-api(7)`, and
+`cloved(8)`.
+
+### Running as a service
+
+After installing with `PREFIX="$HOME/.local"`, install the bundled user unit:
+
+```console
+$ install -Dm 0644 contrib/systemd/clove-user.service \
+    ~/.config/systemd/user/clove.service
+$ systemctl --user daemon-reload
+$ systemctl --user enable --now clove
+$ journalctl --user -u clove -f
+```
+
+The user unit applies filesystem, process, and syscall hardening. On most
+systems a user service cannot enforce systemd's IP address filtering. For an
+independent kernel-enforced clearnet lock, use the bundled
+[`clove.service`](contrib/systemd/clove.service) system unit.
+
+## Configuration
+
+See [`clove.conf(5)`](man/clove.conf.5) for every setting and its default.
+
+## Security model
+
+clove aspires to be secure and I2P-only through three independent layers.
+No layer assumes another is present.
+
+1. **By construction.** Only `i2pnet` may use socket-capable APIs. The engine
+   has no IP vocabulary, SAM addresses are restricted to loopback, DNS is not
+   used, and non-I2P trackers are discarded. Lints and
+   [`ci/check-net-deps.sh`](ci/check-net-deps.sh) enforce the dependency
+   boundary in CI.
+2. **Self-restriction.** After initialization, `cloved` attempts to confine its
+   filesystem and outbound TCP with Landlock and deny unneeded syscall classes
+   with seccomp. These mechanisms are best-effort; the daemon reports what was
+   applied and continues if the running kernel cannot provide them.
+3. **OS sandbox.** The system service and network-namespace recipe provide a
+   separate deployment-level clearnet lock and further process hardening.
+
+This model does not protect against a compromised kernel or I2P router,
+resource exhaustion, an attacker who already controls the daemon's account, or
+the normal visibility of your I2P destination to peers in a public swarm.
+
+Please report suspected vulnerabilities through GitHub's private vulnerability
+reporting—*not a public issue*. See [`SECURITY.md`](SECURITY.md) for scope and the
+information that helps investigate a report.
+
+## Limitations
+
+- No clearnet or mixed-network mode—ever.
+- No built-in Web UI—ever.
+- No embedded I2P router.
+- No I2P DHT; discovery currently uses trackers and peer exchange.
+- No UDP tracker announces, BitTorrent v2, uTP, or local peer discovery.
+- No daemon-less one-shot download mode.
+
+See [`docs/SCOPE.md`](docs/SCOPE.md) for the full goals and non-goals.
+
+## Testing
+
+All routine tests run without an I2P router:
+
+```console
+$ make test       # unit, model, hostile-input, and evil-peer tests
+$ make smoke      # daemon and CLI end to end
+$ make chaos      # crash and failed-state-write scenarios
+$ make man-lint   # mdoc validation, when mandoc is installed
+$ make doc-lint   # rustdoc links and warnings
+$ make lint       # clippy with warnings denied
+$ make fmt        # rustfmt check
+```
+
+`make fuzz` requires a nightly toolchain and `cargo-fuzz`; see
+[`fuzz/README.md`](fuzz/README.md).
+
+CI also checks the dependency allowlist and fails if a socket-capable crate
+crosses the network boundary without review. Live interoperability findings are
+recorded in [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt).
+
+## Documentation
+
+The man pages are the primary user documentation:
+
+- [`clove(1)`](man/clove.1) — CLI commands and examples;
+- [`cloved(8)`](man/cloved.8) — daemon lifecycle, files, and confinement;
+- [`clove.conf(5)`](man/clove.conf.5) — configuration and defaults; and
+- [`clove-api(7)`](man/clove-api.7) — the local HTTP API.
+
+Design and protocol documents live in the repository:
+
+- [`docs/SCOPE.md`](docs/SCOPE.md) — goals, non-goals, and engineering scope;
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — resolved design decisions;
+- [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt) — I2P BitTorrent dialect and
+  interoperability findings;
+- [`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md) — persistent state format;
+- [`DEPENDENCIES.md`](DEPENDENCIES.md) — reviewed dependency allowlist; and
+- [`SECURITY.md`](SECURITY.md) — vulnerability policy and security guarantees.
+
+## License
+
+clove is available under the [ISC License](LICENSE).
