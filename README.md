@@ -1,25 +1,31 @@
-# clove
+# clove 🧄
 
-clove is an I2P-only BitTorrent client. Split into daemon (`cloved`) and CLI (`clove`),
-speaking SAMv3 to an external I2P router.
+clove is an I2P-only BitTorrent client.
 
-## Status
+> ⚠️ **Work in progress:** clove is currently under active development.
+> If your personal safety depends on its anonymity, do not use it.
 
-**Pre-alpha.** Feature-complete against its v1 scope — daemon, CLI,
-engine, tracker, PEX, magnets, persistence — and it downloads from and seeds to
-live swarms on i2pd and Java I2P. Phase H added what running *many* torrents
-needs: a client-wide peer budget, a download/seed queue, seeding limits, and
-torrents named by hash prefix. The CLI has since been narrowed to one view:
-`clove list`, with a live view spelled `watch -n 2 clove list`
-([`DECISIONS.md`](docs/DECISIONS.md) S3).
+> 🤖 **Vibe-coded:** Much of this project was developed using AI.
+>If you have any ethical or security concerns because of this,
+> use something else.
+
+## Overview
+
+clove is a BitTorrent client for I2P. It is split into a long-running daemon
+(`cloved`) and a control CLI (`clove`), and connects to an external I2P router
+over SAMv3.
+
+Unlike a general-purpose BitTorrent client with an anonymous mode, clove has no
+clearnet mode to misconfigure. Peers are I2P destinations throughout the
+engine, non-I2P trackers are discarded, and the only component allowed to open
+an IP socket is the small `i2pnet` boundary that connects to a loopback SAM
+bridge.
 
 ## Documents
 
-- [`docs/SCOPE.md`](docs/SCOPE.md) — what clove is and is not (the spec)
+- [`docs/SCOPE.md`](docs/SCOPE.md) — the spec: what clove is and is not
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — resolved design questions Q1–Q7
 - [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt) — the I2P-BitTorrent dialect, and every live finding
-- [`docs/PHASE-F.md`](docs/PHASE-F.md) — daemon/CLI/API design, and the TUI decision
-- [`docs/PHASE-H.md`](docs/PHASE-H.md) — the multi-torrent budget, the queue, and seeding limits
 - [`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md) — the data directory and the resume file
 - [`DEPENDENCIES.md`](DEPENDENCIES.md) — the dependency allowlist
 - [`SECURITY.md`](SECURITY.md) — how to report a vulnerability, and what counts as one
@@ -31,7 +37,7 @@ stays short on purpose.
 
 ## Confinement
 
-Aspires to be leak-proof by construction. Three independent layers (`docs/SCOPE.md` §5), none assuming another is present:
+Aspires to be leak-proof by construction, based on three independent layers (`docs/SCOPE.md` §5). No layer assumes that another is present:
 
 1. **By construction** — the engine has no IP vocabulary and cannot open a
    socket; only `i2pnet` can, and only to a loopback SAM bridge. Enforced by
@@ -47,18 +53,6 @@ Aspires to be leak-proof by construction. Three independent layers (`docs/SCOPE.
 
 clove talks to any router exposing SAMv3. It is developed against i2pd and
 Java I2P, and both have carried full downloads from public i2psnark swarms.
-
-## Development
-
-**This is entirely vibe-coded. Here be dragons.**
-
-Every defect that has mattered was found by running it against a real router
-and a real swarm; none was reachable from a router-free test, and the unit
-suite was green through all of them. They are recorded in
-[`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt), each with the test that catches
-it now. clove has since downloaded and seeded a 3.2 GiB torrent from a public
-i2psnark swarm on both i2pd and Java I2P.
-
 
 ## Building and testing
 
