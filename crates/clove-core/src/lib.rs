@@ -18,6 +18,7 @@ pub mod picker;
 pub mod resume;
 pub mod storage;
 pub mod swarm;
+pub mod text;
 pub mod torrent;
 pub mod tracker;
 pub mod wire;

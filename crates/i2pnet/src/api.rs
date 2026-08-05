@@ -58,6 +58,22 @@ impl ApiListener {
         Ok(ApiListener::Tcp(TcpListener::bind(parsed)?))
     }
 
+    /// The TCP port this listener is bound to, or `None` for a unix socket.
+    ///
+    /// Chiefly for a listener bound to port 0, where the kernel chose the port
+    /// and only it knows which — a test that then dials itself, and an operator
+    /// who needs the daemon to say where it is listening.
+    ///
+    /// # Errors
+    ///
+    /// The underlying `getsockname` fails.
+    pub fn local_port(&self) -> io::Result<Option<u16>> {
+        match self {
+            ApiListener::Unix(_) => Ok(None),
+            ApiListener::Tcp(l) => Ok(Some(l.local_addr()?.port())),
+        }
+    }
+
     /// Accept one connection.
     ///
     /// # Errors

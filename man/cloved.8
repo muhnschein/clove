@@ -101,17 +101,27 @@ confining the filesystem to the data directory and the control socket's
 directory, and, on kernels with Landlock ABI 4 or later, confining outbound
 TCP to the single SAM port; plus a
 .Xr seccomp 2
-filter refusing
-.Xr execve 2 ,
-.Xr ptrace 2 ,
-module and BPF loading, mount and namespace calls, kernel replacement, the
-kernel keyring, and
+allowlist: every syscall the daemon no longer needs returns
+.Er EPERM ,
+and
 .Xr socket 2
-for any address family other than
+is permitted only for
 .Dv AF_UNIX ,
 .Dv AF_INET
 and
 .Dv AF_INET6 .
+.Pp
+An allowlist rather than a list of refusals, because a list of refusals can only
+name what somebody thought of.
+.Xr execve 2 ,
+.Xr ptrace 2 ,
+module and BPF loading, mount and namespace calls, kernel replacement, the
+kernel keyring and
+.Xr io_uring_setup 2
+are all denied \(em not because each is named, but because none is allowed.
+The permitted set is measured from a traced run of the daemon rather than
+guessed at, and the daemon's own test suite performs that workload under the
+live filter.
 .Pp
 Neither mechanism is allowed to fail startup.
 What was actually applied is reported in one line on standard error, for
@@ -124,9 +134,7 @@ On a kernel without Landlock the same line says so, and the daemon continues:
 this is one of three independent layers, and no layer assumes another is
 present.
 The others are the by-construction restrictions above and the OS sandbox in
-.Pa contrib/systemd
-and
-.Pa contrib/netns .
+.Pa contrib/systemd .
 .Sh FILES
 .Bl -tag -width Ds -compact
 .It Pa ~/.config/clove/clove.conf

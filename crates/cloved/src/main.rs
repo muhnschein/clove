@@ -265,6 +265,11 @@ fn scan_watch_dir(daemon: &Arc<Daemon>, dir: &Path) {
         if path.extension().and_then(|e| e.to_str()) != Some("torrent") {
             continue;
         }
+        // The watch directory is the one path an operator points *outward*, so
+        // its filenames are chosen by whoever produced the file — a browser
+        // download, a script, a stranger. Scrubbed once here for the three log
+        // lines below (`clove_core::text`).
+        let shown = clove_core::text::scrub(&path.display().to_string());
         let Ok(bytes) = fs::read(&path) else {
             continue;
         };
@@ -274,24 +279,20 @@ fn scan_watch_dir(daemon: &Arc<Daemon>, dir: &Path) {
                 // Same as the API path: the initial hash of whatever is
                 // already on disk runs with the registry unlocked.
                 let _ = run_scan(daemon, &job);
-                eprintln!(
-                    "cloved: added {} from {}",
-                    registry::hex(&info_hash),
-                    path.display()
-                );
+                eprintln!("cloved: added {} from {shown}", registry::hex(&info_hash));
                 "added"
             }
             // A duplicate is not a failure: the operator dropped in something
             // already hosted, and the file has still been dealt with.
             Err(AddError::Duplicate) => "added",
             Err(e) => {
-                eprintln!("cloved: not adding {}: {e}", path.display());
+                eprintln!("cloved: not adding {shown}: {e}");
                 "rejected"
             }
         };
         let taken = path.with_extension(format!("torrent.{suffix}"));
         if let Err(e) = fs::rename(&path, &taken) {
-            eprintln!("cloved: leaving {} where it is: {e}", path.display());
+            eprintln!("cloved: leaving {shown} where it is: {e}");
         }
     }
 }
@@ -625,8 +626,11 @@ pub(crate) struct FetchRound {
 impl FetchRound {
     /// Record a failure against something safe to name — a tracker hostname is
     /// published in the torrent that carried it and is nobody's identity.
+    ///
+    /// Safe to *name*, not safe to print raw: `what` is a URL or host out of a
+    /// magnet somebody else wrote, and this goes to stderr and into the API.
     fn fail(&mut self, stage: &str, what: &str, e: &dyn std::fmt::Display) {
-        let text = format!("{stage} {what}: {e}");
+        let text = format!("{stage} {}: {e}", clove_core::text::scrub(what));
         eprintln!("cloved: metadata fetch: {text}");
         self.last_error = Some(text);
     }
@@ -723,7 +727,7 @@ where
                 // that finds out.
                 eprintln!(
                     "cloved: the announce that failed was {}",
-                    clove_core::tracker::announced_url(&host, &request)
+                    clove_core::text::scrub(&clove_core::tracker::announced_url(&host, &request))
                 );
             }
         }

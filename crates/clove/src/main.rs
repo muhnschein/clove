@@ -410,7 +410,10 @@ fn cmd_add(where_: &Where, operands: &[String]) -> Result<(), Fail> {
     let value = parse_body(&reply)?;
     match value.get("info_hash").and_then(Value::as_str) {
         Some(info_hash) => println!("added {info_hash}"),
-        None => println!("{}", String::from_utf8_lossy(&reply).trim()),
+        // A reply we did not recognise, shown as-is so it is not lost — but
+        // scrubbed, because "as-is" here means straight from the daemon's JSON
+        // to a terminal, and that is the one thing this must not be.
+        None => println!("{}", display(String::from_utf8_lossy(&reply).trim())),
     }
     Ok(())
 }
@@ -714,24 +717,15 @@ const NAME_WIDTH: usize = 60;
 /// substitution happens at the one boundary where bytes become a terminal's
 /// input.
 ///
-/// Replaced with `.`:
-/// - the `Cc` category (C0, `DEL` and C1), which is where the escapes live;
-/// - the bidirectional overrides, which reorder *neighbouring* text rather
-///   than drawing anything themselves, and so can make `…rat.exe` render as
-///   `…exe.tar` in the list an operator is reading to decide what to trust.
+/// What is replaced, and why, is [`clove_core::text::scrub`]'s to say — the
+/// daemon scrubs its own stderr with the same function, and two copies of a
+/// security control are how one of them comes to be missing a case.
 ///
 /// Everything else passes through, including the UTF-8 that makes [`align`]
 /// approximate — it counts characters, not display columns, which is unchanged
 /// here and not worth a dependency to fix.
 fn display(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            c if c.is_control() => '.',
-            // LRM/RLM, the LRE/RLE/PDF/LRO/RLO run, and the isolates.
-            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '.',
-            c => c,
-        })
-        .collect()
+    clove_core::text::scrub(s)
 }
 
 /// [`display`], then clamp to `width` characters, marking any elision.
@@ -1222,10 +1216,15 @@ fn request(
     }
     if !(200..300).contains(&response.status) {
         let detail = String::from_utf8_lossy(&response.body);
+        // Scrubbed: an error body carries torrent names — the 409 an ambiguous
+        // prefix returns lists its candidates — and this string is printed
+        // straight to a terminal by `main`. `json::write_string` escapes
+        // everything below `0x20`, so the escape sequences cannot survive the
+        // daemon's encoder, but the bidirectional overrides can and do.
         return Err(Fail::Failed(format!(
             "daemon returned {} — {}",
             response.status,
-            detail.trim()
+            display(detail.trim())
         )));
     }
     Ok(response.body)

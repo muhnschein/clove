@@ -10,6 +10,20 @@
 
 ---
 
+## 0. Target Platform
+
+**Modern Linux, and nothing else.** clove requires a kernel of **6.12 or newer**,
+`seccomp`, Landlock, and systemd, and is built and tested only there. The three
+architectures the syscall filter is emitted for are `x86_64`, `aarch64` and
+`riscv64`.
+
+The choice follows OpenSSH's: support one platform properly rather than support
+every platform partially. No portability shims, no feature detection beyond what
+the kernel baseline already guarantees, no accommodation for other operating
+systems in the code, the documentation, or the packaging.
+
+---
+
 ## 1. Goals
 
 Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
@@ -27,6 +41,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 - UDP tracker announces (Prop 160, finalized 2025-06). Deferred; requires Datagram2/3 support end-to-end (router, SAM lib, trackers). HTTP announces work everywhere today. Revisit when tracker deployment exists.
 - BitTorrent v2 (BEP 52), uTP, Local Peer Discovery, IP-based anything.
 - Embedded router. We require an external router exposing SAMv3 (i2pd or Java I2P).
+- Any platform that is not modern Linux (§0).
 - A daemon-less one-shot download mode (think `clove fetch`). It would need a second lifecycle (session setup, download, teardown, all in one process) whose failure modes are not the daemon's, and every hour spent on it is an hour not spent on improving the daemon.
 
 ## 3. Initial Feature Cut
@@ -100,7 +115,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 
 ## 5. No-Clearnet Enforcement (defense in depth, three independent layers)
 
-**Layer 1 — by construction (primary):**
+**Layer 1 — by construction:**
 - Only the `i2pnet` crate may depend on socket-capable APIs. The engine crates forbid `std::net` and `socket2` via `clippy` `disallowed_types`/`disallowed_methods` config + a CI grep gate over `Cargo.lock` (`ci/check-net-deps.sh`).
 - `i2pnet` itself may open exactly one kind of socket: a TCP connection to the configured SAM address, which must be a loopback address or unix socket unless `--i-know-sam-is-remote` (explicit, ugly, documented as dangerous) is set. The opt-in localhost-TCP listener for the local HTTP API is also constructed inside `i2pnet` (loopback-validating helper), so every IP-socket construction site is in one crate.
 - No DNS resolution code paths: hostnames are rejected in config except `localhost`; naming is I2P naming only.
@@ -109,13 +124,12 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 **Layer 2 — runtime self-restriction (pledge/unveil doctrine, Linux mechanisms):**
 - The daemon restricts *itself* as it passes lifecycle phases, OpenSSH-style. After initialization (config read, data directory opened, SAM connected, control socket bound), it applies:
   - **Landlock**: filesystem access reduced to the data directory (+ log path if separate). Applied only **if available** on the running kernel (probe the Landlock ABI at startup); when unavailable, log one clear line stating so and continue — never fail startup, never assume it, per the no-layer-assumes-another rule.
-  - **seccomp**: post-init syscall filter dropping everything no longer needed (exec, ptrace, module/bpf syscalls, new address families). Same graceful-degradation rule.
-- Phase hooks are structured so that OpenBSD `pledge(2)`/`unveil(2)` calls slot into the same points if/when clove is ported — the design is "pledge-shaped," the Linux mechanisms are the current backends.
+  - **seccomp**: post-init syscall **allowlist** — anything not needed after initialization returns `EPERM`, and `socket(2)` is restricted to `AF_UNIX`/`AF_INET`/`AF_INET6`.
+  - The allowlist is **measured, not guessed**, and re-measured whenever the daemon learns to do something new. The procedure: run `cloved` under `strace -f` against a SAM bridge complete enough to bring the whole network path up (session, forwarded listener, naming lookup, tracker announce, inbound peer), drive it through every API operation, split the trace at the `seccomp(2)` call that installs the filter, and take everything after it. Then add, with a written reason at each entry, the calls a trace cannot reach (clean shutdown, a block actually being written, `preallocate yes`) and the several spellings a libc or architecture may choose for one operation (`clone`/`clone3`, `poll`/`ppoll`, `mkdir`/`mkdirat`, the vDSO time fallbacks). `cloved`'s own confinement test then performs that workload under the live filter, so an omission fails in CI rather than in the field.
 - Destination-level restriction (loopback-only) is not expressible in these mechanisms alone; that remains Layer 1's (by construction) and Layer 3's (sandbox) job. Layer 2's guarantee is about post-init *capabilities*: no exec, no filesystem outside the data dir, no new privilege.
 
-**Layer 3 — OS sandbox (shipped, documented, optional but default in packaging):**
+**Layer 3 — OS sandbox (shipped, documented, default in packaging):**
 - systemd unit with `IPAddressDeny=any` + `IPAddressAllow=localhost`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `PrivateDevices`, `ProtectSystem=strict` + `ReadWritePaths` for data dir, `NoNewPrivileges`, syscall filter.
-- Alternative: documented network-namespace recipe with a veth to loopback-only, for non-systemd users.
 - The client must behave correctly *inside* this sandbox (e.g., never attempt anything the sandbox would kill it for), and correctly *without* it (Layers 1–2 unaffected).
 
 No layer assumes another is present.
@@ -197,6 +211,6 @@ Reference class: OpenBSD base, OpenSSH (non-portable), doas, opentracker, SQLite
 - **Boring is good:** Few, boring, well-tested releases over frequent ones.
 - **Culture of deletion:** every feature must justify its continued existence at each release; removals are announced proudly in release notes, not buried. The LOC metric above is allowed — encouraged — to go down.
 
-## 10. Out of Scope Forever (unless explicitly re-scoped)
+## 10. Out of Scope Forever
 
 Clearnet peers/trackers, mixed-network mode, outproxy usage of any kind, telemetry of any kind.

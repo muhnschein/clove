@@ -1568,7 +1568,14 @@ where
                 // recoverable.
                 if let Err(e) = clove_core::storage::remove_beneath(&self.downloads_dir, &file.path)
                 {
-                    eprintln!("cloved: not deleting {}: {e}", file.path.join("/"));
+                    // The path is the torrent's, so it is a stranger's text on
+                    // its way to a terminal: `check_component` refuses
+                    // separators, `.`, `..` and NUL, and has no opinion about
+                    // `ESC`. See `clove_core::text`.
+                    eprintln!(
+                        "cloved: not deleting {}: {e}",
+                        clove_core::text::scrub(&file.path.join("/"))
+                    );
                 }
             }
             // Best-effort: drop the torrent's now-empty top directory.

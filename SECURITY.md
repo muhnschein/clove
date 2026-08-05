@@ -65,6 +65,22 @@ These are enforced in the codebase and checked in CI, not merely intended:
 - Announce URLs that are not I2P URLs are dropped when the torrent is parsed —
   never contacted, never logged beyond a count.
 - State files are written temp-then-rename, so a crash cannot corrupt them.
+- After initialisation the daemon holds a `seccomp` **allowlist**: a syscall it
+  does not need returns `EPERM`, whether or not anyone thought to name it. The
+  permitted set is measured from a traced run rather than guessed, and the test
+  suite performs that workload under the live filter.
+- **One peer destination cannot take over a torrent.** It may hold at most a
+  couple of concurrent connections, so it can neither fill the peer table nor
+  become the only availability the piece picker can see.
+- **Peers advertised over PEX cannot crowd out a tracker's.** The known-peer set
+  is capped, and at the cap a PEX-learned entry is evicted to make room for a
+  destination from a tracker, an inbound connection or the operator. PEX itself
+  evicts nothing.
+- **Foreign text is scrubbed where it becomes a terminal's input**, in the
+  daemon's log lines and in `clove`'s output alike: control characters and
+  bidirectional overrides out of a torrent, a tracker or a SAM bridge cannot
+  forge a log line or rewrite what the rest of the screen says. The stored value
+  and the API's JSON keep the real name.
 
 If you find a way to violate one of these, that is a vulnerability by
 definition, even without a demonstrated exploit.
