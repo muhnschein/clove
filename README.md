@@ -7,8 +7,12 @@ A modern I2P-only BitTorrent client designed to have no clearnet path.
 
 > 🤖 **Vibe-coded:** Much of this project was developed using AI.
 > Treat its security properties as claims to verify, not a substitute for
-> independent review. If that provenance conflicts with your requirements, use
+> independent review. If that provenance troubles you, use
 > something else.
+
+> 🐧 **Linux-focused:** clove focuses solely on modern Linux environments and
+> relies on functionality they offer (Landlock, seccomp, systemd, etc.). No 
+> efforts are made to accomodate other platforms.
 
 ## Overview
 
@@ -53,9 +57,6 @@ $ clove list
 $ watch clove list
 ```
 
-`cloved` runs in the foreground and logs to standard error. For regular use,
-see [Running as a service](#running-as-a-service).
-
 ## Installation
 
 clove is currently built from source.
@@ -79,29 +80,29 @@ $ make install PREFIX="$HOME/.local"
 $ sudo make install PREFIX=/usr/local
 ```
 
-The installed manuals are `clove(1)`, `clove.conf(5)`, `clove-api(7)`, and
-`cloved(8)`.
-
-### Running as a service
-
-After installing with `PREFIX="$HOME/.local"`, install the bundled user unit:
-
-```console
-$ install -Dm 0644 contrib/systemd/clove-user.service \
-    ~/.config/systemd/user/clove.service
-$ systemctl --user daemon-reload
-$ systemctl --user enable --now clove
-$ journalctl --user -u clove -f
-```
-
-The user unit applies filesystem, process, and syscall hardening. On most
-systems a user service cannot enforce systemd's IP address filtering. For an
-independent kernel-enforced clearnet lock, use the bundled
-[`clove.service`](contrib/systemd/clove.service) system unit.
-
-## Configuration
+### Configuration
 
 See [`clove.conf(5)`](man/clove.conf.5) for every setting and its default.
+
+
+## Documentation
+
+The man pages are the primary user documentation:
+
+- [`clove(1)`](man/clove.1) — CLI commands and examples;
+- [`cloved(8)`](man/cloved.8) — daemon lifecycle, files, and confinement;
+- [`clove.conf(5)`](man/clove.conf.5) — configuration and defaults; and
+- [`clove-api(7)`](man/clove-api.7) — the local HTTP API.
+
+Design and protocol documents live in the repository:
+
+- [`docs/SCOPE.md`](docs/SCOPE.md) — goals, non-goals, and engineering scope;
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — resolved design decisions;
+- [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt) — I2P BitTorrent dialect and
+  interoperability findings;
+- [`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md) — persistent state format;
+- [`DEPENDENCIES.md`](DEPENDENCIES.md) — reviewed dependency allowlist; and
+- [`SECURITY.md`](SECURITY.md) — vulnerability policy and security guarantees.
 
 ## Security model
 
@@ -160,24 +161,6 @@ CI also checks the dependency allowlist and fails if a socket-capable crate
 crosses the network boundary without review. Live interoperability findings are
 recorded in [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt).
 
-## Documentation
-
-The man pages are the primary user documentation:
-
-- [`clove(1)`](man/clove.1) — CLI commands and examples;
-- [`cloved(8)`](man/cloved.8) — daemon lifecycle, files, and confinement;
-- [`clove.conf(5)`](man/clove.conf.5) — configuration and defaults; and
-- [`clove-api(7)`](man/clove-api.7) — the local HTTP API.
-
-Design and protocol documents live in the repository:
-
-- [`docs/SCOPE.md`](docs/SCOPE.md) — goals, non-goals, and engineering scope;
-- [`docs/DECISIONS.md`](docs/DECISIONS.md) — resolved design decisions;
-- [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt) — I2P BitTorrent dialect and
-  interoperability findings;
-- [`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md) — persistent state format;
-- [`DEPENDENCIES.md`](DEPENDENCIES.md) — reviewed dependency allowlist; and
-- [`SECURITY.md`](SECURITY.md) — vulnerability policy and security guarantees.
 
 ## License
 

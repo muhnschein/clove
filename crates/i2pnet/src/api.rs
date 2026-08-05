@@ -1,4 +1,4 @@
-//! Local control-API transport (Phase F, `docs/PHASE-F.md`).
+//! Local control-API transport.
 //!
 //! `cloved` serves its `/v1/` API here and `clove` connects here, so — like
 //! every other socket in clove — the construction lives in `i2pnet` (Layer 1,

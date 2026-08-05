@@ -90,8 +90,7 @@ pub struct Config {
     /// Grow each file to its full length when a torrent is added, rather than
     /// letting it become sparse as pieces land (SCOPE §4).
     pub preallocate: bool,
-    /// Ceiling on peer connections across *every* torrent at once
-    /// (`docs/PHASE-H.md` §3).
+    /// Ceiling on peer connections across *every* torrent at once.
     pub peer_limit: usize,
     /// Ceiling on peer connections for any one torrent, applied under
     /// [`peer_limit`](Config::peer_limit).

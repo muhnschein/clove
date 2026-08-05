@@ -234,7 +234,7 @@ impl ScanJob {
 enum Wanted {
     /// Should run, and does when the session is up.
     Running,
-    /// Wanted and startable, but past the active limit (`docs/PHASE-H.md` §4).
+    /// Wanted and startable, but past the active limit.
     Queued,
     /// Stopped, and why. Survives restarts; nothing but the operator takes a
     /// torrent out of this state, whichever reason put it there.
@@ -252,7 +252,7 @@ enum Why {
     /// `clove pause`, or a torrent loaded from a resume file that predates
     /// this distinction.
     Operator,
-    /// It reached its seed ratio (`seed_ratio`, `docs/PHASE-H.md` §5).
+    /// It reached its seed ratio (`seed_ratio`).
     SeedRatio,
     /// It seeded with no peer for `seed_idle_minutes`.
     SeedIdle,
