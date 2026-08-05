@@ -6,15 +6,11 @@ A modern I2P-only BitTorrent client.
 > your personal safety depends on its anonymity, do not use it.
 
 > 🤖 **Vibe-coded:** Much of this project was developed using AI.
-> Treat its security properties as claims to verify, not a substitute for
-> independent review. If that provenance troubles you, use
-> something else.
+> If that provenance troubles you, use something else.
 
-> 🐧 **Linux-only:** clove requires a modern Linux kernel (**6.12 or newer**),
-> `seccomp`, Landlock, and systemd, and relies on them for two of its three
-> security layers. It is built and tested nowhere else, and no effort is made to
-> accommodate other platforms — the same choice OpenSSH makes, for the same
-> reason: support one platform properly rather than several partially.
+> 🐧 **Linux-only:** clove requires a modern Linux kernel (6.12),
+> seccomp, Landlock, and systemd, and relies on them for two of its three
+> security layers. No effort is made to accommodate other platforms.
 
 ## Overview
 
@@ -69,8 +65,8 @@ clove is currently built from source.
   [`rust-toolchain.toml`](rust-toolchain.toml));
 - an external i2pd or Java I2P router exposing SAMv3 over loopback; and
 - Linux 6.12 or newer, with `seccomp` and Landlock available, on `x86_64`,
-  `aarch64` or `riscv64`. This is a requirement, not a preference: see
-  [`docs/SCOPE.md`](docs/SCOPE.md) §0.
+  `aarch64` or `riscv64` see
+  [`docs/SCOPE.md`](docs/SCOPE.md) §0).
 
 ### Install binaries and man pages
 
@@ -122,11 +118,6 @@ No layer assumes another is present.
 3. **OS sandbox.** The [systemd unit](contrib/systemd/clove.service) provides a
    separate deployment-level clearnet lock (`IPAddressDeny=any`) and further
    process hardening.
-
-Within it, a single peer destination is bounded: it may hold only a couple of
-connections to any one torrent, and peers it advertises over PEX are the first
-thing evicted when the candidate set is full — so one destination can neither
-fill the peer table nor crowd a tracker's peers out of it.
 
 This model does not protect against a compromised kernel or I2P router,
 resource exhaustion in general, an attacker who already controls the daemon's
