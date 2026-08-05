@@ -151,7 +151,10 @@ pub const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 /// thousands of destinations that will each cost a tunnel and a timeout.
 ///
 /// A cap alone is not enough, because *which* entries it keeps decides whether a
-/// flood can shut real peers out. [`Source`] is what decides that.
+/// flood can shut real peers out. At the cap, a destination from a tracker, an
+/// inbound connection or the operator displaces one learned over PEX, and PEX
+/// displaces nothing — so a flood can fill the free space but cannot take space
+/// from a real peer.
 pub const MAX_KNOWN_PEERS: usize = 1024;
 
 /// Concurrent connections one I2P destination may hold on one torrent.
