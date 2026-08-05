@@ -147,6 +147,7 @@ All routine tests run without an I2P router:
 $ make test       # unit, model, hostile-input, and evil-peer tests
 $ make smoke      # daemon and CLI end to end
 $ make chaos      # crash and failed-state-write scenarios
+$ make router     # the SAM path against a fake bridge (no router needed)
 $ make man-lint   # mdoc validation, when mandoc is installed
 $ make doc-lint   # rustdoc links and warnings
 $ make lint       # clippy with warnings denied

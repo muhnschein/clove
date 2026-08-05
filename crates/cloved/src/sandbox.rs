@@ -21,7 +21,7 @@
 //!   anything not on it returns `EPERM`, and `socket(2)` is further restricted
 //!   by address family to `AF_UNIX`/`AF_INET`/`AF_INET6`.
 //!
-//! Tthe daemon was run under `strace`
+//! The daemon was run under `strace`
 //! against a SAM bridge complete enough to bring the whole network path up —
 //! session, forwarded listener, naming lookup, tracker announce, inbound peer —
 //! and driven through every API operation, and the trace was split at the
