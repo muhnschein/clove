@@ -1,6 +1,6 @@
 # clove 🧄
 
-A modern I2P-only BitTorrent client designed to have no clearnet path.
+A modern I2P-only BitTorrent client.
 
 > ⚠️ **Work in progress:** clove is pre-alpha and under active development. If
 > your personal safety depends on its anonymity, do not use it.
@@ -79,11 +79,6 @@ $ make install PREFIX="$HOME/.local"
 # Or system-wide
 $ sudo make install PREFIX=/usr/local
 ```
-
-### Configuration
-
-See [`clove.conf(5)`](man/clove.conf.5) for every setting and its default.
-
 
 ## Documentation
 
