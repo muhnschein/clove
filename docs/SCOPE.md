@@ -17,23 +17,10 @@
 architectures the syscall filter is emitted for are `x86_64`, `aarch64` and
 `riscv64`.
 
-This is a scope decision, not an accident of where it was written. clove's
-security model is three layers of enforcement (§5), and two of those layers *are*
-Linux kernel interfaces — Landlock for the filesystem and outbound TCP, `seccomp`
-for the post-init syscall allowlist, systemd for the deployment-level clearnet
-lock. A build that ran without them would be a different program with the same
-name and weaker guarantees, presented to the user as the same thing.
-
-The choice follows OpenSSH's: support the platform properly rather than support
+The choice follows OpenSSH's: support one platform properly rather than support
 every platform partially. No portability shims, no feature detection beyond what
 the kernel baseline already guarantees, no accommodation for other operating
-systems in the code, the documentation, or the packaging. 6.12 in particular is
-what makes Landlock ABI 4's outbound-TCP restriction and ABI 6's scoping
-something the code may rely on rather than probe for and hope.
-
-Layer 2's mechanisms are still reached through a single phase hook
-(`cloved`'s `sandbox::enter_post_init`), because one call site is easier to reason
-about than several — not because a port to another platform is planned. None is.
+systems in the code, the documentation, or the packaging.
 
 ---
 
@@ -226,6 +213,6 @@ Reference class: OpenBSD base, OpenSSH (non-portable), doas, opentracker, SQLite
 - **Boring is good:** Few, boring, well-tested releases over frequent ones.
 - **Culture of deletion:** every feature must justify its continued existence at each release; removals are announced proudly in release notes, not buried. The LOC metric above is allowed — encouraged — to go down.
 
-## 10. Out of Scope Forever (unless explicitly re-scoped)
+## 10. Out of Scope Forever
 
 Clearnet peers/trackers, mixed-network mode, outproxy usage of any kind, telemetry of any kind.
