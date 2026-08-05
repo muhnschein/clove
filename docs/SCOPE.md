@@ -41,7 +41,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 - UDP tracker announces (Prop 160, finalized 2025-06). Deferred; requires Datagram2/3 support end-to-end (router, SAM lib, trackers). HTTP announces work everywhere today. Revisit when tracker deployment exists.
 - BitTorrent v2 (BEP 52), uTP, Local Peer Discovery, IP-based anything.
 - Embedded router. We require an external router exposing SAMv3 (i2pd or Java I2P).
-- Any platform that is not modern Linux (§0). Not Windows, not macOS, not the BSDs, not a kernel older than 6.12. No portability layer, no graceful degradation to a build without Landlock and `seccomp`.
+- Any platform that is not modern Linux (§0).
 - A daemon-less one-shot download mode (think `clove fetch`). It would need a second lifecycle (session setup, download, teardown, all in one process) whose failure modes are not the daemon's, and every hour spent on it is an hour not spent on improving the daemon.
 
 ## 3. Initial Feature Cut
@@ -115,7 +115,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 
 ## 5. No-Clearnet Enforcement (defense in depth, three independent layers)
 
-**Layer 1 — by construction (primary):**
+**Layer 1 — by construction:**
 - Only the `i2pnet` crate may depend on socket-capable APIs. The engine crates forbid `std::net` and `socket2` via `clippy` `disallowed_types`/`disallowed_methods` config + a CI grep gate over `Cargo.lock` (`ci/check-net-deps.sh`).
 - `i2pnet` itself may open exactly one kind of socket: a TCP connection to the configured SAM address, which must be a loopback address or unix socket unless `--i-know-sam-is-remote` (explicit, ugly, documented as dangerous) is set. The opt-in localhost-TCP listener for the local HTTP API is also constructed inside `i2pnet` (loopback-validating helper), so every IP-socket construction site is in one crate.
 - No DNS resolution code paths: hostnames are rejected in config except `localhost`; naming is I2P naming only.
@@ -124,14 +124,12 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 **Layer 2 — runtime self-restriction (pledge/unveil doctrine, Linux mechanisms):**
 - The daemon restricts *itself* as it passes lifecycle phases, OpenSSH-style. After initialization (config read, data directory opened, SAM connected, control socket bound), it applies:
   - **Landlock**: filesystem access reduced to the data directory (+ log path if separate). Applied only **if available** on the running kernel (probe the Landlock ABI at startup); when unavailable, log one clear line stating so and continue — never fail startup, never assume it, per the no-layer-assumes-another rule.
-  - **seccomp**: post-init syscall **allowlist** — anything not needed after initialization returns `EPERM`, and `socket(2)` is restricted to `AF_UNIX`/`AF_INET`/`AF_INET6`. An allowlist rather than a deny list because a deny list can only refuse what somebody thought of, and `io_uring` is the standing counterexample: it performs operations in kernel workers that do not re-check the submitter's filter, so its absence from a deny list gives back most of what the list took away. Same graceful-degradation rule.
+  - **seccomp**: post-init syscall **allowlist** — anything not needed after initialization returns `EPERM`, and `socket(2)` is restricted to `AF_UNIX`/`AF_INET`/`AF_INET6`.
   - The allowlist is **measured, not guessed**, and re-measured whenever the daemon learns to do something new. The procedure: run `cloved` under `strace -f` against a SAM bridge complete enough to bring the whole network path up (session, forwarded listener, naming lookup, tracker announce, inbound peer), drive it through every API operation, split the trace at the `seccomp(2)` call that installs the filter, and take everything after it. Then add, with a written reason at each entry, the calls a trace cannot reach (clean shutdown, a block actually being written, `preallocate yes`) and the several spellings a libc or architecture may choose for one operation (`clone`/`clone3`, `poll`/`ppoll`, `mkdir`/`mkdirat`, the vDSO time fallbacks). `cloved`'s own confinement test then performs that workload under the live filter, so an omission fails in CI rather than in the field.
-- Phase hooks are structured so that OpenBSD `pledge(2)`/`unveil(2)` calls slot into the same points if/when clove is ported — the design is "pledge-shaped," the Linux mechanisms are the current backends.
 - Destination-level restriction (loopback-only) is not expressible in these mechanisms alone; that remains Layer 1's (by construction) and Layer 3's (sandbox) job. Layer 2's guarantee is about post-init *capabilities*: no exec, no filesystem outside the data dir, no new privilege.
 
 **Layer 3 — OS sandbox (shipped, documented, default in packaging):**
 - systemd unit with `IPAddressDeny=any` + `IPAddressAllow=localhost`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `PrivateDevices`, `ProtectSystem=strict` + `ReadWritePaths` for data dir, `NoNewPrivileges`, syscall filter.
-- systemd is the only shipped form. A network-namespace recipe was carried here for non-systemd users and is gone: its stronger variant required a unix-socket `sam_address`, which the SAM backend does not implement and the config parser now refuses outright, so the recipe could not be followed as written. A hardening document that does not work is worse than none — an operator who hits the refusal abandons Layer 3 rather than debugging it. clove targets modern Linux with systemd (§0), so the alternative had no constituency left.
 - The client must behave correctly *inside* this sandbox (e.g., never attempt anything the sandbox would kill it for), and correctly *without* it (Layers 1–2 unaffected).
 
 No layer assumes another is present.
