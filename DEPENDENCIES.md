@@ -8,19 +8,18 @@ commit. Closure sizes are recorded when the dependency is actually added.
 
 ## Current
 
-- **`sha1` 0.11** (RustCrypto, `clove-core`) — entered Phase A (info-hash
-  needs it at .torrent parse time, ahead of Phase C piece verification).
+- **`sha1` 0.11** (RustCrypto, `clove-core`).
   SHA-1 is by protocol; rolling our own cryptographic hash is the one place
   hand-rolling is *worse* engineering. Small, `no_std`-capable, no proc
   macros. Transitive closure: RustCrypto-adjacent only (`digest`,
   `block-buffer`, `crypto-common`, `hybrid-array`, `typenum`, `cpufeatures`,
   `cfg-if`), none socket-capable.
-- **`sha2` 0.11** (RustCrypto, `i2pnet`) — entered Phase D. A peer's
+- **`sha2` 0.11** (RustCrypto, `i2pnet`). A peer's
   32-byte destination hash is SHA-256 of its full I2P destination
   (`i2pnet::addr`). Kept on the same major as `sha1` so the two share one
   `digest` tree instead of pulling a second copy; when one moves, both move.
   No new socket-capable crates.
-- **`yosemite` 0.7** (features = `["sync"]`, `i2pnet`) — entered Phase D.
+- **`yosemite` 0.7** (features = `["sync"]`, `i2pnet`).
   The reason this project is buildable: SAMv3 sessions/streams/naming.
   MIT, responsive author (R1); consumed only inside `i2pnet` behind our
   traits, vendorable if upstream stalls. The only socket-capable
@@ -52,7 +51,7 @@ commit. Closure sizes are recorded when the dependency is actually added.
   The closure has not shrunk: `yosemite` is one crate in the `Cargo.toml`
   either way, and the ~24-crate cost above is unchanged.
 
-- **`landlock` 0.4** (`cloved`, Linux only) — entered Phase G. Layer-2
+- **`landlock` 0.4** (`cloved`, Linux only). Layer-2
   filesystem (and, on ABI 4+, outbound-TCP) self-restriction; see
   `crates/cloved/src/sandbox.rs`. The raw `landlock_*` syscalls are unsafe and
   the ABI negotiation is fiddly enough to get subtly wrong, which is the whole
@@ -60,11 +59,11 @@ commit. Closure sizes are recorded when the dependency is actually added.
   `unsafe_code`, so a hand-rolled binding is not on the table. Maintained by
   the Landlock authors. Not socket-capable: it takes rights away. Closure:
   `enumflags2` (+ its derive), `thiserror` 2, `libc`.
-- **`seccompiler` 0.5** (`cloved`, Linux only) — entered Phase G. Builds and
+- **`seccompiler` 0.5** (`cloved`, Linux only). Builds and
   installs the post-init seccomp-BPF deny filter. Firecracker lineage, small,
   the `json` feature (and its serde dependency) left off, so what we compile is
   the BPF backend and nothing else. Closure: `libc`.
-- **`libc` 0.2** (`cloved`, Linux only) — entered Phase G. The seccomp filter
+- **`libc` 0.2** (`cloved`, Linux only). The seccomp filter
   names syscalls and address families; these are the C ABI constants for them,
   and getting them from the maintained table beats a hand-written per-
   architecture list that is wrong on the one machine nobody tested. Already in
@@ -72,8 +71,7 @@ commit. Closure sizes are recorded when the dependency is actually added.
   edge to an existing node, not a new crate. Not socket-capable in our use: we
   reference constants, and `unsafe_code = "forbid"` means we cannot call it.
 - **`rustix` 1.1** (features = `["fs", "std"]`, `default-features = false`,
-  `clove-core`) — entered 2026-07-29, closing the path-traversal finding
-  (M-01). Torrent file names are attacker-supplied, and validating them
+  `clove-core`). Torrent file names are attacker-supplied, and validating them
   lexically — no separators, no `..` — says nothing about what the filesystem
   does with them: a symlink already sitting under the download directory turns
   an ordinary join-and-open into a write outside it. The fix is to walk the
@@ -96,21 +94,7 @@ commit. Closure sizes are recorded when the dependency is actually added.
   turns the `net` feature on — the allowlist alone would have said nothing.
   That check is per-manifest, so it covers the second consumer below as well.
 
-  **A second consumer entered and left again.** Phase H added `termios` and
-  `stdio` on the `clove` crate for `clove top`'s raw mode and window size —
-  the finding `docs/DECISIONS.md` S2 turned on, and it cost nothing: the
-  features resolved to `{rustix, bitflags, errno, libc, linux-raw-sys,
-  windows-link, windows-sys}`, every one already locked at the same version.
-  The full-screen view was removed on 2026-07-31 (`DECISIONS.md` S3) and those
-  features went with it, so `clove(1)` now has **no dependency on `rustix` at
-  all** and the only consumers are the two above.
-
-  S2's measurement stands for whenever the question returns: on 2026-07-30
-  `ratatui` 0.30 locked 181 crates with default features and 91 with none, and
-  `iocraft` 0.8 locked 68 — against clove's 48. A TUI *framework* still cannot
-  be paid for. What changed is that clove no longer buys the syscalls behind
-  one either.
-- **`getrandom` 0.2** (`cloved`) — entered Phase F. The API token and the
+- **`getrandom` 0.2** (`cloved`). The API token and the
   peer-ID suffix are bytes straight from the OS RNG; `getrandom` is the
   maintained thin wrapper over `getrandom(2)`/`/dev/urandom`, exactly the
   syscall access we do not want to hand-roll. **Deliberately held at 0.2**
@@ -118,35 +102,3 @@ commit. Closure sizes are recorded when the dependency is actually added.
   one call-site API name and saves a duplicate crate in the tree. Revisit when
   yosemite moves to a `rand` built on 0.3. Tiny closure (`cfg-if`, `libc`);
   not socket-capable.
-
-## Currency
-
-Checked against crates.io on 2026-07-25. `yosemite` 0.7.0 is current;
-`sha1`/`sha2` were moved 0.10 → 0.11 together; `getrandom` is held at 0.2 on
-purpose (above). Total transitive closure: **48 crates**, the bulk of it
-yosemite's (`rand`, `thiserror`, `nom`, `tracing` and the proc-macro trio).
-
-Counted as `Cargo.lock` entries less the four workspace members:
-
-```
-grep -c '^name = ' Cargo.lock   # 52, less the 4 workspace crates
-```
-
-It counts the duplicated crates below twice and includes the target-gated
-`rustix` entries (`errno`, `windows-sys`, `windows-link`) that are never
-compiled on Linux. **Recounted 2026-07-30**, and restated against that command
-rather than left as a bare figure: it read 46 when written, which was the whole
-lockfile *including* the workspace members, and `rustix` then added its
-documented six entries. Two different countings of one number is how it drifted
-in the first place — the command above is now the definition.
-
-`cargo tree -d` should report no duplicates; if it does, that is a review
-topic, not a shrug. It currently reports one, arriving with Phase G:
-`thiserror` (and so `thiserror-impl` and `syn`) exists twice, because
-`yosemite` is on `thiserror` 1 and `landlock` is on `thiserror` 2. Three
-duplicated crates, all build-time-only in the second copy. The two ways out
-are both worse than the duplicate: pinning `landlock` back to a 0.4.x on
-`thiserror` 1 downgrades the crate whose correctness is the entire point of
-Layer 2, and dropping `landlock` means hand-written `landlock_*` syscalls in a
-workspace that forbids `unsafe_code`. The real fix is upstream — recheck when
-`yosemite` moves to `thiserror` 2.

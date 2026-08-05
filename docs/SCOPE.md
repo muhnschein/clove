@@ -1,6 +1,6 @@
 # Scope Document — clove: an I2P-Only BitTorrent Client
 
-**Name:** clove (daemon: `cloved`, control CLI: `clove`) — pending final trademark/crates.io/distro-package sweep
+**Name:** clove (daemon: `cloved`, control CLI: `clove`)
 
 **Language:** Rust (stable toolchain) 
 
@@ -19,17 +19,17 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 3. **Interoperable.** A first-class citizen on existing I2P swarms (i2psnark-dominated) and with both major router implementations.
 4. **Operable.** A CLI pleasant enough for daily use, plus a local HTTP API for future frontends.
 
-## 2. Non-Goals (v1)
+## 2. Non-Goals
 
 - Clearnet BitTorrent support. Ever. This is an I2P-only client by design.
-- i2p_dht (DHT over I2P). Deferred to v2. Tracker + PEX covers current I2P swarm reality; i2psnark's DHT is its own protocol variant and a significant sub-project.
+- No Web UI. Ever. The HTTP API is designed so another project can add a Web UI on top. This is not that project.
+- i2p_dht (DHT over I2P). Deferred to v2+. Tracker + PEX covers current I2P swarm reality; i2psnark's DHT is its own protocol variant and a significant sub-project.
 - UDP tracker announces (Prop 160, finalized 2025-06). Deferred; requires Datagram2/3 support end-to-end (router, SAM lib, trackers). HTTP announces work everywhere today. Revisit when tracker deployment exists.
-- Web UI. Deferred to v2. The HTTP API is designed so a web UI can be added without engine changes.
 - BitTorrent v2 (BEP 52), uTP, Local Peer Discovery, IP-based anything.
 - Embedded router. We require an external router exposing SAMv3 (i2pd or Java I2P).
-- `clove fetch`, the daemon-less one-shot download mode. Entered §3 as an explicit stretch goal and is **cut** rather than carried: it needs a second lifecycle (session setup, download, teardown, all in one process) whose failure modes are not the daemon's, and every hour spent on it was an hour not spent on getting the daemon working against a real router. Nothing about the design forecloses it — the engine already runs headless in tests — so it is a v2 candidate, not a rejection.
+- A daemon-less one-shot download mode (think `clove fetch`). It would need a second lifecycle (session setup, download, teardown, all in one process) whose failure modes are not the daemon's, and every hour spent on it is an hour not spent on improving the daemon.
 
-## 3. v1 Feature Cut
+## 3. Initial Feature Cut
 
 ### Core engine
 - BEP 3 peer wire protocol over I2P streams (SAM STREAM), including keep-alives, proper choke/interest state machines.
@@ -39,8 +39,8 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 - HTTP tracker announces over I2P (announce via SAM stream to tracker destination; compact peer response = concatenated 32-byte SHA-256 destination hashes, no port; non-compact destinations used directly).
 - Multi-tracker support (BEP 12) — I2P announce URLs only; non-I2P announce URLs in torrent files are ignored, never resolved, never logged as anything but "skipped non-I2P tracker."
 - Piece selection: rarest-first with endgame mode. Sequential mode as a per-torrent flag (nice for media).
-- Seeding, super-seeding excluded (v2 candidate).
-- Fast extension (BEP 6) — in v1 per Q3 decision; i2psnark supports it, improves swarm behavior.
+- Seeding, super-seeding excluded (v2+ candidate).
+- Fast extension (BEP 6) — i2psnark supports it, improves swarm behavior.
 - SHA-1 verification on read-in and download; full recheck command.
 
 ### Address handling
@@ -64,14 +64,14 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 
 ### CLI
 - Daemon `cloved` + control CLI `clove`, speaking to the local HTTP API over a unix socket (default) or localhost TCP (opt-in).
-- Commands: add (file/magnet), remove (with/without data), list, status (per torrent: peers, tunnels, speeds, availability), pause/resume, verify, set file priorities, tracker re-announce, client-level stats. *Two of those are capabilities rather than commands as built: tracker re-announce and manual peer injection are versioned API endpoints with no CLI wrapper, and client-level stats are part of `clove status` rather than a command of their own (`DECISIONS.md` S3).*
+- Commands: add (file/magnet), remove (with/without data), list, status (per torrent: peers, tunnels, speeds, availability), pause/resume, verify, set file priorities, client-level stats.
 - Human-friendly default output (aligned tables, progress, rates); `--json` on every read command for scripting.
-- Sensible exit codes, shell completion generation. The `clove fetch`-style one-shot download mode (no daemon) was the one stretch goal here and is **cut from v1** — see §2.
+- Sensible exit codes, shell completion generation.
 - Peer identity on the wire: Azureus-style peer-ID prefix and client name string chosen per Q7 and kept stable thereafter; checked against the informal BEP 20 registry to avoid collisions.
 
 ### HTTP API
 - Local-only (unix socket default). Token auth even on localhost TCP.
-- REST-ish JSON; versioned under `/v1/`. Explicitly not compatible with the Transmission/qBittorrent APIs in v1 (compat shim is a v2 candidate — worth it for *arr-style tooling, not worth the constraint now).
+- REST-ish JSON; versioned under `/v1/`. Explicitly not compatible with the Transmission/qBittorrent APIs in v1. Another project can add this if need be. This is not that project.
 
 ## 4. Architecture
 
@@ -79,7 +79,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 +-------------------------------------------------------+
 |  CLI (clove)          --unix socket-->   HTTP API      |
 +-------------------------------------------------------+
-|            Engine (sync threads, per Q5) [rev]          |
+|                Engine (sync threads) [rev]              |
 |  torrent supervisor / piece picker / choker / storage   |
 |  tracker client / pex / destination address book        |
 +-------------------------------------------------------+
@@ -89,13 +89,13 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 +-------------------------------------------------------+
                     | SAMv3 (localhost)
                     v
-                i2pd / Java I2P
+                I2P router
 ```
 
 - **`i2pnet` module boundary.** All of yosemite is consumed behind our own trait (`I2pDialer`, `I2pListener`, `I2pNamingLookup`, later `I2pDatagram`). Rationale: yosemite is young and small; if it stalls or we outgrow it, we swap the impl without touching the engine. Also gives us a mock implementation for engine tests without a router.
-- **Session topology:** one SAM PRIMARY session per client identity, with stream subsession for peer traffic. Tracker announces share the peer session's destination (this is what i2psnark does and what trackers expect — announced identity must match peer identity). Q1 resolved: same subsession, see `DECISIONS.md`.
-- **Reconnect discipline:** the SAM control socket, sessions, and forwarded listeners are supervised. Router restart ⇒ exponential-backoff resurrection of the full session tree, torrents transition to a visible "waiting for router" state, no thundering-herd re-announce. This state machine gets designed and tested explicitly — it is Suspect #1 for XD-style flakiness.
-- **Concurrency model (Q5, decided):** synchronous, thread-per-peer with blocking I/O — the most auditable and most OpenBSD-like; entirely viable at I2P scale (50–200 peers, high tunnel latency makes per-connection thread cost irrelevant). yosemite ships a first-class `sync` feature. Fallback if a concrete wall is hit: smol via yosemite's `smol` feature. The engine is written against narrow internal traits so this choice stays swappable longer than usual.
+- **Session topology:** one SAM PRIMARY session per client identity, with stream subsession for peer traffic. Tracker announces share the peer session's destination (this is what i2psnark does and what trackers expect — announced identity must match peer identity).
+- **Reconnect discipline:** the SAM control socket, sessions, and forwarded listeners are supervised. Router restart ⇒ exponential-backoff resurrection of the full session tree, torrents transition to a visible "waiting for router" state, no thundering-herd re-announce. This state machine gets designed and tested explicitly.
+- **Concurrency model:** synchronous, thread-per-peer with blocking I/O — the most simple and mostauditable; entirely viable at I2P scale (50–200 peers, high tunnel latency makes per-connection thread cost irrelevant). yosemite ships a first-class `sync` feature. Fallback if a concrete wall is hit: smol via yosemite's `smol` feature. The engine is written against narrow internal traits so this choice stays swappable longer than usual.
 - **Storage:** file-backed with preallocation option; mmap explicitly out (predictable memory > speed here). Disk I/O and hashing on dedicated worker threads; bounded queues everywhere (no unbounded channels anywhere in the engine — lint-enforced).
 
 ## 5. No-Clearnet Enforcement (defense in depth, three independent layers)
@@ -153,26 +153,15 @@ covered by any test in this repo — `crates/clove-core`'s loopback download is
 | # | Item | Plan |
 |---|---|---|
 | R1 | yosemite maturity (v0.7, few users) | Wrap behind `i2pnet` trait; vendor if needed; upstream fixes (author is responsive/active) |
-| R2 | i2pd SAM behavior under many concurrent streams on one session (possible root of XD flakiness) | **Closed 2026-07-28, negative** (`PROTOCOL.i2p-bt` §2.6e): two stress ladders on i2pd 2.61.0, 30 runs, every one dialled N of N to 200 concurrent — connect latency uncorrelated with N. Not the root of the flakiness; §2.12 is the better candidate |
+| R2 | [Outdated] | [Outdated] |
 | R3 | Datagram2/3 availability in yosemite + routers (gates future UDP announces, DHT) | Not needed for v1; track upstream |
 | R4 | i2p_pex flag semantics underspecified ("review libtorrent source") | Conformance testing vs i2psnark; treat i2psnark behavior as normative |
 | R5 | Tunnel latency vs choker/timeout tuning (clearnet BT timing assumptions are wrong on I2P) | Make all timeouts config-tunable; benchmark on live swarms; expect several rounds |
 | R6 | Naming lookups for large peer sets (b32 resolution latency/failures) | Cache aggressively, cap concurrent lookups, negative caching |
 
-Q1–Q7 from the draft are resolved as reversible defaults — see `DECISIONS.md`.
-
 ## 8. Milestones
 
-- **M0 — Bootstrap (this repo state):** workspace, lint/CI no-clearnet gates, decision memos Q1–Q7, dependency allowlist. The concurrency spike is dropped (yosemite `sync` verified); the R2 stress harness moves to Phase D where its findings land.
-- **M1 — SAM foundation:** `i2pnet` module complete with supervision/reconnect, naming cache, mock impl; chaos-tested against router restarts.
-- **M2 — Engine core:** wire protocol, piece picker, storage, verification; downloads a torrent from a single known peer (lab, two instances).
-- **M3 — Swarm citizen:** HTTP tracker announces, i2p_pex, BEP 9 magnets, choker; downloads from and seeds to live i2psnark swarms.
-- **M4 — Operable:** `cloved` + HTTP API + `clove` CLI incl. `-C` config check, resume/persistence with format spec, Layer-2 self-restriction (Landlock/seccomp with graceful fallback), man pages, SECURITY.md, packaging (systemd unit, sandbox docs), no-clearnet CI gates in place from M1 onward.
-- **M5 — Hardening:** chaos tests, long-running seed soak, timeout tuning on live swarms.
-
-Each milestone ends in something runnable; M2 onward each produce a demo you can verify on your own router.
-
-A milestone is only "met" against a specific router version, so any claim that one is should name the router and the date it was checked.
+[Outdated]
 
 ## 9. Engineering Standards
 
@@ -181,7 +170,7 @@ Reference class: OpenBSD base, OpenSSH (non-portable), doas, opentracker, SQLite
 ### Smallness
 - **Dependency allowlist, committed in-repo.** Every direct dependency is named in `DEPENDENCIES.md` with a one-paragraph justification and the size of its transitive closure. Target: **≤ ~15 direct dependencies**, transitive closure small enough that `cargo vendor` output is human-reviewable. Additions require the same scrutiny as adding code — because they are adding code.
 - Prefer writing 300 focused lines over importing 30,000 general ones: arg parsing, the HTTP/1.1 server for the local API, bencode, and config parsing are all candidates for hand-rolled implementations (bencode especially — it is ~200 lines done carefully, and we need hostile-input control over it anyway).
-- No proc-macro-heavy frameworks. serde only if the resume-format decision (Q2) genuinely warrants it; otherwise hand-written encoders (bencode makes this natural). Q2 resolved to bencode, so no serde.
+- No proc-macro-heavy frameworks.
 - **LOC as a watched metric.** Not a hard cap, but unexplained growth is considered a review topic. Take pride in what *isn't* there.
 
 ### Code quality
@@ -204,6 +193,7 @@ Reference class: OpenBSD base, OpenSSH (non-portable), doas, opentracker, SQLite
 - **Regress runnable by anyone:** `make test` from a clean checkout runs the whole suite with zero infrastructure. If contributors can't run the tests, the tests decay into ours alone, then nobody's.
 
 ### Releases & project hygiene
+- **Date-based versioning:** No major/minor/patch-releases. Just simple iterations, e.g. *2026.08*.
 - **Boring is good:** Few, boring, well-tested releases over frequent ones.
 - **Culture of deletion:** every feature must justify its continued existence at each release; removals are announced proudly in release notes, not buried. The LOC metric above is allowed — encouraged — to go down.
 

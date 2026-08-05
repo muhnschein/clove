@@ -5,7 +5,7 @@
 //! - **Client** ([`Request::encode`], [`read_response`]) — the tracker client
 //!   (announces are HTTP GETs over an I2P stream).
 //! - **Server** ([`read_request`], [`Response::encode`]) — the local `/v1/`
-//!   API in `cloved` (Phase F), served over a unix socket / loopback TCP.
+//!   API in `cloved`, served over a unix socket / loopback TCP.
 //!
 //! It stays transport-agnostic: everything reads from and writes to any
 //! `Read`/`Write` — an `i2pnet` stream, a unix socket, or a cursor in tests.
@@ -14,7 +14,7 @@
 //!
 //! Response bodies arrive `Content-Length`-delimited, `chunked`, or
 //! close-delimited. Chunked was not supported until a live announce to
-//! postman's tracker failed on it: the reader fell through to
+//! a tracker failed on it: the reader fell through to
 //! read-until-close and handed the *chunk framing* to the bencode parser,
 //! which reported "not bencode" — an accurate description of `1a4\r\n…` and a
 //! useless one. Every announce failed identically, so the client acquired no
@@ -613,7 +613,7 @@ mod tests {
         assert_eq!(resp.body, b"bencoded-body-here");
     }
 
-    /// The shape a live announce to postman's tracker actually came back in,
+    /// The shape a live announce to a tracker actually came back in,
     /// and which this client used to hand to the bencode parser verbatim —
     /// chunk framing and all — reporting "not bencode" every single time.
     #[test]

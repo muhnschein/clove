@@ -17,12 +17,10 @@ use crate::bencode::{self, Value};
 
 /// Current resume-format version. Bump on any semantic change.
 ///
-/// History: v1 initial; v2 added the optional `paused` flag (a v1 file reads
-/// as not paused); v3 added the optional `sequential` flag (an earlier file
-/// reads as rarest-first); v4 added the optional `added` timestamp (an earlier
-/// file reads as 0, which sorts it before anything added since); v5 added the
-/// optional `pause_reason` and `seed_ratio` (an earlier file reads as paused
-/// by the operator, with no per-torrent ratio).
+/// History: v1 initial; v2 added the optional `paused` flag; v3 added the
+// ///optional `sequential` flag; v4 added the optional `added` timestamp;
+// v5 added /// optional `pause_reason` and `seed_ratio` (an earlier file 
+// reads as paused by the operator, with no per-torrent ratio).
 pub const VERSION: i64 = 5;
 
 /// Everything clove needs to pick a torrent back up after a restart.

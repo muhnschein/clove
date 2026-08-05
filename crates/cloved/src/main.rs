@@ -321,7 +321,7 @@ fn sam_tcp_port(sam_address: &str) -> Option<u16> {
         .and_then(|(_, p)| p.parse::<u16>().ok())
 }
 
-/// The daemon's I2P identity across restarts (Q4).
+/// The daemon's I2P identity across restarts.
 ///
 /// One destination keypair per client, kept as SAM's own base64 private key
 /// blob in `<data_dir>/destination.key` at `0600`. `ephemeral yes` in
@@ -352,9 +352,7 @@ impl Identity {
     /// A file that is present but not a key is refused rather than sent to the
     /// router. The failure it prevents is specific and nasty: `SESSION CREATE`
     /// with a malformed `DESTINATION=` is refused, the supervisor backs off and
-    /// retries into the same refusal, and the daemon never connects again —
-    /// §2.9's "back off into the same refusal forever", reached this time by a
-    /// truncated file rather than a stale session id.
+    /// retries into the same refusal, and the daemon never connects again.
     fn load(&self) -> Option<String> {
         let path = self.path.as_ref()?;
         let text = match read_private_file(path) {
@@ -425,8 +423,7 @@ const MIN_PRIVATE_KEY_BYTES: usize = 256 + 20;
 /// cannot sign with it. So was "a destination and one byte", which is what this
 /// used to accept: any trailing byte at all passed, and the resulting blob was
 /// handed to `SESSION CREATE` on every attempt, refused every time, and retried
-/// for the life of the process — §2.9's back-off-into-the-same-refusal, reached
-/// by a file that was checked and found wanting-but-acceptable.
+/// for the life of the process.
 fn is_private_key_blob(text: &str) -> bool {
     let Some(bytes) = i2pnet::addr::i2p_base64_decode(text) else {
         return false;
@@ -611,15 +608,6 @@ fn spawn_metadata_fetch(daemon: &Arc<Daemon>, info_hash: [u8; 20]) {
 }
 
 /// What one fetch round did, so the caller can log it and publish it.
-///
-/// This type exists because the round used to be six `let … else { continue }`
-/// arms that dropped every error on the floor. A magnet that never resolved
-/// therefore produced *no output at all* — no log line, no state beyond
-/// `fetching-metadata`, nothing to distinguish "the tracker's name will not
-/// resolve" from "the tracker returned no peers" from "thirty peers were
-/// dialed and none served the metadata". The first live swarm run spent nine
-/// minutes in exactly that hole. Every arm now records its reason
-/// (`SCOPE.md` §9: error text written for the operator reading a log at 2am).
 #[derive(Default)]
 pub(crate) struct FetchRound {
     /// Trackers that answered with a peer list.
@@ -630,9 +618,7 @@ pub(crate) struct FetchRound {
     pub(crate) peers_returned: usize,
     /// Peers dialed for metadata this round.
     pub(crate) peers_tried: usize,
-    /// The most recent failure, with the stage that produced it. This is the
-    /// line an operator needs; it is kept rather than merely logged so
-    /// `clove list` can show it without anyone reading the daemon's stderr.
+    /// The most recent failure, with the stage that produced it.
     pub(crate) last_error: Option<String>,
 }
 
@@ -645,19 +631,7 @@ impl FetchRound {
         self.last_error = Some(text);
     }
 
-    /// Record a failure against a *peer*, without saying which one.
-    ///
-    /// The obvious thing to write here is the peer's b32, and it is what this
-    /// did. `SECURITY.md` puts a peer's destination reaching "logs, error
-    /// messages, or the local API" in the leak class, and this reached all
-    /// three: straight to stderr, and kept in `last_error`, which `clove list`
-    /// serves. A tracker chooses which peers we dial, so a tracker chooses
-    /// which destinations end up recorded next to our torrent.
-    ///
-    /// Truncating or hashing it would not help — a b32 *is* the hash of the
-    /// destination, and a stable tag stays linkable. So the peer is not named
-    /// at all. The stage and the error survive, which is the part that says
-    /// what to do next, and `peers_tried` already says how many there were.
+    /// Record a failure against *a peer*, without saying which one.
     fn fail_peer(&mut self, stage: &str, e: &dyn std::fmt::Display) {
         let text = format!("{stage}: {e}");
         eprintln!("cloved: metadata fetch: {text}");
@@ -676,7 +650,7 @@ impl FetchRound {
 
 /// One fetch round: announce to each tracker for peers, then ask each peer
 /// for the metadata. Returns synthesized `.torrent` bytes on success, plus a
-/// report of what happened either way.
+/// report of what happened either way. 
 /// Generic so the mock network proves it in tests.
 fn try_fetch_round<D>(
     ctx: &registry::FetchContext<D>,
@@ -713,11 +687,6 @@ where
                 continue;
             }
         };
-        // The stage that most often stalls a magnet, and the one that used to
-        // be invisible: an address-book name the router has never heard of
-        // fails here, and the naming cache then declines to ask again for up
-        // to half an hour (i2pnet::naming) — so the symptom is not even a
-        // stream of lookups, it is silence.
         let dest = match i2pnet::I2pNamingLookup::lookup(&ctx.naming, &host) {
             Ok(dest) => dest,
             Err(e) => {
@@ -816,7 +785,7 @@ fn distinct(mut peers: Vec<DestHash>) -> Vec<DestHash> {
     peers
 }
 
-/// The daemon's wire identity: the Q7 `-CV0001-` prefix plus 12 random bytes.
+/// The daemon's wire identity: the prefix plus 12 random bytes.
 ///
 /// # Errors
 ///
@@ -832,8 +801,7 @@ fn build_peer_id() -> std::io::Result<[u8; 20]> {
     Ok(id)
 }
 
-/// Accept loop: one thread per connection (Q5; API load is tiny). Only a fatal
-/// accept error returns.
+/// Accept loop: one thread per connection. Only a fatal accept error returns.
 fn serve(listener: &ApiListener, daemon: &Arc<Daemon>) -> Result<(), String> {
     loop {
         match listener.accept() {

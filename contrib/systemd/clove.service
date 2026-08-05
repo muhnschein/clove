@@ -19,9 +19,7 @@
 
 [Unit]
 Description=clove, an I2P-only BitTorrent daemon
-Documentation=man:cloved(8) man:clove.conf(5)
-# The router is a separate service; clove tolerates it being absent or
-# restarting, so this is ordering only, not a hard dependency.
+Documentation=man:clove(1) man:clove.conf(5) man:clove-api(7) man:cloved(8)
 After=network.target i2pd.service
 Wants=i2pd.service
 

@@ -3,7 +3,7 @@
 //! attached, a live [`Torrent`] + [`Swarm`] per unpaused entry.
 //!
 //! Generic over the dialer so the mock network proves the engine wiring in CI
-//! and the SAM backend slots into the same seam (`docs/PHASE-F.md` §7 5c).
+//! and the SAM backend slots into the same seam.
 //! Until [`attach_network`](Registry::attach_network) is called, entries are
 //! static state ("waiting for router"); afterwards each unpaused torrent gets
 //! storage, a live engine instance registered with the session's
@@ -106,8 +106,7 @@ where
     state_dir: PathBuf,
     downloads_dir: PathBuf,
     limits: Limits,
-    /// The client-wide connection ceiling every hosted torrent draws on
-    /// (`docs/PHASE-H.md` §3).
+    /// The client-wide connection ceiling every hosted torrent draws on.
     ///
     /// Owned by the registry rather than by the attached network, because it
     /// outlives any one session: a router restart tears every peer down and
@@ -316,7 +315,7 @@ struct Hosted {
     /// identical without this number.
     peers: usize,
     known_peers: usize,
-    /// Of those, how many arrived over `i2p_pex` (M3's PEX criterion).
+    /// Of those, how many arrived over `i2p_pex`.
     pex_peers: u64,
     /// Peers that reached us rather than being dialed — the live proof of the
     /// inbound `STREAM FORWARD` path (`PROTOCOL.i2p-bt` §2.5).
@@ -512,7 +511,10 @@ impl fmt::Display for ActionError {
             ActionError::BadInput(what) => write!(f, "{what}"),
             ActionError::Io(e) => write!(f, "{e}"),
         }
-    }
+    }ed the files and the piece was good as of then
+            // (`docs/STATE-FORMAT.md`). Copying `have` here is what let a
+            // crash — or a bad sector afterwards — come back as a torrent
+            // serving pieces nobody had checked.
 }
 
 /// What an operator asked for at add time.
@@ -631,7 +633,7 @@ where
     /// another.
     ///
     /// Order is the queue: forced torrents (`clove start`) first, then add
-    /// order (`docs/PHASE-H.md` §7). Downloads and seeds draw on separate
+    /// order. Downloads and seeds draw on separate
     /// allowances, which is what makes a completion promote the next waiting
     /// *download* rather than competing with it — the finished torrent has
     /// moved to the other budget.

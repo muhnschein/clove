@@ -1,18 +1,5 @@
 //! The shared peer budget: one ceiling on how many peer connections exist
-//! across every torrent at once (`docs/PHASE-H.md` §3).
-//!
-//! Every torrent used to keep its own [`SwarmConfig::max_peers`] and nothing
-//! kept a total, so the cost of hosting *n* torrents was *n* times a number
-//! chosen for one. Ten torrents at the default 50 is up to 500 concurrent I2P
-//! streams on a single SAM session — against `SCOPE.md` R2's measured ceiling
-//! of 200 (`PROTOCOL.i2p-bt` §2.6e) and a session already known to wedge under
-//! an unexpected stream failure (§2.12). One wedged session takes *every*
-//! torrent down, not the one that overspent, which is why this is a shared
-//! resource with a hard cap rather than per-torrent advice.
-//!
-//! The scarce thing is the **stream**, not the peer: the budget is global
-//! because the SAM session is, and a per-torrent cap remains on top of it so
-//! one torrent still cannot take the whole allowance.
+//! across every torrent at once.
 //!
 //! # Discipline
 //!

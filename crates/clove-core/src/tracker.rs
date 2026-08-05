@@ -1230,10 +1230,6 @@ mod tests {
             "the error must identify the page, got: {text}"
         );
 
-        // The shape that defeated two previews: a modern page whose <head> is
-        // mostly inline CSS, so the raw prefix is a stylesheet and the one
-        // identifying token sits well past any sane cut. Summarising beats
-        // quoting, and it is shorter.
         let page = "<!DOCTYPE html>\n<html>\n<head>\n<style type=\"text/css\">\n:root{\n\
              --border_table:inset 0 0 0 1px rgba(255,255,255,.3);\n\
              --postman:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'\

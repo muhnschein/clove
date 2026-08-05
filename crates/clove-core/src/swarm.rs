@@ -1,5 +1,4 @@
-//! Peer acquisition for a running torrent: the swarm runner (Phase F,
-//! `docs/PHASE-F.md` — the mock-first half of the SAM wiring slice).
+//! Peer acquisition for a running torrent: the swarm runner.
 //!
 //! A [`Swarm`] owns two background threads around one [`Torrent`]:
 //!
@@ -11,17 +10,7 @@
 //!   dial (leaseSet warmup `CantReachPeer`, refusal, timeout — see
 //!   `PROTOCOL.i2p-bt` §2.6b) schedules that peer for retry after
 //!   [`SwarmConfig::retry_backoff`] instead of being forgotten.
-//!
-//!   Up to [`SwarmConfig::dial_concurrency`] dials run at once. They used to
-//!   run strictly one after another, on the reasoning that they serialized on
-//!   the session anyway (§2.6a) — which stopped being true when clove took
-//!   over dialling (§2.12) and the sweep was never revisited. The cost was
-//!   severe and easy to miss: a tracker hands back fifty destinations, a good
-//!   fraction of any I2P swarm's are unreachable, and each unreachable one is
-//!   worth a whole [`SwarmConfig::dial_timeout`] of doing nothing else. One
-//!   sweep could outlast the session it was running on, so a live run reached
-//!   a *single* peer attempt per session and reported zero peers against fifty
-//!   known.
+//!   Up to [`SwarmConfig::dial_concurrency`] dials run at once.
 //! - the **acceptor**: blocks on [`I2pListener::accept`], attaching each
 //!   inbound peer, refusing (dropping) connections past `max_peers`. It exits
 //!   when `accept` fails — session loss — because re-establishing the session
@@ -423,10 +412,7 @@ where
     // — and with it this torrent's announces — for the life of the process.
     let _ = stream.set_timeouts(Some(tracker::ANNOUNCE_IO_TIMEOUT));
     // Which destination the host resolved to, on every announce that then
-    // goes wrong. A tracker answering 200 with somebody else's web page is
-    // indistinguishable from a tracker that is broken, unless you can see
-    // that the name resolved somewhere unexpected — and an address book is a
-    // file of assertions, not a fact.
+    // goes wrong.
     let response = tracker::announce_over(&mut stream, &request).inspect_err(|_| {
         eprintln!("clove: {host} resolved to {}", dest.to_b32());
         eprintln!(
@@ -472,7 +458,7 @@ fn sweep<D>(
     let connected: Vec<DestHash> = torrent.connected_peers();
     // Two ceilings, and the wave is sized by the tighter one: this torrent's
     // own `max_peers`, and what is left of the client-wide budget every other
-    // torrent is drawing on too (`docs/PHASE-H.md` §3). The second read is
+    // torrent is drawing on too. The second read is
     // advisory — another torrent may claim the slot before this wave attaches
     // — but its job is only to stop us spending a `dial_timeout` reaching for
     // room that is not there. `Torrent::attach` makes the binding claim.
@@ -1580,11 +1566,6 @@ mod tests {
 
     /// Several torrents sharing one client's budget must not add up past it,
     /// however generous each one's own `max_peers` is.
-    ///
-    /// This is the whole point of `docs/PHASE-H.md` §3: the per-torrent cap
-    /// bounds one torrent, and nothing used to bound the sum, so hosting *n*
-    /// torrents cost *n* times a number chosen for one — against a single SAM
-    /// session measured only to 200 concurrent streams.
     #[test]
     fn torrents_sharing_a_budget_cannot_add_up_past_it() {
         const LIMIT: usize = 5;

@@ -1,7 +1,6 @@
 # Decisions
 
-The scope draft deferred Q1–Q7 to M0 spike memos but stated a lean for each.
-These memos lock the leans in as **documented, reversible defaults**: the
+These memos in **documented, reversible defaults**: the
 `i2pnet` trait boundary and per-module error/enum discipline keep every one
 of them swappable, and any that fails in practice gets revisited *with
 evidence* rather than re-litigated up front. Revisiting one is a normal PR,
@@ -18,15 +17,14 @@ remains possible without engine changes.
 
 ## Q2 — Resume format: bencode
 
-We hand-roll a bencode codec anyway (torrent files require it, and §9 wants
+We hand-roll a bencode codec (torrent files require it, and §9 wants
 hostile-input control over it). Reusing it for resume data means zero new
 dependencies, no serde, and exactly one hostile-input parser to harden and
 fuzz instead of two. Every resume file carries an integer `version` key from
-day one; the format spec lives in `STATE-FORMAT.md` (written with the
-implementation at M4). Policy per SCOPE §3: newer clove reads older state;
-older clove refuses newer state cleanly.
+day one; the format spec lives in `STATE-FORMAT.md`. Policy per SCOPE §3:
+newer clove reads older state; older clove refuses newer state cleanly.
 
-## Q3 — Fast extension (BEP 6): yes, in v1
+## Q3 — Fast extension (BEP 6) in v1
 
 i2psnark supports it, it measurably improves swarm behavior (allowed-fast
 pieces during choke, precise have-all/have-none), and it is cheap next to
@@ -36,7 +34,7 @@ BEP 10 which we need regardless. Wire-codec work, no architectural cost.
 
 One persisted destination keypair per client (stable identity across
 restarts), plus one global `ephemeral` config flag that skips persistence.
-Per-torrent transient identities are v2: they multiply session topology
+Per-torrent transient identities are v2+: they multiply session topology
 (one PRIMARY session each) and supervision state for a niche benefit.
 
 ## Q5 — Concurrency: synchronous thread-per-peer
@@ -46,175 +44,18 @@ disk and hashing, bounded channels between them. Most auditable option and
 entirely viable at I2P scale (50–200 peers; tunnel latency dwarfs thread
 cost). **De-risked externally:** yosemite 0.7.0 ships a first-class `sync`
 cargo feature (alongside `tokio`/`smol`), so no async runtime enters the
-dependency tree at all. The planned M0 concurrency spike is therefore
-dropped. Fallback if a concrete wall is hit: smol via yosemite's `smol`
-feature, behind the same `i2pnet` traits. The R2 stress harness (i2pd SAM
-under many concurrent streams) stays — it tests router behavior, not our
-runtime choice — and runs in Phase D.
+dependency tree at all.
 
 ## Q6 — HTTP API server: hand-rolled HTTP/1.1
 
 We control both ends (our CLI, local socket), need a tiny subset (GET/POST,
-JSON bodies, token header, unix socket first), and the opentracker precedent
-says a few hundred careful lines beat a framework's transitive closure.
+JSON bodies, token header, unix socket first), and the opentracker project
+shows how a few hundred careful lines beat a framework's transitive closure.
 Same reasoning covers the *client* side (tracker announces over I2P
 streams): one shared minimal HTTP/1.1 implementation in `clove-core`.
 
-## Q7 — Wire identity: peer-ID prefix `-CV0001-`, client string `clove/0.1`
+## Q7 — Wire identity: peer-ID prefix `-CV0001-`, client string `clove/2026.08`
 
 Azureus-style prefix `CV`, which does not collide with anything in the
 informal BEP 20 registry (CT/CD/CB etc. are taken; CV is free as of this
-writing). Version digits track releases. **Checkpoint:** re-verify against
-the registry *and* observed I2P-swarm peer IDs before M3 — first live
-announce is the wire-permanent moment. Until then this is a candidate, after
-that it never changes.
-
----
-
-# Scope amendments
-
-Unlike the Q memos above, these change `SCOPE.md` rather than fill in a blank
-it left. Each states what moved, the evidence that moved it, and the condition
-under which it moves back — a deferral with a trigger is a decision; one
-without is a quiet drop.
-
-## S2 — A TUI, but no TUI framework (2026-07-30)
-
-> **Superseded in part by S3 (2026-07-31).** The framework rejection stands
-> and is unweakened. The permission it granted was exercised, `clove top` was
-> built exactly as specified below, and it has since been removed under this
-> memo's own reversal condition. Read what follows as the record of a decision
-> that was made, paid for and then reversed on its own terms — not as a
-> description of the CLI as it stands.
-
-`PHASE-F.md` §6 rejected a TUI and invited this memo in the same breath: *"if a
-full curses-style UI is ever genuinely wanted, it is a separate,
-budget-spending decision — not smuggled in with M4."* It is wanted, this is the
-decision, and it spends nothing.
-
-**What §6 got right, and how far it reaches.** §6 rejected `ratatui` +
-`crossterm` on `SCOPE.md` §9 grounds — roughly doubling the tree, breaking the
-human-reviewable `cargo vendor` goal, a large raw-mode/input/resize surface to
-audit. Measured rather than estimated, against crates.io on 2026-07-30, with
-`cargo add` into an empty crate:
-
-| Candidate | Locked crates |
-|---|---|
-| clove today | **48** |
-| `iocraft` 0.8.4 | 68 |
-| `ratatui` 0.30.2, `default-features = false, features = ["crossterm"]` | 91 |
-| `ratatui` 0.30.2, default features | 181 |
-
-§6 undersold it. The full `ratatui` is not double the tree, it is **just under
-four times** it, and it arrives with `syn` at three major versions, `serde`,
-`mio`, `signal-hook`, `strum` and `regex`. Stripping it to no default features
-still lands at 91 — nearly double clove's whole closure for the parts of a
-framework we would use least. `iocraft` is smaller at 68 and still out: it
-pulls `crossterm` anyway, adds `futures`/`parking_lot`/`regex` and its own
-proc-macro pair, and its async-React model fights Q5's synchronous
-thread-per-peer discipline rather than fitting it. **All three stay rejected,
-and the rejection is now quantified.**
-
-**What §6 did not distinguish.** It treated "a TUI" and "a TUI framework" as
-one thing. They are not. A full-screen view needs raw mode, window size,
-keypress decoding, cursor addressing and a repaint discipline. Four of those
-five are ANSI escape sequences and a byte-level state machine — which is
-precisely the "300 focused lines over 30,000 imported" clove already chose for
-bencode, HTTP/1.1 at both ends, JSON at both ends, and argument parsing. Only
-raw mode and window size need a syscall, and `unsafe_code = "forbid"` is what
-stops us calling them directly.
-
-**The finding that closes it.** clove already depends on `rustix` (entered
-2026-07-29 for `openat`-based path handling). Enabling `termios`, `event` and
-`stdio` on it resolves to exactly `{rustix, bitflags, errno, libc,
-linux-raw-sys, windows-link, windows-sys}` — **seven crates, every one already
-in `Cargo.lock` at the same version**. `tcgetattr`/`tcsetattr` give raw mode and
-`tcgetwinsize` gives the window size, both without `unsafe`, at a dependency
-cost of **zero new crates**. The reason §6 could not reach this conclusion is
-that it was written in Phase F and `rustix` did not enter the tree until Phase
-G — the argument was sound on the evidence it had.
-
-**The decision.** No TUI framework, unchanged and now with numbers. A
-hand-rolled full-screen view is permitted, specified as `clove top` in
-`PHASE-H.md` §9, on these conditions:
-
-- It lives entirely in `clove(1)`. **No new API endpoint**, no engine state,
-  no daemon change. Every keystroke is the same `/v1/` call the equivalent
-  subcommand already makes, so a bug in it cannot reach `cloved`.
-- It reuses the existing table renderers rather than growing a second set.
-- `clove watch` stays exactly as it is — no raw mode, pipe-safe, nothing to
-  restore. `clove top` is an additional command, not a replacement, and
-  nothing chooses between them by sniffing `isatty`.
-- The costs are documented before they are paid, in `PHASE-H.md` §9: a
-  `SIGTERM`-killed `clove top` leaves a terminal wanting `stty sane` (a signal
-  handler needs `unsafe` or a crate, and we take neither), and columns are
-  padded by character count so wide glyphs misalign — which is what
-  `clove list` already does.
-- The escape-sequence input decoder gets a `cargo-fuzz` target like every
-  other parser here. **Done:** `fuzz/fuzz_targets/keys.rs`, which is why
-  `clove` is a library as well as a binary. For a decoder the failure that
-  matters is a stall rather than an attacker, so it asserts that every decode
-  makes progress, over-reads nothing, and follows no sequence past its bound.
-
-**Reversal condition.** Two, in opposite directions. If the hand-rolled view
-exceeds roughly 800 lines in `clove`, or if terminal restoration needs a signal
-handler after all, the "write it ourselves" premise has failed and `ratatui` is
-re-costed honestly against that failure rather than against an estimate. *As
-built it is ~640 lines across `term` and `top`, and `Cargo.lock` holds the same
-52 entries it did before — so the premise held, on both counts, and the bound
-stays live for whatever the view grows into next.* And if
-`clove top` lands and nobody uses it over `clove watch`, §9 of `SCOPE.md`
-applies in its usual direction — *removals are announced proudly* — and it
-goes.
-
-## S3 — One view, and it is `clove list` (2026-07-31)
-
-S2's reversal condition, exercised in the direction it named: *"if `clove top`
-lands and nobody uses it over `clove watch`, §9 of `SCOPE.md` applies in its
-usual direction — removals are announced proudly — and it goes."* It went, and
-`clove watch` went with it.
-
-**What was removed.** `clove top` (the full-screen view, `top.rs`), the
-terminal primitives it needed (`term.rs`: raw mode, window size, the
-escape-sequence key decoder), `clove watch` (the repaint loop), and — because
-they existed only to serve those — the `clove` library target, its
-`fuzz_targets/keys.rs` target, and the `rustix` dependency on the `clove`
-crate. Removed alongside them, on the same "one obvious way" reasoning:
-`clove stats` (folded into `clove status`), and the `clove announce` and
-`clove peer` command wrappers (the versioned endpoints they called remain).
-
-**Why, when S2 measured the cost so carefully and found it affordable.**
-Because affordable is not the same as earned, and the memo was honest about
-which question it had answered. S2 proved a full-screen view cost zero new
-crates; it could not prove anyone would reach for it over the listing, which
-is why it wrote the reversal condition in the first place. Three views of the
-same table — `list`, `watch`, `top` — is two views too many, and the second
-rendering path was the expensive one: `top` carried its own table renderer
-with its own column arithmetic, its own selection state, its own
-destructive-action confirmation, and the only raw-mode surface in the project.
-
-**What replaced it.** `clove list` grew the header bar `top` opened with, a
-progress bar in the column that was a bare percentage, a peer column, and
-**fixed column widths** — which is the change that makes the rest work. A live
-view is now `watch -n 2 clove list`: an ordinary program composed with this
-one, repainting a table whose columns do not move. That composition was always
-available; what it lacked was a listing worth repainting.
-
-**What this buys, beyond the lines.** No raw mode anywhere in clove. No
-alternate screen, no termios, no `SIGTERM`-leaves-your-terminal-broken caveat,
-no signal-handler question to reopen later. The `clove` binary talks to a
-socket and prints; it has no terminal state to get wrong. S2's costs section
-is not mitigated, it is *gone*.
-
-**What is unchanged.** The framework rejection, entirely — this memo removes a
-hand-rolled view, it does not reopen `ratatui` or `iocraft`. Should a
-full-screen view ever be wanted again, S2's measurements stand and its
-conditions still bind; nothing here makes that decision easier or harder than
-it was, only unspent.
-
-**Reversal condition.** If `watch -n 2 clove list` proves genuinely worse than
-what was removed — a flicker no fixed-width table can settle, or an operation
-that wants a cursor on a row — then the honest answer is a *narrow* selection
-view, re-costed under S2's conditions, and not the restoration of three
-overlapping ones. The listing's fixed widths are the load-bearing part: if
-they are ever measured from the rows again, this memo's premise has failed.
+writing). Version digits track releases.

@@ -23,7 +23,7 @@
 
 [Unit]
 Description=clove, an I2P-only BitTorrent daemon
-Documentation=man:cloved(8) man:clove.conf(5)
+Documentation=man:clove(1) man:clove.conf(5) man:clove-api(7) man:cloved(8)
 After=default.target
 
 [Service]

@@ -85,7 +85,7 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Control socket path for the local HTTP API.
     pub api_socket: PathBuf,
-    /// Transient identity: never persist destination keys (Q4).
+    /// Transient identity: never persist destination keys.
     pub ephemeral: bool,
     /// Grow each file to its full length when a torrent is added, rather than
     /// letting it become sparse as pieces land (SCOPE §4).
@@ -97,7 +97,7 @@ pub struct Config {
     /// [`peer_limit`](Config::peer_limit).
     pub torrent_peer_limit: usize,
     /// How many incomplete torrents may run at once; the rest wait in the
-    /// queue (`docs/PHASE-H.md` §4).
+    /// queue.
     pub max_active_downloads: usize,
     /// How many complete torrents may seed at once.
     pub max_active_seeds: usize,
@@ -113,17 +113,10 @@ pub struct Config {
 }
 
 /// Client-wide peer ceiling when the config does not say otherwise.
-///
-/// The concurrency `SCOPE.md` R2 actually measured — 200 concurrent streams on
-/// one i2pd SAM session, uncorrelated with connect latency across 30 runs
-/// (`PROTOCOL.i2p-bt` §2.6e) — rather than a round number. Above it we would be
-/// guessing, and the thing being guessed with is the session every torrent
-/// shares.
 pub const DEFAULT_PEER_LIMIT: usize = 200;
 
 /// Per-torrent peer ceiling when the config does not say otherwise. The
-/// long-standing `SwarmConfig::max_peers` default, now a sub-cap rather than
-/// the only cap.
+/// long-standing `SwarmConfig::max_peers` default.
 pub const DEFAULT_TORRENT_PEER_LIMIT: usize = 50;
 
 /// Concurrently downloading torrents when the config does not say otherwise.
@@ -427,11 +420,6 @@ impl Config {
 }
 
 /// Largest accepted value for either peer ceiling.
-///
-/// Not a considered engineering limit so much as a refusal to accept a typo:
-/// the numbers that make sense here are in the hundreds, and a `peer_limit` of
-/// 100000 is a slipped keystroke that would be discovered as a wedged SAM
-/// session hours later rather than as a failed start.
 pub const MAX_PEER_LIMIT: usize = 10_000;
 
 /// Parse a peer-count value: a plain decimal, at least 1, at most
@@ -658,9 +646,7 @@ preallocate yes
             MAX_PEER_LIMIT
         );
 
-        // Zero is not "unlimited" — a client that may hold no peers is never
-        // what was meant — and a slipped keystroke fails the start rather
-        // than being discovered later as a wedged session.
+        // Zero is not "unlimited".
         for bad in [
             "peer_limit 0",
             "peer_limit -1",
@@ -780,9 +766,7 @@ preallocate yes
 
         // The ugly flag gets you past the loopback rule and straight into the
         // truth: this build dials 127.0.0.1 and cannot do otherwise, so saying
-        // "I know" does not make a remote bridge work. It used to be accepted
-        // here and then quietly redirected to the local router — a different
-        // machine than the one the operator deliberately asked for.
+        // "I know" does not make a remote bridge work.
         assert_eq!(
             Config::parse("sam_address 10.0.0.2:7656\ni_know_sam_is_remote yes\n", &d).unwrap_err(),
             Error::Line {

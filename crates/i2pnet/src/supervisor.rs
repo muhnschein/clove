@@ -1,12 +1,6 @@
 //! SAM session reconnection policy (SCOPE §4).
 //!
-//! This is the arithmetic behind the state machine the scope calls Suspect #1
-//! for XD-style flakiness: when the router restarts or the SAM control
-//! connection drops, the whole session tree must come back on its own, on an
-//! exponential backoff, without a thundering-herd reconnect and without the
-//! engine above ever seeing a torn-down session as anything but a visible
-//! "waiting for router" pause.
-//!
+//! This is the arithmetic behind the state machine.
 //! The cycle itself lives in `cloved` — it owns the session, the forwarded
 //! listener, the inbound demux and the registry, and the order in which those
 //! are built and torn down is the daemon's business:
@@ -27,14 +21,6 @@
 //! that wait so a host running several daemons does not retry in lockstep.
 //! Keeping it pure means the daemon's loop has no arithmetic of its own to get
 //! wrong, and this file needs no router to test.
-//!
-//! There used to be a `Supervisor` here that drove a `SessionFactory` through
-//! the cycle above. It was never used: the session tree is three objects with
-//! different owners (an `Arc` session, a listener moved into an accept loop, a
-//! registry to attach), and threading that through a generic factory cost more
-//! than it explained. The daemon's own loop is the one that runs, so the
-//! untested duplicate is gone (SCOPE §9, culture of deletion) and the policy it
-//! calls is what is tested below.
 
 use std::time::Duration;
 

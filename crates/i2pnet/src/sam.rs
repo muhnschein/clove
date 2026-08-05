@@ -30,7 +30,6 @@
 //!   loop. With `SILENT=false` (yosemite's default) the router prepends each
 //!   forwarded connection with the peer's base64 destination line, from
 //!   which we derive its [`DestHash`] (`docs/PROTOCOL.i2p-bt` §1.3, §2.5).
-//!   The exact framing is confirmed against a live router at M1.
 //!
 //! Every socket here is opened to `127.0.0.1` by construction, which is
 //! Layer 1's loopback-only rule; the `--i-know-sam-is-remote` escape hatch
@@ -1115,7 +1114,7 @@ impl I2pDialer for SamSession {
             // a reconnect. Without it every announce and every peer dial
             // fails identically and forever, `clove status` still reports
             // `connected`, and the only cure is restarting the daemon —
-            // which is exactly the XD-style flakiness SCOPE §4 exists to
+            // which is exactly the <sflakiness SCOPE §4 exists to
             // rule out.
             if let DialFailed::SessionGone(e) = &failed {
                 self.life
@@ -1384,8 +1383,7 @@ mod hostile_bridge_tests {
             };
             let err = result.expect_err(&format!("{how:?} was accepted as a SAM bridge"));
             assert!(elapsed < LIMIT, "{how:?}: probe took {elapsed:?}");
-            // The operator has to be able to act on this at 2 a.m., so the
-            // message names the address it could not talk to.
+            // The message names the address it could not talk to.
             assert!(
                 err.to_string().contains("127.0.0.1:"),
                 "{how:?}: unhelpful error {err}"

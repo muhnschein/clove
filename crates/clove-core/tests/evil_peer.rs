@@ -1325,8 +1325,7 @@ fn the_maintenance_tick_outlives_neither_its_handle_nor_its_torrent() {
     drop(forgotten);
 }
 
-/// A peer that takes blocks and never answers — the fault that stalled a live
-/// download at 48%, and the one no other test in this file produces.
+/// A peer that takes blocks and never answers.
 ///
 /// Every hostile peer above is hostile in a way the engine can see: it lies,
 /// it sends rubbish, it floods, or it goes silent and trips the idle timeout.

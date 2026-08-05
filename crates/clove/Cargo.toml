@@ -7,10 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# A binary and nothing else. It was briefly a library too, so the
-# escape-sequence decoder behind `clove top` could carry a fuzz target; with
-# the full-screen view gone there is no parser here to fuzz and no reason for
-# anything to link against the CLI.
+# A binary and nothing else.
 [[bin]]
 name = "clove"
 path = "src/main.rs"

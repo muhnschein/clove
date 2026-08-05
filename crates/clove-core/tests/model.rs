@@ -14,14 +14,6 @@
 //! The piece geometry is duplicated because it is three lines of arithmetic and
 //! every interesting property needs it.
 //!
-//! That is where the bugs were. Three of the findings in
-//! `docs/CODE-REVIEW-2026-07.md` — a duplicate block reopening a finished
-//! piece, availability inflated past what the peers justify, a request counted
-//! as outstanding that nobody owes — are all "the bookkeeping drifted from
-//! reality", and none of them needed a network to reproduce. Two of them
-//! survived a green test suite because nothing drove the picker into the state
-//! that exposed them.
-//!
 //! Beyond agreement, the sweeps assert *liveness*: that a picker with work
 //! available always offers some, and that every interested peer eventually gets
 //! a turn. A picker that quietly stops handing out blocks, or a choker whose

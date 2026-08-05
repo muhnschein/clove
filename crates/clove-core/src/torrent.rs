@@ -420,7 +420,7 @@ impl Torrent {
     ///
     /// What the daemon uses: the ceiling that matters is on concurrent streams
     /// against one SAM session, so it belongs to the client rather than to any
-    /// torrent (`docs/PHASE-H.md` §3). A torrent built with [`new`](Torrent::new)
+    /// torrent. A torrent built with [`new`](Torrent::new)
     /// gets an unlimited budget and behaves as it did before there was one.
     #[must_use]
     pub fn with_budget(
@@ -769,7 +769,7 @@ impl Torrent {
         self.shared.info_hash
     }
 
-    /// Our peer id on the wire and in announces (Q7).
+    /// Our peer id on the wire and in announces.
     #[must_use]
     pub fn peer_id(&self) -> [u8; 20] {
         self.shared.peer_id
@@ -2258,7 +2258,7 @@ mod tests {
         );
     }
 
-    /// The M2 demo: a seeder and a leecher over the mock network complete a
+    /// A seeder and a leecher over the mock network complete a
     /// full multi-piece, multi-file download.
     #[test]
     fn two_instances_download_over_mock() {

@@ -7,10 +7,7 @@
 //! `completions`.
 //!
 //! One view concept, deliberately. `list` is a one-shot table under a summary
-//! header, and a live view is `watch -n 2 clove list` — an ordinary program
-//! composed with this one, rather than a repaint loop and a full-screen mode
-//! carried here. Nothing enters raw mode, nothing owns the alternate screen,
-//! and there is nothing to restore if a command is killed mid-print.
+//! header; for a live view users will need to use  `watch clove list`.
 //!
 //! A torrent is named by info-hash, by a unique prefix of one, or by its
 //! position in `list` — resolved by the daemon except for the position, which
@@ -334,11 +331,6 @@ where
 
 /// The one client-wide report: is the daemon and its router alright, and what
 /// is the client doing.
-///
-/// These used to be two commands — `status` for the first question and `stats`
-/// for the second — which meant two round trips, two things to remember, and
-/// an operator reading one when the answer was in the other. They are read at
-/// the same moment often enough that splitting them was the mistake.
 fn cmd_status(where_: &Where, json: bool) -> Result<(), Fail> {
     let (socket, token) = resolve(where_)?;
     let body = request(&socket, &token, "GET", "/v1/status", &[])?;
@@ -365,8 +357,7 @@ fn cmd_list(where_: &Where, json: bool) -> Result<(), Fail> {
         return Ok(());
     }
     // The header bar is the second request, and only on the human path: a
-    // listing worth reading answers "and how is the client overall" in the
-    // same glance — the one thing `top` carried that the listing did not.
+    // listing worth reading answers "and how is the client overall".
     let status = parse_body(&request(&socket, &token, "GET", "/v1/status", &[])?)?;
     print!("{}", render_list(&status, &parse_body(&body)?));
     Ok(())
@@ -702,9 +693,7 @@ fn render_detail(value: &Value) -> String {
 }
 
 /// How wide a torrent name is allowed to be in a table cell before it is
-/// elided. Long enough for anything an operator recognises a torrent by,
-/// short enough that one pathological name cannot push the info-hash column
-/// off the far side of the terminal.
+/// elided.
 const NAME_WIDTH: usize = 60;
 
 /// Make an attacker-controlled string safe to write to a terminal.
@@ -1090,10 +1079,6 @@ fn write_row(out: &mut String, cells: &[String], widths: &[usize]) {
 }
 
 /// A transfer rate, or a dash when there is nothing moving.
-///
-/// Zero prints as `-` rather than `0 B/s`: a listing is mostly idle torrents,
-/// and a column of zeroes is noise that hides the one row that is doing
-/// something — which is the whole reason the column is there.
 fn human_rate(bytes_per_sec: Option<u64>) -> String {
     match bytes_per_sec {
         Some(0) | None => "-".to_owned(),
@@ -1110,11 +1095,6 @@ fn whole_rate(bytes_per_sec: Option<u64>) -> String {
 }
 
 /// [`human_size`] rounded to whole units: `1 GiB`, `700 MiB`.
-///
-/// The listing's columns are a fixed width and are read while they repaint, so
-/// what matters there is that a figure keeps its shape — `9.9 GiB` becoming
-/// `10.0 GiB` is a character of drift for a tenth of a unit nobody is acting
-/// on. `show` keeps the decimal, where the number is read once and precisely.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -1343,7 +1323,7 @@ mod tests {
 
         // What must *not* change: ordinary text, and the non-ASCII that a
         // legitimately-named torrent is full of.
-        for ok in ["ubuntu-24.04.iso", "Дистрибутив", "日本語", "café", "🎉"] {
+        for ok in ["Jeffrey Epstein House Oversight Committee Photo Release Dec 19th 2025.zip", "Путін — хуйло!", "小熊维尼", "café", "🎉"] {
             assert_eq!(display(ok), ok);
         }
 
