@@ -511,10 +511,7 @@ impl fmt::Display for ActionError {
             ActionError::BadInput(what) => write!(f, "{what}"),
             ActionError::Io(e) => write!(f, "{e}"),
         }
-    }ed the files and the piece was good as of then
-            // (`docs/STATE-FORMAT.md`). Copying `have` here is what let a
-            // crash — or a bad sector afterwards — come back as a torrent
-            // serving pieces nobody had checked.
+    }
 }
 
 /// What an operator asked for at add time.

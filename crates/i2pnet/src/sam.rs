@@ -1114,8 +1114,7 @@ impl I2pDialer for SamSession {
             // a reconnect. Without it every announce and every peer dial
             // fails identically and forever, `clove status` still reports
             // `connected`, and the only cure is restarting the daemon —
-            // which is exactly the <sflakiness SCOPE §4 exists to
-            // rule out.
+            // which is exactly the flakiness SCOPE §4 exists to rule out.
             if let DialFailed::SessionGone(e) = &failed {
                 self.life
                     .end(&format!("the router no longer has our session ({e})"));

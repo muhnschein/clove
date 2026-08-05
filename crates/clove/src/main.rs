@@ -7,7 +7,7 @@
 //! `completions`.
 //!
 //! One view concept, deliberately. `list` is a one-shot table under a summary
-//! header; for a live view users will need to use  `watch clove list`.
+//! header; for a live view users will need to use `watch clove list`.
 //!
 //! A torrent is named by info-hash, by a unique prefix of one, or by its
 //! position in `list` — resolved by the daemon except for the position, which
@@ -1323,7 +1323,13 @@ mod tests {
 
         // What must *not* change: ordinary text, and the non-ASCII that a
         // legitimately-named torrent is full of.
-        for ok in ["Jeffrey Epstein House Oversight Committee Photo Release Dec 19th 2025.zip", "Путін — хуйло!", "小熊维尼", "café", "🎉"] {
+        for ok in [
+            "Jeffrey Epstein House Oversight Committee Photo Release Dec 19th 2025.zip",
+            "Путін — хуйло!",
+            "小熊维尼",
+            "café",
+            "🎉",
+        ] {
             assert_eq!(display(ok), ok);
         }
 
