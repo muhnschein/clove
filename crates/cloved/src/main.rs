@@ -650,7 +650,7 @@ impl FetchRound {
 
 /// One fetch round: announce to each tracker for peers, then ask each peer
 /// for the metadata. Returns synthesized `.torrent` bytes on success, plus a
-/// report of what happened either way. 
+/// report of what happened either way.
 /// Generic so the mock network proves it in tests.
 fn try_fetch_round<D>(
     ctx: &registry::FetchContext<D>,
