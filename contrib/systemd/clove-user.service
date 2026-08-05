@@ -17,9 +17,9 @@
 # which most do not. They are therefore omitted here rather than left in place
 # to give false comfort. The directives below do work per-user.
 #
-# If you want the kernel-enforced clearnet lock, use the system unit, or the
-# network-namespace recipe in contrib/netns/README.md. clove remains I2P-only
-# by construction either way (SCOPE §5, Layer 1); Layer 3 is defence in depth.
+# If you want the kernel-enforced clearnet lock, use the system unit
+# (contrib/systemd/clove.service). clove remains I2P-only by construction either
+# way (SCOPE §5, Layer 1); Layer 3 is defence in depth.
 
 [Unit]
 Description=clove, an I2P-only BitTorrent daemon

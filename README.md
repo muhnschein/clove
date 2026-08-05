@@ -10,9 +10,11 @@ A modern I2P-only BitTorrent client.
 > independent review. If that provenance troubles you, use
 > something else.
 
-> 🐧 **Linux-focused:** clove focuses solely on modern Linux environments and
-> relies on functionality they offer (Landlock, seccomp, systemd, etc.). No 
-> efforts are made to accomodate other platforms.
+> 🐧 **Linux-only:** clove requires a modern Linux kernel (**6.12 or newer**),
+> `seccomp`, Landlock, and systemd, and relies on them for two of its three
+> security layers. It is built and tested nowhere else, and no effort is made to
+> accommodate other platforms — the same choice OpenSSH makes, for the same
+> reason: support one platform properly rather than several partially.
 
 ## Overview
 
@@ -66,9 +68,9 @@ clove is currently built from source.
 - Rust 1.94.1 with `cargo`, `clippy`, and `rustfmt` (pinned in
   [`rust-toolchain.toml`](rust-toolchain.toml));
 - an external i2pd or Java I2P router exposing SAMv3 over loopback; and
-- Linux for Landlock/seccomp self-confinement and the bundled sandboxing
-  recipes. Other platforms fall back without those Linux-specific layers and
-  are not the primary deployment target.
+- Linux 6.12 or newer, with `seccomp` and Landlock available, on `x86_64`,
+  `aarch64` or `riscv64`. This is a requirement, not a preference: see
+  [`docs/SCOPE.md`](docs/SCOPE.md) §0.
 
 ### Install binaries and man pages
 
@@ -109,16 +111,27 @@ No layer assumes another is present.
    used, and non-I2P trackers are discarded. Lints and
    [`ci/check-net-deps.sh`](ci/check-net-deps.sh) enforce the dependency
    boundary in CI.
-2. **Self-restriction.** After initialization, `cloved` attempts to confine its
-   filesystem and outbound TCP with Landlock and deny unneeded syscall classes
-   with seccomp. These mechanisms are best-effort; the daemon reports what was
-   applied and continues if the running kernel cannot provide them.
-3. **OS sandbox.** The system service and network-namespace recipe provide a
-   separate deployment-level clearnet lock and further process hardening.
+2. **Self-restriction.** After initialization, `cloved` confines its filesystem
+   and outbound TCP with Landlock, and drops every syscall it no longer needs
+   with a `seccomp` **allowlist** — anything not on the list returns `EPERM`,
+   and `socket(2)` is limited to `AF_UNIX`/`AF_INET`/`AF_INET6`. The list is
+   measured from a traced run rather than guessed, and the daemon's own tests
+   perform that workload under the live filter. These mechanisms are still
+   best-effort at runtime: the daemon reports what was applied and continues if
+   the running kernel cannot provide them.
+3. **OS sandbox.** The [systemd unit](contrib/systemd/clove.service) provides a
+   separate deployment-level clearnet lock (`IPAddressDeny=any`) and further
+   process hardening.
+
+Within it, a single peer destination is bounded: it may hold only a couple of
+connections to any one torrent, and peers it advertises over PEX are the first
+thing evicted when the candidate set is full — so one destination can neither
+fill the peer table nor crowd a tracker's peers out of it.
 
 This model does not protect against a compromised kernel or I2P router,
-resource exhaustion, an attacker who already controls the daemon's account, or
-the normal visibility of your I2P destination to peers in a public swarm.
+resource exhaustion in general, an attacker who already controls the daemon's
+account, or the normal visibility of your I2P destination to peers in a public
+swarm.
 
 Please report suspected vulnerabilities through GitHub's private vulnerability
 reporting—*not a public issue*. See [`SECURITY.md`](SECURITY.md) for scope and the

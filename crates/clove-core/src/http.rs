@@ -462,7 +462,7 @@ pub fn read_request<R: Read>(reader: &mut R, max_body: usize) -> Result<ServerRe
     }
 
     let mut headers = Vec::new();
-    let mut content_length = 0usize;
+    let mut content_length: Option<usize> = None;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -473,16 +473,33 @@ pub fn read_request<R: Read>(reader: &mut R, max_body: usize) -> Result<ServerRe
         let name = name.trim().to_ascii_lowercase();
         let value = value.trim().to_owned();
         if name == "content-length" {
+            // A second one is refused rather than resolved. Two
+            // `Content-Length` headers are how a request means one length to
+            // one reader and another to the next (RFC 9112 §6.3), and picking
+            // either is picking a side in a disagreement the sender created.
+            // This API is one request per connection with no keep-alive, so
+            // nothing can be smuggled past it today — the refusal is here so
+            // that stays true of a future that reuses connections.
+            if content_length.is_some() {
+                return Err(Error::BadRequest("more than one content-length"));
+            }
             let n: usize = value
                 .parse()
                 .map_err(|_| Error::BadRequest("bad content-length"))?;
             if n > max_body {
                 return Err(Error::BodyTooLarge);
             }
-            content_length = n;
+            content_length = Some(n);
+        }
+        // Chunked request bodies are not read here, and a request carrying one
+        // must therefore be refused rather than silently treated as bodyless —
+        // which is a `POST /v1/torrents` that adds nothing and reports success.
+        if name == "transfer-encoding" {
+            return Err(Error::BadRequest("transfer-encoding is not supported"));
         }
         headers.push((name, value));
     }
+    let content_length = content_length.unwrap_or(0);
 
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body)?;
@@ -781,6 +798,43 @@ mod tests {
             read_request(&mut cur, 1024),
             Err(Error::BadRequest(_))
         ));
+    }
+
+    /// A request whose framing is ambiguous is refused, not resolved.
+    #[test]
+    fn rejects_ambiguous_request_framing() {
+        // Two Content-Lengths: the sender is telling two different stories, and
+        // agreeing with either is how a body gets read as a second request.
+        let two =
+            b"POST /v1/torrents HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\nabcde";
+        let mut cur = Cursor::new(two.to_vec());
+        assert!(matches!(
+            read_request(&mut cur, 1024),
+            Err(Error::BadRequest(_))
+        ));
+
+        // Identical duplicates are refused too: collapsing them is legal, and
+        // refusing is simpler than being right about when it is.
+        let same =
+            b"POST /v1/torrents HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc";
+        let mut cur = Cursor::new(same.to_vec());
+        assert!(read_request(&mut cur, 1024).is_err());
+
+        // A chunked request body is not read by this server, so a request
+        // carrying one must fail rather than look like an empty-bodied POST that
+        // succeeded at adding nothing.
+        let chunked =
+            b"POST /v1/torrents HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
+        let mut cur = Cursor::new(chunked.to_vec());
+        assert!(matches!(
+            read_request(&mut cur, 1024),
+            Err(Error::BadRequest(_))
+        ));
+
+        // One Content-Length is of course still fine.
+        let ok = b"POST /v1/torrents HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+        let mut cur = Cursor::new(ok.to_vec());
+        assert_eq!(read_request(&mut cur, 1024).unwrap().body, b"abc");
     }
 
     #[test]

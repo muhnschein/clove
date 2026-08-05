@@ -808,8 +808,22 @@ fn looks_like_key_material(field: &str, min: usize) -> bool {
     false
 }
 
+/// One character's worth of the above.
+///
+/// The same two families `clove_core::text::scrub` replaces, and deliberately
+/// not a call to it: `clove-core` depends on this crate, not the other way
+/// round, so the shared helper is not reachable from here. The duplication is
+/// four lines and the alternative is a text utility living in the crate whose
+/// entire job is sockets.
 fn scrub_char(c: char) -> char {
-    if c.is_control() { '?' } else { c }
+    match c {
+        c if c.is_control() => '?',
+        // The bidirectional overrides and isolates draw nothing and reorder the
+        // text around them, so a bridge could make the rest of a log line read
+        // as something else. Not caught by `is_control`.
+        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '?',
+        c => c,
+    }
 }
 
 /// Pull the destination blob out of a `SESSION STATUS` reply, or say what the

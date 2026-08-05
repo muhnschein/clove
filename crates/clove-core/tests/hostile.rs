@@ -203,6 +203,25 @@ fn metainfo_survives_hostile_input() {
                     assert!(!part.contains('\0'), "accepted NUL in a path");
                 }
             }
+            // What the parser accepts, the display layer must be able to make
+            // safe. These are separate jobs — `check_component` refuses what a
+            // *path* must not contain and has no opinion about `ESC`, which is
+            // right — so the guarantee is a joint one, and this is the seam it
+            // lives on. It was not held: a torrent's file path went to the
+            // daemon's stderr verbatim, escape sequences and all.
+            for part in meta.files.iter().flat_map(|f| &f.path) {
+                let shown = clove_core::text::scrub(part);
+                assert!(
+                    !shown.chars().any(char::is_control),
+                    "a control character survived scrubbing: {shown:?}"
+                );
+            }
+            assert!(
+                !clove_core::text::scrub(&meta.name)
+                    .chars()
+                    .any(char::is_control),
+                "a control character survived scrubbing the torrent name"
+            );
         }
         let _ = metainfo::MetaInfo::from_info_dict(case);
     });

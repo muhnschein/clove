@@ -1027,6 +1027,198 @@ fn peer_exchange_stays_within_the_limit_it_enforces() {
     }
 }
 
+/// One destination may not take the whole peer table.
+///
+/// Nothing used to stop it. The dial sweep skips destinations it is already
+/// connected to, but the inbound path had no such check, so a single destination
+/// could dial in a loop and fill every slot — and, through the shared budget,
+/// slots belonging to every other torrent. The damage is not just the memory: a
+/// peer holding every slot is the only peer we talk to, so its piece set is the
+/// only availability rarest-first can see, and no honest peer can get in.
+///
+/// The cap is per destination, not per connection attempt, so the check must
+/// hold however many connections arrive at once — hence the concurrent burst
+/// rather than a tidy loop.
+#[test]
+fn one_destination_cannot_monopolise_the_peer_table() {
+    use clove_core::torrent::MAX_CONNECTIONS_PER_DEST;
+
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("one-dest");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    // One endpoint — one destination — dialling far more times than its share,
+    // all at once. Each connection handshakes correctly and then just sits
+    // there, which is the cheapest possible attack and the hardest to fault.
+    let attacker = net.endpoint();
+    let attacker_dest = attacker.dest();
+    let attempts = MAX_CONNECTIONS_PER_DEST + 6;
+    let mut held = Vec::new();
+    for _ in 0..attempts {
+        let Ok(mut stream) = attacker.dial(dest, Duration::from_secs(5)) else {
+            continue;
+        };
+        if handshake(&mut stream, info_hash).is_err() {
+            continue;
+        }
+        stream.set_timeouts(Some(FRAME_WAIT));
+        held.push(stream);
+    }
+
+    // The table settles at the cap, not at the number of connections offered.
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let peers = seeder.connected_peers();
+        let mine = peers.iter().filter(|&&d| d == attacker_dest).count();
+        assert!(
+            mine <= MAX_CONNECTIONS_PER_DEST,
+            "one destination holds {mine} connections, cap is {MAX_CONNECTIONS_PER_DEST}"
+        );
+        if mine == MAX_CONNECTIONS_PER_DEST {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the attacker never reached the cap ({mine} connections); \
+             the test is not exercising it"
+        );
+    }
+    // Give any connection the engine was going to accept time to show up, then
+    // re-check: the assertion above must hold at rest, not just in passing.
+    std::thread::sleep(Duration::from_millis(200));
+    let settled = seeder
+        .connected_peers()
+        .iter()
+        .filter(|&&d| d == attacker_dest)
+        .count();
+    assert_eq!(
+        settled, MAX_CONNECTIONS_PER_DEST,
+        "the cap did not hold once the burst finished"
+    );
+
+    // And the whole point: an honest peer still gets in and still finishes.
+    honest_download_completes(&net, &meta, dest, "one-dest-honest");
+    drop(held);
+}
+
+/// A PEX flood cannot shut the tracker's real peers out of the candidate set.
+///
+/// `known_peers` is capped, and the cap used to refuse *new* entries once full
+/// rather than evicting — which sounds conservative and is the opposite. PEX
+/// carries 512 destinations per message with no limit on messages, so two
+/// messages from the first peer to connect filled the set with addresses of its
+/// choosing, and from then until a restart no tracker reply could add a single
+/// real peer to that torrent.
+///
+/// A PEX-learned entry is now the first thing evicted when a trusted source
+/// needs the room, and PEX itself evicts nothing.
+#[test]
+fn a_pex_flood_cannot_shut_out_the_trackers_peers() {
+    use clove_core::pex::{MAX_PEX_PEERS, PexMessage};
+    use clove_core::torrent::MAX_KNOWN_PEERS;
+
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("pex-flood");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    let mut peer = raw_peer(&net, dest, info_hash);
+    // Advertise i2p_pex so the engine routes our messages to the PEX handler.
+    let mut m = BTreeMap::new();
+    m.insert(b"i2p_pex".to_vec(), Ben::Int(1));
+    let mut hs = BTreeMap::new();
+    hs.insert(b"m".to_vec(), Ben::Dict(m));
+    wire::write_message(
+        &mut peer,
+        &Message::Extended {
+            id: 0,
+            payload: bencode::encode(&Ben::Dict(hs)),
+        },
+    )
+    .expect("ext handshake");
+
+    // Flood the set to its cap, 512 fabricated destinations at a time. Each
+    // message is well-formed and within every limit the parser enforces — that
+    // is what made this work.
+    let mut sent = 0usize;
+    let mut tag = 0u32;
+    while sent < MAX_KNOWN_PEERS * 2 {
+        let added: Vec<DestHash> = (0..MAX_PEX_PEERS)
+            .map(|_| {
+                tag += 1;
+                let mut hash = [0xEEu8; 32];
+                hash[..4].copy_from_slice(&tag.to_be_bytes());
+                DestHash(hash)
+            })
+            .collect();
+        wire::write_message(
+            &mut peer,
+            &Message::Extended {
+                id: 1,
+                payload: PexMessage {
+                    added,
+                    dropped: Vec::new(),
+                }
+                .encode(),
+            },
+        )
+        .expect("pex flood");
+        sent += MAX_PEX_PEERS;
+    }
+
+    // Wait for the flood to land, so the set really is full when we test it.
+    let deadline = Instant::now() + DEADLINE;
+    while seeder.known_peers().len() < MAX_KNOWN_PEERS {
+        assert!(
+            Instant::now() < deadline,
+            "the flood never filled the set ({} entries); the test proves nothing",
+            seeder.known_peers().len()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        seeder.known_peers().len() <= MAX_KNOWN_PEERS,
+        "the flood pushed the set past its cap"
+    );
+
+    // Now the tracker answers. Every one of these must be remembered.
+    let from_tracker: Vec<DestHash> = (0..64u32)
+        .map(|i| {
+            let mut hash = [0x11u8; 32];
+            hash[..4].copy_from_slice(&i.to_be_bytes());
+            DestHash(hash)
+        })
+        .collect();
+    seeder.add_peers(&from_tracker);
+
+    let known = seeder.known_peers();
+    let kept = from_tracker.iter().filter(|d| known.contains(d)).count();
+    assert_eq!(
+        kept,
+        from_tracker.len(),
+        "{} of {} tracker peers were shut out by the flood",
+        from_tracker.len() - kept,
+        from_tracker.len()
+    );
+    assert!(
+        known.len() <= MAX_KNOWN_PEERS,
+        "making room for the tracker's peers broke the cap"
+    );
+}
+
 /// Choke rounds are periodic in BEP 3, and the optimistic slot is how a peer
 /// that arrives after the slots are taken ever gets served. Without a round on
 /// a timer, whoever was unchoked first keeps the slot for the life of the

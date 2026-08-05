@@ -37,7 +37,7 @@
 //! against the mock network in CI and a real router in production; peer
 //! acquisition (dialling, accepting) belongs to [`crate::swarm`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -149,7 +149,36 @@ pub const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 /// peer-controlled: 512 destinations per message with no limit on messages. The
 /// cap is what stops one peer filling memory and pointing the dial sweep at
 /// thousands of destinations that will each cost a tunnel and a timeout.
+///
+/// A cap alone is not enough, because *which* entries it keeps decides whether a
+/// flood can shut real peers out. [`Source`] is what decides that.
 pub const MAX_KNOWN_PEERS: usize = 1024;
+
+/// Concurrent connections one I2P destination may hold on one torrent.
+///
+/// A destination is a peer's identity, and nothing about `BitTorrent` needs the
+/// same peer twice. Nothing used to stop it either: the dial sweep skips
+/// destinations it is already connected to, but the inbound path had no such
+/// check, so a single destination could dial us over and over and take every
+/// slot in the table — and with it, through the shared [`PeerBudget`], slots
+/// belonging to every other torrent. That is not merely resource exhaustion: a
+/// peer holding every slot is the only peer we talk to, its piece set is the
+/// only availability rarest-first can see, and honest peers cannot get in at
+/// all.
+///
+/// **Two, not one.** One is the honest ceiling and two is the forgiving one,
+/// because a *legitimate* second connection is ordinary here:
+///
+/// - both sides dial at once — a routine `BitTorrent` race, and on I2P a slow one,
+///   since a dial takes seconds to resolve a leaseSet; and
+/// - a connection we still believe in that the peer has already given up on
+///   (its side torn down without a FIN that reached us) blocks the peer's
+///   reconnect until our idle timeout expires, five minutes later.
+///
+/// At one, both cases cost a real peer a connection. At two, an attacker gets
+/// two slots out of `max_peers` instead of all of them, which is the whole point
+/// — the cap does not have to be tight to stop a monopoly, only finite.
+pub const MAX_CONNECTIONS_PER_DEST: usize = 2;
 
 /// Outgoing message queue depth per peer before the writer applies
 /// backpressure. Bounded — no unbounded channels in the engine (SCOPE §4).
@@ -281,8 +310,9 @@ struct State {
     peers: Vec<Peer>,
     next_id: u64,
     /// Peer destinations we know about (from connections, PEX, or the
-    /// tracker), for peer exchange and future dialing.
-    known_peers: HashSet<DestHash>,
+    /// tracker), for peer exchange and future dialing, each with where we
+    /// heard it — see [`Source`].
+    known_peers: HashMap<DestHash, Source>,
     /// How many destinations we first heard of from a peer's `i2p_pex`
     /// message rather than from a tracker or an inbound connection.
     ///
@@ -302,20 +332,65 @@ struct State {
     last_announce_error: Option<String>,
 }
 
+/// Where a known destination came from, which is what decides whether it may
+/// be evicted to make room for another.
+///
+/// The distinction exists because one of these sources is a stranger's word and
+/// the rest are not. `known_peers` is capped, and the cap used to refuse *new*
+/// entries once full rather than evicting — which sounds conservative and is the
+/// opposite. PEX carries 512 destinations per message with no limit on messages,
+/// so two messages from the first peer to connect filled the set with addresses
+/// of its choosing, and from then until a restart no tracker reply could add a
+/// single real peer to that torrent. The dial sweep would spend every wave on
+/// the flood.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Source {
+    /// A peer told us about it over `i2p_pex`. Unverified, unbounded in supply,
+    /// and therefore the first thing to go.
+    Pex,
+    /// A tracker returned it, a peer dialled us from it, the operator asked for
+    /// it, or we are connected to it. Not something a stranger can displace.
+    Trusted,
+}
+
 impl State {
     /// Remember a destination we could dial, up to [`MAX_KNOWN_PEERS`].
     ///
-    /// Refusing new entries rather than evicting old ones keeps the peers we
-    /// learned first — which includes every peer we are connected to, since
-    /// registering a connection records its destination.
+    /// At the cap, a [`Source::Trusted`] destination displaces a
+    /// [`Source::Pex`] one; PEX never displaces anything, so a flood can fill
+    /// the free space but cannot take space from a real peer. When every entry
+    /// is trusted there is nothing worth evicting and the new one is refused.
+    ///
+    /// A trusted sighting of a destination we first heard over PEX upgrades it,
+    /// so a peer we actually reached stops being eviction fodder. Nothing
+    /// downgrades an entry.
     ///
     /// Returns whether this destination was new to us.
-    fn remember_peer(&mut self, dest: DestHash) -> bool {
-        if self.known_peers.len() < MAX_KNOWN_PEERS || self.known_peers.contains(&dest) {
-            self.known_peers.insert(dest)
-        } else {
-            false
+    fn remember_peer_from(&mut self, dest: DestHash, source: Source) -> bool {
+        if let Some(existing) = self.known_peers.get_mut(&dest) {
+            if source == Source::Trusted {
+                *existing = Source::Trusted;
+            }
+            return false;
         }
+        if self.known_peers.len() >= MAX_KNOWN_PEERS {
+            if source == Source::Pex {
+                return false;
+            }
+            // Any PEX entry will do; which one is not worth deciding, and an
+            // arbitrary victim is one less thing for a flood to game.
+            let victim = self
+                .known_peers
+                .iter()
+                .find(|(_, held)| **held == Source::Pex)
+                .map(|(dest, _)| *dest);
+            let Some(victim) = victim else {
+                return false;
+            };
+            self.known_peers.remove(&victim);
+        }
+        self.known_peers.insert(dest, source);
+        true
     }
 }
 
@@ -465,7 +540,7 @@ impl Torrent {
                 request_timeout: DEFAULT_REQUEST_TIMEOUT,
                 peers: Vec::new(),
                 next_id: 0,
-                known_peers: HashSet::new(),
+                known_peers: HashMap::new(),
                 pex_learned: 0,
                 announces_ok: 0,
                 announces_failed: 0,
@@ -511,7 +586,7 @@ impl Torrent {
     pub fn add_peers(&self, peers: &[DestHash]) {
         let mut st = lock(&self.shared.state);
         for &p in peers {
-            st.remember_peer(p);
+            st.remember_peer_from(p, Source::Trusted);
         }
     }
 
@@ -625,7 +700,7 @@ impl Torrent {
     pub fn known_peers(&self) -> Vec<DestHash> {
         lock(&self.shared.state)
             .known_peers
-            .iter()
+            .keys()
             .copied()
             .collect()
     }
@@ -903,7 +978,17 @@ impl Torrent {
         let (reader, writer) = stream.split()?;
         let (tx, rx) = sync_channel::<Message>(OUTGOING_QUEUE);
 
-        let id = self.shared.register_peer(tx.clone(), closer, remote, slot);
+        // Registration can refuse: one destination may hold only
+        // [`MAX_CONNECTIONS_PER_DEST`] connections here. Refusing returns the
+        // budget slot and drops both stream halves, which closes the
+        // connection — the same outcome the dialling side sees from any other
+        // refusal.
+        let Some(id) = self.shared.register_peer(tx.clone(), closer, remote, slot) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "this destination already holds its share of connections",
+            ));
+        };
 
         // Announce our piece set, then our extension handshake if the peer
         // speaks BEP 10.
@@ -972,17 +1057,32 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
 }
 
 impl Shared {
+    /// Add the peer to the table and return its id, or `None` when `dest`
+    /// already holds [`MAX_CONNECTIONS_PER_DEST`] connections here.
+    ///
+    /// The check lives *inside* the lock that pushes the entry, because that is
+    /// the only place it can be right: two inbound connections from one
+    /// destination can be in `finish_attach` at the same instant, and a count
+    /// taken before the lock would let both through. Same reasoning as the
+    /// budget's compare-exchange, one level up.
+    ///
+    /// Taking `slot` by value is what returns it: on refusal the slot is dropped
+    /// here, so the budget cannot leak a slot to a connection that was never
+    /// registered.
     fn register_peer(
         &self,
         out: SyncSender<Message>,
         closer: Arc<dyn I2pClose + Send + Sync>,
         dest: DestHash,
         slot: PeerSlot,
-    ) -> u64 {
+    ) -> Option<u64> {
         let mut st = lock(&self.state);
+        if st.peers.iter().filter(|p| p.dest == dest).count() >= MAX_CONNECTIONS_PER_DEST {
+            return None;
+        }
         let id = st.next_id;
         st.next_id += 1;
-        st.remember_peer(dest);
+        st.remember_peer_from(dest, Source::Trusted);
         st.peers.push(Peer {
             id,
             _slot: slot,
@@ -1002,7 +1102,7 @@ impl Shared {
             pex_id: None,
             metadata_id: None,
         });
-        id
+        Some(id)
     }
 
     /// Our BEP 10 handshake payload: advertise `i2p_pex` and `ut_metadata`, and
@@ -1245,7 +1345,7 @@ impl Shared {
             OUR_PEX_ID => {
                 if let Ok(pex) = PexMessage::parse(payload) {
                     for dest in pex.added {
-                        if st.remember_peer(dest) {
+                        if st.remember_peer_from(dest, Source::Pex) {
                             st.pex_learned = st.pex_learned.saturating_add(1);
                         }
                     }
@@ -1273,7 +1373,7 @@ impl Shared {
         // exactly the busy torrents peer exchange is for.
         let added: Vec<DestHash> = st
             .known_peers
-            .iter()
+            .keys()
             .copied()
             .filter(|&d| d != peer_dest)
             .take(crate::pex::MAX_PEX_PEERS)

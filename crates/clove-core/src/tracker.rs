@@ -204,22 +204,10 @@ const MAX_TRACKER_TEXT: usize = 512;
 /// Make tracker-supplied text safe to put in a log line or an API field.
 ///
 /// The text is a stranger's, and it ends up in the daemon's stderr and in
-/// `clove list`. A newline in it forges a log line — an operator reading
-/// `cloved: …` has no way to tell which of those lines clove wrote — and a
-/// terminal escape can rewrite what the rest of the screen says. Replaced
-/// rather than stripped, so the message still reads as having had something
-/// there, and truncated because a tracker does not get to decide how much of a
-/// log it occupies.
+/// `clove list`. See [`crate::text`] for what is replaced and why; the bound is
+/// here because a tracker does not get to decide how much of a log it occupies.
 fn sanitise(text: &str) -> String {
-    let mut out: String = text
-        .chars()
-        .take(MAX_TRACKER_TEXT)
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect();
-    if text.chars().count() > MAX_TRACKER_TEXT {
-        out.push('…');
-    }
-    out
+    crate::text::scrub_bounded(text, MAX_TRACKER_TEXT)
 }
 
 /// A tracker's decoded reply.

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use i2pnet::{DestHash, I2pDialer, I2pListener, I2pNamingLookup, I2pStream};
 
-use crate::torrent::{HANDSHAKE_TIMEOUT, Torrent};
+use crate::torrent::{HANDSHAKE_TIMEOUT, MAX_CONNECTIONS_PER_DEST, Torrent};
 use crate::tracker;
 use crate::wire::{self, Handshake};
 
@@ -347,6 +347,13 @@ fn announce_loop<D, N>(
                 // fixed for exactly this and the running announcer, which is
                 // the one a real torrent uses, still swallowed everything.
                 Err(e) => {
+                    // The URL is the torrent's. `TrackerUrl::parse` refuses any
+                    // byte at or below 0x20, so the escapes and newlines are
+                    // already gone — but it works on bytes, and the
+                    // bidirectional overrides are three bytes each, well above
+                    // that. Scrubbed here and in the stored error, which is the
+                    // one that reaches the API.
+                    let url = crate::text::scrub(url);
                     eprintln!("clove: announce to {url} failed: {e}");
                     state.on_failure(unix_now());
                     torrent.note_announce(Err(format!("{url}: {e}")));
@@ -414,10 +421,17 @@ where
     // Which destination the host resolved to, on every announce that then
     // goes wrong.
     let response = tracker::announce_over(&mut stream, &request).inspect_err(|_| {
-        eprintln!("clove: {host} resolved to {}", dest.to_b32());
+        // Both carry the torrent's own text — the host, and the announce path
+        // it came with. See the scrub in `announce_loop` for why the URL
+        // filter is not enough on its own.
+        eprintln!(
+            "clove: {} resolved to {}",
+            crate::text::scrub(&host),
+            dest.to_b32()
+        );
         eprintln!(
             "clove: the announce that failed was {}",
-            tracker::announced_url(&host, &request)
+            crate::text::scrub(&tracker::announced_url(&host, &request))
         );
     })?;
     torrent.add_peers(&response.peers);
@@ -687,11 +701,20 @@ impl InboundDemux {
         let Some(torrent) = torrent else {
             return; // unknown info-hash: drop, nothing to say
         };
-        if torrent.connected_peers().len() >= self.max_peers || torrent.budget().available() == 0 {
+        let connected = torrent.connected_peers();
+        if connected.len() >= self.max_peers || torrent.budget().available() == 0 {
+            return;
+        }
+        // One destination gets a bounded share of the table. Checked here as
+        // well as in `attach_accepted` so a destination dialling us in a loop is
+        // turned away before we spend a handshake reply on it; the check that
+        // actually binds is the one inside the registration lock.
+        if connected.iter().filter(|&&d| d == from).count() >= MAX_CONNECTIONS_PER_DEST {
             return;
         }
         // Still only advisory: `attach_accepted` claims the slot, and refuses
-        // with `WouldBlock` if the client filled up between here and there.
+        // with `WouldBlock` if the client filled up — or if this destination
+        // took its last permitted slot — between here and there.
         let _ = torrent.attach_accepted(stream, from, &theirs);
     }
 }
