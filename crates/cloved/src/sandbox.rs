@@ -21,18 +21,7 @@
 //!   anything not on it returns `EPERM`, and `socket(2)` is further restricted
 //!   by address family to `AF_UNIX`/`AF_INET`/`AF_INET6`.
 //!
-//! This was a deny list until it was not enough. The argument for one was that
-//! an allowlist over a threaded Rust process with an allocator underneath is a
-//! list that breaks in the field on a kernel or libc nobody tested — which is
-//! true, and is a reason to build the list carefully rather than a reason to
-//! enumerate the attacker's options instead. A deny list can only ever name what
-//! somebody thought of, and `io_uring` is the standing proof: it submits
-//! operations that kernel workers perform *without* re-checking the submitter's
-//! filter, so three syscall numbers absent from a deny list hand back most of
-//! what the rest of it took away. An allowlist has no such gap by construction —
-//! a capability nobody enumerated is denied rather than granted.
-//!
-//! `ALLOWED` is not a guess. It was measured: the daemon was run under `strace`
+//! Tthe daemon was run under `strace`
 //! against a SAM bridge complete enough to bring the whole network path up —
 //! session, forwarded listener, naming lookup, tracker announce, inbound peer —
 //! and driven through every API operation, and the trace was split at the
