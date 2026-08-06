@@ -82,19 +82,54 @@ pub(crate) enum Role {
     Watch,
 }
 
+/// What the two mechanisms actually came to.
+///
+/// A structure rather than the one-line string this used to be, because two
+/// callers now need the answer and neither should get it by matching on prose.
+/// `cloved` reports [`Verdict::line`] at startup and through the API, and
+/// enforces `sandbox require` against the two booleans (`clove.conf(5)`).
+pub(crate) struct Verdict {
+    /// The operator-facing summary, as printed at startup and served from
+    /// `GET /v1/status`. Names what applied *and* what did not, because a
+    /// mechanism that quietly did nothing is the failure this layer has.
+    ///
+    /// Carries no `sandbox:` prefix — the startup line adds one, and the API
+    /// field and the CLI row are already labelled.
+    pub(crate) line: String,
+    /// Landlock is enforcing, fully or partially. Partial means only that the
+    /// kernel declined the ABI 9 addition; the ABI 6 floor is a hard
+    /// requirement, so it cannot be partially met.
+    pub(crate) landlock: bool,
+    /// The seccomp filter is installed.
+    pub(crate) seccomp: bool,
+}
+
+impl Verdict {
+    /// Whether both mechanisms applied, which is what `sandbox require` means.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.landlock && self.seccomp
+    }
+}
+
 /// Drop the capabilities the daemon no longer needs, and describe what
-/// actually happened in one line for the operator.
+/// actually happened.
 ///
 /// Never fails: an unavailable or partial mechanism is reported, not raised.
-pub(crate) fn enter_post_init(limits: &Limits) -> String {
-    let fs = landlock_restrict(limits);
-    let syscalls = seccomp_restrict();
-    format!("sandbox: {fs}; {syscalls}")
+/// Whether *reporting* it is enough is the caller's decision, not this
+/// module's — see `sandbox require`.
+pub(crate) fn enter_post_init(limits: &Limits) -> Verdict {
+    let (landlock, fs) = landlock_restrict(limits);
+    let (seccomp, syscalls) = seccomp_restrict();
+    Verdict {
+        line: format!("{fs}; {syscalls}"),
+        landlock,
+        seccomp,
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn landlock_restrict(_limits: &Limits) -> String {
-    "landlock unavailable (not Linux)".to_owned()
+fn landlock_restrict(_limits: &Limits) -> (bool, String) {
+    (false, "landlock unavailable (not Linux)".to_owned())
 }
 
 /// Confine the filesystem, outbound TCP, and — where the kernel has it — the
@@ -120,7 +155,7 @@ fn landlock_restrict(_limits: &Limits) -> String {
 /// narrowing belongs in the per-path rules, never in the handled set.
 #[cfg(target_os = "linux")]
 #[allow(clippy::needless_pass_by_value)] // the landlock builders consume self
-fn landlock_restrict(limits: &Limits) -> String {
+fn landlock_restrict(limits: &Limits) -> (bool, String) {
     use landlock::{
         ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, Ruleset, RulesetAttr,
         RulesetCreatedAttr, RulesetStatus, Scope, path_beneath_rules,
@@ -168,26 +203,70 @@ fn landlock_restrict(limits: &Limits) -> String {
     };
 
     match restrict() {
-        Ok(RulesetStatus::FullyEnforced) => {
-            "landlock enforced (unix-socket connects denied too)".to_owned()
-        }
+        Ok(RulesetStatus::FullyEnforced) => (
+            true,
+            "landlock enforced (unix-socket connects denied too)".to_owned(),
+        ),
         // The required tier is a hard requirement, so nothing in it can be
         // missing here: the only access asked for best-effort is `ResolveUnix`,
         // and the only kernels that decline it are those below ABI 9.
-        Ok(RulesetStatus::PartiallyEnforced) => {
-            "landlock enforced; unix-socket connects unrestricted (kernel below ABI 9)".to_owned()
-        }
-        Ok(RulesetStatus::NotEnforced) => {
-            "landlock not applied (built in but disabled — check the kernel's LSM list)".to_owned()
-        }
-        // A compatibility error means the running kernel could not provide ABI 6.
-        // That is a kernel below the 6.12 this project requires, or Landlock
-        // missing entirely — different from "disabled", and worth different words.
-        Err(e) => format!(
-            "landlock unavailable: this kernel cannot provide ABI {} (clove requires Linux 6.12; \
-             see docs/SCOPE.md §0) — {e}",
-            REQUIRED as u32
+        Ok(RulesetStatus::PartiallyEnforced) => (
+            true,
+            "landlock enforced; unix-socket connects unrestricted (kernel below ABI 9)".to_owned(),
         ),
+        Ok(RulesetStatus::NotEnforced) => (
+            false,
+            "landlock not applied (the kernel accepted the ruleset and enforced nothing)"
+                .to_owned(),
+        ),
+        Err(e) => (false, why_landlock_is_unavailable(&e)),
+    }
+}
+
+/// Say *why* the ruleset could not be applied, having asked the kernel rather
+/// than assumed.
+///
+/// This used to read "this kernel cannot provide ABI 6 (clove requires Linux
+/// 6.12)" for every error, which is one of three possible causes and was the
+/// wrong one often enough to matter: on a 6.18 kernel with Landlock simply
+/// absent from the `lsm=` list, it sent the operator to check a version that
+/// was never the problem. A diagnostic nobody can trust is worse than none,
+/// because this is the only line saying whether Layer 2 exists at all.
+///
+/// `RestrictSelf` is the probe: it reports the running kernel's Landlock status
+/// without building a domain, and `no_new_privs(false)` keeps it from having
+/// any effect on the process at all. If even that fails, say so rather than
+/// invent a reason.
+#[cfg(target_os = "linux")]
+fn why_landlock_is_unavailable(e: &landlock::RulesetError) -> String {
+    use landlock::{ABI, LandlockStatus, RestrictSelf};
+
+    match RestrictSelf::default().no_new_privs(false).apply() {
+        Ok(status) => match status.landlock {
+            // Deliberately does not mention the 6.12 floor: the syscall being
+            // absent says nothing about the version, and a 6.18 kernel built
+            // without `CONFIG_SECURITY_LANDLOCK` lands here. Sending that
+            // operator to check their kernel version is the exact misdirection
+            // this function exists to stop.
+            LandlockStatus::NotImplemented => "landlock unavailable: this kernel has no Landlock \
+                 at all (CONFIG_SECURITY_LANDLOCK is off, or the kernel predates it) — clove \
+                 expects it, see docs/SCOPE.md §0"
+                .to_owned(),
+            LandlockStatus::NotEnabled => "landlock unavailable: built into this kernel but not \
+                 enabled — add it to the lsm= boot parameter or CONFIG_LSM"
+                .to_owned(),
+            // The genuine too-old case, and now it can name the number it found
+            // instead of naming the number it wanted.
+            LandlockStatus::Available { effective_abi, .. } => format!(
+                "landlock unavailable: this kernel offers ABI {}, below the {} clove requires \
+                 (Linux 6.12; see docs/SCOPE.md §0)",
+                effective_abi as u32,
+                ABI::V6 as u32
+            ),
+        },
+        // Both the ruleset and the probe failed. Report both rather than
+        // choosing which to believe.
+        Err(probe) => format!("landlock unavailable: {e} (probing why also failed: {probe})"),
     }
 }
 
@@ -251,8 +330,11 @@ use seccomp::restrict as seccomp_restrict;
         target_arch = "riscv64"
     )
 )))]
-fn seccomp_restrict() -> String {
-    "seccomp unavailable (unsupported platform)".to_owned()
+fn seccomp_restrict() -> (bool, String) {
+    (
+        false,
+        "seccomp unavailable (unsupported platform)".to_owned(),
+    )
 }
 
 #[cfg(all(
@@ -618,13 +700,13 @@ mod seccomp {
     /// `seccompiler` does not set `SECCOMP_FILTER_FLAG_LOG`. A refusal surfaces
     /// as whatever the daemon reports about the operation that failed, and
     /// `ci/router.sh --trace` is what turns it into an answer in CI.
-    pub(super) fn restrict() -> String {
+    pub(super) fn restrict() -> (bool, String) {
         match build() {
             Ok(program) => match seccompiler::apply_filter_all_threads(&program) {
-                Ok(()) => "seccomp filter installed".to_owned(),
-                Err(e) => format!("seccomp filter not installed ({e})"),
+                Ok(()) => (true, "seccomp filter installed".to_owned()),
+                Err(e) => (false, format!("seccomp filter not installed ({e})")),
             },
-            Err(e) => format!("seccomp filter not built ({e})"),
+            Err(e) => (false, format!("seccomp filter not built ({e})")),
         }
     }
 }
@@ -775,7 +857,7 @@ mod tests {
             .expect("a listener that can be polled without a client");
 
         let paths: &[(&Path, Role)] = &[(dir.as_path(), Role::State)];
-        let line = enter_post_init(&Limits {
+        let verdict = enter_post_init(&Limits {
             paths,
             connect_tcp: None,
         });
@@ -783,10 +865,12 @@ mod tests {
         // "landlock enforced" prefixes both the fully- and partially-enforced
         // messages, the difference between them being only whether the kernel
         // took the ABI 9 addition — so one substring covers both.
-        let landlocked = line.contains("landlock enforced");
-        let seccomped = line.contains("seccomp filter installed");
+        // The booleans rather than the prose: `Verdict` now says which
+        // mechanism applied, so the test asks it instead of matching on the
+        // wording of a message that exists for operators.
+        let (landlocked, seccomped) = (verdict.landlock, verdict.seccomp);
         if !landlocked && !seccomped {
-            println!("SKIP {line}");
+            println!("SKIP {}", verdict.line);
             return;
         }
         if landlocked {
@@ -838,7 +922,7 @@ mod tests {
             // allowlist can get wrong, and the half a deny list never could.
             exercise_the_daemons_syscalls(&dir, &control);
         }
-        println!("CONFINED {line}");
+        println!("CONFINED {}", verdict.line);
     }
 
     /// A representative slice of what `cloved` does after initialisation, so a

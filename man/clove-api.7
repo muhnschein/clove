@@ -96,7 +96,14 @@ and
 .Pq attached across every torrent, and the ceiling they come from ,
 and
 .Sy router
-.Pq Sy connecting , Sy waiting-for-router , Sy connected , Sy unsupported-sam-address .
+.Pq Sy connecting , Sy waiting-for-router , Sy connected , Sy unsupported-sam-address ,
+and
+.Sy sandbox ,
+the Layer-2 confinement this daemon actually achieved at start-up
+.Pq Xr cloved 8 , SECURITY .
+It is fixed for the life of the process and is the only way to ask a running
+daemon whether anything is confining it; a daemon on which both mechanisms
+failed is otherwise indistinguishable from one on which both applied.
 .It Sy GET Pa /v1/torrents
 An array of torrent summaries, in the order the torrents were added:
 .Sy info_hash ,
@@ -282,7 +289,8 @@ $ tok=$(cat ~/.local/share/clove/token)
 $ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
     -H "X-Clove-Token: $tok" http://clove/v1/status
 {"version":"0.1.0","uptime_secs":842,"sam_address":"127.0.0.1:7656",
- "torrents":3,"router":"connected"}
+ "torrents":3,"router":"connected",
+ "sandbox":"landlock enforced; seccomp filter installed"}
 .Ed
 .Pp
 Add a torrent file:

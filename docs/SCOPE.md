@@ -12,8 +12,12 @@
 
 ## 0. Target Platform
 
-**Modern Linux, and nothing else.** clove requires a kernel of **6.12 or newer**,
-`seccomp`, Landlock, and systemd, and is built and tested only there. The three
+**Modern Linux, and nothing else.** clove targets a kernel of **6.12 or newer**,
+`seccomp`, Landlock, and systemd, and is built and tested only there.
+"Targets", not "requires", because the code does not require them: Layer 2 is
+best-effort at runtime and says so, and `sandbox require` (`clove.conf(5)`) is
+how an operator turns the aspiration into an actual requirement for their
+deployment. The three
 architectures the syscall filter is emitted for are `x86_64`, `aarch64` and
 `riscv64`.
 
@@ -129,6 +133,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
   - **seccomp**: post-init syscall **allowlist** — anything not needed after initialization returns `ENOSYS`, which is the answer a libc's fallback paths are written for; `EPERM` is what stops glibc falling back from `clone3` to `clone`, and a hand-maintained list this short will be probed past eventually.
   - A syscall number is not always the whole policy, so four calls are restricted by **argument** as well. `socket(2)` to `AF_INET` *and* `SOCK_STREAM`: the family because the control listener is bound during initialization and only `accept4`-ed afterwards, and the type because Landlock's `ConnectTcp` says nothing about UDP, so this is where Layer 2 closes datagram egress. `ioctl(2)` to `FIONBIO`, its only use here, which is where interface enumeration via `SIOCGIFCONF` is closed — the last route by which a client with no IP vocabulary could ask what its IP is. `mmap(2)`/`mprotect(2)` to W^X, which is what Layer 3's `MemoryDenyWriteExecute=yes` has always required of the same process.
   - The allowlist is **measured, not guessed**, and re-measured whenever the daemon learns to do something new. The procedure: run `cloved` under `strace -f` against a SAM bridge complete enough to bring the whole network path up (session, forwarded listener, naming lookup, tracker announce, inbound peer), drive it through every API operation, split the trace at the `seccomp(2)` call that installs the filter, and take everything after it. Then add, with a written reason at each entry, the calls a trace cannot reach (clean shutdown, a block actually being written, `preallocate yes`) and the several spellings a libc or architecture may choose for one operation (`clone`/`clone3`, `poll`/`ppoll`, `mkdir`/`mkdirat`, the vDSO time fallbacks). `cloved`'s own confinement test then performs that workload under the live filter, so an omission fails in CI rather than in the field. The rig is committed, not a one-off: `ci/fake-sam.py` is the bridge and `ci/router.sh --trace` runs the measurement and fails if the allowlist refused anything the daemon needed.
+  - **Reported, and optionally required.** Both mechanisms are best-effort, which means the interesting failure is silent: a daemon on which neither applied behaves exactly like one on which both did. So the verdict is not merely logged at startup — it is held for the life of the process and served from `GET /v1/status`, and `sandbox require` (`clove.conf(5)`) turns an incomplete confinement into a refusal to start. The default stays permissive, because Landlock is absent under a number of container runtimes and a client that will not start there is a client nobody runs; the point is that the operator can now see which case they are in, and say which one they will accept.
 - Destination-level restriction (loopback-only) is not expressible in these mechanisms alone; that remains Layer 1's (by construction) and Layer 3's (sandbox) job. Layer 2's guarantee is about post-init *capabilities*: no exec, no filesystem outside the data dir, no new privilege.
 
 **Layer 3 — OS sandbox (shipped, documented, default in packaging):**

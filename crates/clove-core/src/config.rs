@@ -109,6 +109,33 @@ pub struct Config {
     /// A directory to watch for `.torrent` files to add, or `None` to watch
     /// none — the default.
     pub watch_dir: Option<PathBuf>,
+    /// What to do when the Layer-2 self-restriction cannot be applied.
+    pub sandbox: SandboxPolicy,
+}
+
+/// What `cloved` does when Landlock or `seccomp` does not apply (SCOPE §5).
+///
+/// Layer 2 is best-effort by design: the kernel it lands on is not the
+/// operator's choice on every machine, and a torrent client that will not start
+/// under a container runtime is a torrent client nobody runs. The cost of that
+/// default is that "unconfined" and "confined" look identical from outside —
+/// one startup line apart — so this exists to let an operator who *does* care
+/// say so, and be told rather than trusted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SandboxPolicy {
+    /// Apply what the kernel allows, report the rest, and run either way.
+    ///
+    /// The default, and the reason the word in `docs/SCOPE.md` §0 is now
+    /// "expects" rather than "requires".
+    #[default]
+    BestEffort,
+    /// Refuse to start unless both Landlock and `seccomp` applied.
+    ///
+    /// For deployments where running unconfined is worse than not running.
+    /// Note what it does *not* cover: Layer 3 is the service manager's, and
+    /// nothing the daemon can see tells it whether the unit's `IPAddressDeny=`
+    /// took effect.
+    Require,
 }
 
 /// Client-wide peer ceiling when the config does not say otherwise.
@@ -168,6 +195,8 @@ pub enum Problem {
     DuplicateKey,
     /// Boolean value other than `yes` or `no`.
     BadBool,
+    /// `sandbox` value other than `best-effort` or `require`.
+    BadSandboxPolicy,
     /// A count that is not a positive number, or is absurdly large.
     BadCount,
     /// A ratio that is not a non-negative decimal, or is absurdly large.
@@ -210,6 +239,9 @@ impl fmt::Display for Problem {
             Problem::MissingValue => write!(f, "key has no value"),
             Problem::DuplicateKey => write!(f, "key already set earlier in the file"),
             Problem::BadBool => write!(f, "expected \"yes\" or \"no\""),
+            Problem::BadSandboxPolicy => {
+                write!(f, "expected \"best-effort\" or \"require\"")
+            }
             Problem::BadCount => write!(f, "expected a number from 1 to {MAX_PEER_LIMIT}"),
             Problem::BadRatio => write!(
                 f,
@@ -259,6 +291,7 @@ struct Draft {
     seed_ratio_milli: Option<(usize, u64)>,
     seed_idle_minutes: Option<(usize, u64)>,
     watch_dir: Option<(usize, PathBuf)>,
+    sandbox: Option<(usize, SandboxPolicy)>,
 }
 
 impl Draft {
@@ -307,6 +340,14 @@ impl Draft {
                 set(&mut self.seed_ratio_milli, line, milli)?;
             }
             "watch_dir" => set(&mut self.watch_dir, line, absolute(value, line)?)?,
+            "sandbox" => {
+                let policy = match value {
+                    "best-effort" => SandboxPolicy::BestEffort,
+                    "require" => SandboxPolicy::Require,
+                    _ => return Err(at(Problem::BadSandboxPolicy)),
+                };
+                set(&mut self.sandbox, line, policy)?;
+            }
             "seed_idle_minutes" => {
                 let minutes = value
                     .parse::<u64>()
@@ -365,6 +406,7 @@ impl Config {
             seed_ratio_milli,
             seed_idle_minutes,
             watch_dir,
+            sandbox,
         } = draft;
 
         let i_know_sam_is_remote = i_know_sam_is_remote.is_some_and(|(_, v)| v);
@@ -414,6 +456,7 @@ impl Config {
             seed_ratio_milli: seed_ratio_milli.map_or(0, |(_, v)| v),
             seed_idle_minutes: seed_idle_minutes.map_or(0, |(_, v)| v),
             watch_dir: watch_dir.map(|(_, v)| v),
+            sandbox: sandbox.map_or(SandboxPolicy::BestEffort, |(_, v)| v),
         })
     }
 }
@@ -631,6 +674,33 @@ preallocate yes
         assert!(c.preallocate);
     }
 
+    /// The sandbox policy, and in particular that the *default* is the
+    /// permissive one.
+    ///
+    /// Asserted rather than assumed because it is the one default in this file
+    /// that decides whether the daemon runs unconfined, and because the safe
+    /// default here is genuinely the permissive one: Landlock is absent under
+    /// plenty of container runtimes, and a client that will not start there is
+    /// one nobody runs. If that judgement is ever revisited, this test is what
+    /// says it was a judgement.
+    #[test]
+    fn the_sandbox_policy_defaults_to_best_effort() {
+        let d = defaults();
+        assert_eq!(
+            Config::parse("", &d).unwrap().sandbox,
+            SandboxPolicy::BestEffort,
+            "an empty config must not refuse to start on a kernel without Landlock"
+        );
+        assert_eq!(
+            Config::parse("sandbox best-effort\n", &d).unwrap().sandbox,
+            SandboxPolicy::BestEffort
+        );
+        assert_eq!(
+            Config::parse("sandbox require\n", &d).unwrap().sandbox,
+            SandboxPolicy::Require
+        );
+    }
+
     #[test]
     fn peer_ceilings_are_counts_with_a_refused_zero() {
         let d = defaults();
@@ -733,6 +803,14 @@ preallocate yes
             ("ephemeral", Problem::MissingValue),
             ("ephemeral \t", Problem::MissingValue),
             ("ephemeral maybe", Problem::BadBool),
+            ("sandbox", Problem::MissingValue),
+            ("sandbox maybe", Problem::BadSandboxPolicy),
+            // Near-misses, because this key is the one an operator sets when
+            // they mean it and a silently-ignored typo would be the whole bug.
+            ("sandbox yes", Problem::BadSandboxPolicy),
+            ("sandbox required", Problem::BadSandboxPolicy),
+            ("sandbox best_effort", Problem::BadSandboxPolicy),
+            ("sandbox require\nsandbox require", Problem::DuplicateKey),
             ("data_dir relative/path", Problem::RelativePath),
             ("sam_address 127.0.0.1", Problem::BadSamAddress),
             ("sam_address 127.0.0.1:0", Problem::BadSamAddress),
