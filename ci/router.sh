@@ -201,14 +201,8 @@ if cut is None:
     print("router: FAIL: the filter was never installed in this trace", file=sys.stderr)
     sys.exit(1)
 
-# ENOSYS is what the filter answers a call it does not permit, whether the
-# syscall is missing from the list or on it with arguments the rules refuse
-# (crates/cloved/src/sandbox.rs). EPERM is still checked because it is what the
-# filter used to answer, and a stale binary should not read as a clean run.
-#
-# A kernel that genuinely lacked one of these would also report ENOSYS and fail
-# here. On the 6.12 floor (SCOPE §0) none of them is that new, so that would be
-# worth the look this gives it.
+# ENOSYS is what the filter answers now; EPERM is what it used to, so a stale
+# binary does not read as a clean run.
 refused = re.compile(r"=\s*-1\s+(?:ENOSYS|EPERM)")
 
 seen, denied = Counter(), Counter()

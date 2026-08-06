@@ -63,10 +63,6 @@ UMask=0077
 IPAddressDeny=any
 IPAddressAllow=localhost
 # AF_UNIX for the control socket, AF_INET for the loopback SAM connection.
-# Nothing else — no packet sockets, no netlink, and no AF_INET6: the SAM
-# backend dials 127.0.0.1 by construction, so the daemon's own seccomp filter
-# stopped permitting AF_INET6 and this now matches it. Restoring one means
-# restoring both.
 RestrictAddressFamilies=AF_UNIX AF_INET
 
 # --- Filesystem ---

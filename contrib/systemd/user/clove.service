@@ -80,8 +80,6 @@ RestrictSUIDSGID=yes
 
 # --- Kernel and process surface (seccomp; no privilege required) ---
 # AF_UNIX for the control socket, AF_INET for the loopback SAM connection.
-# No AF_INET6: the SAM backend dials 127.0.0.1 by construction, and the
-# daemon's own filter stopped permitting it.
 RestrictAddressFamilies=AF_UNIX AF_INET
 RestrictNamespaces=yes
 RestrictRealtime=yes

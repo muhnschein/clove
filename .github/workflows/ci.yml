@@ -1,16 +1,7 @@
 name: ci
 
 on:
-  # `main` only. A bare `push:` alongside `pull_request:` runs this whole
-  # workflow *twice* on every push to a branch with a PR open — same commit,
-  # same jobs, two runs — and the duplicates compete with each other and with
-  # CodeQL for the account's runner allowance. Six of nine jobs once sat queued
-  # for fifteen minutes and were culled without ever starting a step, which the
-  # PR reported as six failed checks on code that had in fact passed.
-  #
-  # The trade: a branch pushed with no PR open now gets no CI. That is the
-  # normal arrangement for a workflow whose job is gating PRs and `main`, and
-  # the moment a PR exists the `pull_request` trigger covers it.
+  # `main` only: a bare `push:` beside `pull_request:` runs everything twice.
   push:
     branches: [main]
   pull_request:
@@ -19,18 +10,8 @@ on:
     - cron: '17 3 * * *'
   workflow_dispatch:
 
-# One run per pull request at a time. Without this, a second push while the
-# first run is still going leaves both queued against the same allowance, and
-# the superseded one is dead weight that still has to starve or time out before
-# it goes away — it cannot tell anyone anything about a commit that is no longer
-# the head.
-#
-# `github.head_ref` is set on `pull_request` and empty everywhere else, so a PR
-# groups by its branch and each new push supersedes the last, while a push to
-# `main`, a nightly fuzz sweep and a manual dispatch each fall through to
-# `github.run_id` — a group of one, never cancelled by anything. That asymmetry
-# is the point: superseding a PR run is free, and cancelling a 75-minute fuzz
-# sweep because somebody merged is not.
+# A pull request groups by branch, so a new push supersedes the run in flight.
+# Everything else falls through to `run_id`: a group of one, never cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
