@@ -87,10 +87,6 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Args, String> 
 
 /// Enter the post-initialisation confinement, and hold the daemon to whatever
 /// `sandbox` in `clove.conf` says about the result.
-///
-/// Its own function because it is its own lifecycle phase — the pledge/unveil
-/// point — and because `run()` reads better as the sequence of phases than as
-/// the contents of one of them.
 fn confine(config: &Config) -> Result<sandbox::Verdict, String> {
     // Initialisation is over: everything that needs a path outside the data
     // directory, or a capability beyond talking to the router and its own
@@ -136,35 +132,17 @@ fn confine(config: &Config) -> Result<sandbox::Verdict, String> {
         connect_tcp: sam_tcp_port(&config.sam_address),
     });
     eprintln!("cloved: sandbox: {}", verdict.line);
-    // `sandbox require`: the operator has said that running unconfined is worse
-    // than not running. Checked here rather than inside the sandbox module,
-    // which reports what happened and does not get an opinion about it.
-    //
-    // This is the only place the daemon refuses to start over Layer 2, and it
-    // is off by default — the kernel is not every operator's choice, and a
-    // client that will not start under a container runtime is a client nobody
-    // runs. What the default costs is that confined and unconfined look alike
-    // from outside, which is what the startup line above and the `sandbox`
-    // field in `GET /v1/status` are for.
     honour_sandbox_policy(config.sandbox, &verdict)?;
 
     Ok(verdict)
 }
 
-/// Decide whether the confinement that was achieved is good enough to run with.
+/// Decide whether the confinement achieved is good enough to run with.
 ///
-/// Split out from [`confine`] so it can be tested: applying the sandbox is
-/// irreversible and process-wide, so a test that called `confine` would confine
-/// the test binary, while this is the half with the actual decision in it.
-///
-/// Off by default, and that is a real trade rather than an oversight. The kernel
-/// is not every operator's choice — Landlock is absent under plenty of container
-/// runtimes and on distributions that leave it out of `CONFIG_LSM` — and a
-/// torrent client that refuses to start there is one nobody runs. What the
-/// default costs is that a confined daemon and an unconfined one look identical
-/// from outside, which is what the startup line and the `sandbox` field of
-/// `GET /v1/status` are for, and what `sandbox require` is for when looking is
-/// not enough.
+/// Split from [`confine`] so it can be tested: applying the sandbox is
+/// irreversible and process-wide. Off by default — Landlock is absent under
+/// plenty of container runtimes, and a client that will not start there is one
+/// nobody runs.
 fn honour_sandbox_policy(policy: SandboxPolicy, verdict: &sandbox::Verdict) -> Result<(), String> {
     if policy == SandboxPolicy::Require && !verdict.is_complete() {
         return Err(format!(
@@ -217,13 +195,9 @@ fn run() -> Result<(), String> {
     // created before this, or by a permissive umask, is the case worth fixing.
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|e| format!("creating data dir {}: {e}", config.data_dir.display()))?;
-    // Fatal, not a warning. Everything else in this layer degrades because the
-    // alternative is a daemon that will not start on a kernel it cannot choose;
-    // this is not that. The directory about to hold the destination key and the
-    // API token could not be made private, on the local filesystem, by the user
-    // who owns it — that is a broken installation, and the only thing continuing
-    // buys is a running daemon whose secrets are readable by everyone on the
-    // machine, with one line about it scrolled off the top of a log.
+    // Fatal, unlike the rest of this layer: the local filesystem refusing the
+    // owner permission to make this directory private is a broken install, and
+    // it is about to hold the destination key and the API token.
     std::fs::set_permissions(
         &config.data_dir,
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
@@ -373,13 +347,8 @@ fn scan_watch_dir(daemon: &Arc<Daemon>, dir: &Path) {
 struct Daemon {
     start: Instant,
     sam_address: String,
-    /// What the Layer-2 self-restriction came to, as reported at startup.
-    ///
-    /// Kept so `GET /v1/status` can answer it. Before this the verdict was
-    /// printed once and discarded, which meant the one question only the daemon
-    /// could answer — is anything actually confining this process? — had no
-    /// answer available to anyone who was not reading the log at the moment it
-    /// started.
+    /// What the Layer-2 self-restriction came to, kept so `GET /v1/status` can
+    /// answer it rather than it being printed once and discarded.
     sandbox: String,
     token: String,
     /// Our wire identity for this run, decided before anything can need it.
@@ -1271,9 +1240,8 @@ fn status_json(daemon: &Daemon) -> Vec<u8> {
             "router".to_owned(),
             Value::from(lock(&daemon.router).clone()),
         ),
-        // What Layer 2 actually came to on this kernel. Fixed at startup and
-        // never changing, but served here because startup output is not
-        // something an operator can go and ask for later.
+        // Fixed at startup, served here because a log line is not something
+        // an operator can go and ask for later.
         ("sandbox".to_owned(), Value::from(daemon.sandbox.clone())),
     ])
     .encode()
@@ -2130,12 +2098,8 @@ mod tests {
 
     // ------------------------------------------------- sandbox policy
 
-    /// `sandbox require` is the whole point of the key: an incomplete
-    /// confinement must stop the daemon, and either mechanism missing counts.
-    ///
-    /// Tested here rather than through `confine`, which would restrict the test
-    /// binary and every test after it — this is the half with the decision in
-    /// it, which is the half that can be wrong.
+    /// An incomplete confinement must stop the daemon under `require`, and
+    /// either mechanism missing counts.
     #[test]
     fn sandbox_require_refuses_an_incomplete_confinement() {
         let verdict = |landlock, seccomp| sandbox::Verdict {
@@ -2147,8 +2111,7 @@ mod tests {
         // Both applied: the only combination `require` accepts.
         assert!(honour_sandbox_policy(SandboxPolicy::Require, &verdict(true, true)).is_ok());
 
-        // Each of the three ways to be short of that, including the one that is
-        // easiest to wave through: Landlock on, seccomp off.
+        // The three ways to be short of it.
         for (landlock, seccomp) in [(false, true), (true, false), (false, false)] {
             let e = honour_sandbox_policy(SandboxPolicy::Require, &verdict(landlock, seccomp))
                 .expect_err("require accepted an incomplete sandbox");
@@ -2162,8 +2125,7 @@ mod tests {
             );
         }
 
-        // And best-effort accepts all four, which is what makes it the default
-        // a fresh install can survive on any kernel.
+        // best-effort accepts all four; that is what makes it the default.
         for (landlock, seccomp) in [(true, true), (false, true), (true, false), (false, false)] {
             assert!(
                 honour_sandbox_policy(SandboxPolicy::BestEffort, &verdict(landlock, seccomp))
@@ -2173,8 +2135,8 @@ mod tests {
         }
     }
 
-    /// The verdict reaches `GET /v1/status`, which is the only way to ask a
-    /// running daemon whether anything is confining it.
+    /// The verdict reaches `GET /v1/status`, the only way to ask a running
+    /// daemon whether anything is confining it.
     #[test]
     fn the_status_reports_the_sandbox_verdict() {
         let dir = TempDir::new("sandbox-status");

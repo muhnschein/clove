@@ -114,27 +114,13 @@ pub struct Config {
 }
 
 /// What `cloved` does when Landlock or `seccomp` does not apply (SCOPE §5).
-///
-/// Layer 2 is best-effort by design: the kernel it lands on is not the
-/// operator's choice on every machine, and a torrent client that will not start
-/// under a container runtime is a torrent client nobody runs. The cost of that
-/// default is that "unconfined" and "confined" look identical from outside —
-/// one startup line apart — so this exists to let an operator who *does* care
-/// say so, and be told rather than trusted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SandboxPolicy {
     /// Apply what the kernel allows, report the rest, and run either way.
-    ///
-    /// The default, and the reason the word in `docs/SCOPE.md` §0 is now
-    /// "expects" rather than "requires".
     #[default]
     BestEffort,
-    /// Refuse to start unless both Landlock and `seccomp` applied.
-    ///
-    /// For deployments where running unconfined is worse than not running.
-    /// Note what it does *not* cover: Layer 3 is the service manager's, and
-    /// nothing the daemon can see tells it whether the unit's `IPAddressDeny=`
-    /// took effect.
+    /// Refuse to start unless both Landlock and `seccomp` applied. Covers
+    /// Layer 2 only; the daemon cannot see whether Layer 3 took effect.
     Require,
 }
 
@@ -674,15 +660,8 @@ preallocate yes
         assert!(c.preallocate);
     }
 
-    /// The sandbox policy, and in particular that the *default* is the
-    /// permissive one.
-    ///
-    /// Asserted rather than assumed because it is the one default in this file
-    /// that decides whether the daemon runs unconfined, and because the safe
-    /// default here is genuinely the permissive one: Landlock is absent under
-    /// plenty of container runtimes, and a client that will not start there is
-    /// one nobody runs. If that judgement is ever revisited, this test is what
-    /// says it was a judgement.
+    /// The sandbox policy, and in particular that the default is permissive.
+    /// Asserted so that changing it has to be somebody's decision.
     #[test]
     fn the_sandbox_policy_defaults_to_best_effort() {
         let d = defaults();
@@ -805,8 +784,7 @@ preallocate yes
             ("ephemeral maybe", Problem::BadBool),
             ("sandbox", Problem::MissingValue),
             ("sandbox maybe", Problem::BadSandboxPolicy),
-            // Near-misses, because this key is the one an operator sets when
-            // they mean it and a silently-ignored typo would be the whole bug.
+            // Near-misses: a silently-ignored typo here is the whole bug.
             ("sandbox yes", Problem::BadSandboxPolicy),
             ("sandbox required", Problem::BadSandboxPolicy),
             ("sandbox best_effort", Problem::BadSandboxPolicy),

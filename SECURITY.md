@@ -69,13 +69,10 @@ These are enforced in the codebase and checked in CI, not merely intended:
   does not need returns `ENOSYS`, whether or not anyone thought to name it. The
   permitted set is measured from a traced run rather than guessed, and the test
   suite performs that workload under the live filter.
-- **What the sandbox came to is observable and can be demanded.** The daemon
-  reports which of Landlock and `seccomp` actually applied, on the startup line
-  and for the life of the process in `clove status` and `GET /v1/status` — a
-  best-effort layer whose absence is invisible is a layer you cannot audit.
-  `sandbox require` in `clove.conf` makes an incomplete confinement a refusal
-  to start. It is off by default; the default is that clove runs on kernels
-  without Landlock and says so.
+- **What the sandbox came to is observable and can be demanded.** Which of
+  Landlock and `seccomp` applied is reported at startup and, for the life of the
+  process, in `clove status` and `GET /v1/status`. `sandbox require` makes an
+  incomplete confinement a refusal to start; it is off by default.
 - **No post-initialisation UDP.** `socket(2)` is permitted only for
   `AF_INET`/`SOCK_STREAM`, so the datagram path a Landlock TCP rule cannot
   reach is closed by the syscall filter instead. `ioctl(2)` is likewise

@@ -805,15 +805,9 @@ fn render_status(status: &Value, torrents: &Value) -> String {
         ("sam".to_owned(), field_str(status, "sam_address")),
         ("uptime".to_owned(), human_duration(num("uptime_secs"))),
     ];
-    // Whether anything is actually confining the daemon. Worth a line in the
-    // one command people run to see how things are: a daemon whose Landlock and
-    // seccomp both failed looks exactly like one where both applied, and after
-    // the startup log has scrolled this is the only place the difference shows.
-    //
-    // Omitted entirely when the daemon does not report it, rather than rendered
-    // as the "-" a missing field would otherwise give: this line is read for
-    // reassurance, and a dash in it should not be something an old daemon can
-    // produce. The daemon's words, so through the sanitiser like the rest.
+    // Omitted when the daemon does not report it, rather than rendered as the
+    // "-" a missing field gives: a dash here reads as "nothing applied", and an
+    // old daemon should not be able to say that.
     if status.get("sandbox").is_some() {
         rows.push(("sandbox".to_owned(), field_str(status, "sandbox")));
     }

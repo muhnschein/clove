@@ -118,14 +118,11 @@ No layer assumes another is present.
    says too little: `socket(2)` to `AF_INET`/`SOCK_STREAM` (so no UDP, which
    Landlock's TCP rule does not reach), `ioctl(2)` to `FIONBIO`, and
    `mmap(2)`/`mprotect(2)` to mappings never writable and executable at once.
-   The syscall list is measured from a traced run rather
-   than guessed, and the daemon's own tests perform that workload under the live
-   filter. The daemon reports in one line what was actually applied, and
-   continues either way — no layer assumes another is present. That verdict is
-   not just logged: it stays available from `clove status` and `/v1/status` for
-   the life of the process, because the failure mode of a best-effort layer is
-   that an unconfined daemon looks exactly like a confined one. Set
-   `sandbox require` to refuse to start instead.
+   The syscall list is measured from a traced run rather than guessed, and the
+   daemon's own tests perform that workload under the live filter. What was
+   actually applied stays available from `clove status` and `/v1/status`, since
+   an unconfined daemon otherwise looks exactly like a confined one; `sandbox
+   require` refuses to start instead.
 3. **OS sandbox.** Two systemd units, and `make install` picks by prefix:
    [system](contrib/systemd/system/clove.service) provides a separate
    deployment-level clearnet lock (`IPAddressDeny=any`) and further process

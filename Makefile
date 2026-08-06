@@ -15,30 +15,21 @@ MANDIR ?= $(PREFIX)/share/man
 SYSCONFDIR ?= /etc
 DESTDIR ?=
 
-# Which systemd unit to install (Layer 3, SCOPE §5). There are two, and they
-# are not interchangeable: a user manager cannot apply IPAddressDeny= — "only
-# available for system services, not for per-user services",
-# systemd.resource-control(5) — so the user unit is the seccomp-and-limits
-# subset and says so at the top of itself. Installing the wrong one either
-# refuses to start or silently promises a clearnet lock it is not enforcing.
-#
-# Keyed on the prefix, not on `id -u`: a packaging build runs unprivileged into
-# a DESTDIR and still wants the system unit. An unset HOME — a clean packaging
-# environment — therefore reads as a system install rather than matching
-# everything against an empty prefix.
+# Which systemd unit to install (Layer 3, SCOPE §5). A user manager cannot
+# apply IPAddressDeny=, so the two are not interchangeable. Keyed on the prefix
+# rather than `id -u`: a packaging build runs unprivileged into a DESTDIR and
+# still wants the system unit, and an unset HOME reads as a system install.
 USER_PREFIX := $(if $(HOME),$(filter $(HOME) $(HOME)/%,$(PREFIX)))
 ifeq ($(USER_PREFIX),)
 UNIT_KIND := system
 UNIT_SRC := contrib/systemd/system/clove.service
-# Both /usr/lib/systemd/system and /usr/local/lib/systemd/system are on
-# systemd's own unit search path.
+# Both this and /usr/lib/systemd/system are on systemd's search path.
 UNITDIR ?= $(PREFIX)/lib/systemd/system
 UNIT_ENABLE := systemctl daemon-reload && systemctl enable --now clove
 else
 UNIT_KIND := user
 UNIT_SRC := contrib/systemd/user/clove.service
-# $XDG_DATA_HOME/systemd/user, which for the documented PREFIX="$HOME/.local"
-# is exactly this. Note it is share/, not lib/: ~/.local/lib is not searched.
+# share/, not lib/: $XDG_DATA_HOME/systemd/user is searched, ~/.local/lib is not.
 UNITDIR ?= $(PREFIX)/share/systemd/user
 UNIT_ENABLE := systemctl --user daemon-reload && systemctl --user enable --now clove
 endif
