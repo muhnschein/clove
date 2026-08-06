@@ -154,10 +154,8 @@ fn run() -> Result<(), String> {
     // files, has already happened. Drop the rest (SCOPE §5 Layer 2). This runs
     // before any thread is spawned — a Landlock domain covers the calling
     // thread and its descendants, not siblings that already exist.
-    let mut read_write: Vec<&Path> = vec![&config.data_dir];
-    if let Some(parent) = config.api_socket.parent() {
-        read_write.push(parent);
-    }
+    let mut paths: Vec<(&Path, sandbox::Role)> =
+        vec![(config.data_dir.as_path(), sandbox::Role::State)];
     // The watch directory, if there is one, is the one path an operator names
     // that is deliberately *outside* the data directory — and the daemon both
     // reads it and renames within it. Granted here, before the domain closes,
@@ -169,24 +167,31 @@ fn run() -> Result<(), String> {
     // directory simply reads as empty — nothing added, nothing logged, no
     // error anywhere. CI found it; a local run had not.
     if let Some(dir) = &config.watch_dir {
-        read_write.push(dir);
+        paths.push((dir.as_path(), sandbox::Role::Watch));
     }
-    // Nothing read-only. `/dev/urandom` used to be here, and it was pure
-    // self-reference: the daemon takes its randomness from `getrandom(2)`, which
-    // needs no file at all, and the device is only a fallback for kernels before
-    // 3.17 — three major versions below the 6.12 floor (SCOPE §0), so
-    // unreachable. A traced run says the same thing more bluntly: the one and
-    // only `/dev/urandom` open in it is Landlock's own `O_PATH` open, made while
-    // adding the rule that grants access to `/dev/urandom`.
+    // The control socket's directory is deliberately *not* here, and used to be.
     //
-    // Granting it also cost more than it looked. `AccessFs::from_read` is
-    // `Execute | ReadFile | ReadDir`, so the rule handed out execute on a
-    // character device to buy a file the daemon never opens.
+    // It was granted so the socket "could be unlinked at exit" — but nothing
+    // unlinks it: `ApiListener` has no `Drop`, and the stale socket is cleared by
+    // the *next* start's `bind_unix`, which runs long before this line. So the
+    // grant bought nothing, and it was not cheap: with `XDG_RUNTIME_DIR` set the
+    // directory is `/run/user/<uid>`, shared with every other application's
+    // runtime state, and the daemon held read, write, create and delete over all
+    // of it.
+    //
+    // If unlink-at-exit is ever added, this is what has to come back — as
+    // `Role::Watch`-like rights on that one directory, not as everything.
+    //
+    // Nothing read-only either. `/dev/urandom` used to be listed, and it was pure
+    // self-reference: randomness comes from `getrandom(2)`, which needs no file,
+    // and the device is only a fallback for kernels before 3.17 — far below the
+    // 6.12 floor (SCOPE §0). A traced run puts it bluntly: the one and only
+    // `/dev/urandom` open in it is Landlock's own `O_PATH` open, made while adding
+    // the rule granting access to `/dev/urandom`.
     eprintln!(
         "cloved: {}",
         sandbox::enter_post_init(&sandbox::Limits {
-            read_write: &read_write,
-            read_only: &[],
+            paths: &paths,
             connect_tcp: sam_tcp_port(&config.sam_address),
         })
     );

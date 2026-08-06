@@ -59,12 +59,20 @@ commit. Closure sizes are recorded when the dependency is actually added.
   `unsafe_code`, so a hand-rolled binding is not on the table. Maintained by
   the Landlock authors. Not socket-capable: it takes rights away. Closure:
   `enumflags2` (+ its derive), `thiserror` 2, `libc`.
+  Held at `0.4.7` or newer, for two things `0.4.5` did not have: `ABI::V9`, and
+  with it `AccessFs::ResolveUnix` (Linux 7.1), which is how the daemon is stopped
+  from connecting to any pathname unix socket; and `CompatLevel`, which is what
+  lets ABI 6 be demanded as the documented floor while ABI 9 stays a bonus. The
+  crate deliberately keeps the running kernel's ABI private — deriving access
+  sets from it would make one build behave differently on two machines — so
+  `CompatLevel` is the only sanctioned way to mix required and optional
+  accesses, and the code uses it rather than probing.
 - **`seccompiler` 0.5** (`cloved`, Linux only). Builds and
-  installs the post-init seccomp-BPF deny filter. Firecracker lineage, small,
+  installs the post-init seccomp-BPF allowlist filter. Firecracker lineage, small,
   the `json` feature (and its serde dependency) left off, so what we compile is
   the BPF backend and nothing else. Closure: `libc`.
 - **`libc` 0.2** (`cloved`, Linux only). The seccomp filter
-  names syscalls and address families; these are the C ABI constants for them,
+  names syscalls and the one address family it permits; these are the C ABI constants for them,
   and getting them from the maintained table beats a hand-written per-
   architecture list that is wrong on the one machine nobody tested. Already in
   the tree under `getrandom`, `landlock` and `seccompiler`, so this is a direct

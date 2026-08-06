@@ -10,16 +10,19 @@
 //! the single phase hook: an OpenBSD port drops `pledge(2)`/`unveil(2)` in at
 //! exactly this point and deletes nothing else.
 //!
-//! Two mechanisms, both best-effort:
+//! Two mechanisms:
 //!
-//! - **Landlock** confines the filesystem to the paths handed in. The ABI is
-//!   negotiated by the `landlock` crate's best-effort compatibility mode, so an
-//!   older kernel gets the subset it understands rather than an error. Landlock
-//!   ABI 4 also covers outbound TCP, which is how the SAM port becomes the only
-//!   address this process may connect to.
+//! - **Landlock** confines the filesystem to the paths handed in, each to the
+//!   rights its [`Role`] actually needs rather than to all sixteen; confines
+//!   outbound TCP to the SAM port (ABI 4); and forbids reaching outside the
+//!   domain by abstract unix socket or signal (ABI 6). Where the kernel is newer
+//!   still it also forbids connecting to any *pathname* unix socket (ABI 9).
+//!   ABI 6 — Linux 6.12, the floor in `docs/SCOPE.md` §0 — is a hard
+//!   requirement; only the ABI 9 addition is best-effort.
 //! - **seccomp** installs an *allowlist* over the syscalls in `ALLOWED`:
 //!   anything not on it returns `EPERM`, and `socket(2)` is further restricted
-//!   by address family to `AF_UNIX`/`AF_INET`/`AF_INET6`.
+//!   to `AF_INET`, the only family the daemon creates a socket in after this
+//!   point.
 //!
 //! The daemon was run under `strace`
 //! against a SAM bridge complete enough to bring the whole network path up —
@@ -45,20 +48,36 @@ use std::path::Path;
 
 /// What the daemon still needs after initialisation.
 pub(crate) struct Limits<'a> {
-    /// Directories it may read and write beneath (state, downloads, the
-    /// control socket's directory so the socket can be unlinked at exit).
-    pub(crate) read_write: &'a [&'a Path],
-    /// Paths it may only read. Empty today: the daemon reads nothing outside its
-    /// own data directory, and the `/dev/urandom` that used to be here was a
-    /// grant nothing consumed (see the caller). Kept as a mechanism rather than
-    /// deleted, because "read this, write nothing" is the shape any future
-    /// read-only path wants and rediscovering it is worse than carrying it.
-    pub(crate) read_only: &'a [&'a Path],
+    /// The directories it may still touch, each with what it is *for*.
+    ///
+    /// A role rather than an access set, so the caller names paths and this
+    /// module decides rights. Landlock vocabulary stays on this side of the
+    /// boundary, and the two questions — "which directory is this?" and "what
+    /// may that kind of directory do?" — stay in the file that can answer each.
+    pub(crate) paths: &'a [(&'a Path, Role)],
     /// The one TCP port it may connect to: the SAM bridge. `None` when the
     /// port could not be determined, in which case outbound TCP is left alone
     /// rather than guessed at — a wrong guess is a daemon that cannot reach
     /// its router.
     pub(crate) connect_tcp: Option<u16>,
+}
+
+/// What a directory is for, which is what decides the rights it gets.
+///
+/// Every writable path used to receive `AccessFs::from_all()` — all sixteen
+/// filesystem rights, including `Execute`, `MakeSym`, `MakeBlock` and `Refer`.
+/// The ABI has allowed finer grants since ABI 1; the code simply never asked for
+/// one, so the sandbox was as wide as the widest thing any of its paths needed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Role {
+    /// The data directory: torrents, resume files, the token, the destination
+    /// key, and the downloads themselves. Read, write, create and delete both
+    /// files and directories, and truncate.
+    State,
+    /// The watch directory: list it, read what is dropped in, and rename a file
+    /// within it once taken. Nothing else — no directories are created here and
+    /// nothing is executed.
+    Watch,
 }
 
 /// Drop the capabilities the daemon no longer needs, and describe what
@@ -76,40 +95,70 @@ fn landlock_restrict(_limits: &Limits) -> String {
     "landlock unavailable (not Linux)".to_owned()
 }
 
-/// Confine the filesystem — and, on ABI 4 and up, outbound TCP.
+/// Confine the filesystem, outbound TCP, and — where the kernel has it — the
+/// unix sockets the daemon may connect to.
 ///
-/// The access sets are written against ABI 5; best-effort compatibility trims
-/// them to what the running kernel supports and surfaces the result in the
-/// returned status, which is why the caller logs it instead of ignoring it.
+/// **Two tiers, deliberately.** `REQUIRED` is ABI 6, which is Linux 6.12, which
+/// is the floor `docs/SCOPE.md` §0 commits to — so it is asked for as a
+/// `HardRequirement`. A kernel that cannot provide it is below the documented
+/// baseline and should say so rather than run half-confined and report success.
+/// `AccessFs::ResolveUnix` is ABI 9 (Linux 7.1) and is asked for `BestEffort`,
+/// because it is a bonus rather than a promise.
+///
+/// That split is what makes the returned status mean something. The old code
+/// targeted ABI 5 best-effort throughout, so `PartiallyEnforced` covered
+/// everything from "one nicety missing" to "barely any of this applied" and the
+/// message could only shrug at "kernel supports an older ABI". Here the required
+/// tier cannot be partial — it either applies or errors — so a partial result has
+/// exactly one possible cause, and the message can name it.
+///
+/// The rights themselves come from [`Role`], per path. Note that
+/// `handle_access` still covers *every* filesystem right: what is handled is
+/// what Landlock mediates, and anything unhandled is permitted everywhere. The
+/// narrowing belongs in the per-path rules, never in the handled set.
 #[cfg(target_os = "linux")]
 #[allow(clippy::needless_pass_by_value)] // the landlock builders consume self
 fn landlock_restrict(limits: &Limits) -> String {
     use landlock::{
-        ABI, Access, AccessFs, AccessNet, NetPort, Ruleset, RulesetAttr, RulesetCreatedAttr,
-        RulesetStatus, Scope, path_beneath_rules,
+        ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus, Scope, path_beneath_rules,
     };
 
-    const ABI_TARGET: ABI = ABI::V5;
+    /// The floor: ABI 6 is Linux 6.12 (SCOPE §0). Required, not negotiated.
+    const REQUIRED: ABI = ABI::V6;
 
     let restrict = || -> Result<RulesetStatus, landlock::RulesetError> {
-        let mut ruleset = Ruleset::default().handle_access(AccessFs::from_all(ABI_TARGET))?;
+        let mut ruleset = Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessFs::from_all(REQUIRED))?;
         if limits.connect_tcp.is_some() {
             ruleset = ruleset.handle_access(AccessNet::ConnectTcp)?;
         }
-        // Ignored below ABI 6. Neither is something the daemon does: it talks
-        // to its CLI over a pathname socket, and signals nothing.
+        // ABI 6, so guaranteed at the floor. Neither is something the daemon
+        // does: it serves its CLI over a *pathname* socket, and signals nothing.
         ruleset = ruleset.scope(Scope::AbstractUnixSocket | Scope::Signal)?;
+        // ABI 9 (Linux 7.1), and handled without ever being granted: the daemon
+        // connects to no unix socket at all — it binds one before this point and
+        // only accepts on it afterwards. Handling it therefore costs nothing and
+        // takes away reaching a container runtime's socket, a message bus, an
+        // agent, or any other daemon's control socket. `Scope::AbstractUnixSocket`
+        // above is the abstract-namespace half of the same door; this is the
+        // pathname half.
+        //
+        // `BestEffort`, so a kernel below ABI 9 declines it and carries on rather
+        // than failing the whole ruleset.
+        ruleset = ruleset
+            .set_compatibility(CompatLevel::BestEffort)
+            .handle_access(AccessFs::ResolveUnix)?;
 
-        let mut created = ruleset
-            .create()?
-            .add_rules(path_beneath_rules(
-                limits.read_write,
-                AccessFs::from_all(ABI_TARGET),
-            ))?
-            .add_rules(path_beneath_rules(
-                limits.read_only,
-                AccessFs::from_read(ABI_TARGET),
-            ))?;
+        let mut created = ruleset.create()?;
+        // One call per path rather than one per role: `path_beneath_rules` is
+        // what turns a path into an opened `PathFd` and folds the open error into
+        // `RulesetError`, and a rule is cheap enough that grouping would only
+        // save allocations nobody is counting.
+        for (path, role) in limits.paths {
+            created = created.add_rules(path_beneath_rules([*path], role.rights()))?;
+        }
         if let Some(port) = limits.connect_tcp {
             created = created.add_rule(NetPort::new(port, AccessNet::ConnectTcp))?;
         }
@@ -117,14 +166,65 @@ fn landlock_restrict(limits: &Limits) -> String {
     };
 
     match restrict() {
-        Ok(RulesetStatus::FullyEnforced) => "landlock enforced".to_owned(),
+        Ok(RulesetStatus::FullyEnforced) => {
+            "landlock enforced (unix-socket connects denied too)".to_owned()
+        }
+        // The required tier is a hard requirement, so nothing in it can be
+        // missing here: the only access asked for best-effort is `ResolveUnix`,
+        // and the only kernels that decline it are those below ABI 9.
         Ok(RulesetStatus::PartiallyEnforced) => {
-            "landlock partially enforced (kernel supports an older ABI)".to_owned()
+            "landlock enforced; unix-socket connects unrestricted (kernel below ABI 9)".to_owned()
         }
         Ok(RulesetStatus::NotEnforced) => {
-            "landlock unavailable (kernel too old or disabled)".to_owned()
+            "landlock not applied (built in but disabled — check the kernel's LSM list)".to_owned()
         }
-        Err(e) => format!("landlock not applied ({e})"),
+        // A compatibility error means the running kernel could not provide ABI 6.
+        // That is a kernel below the 6.12 this project requires, or Landlock
+        // missing entirely — different from "disabled", and worth different words.
+        Err(e) => format!(
+            "landlock unavailable: this kernel cannot provide ABI {} (clove requires Linux 6.12; \
+             see docs/SCOPE.md §0) — {e}",
+            REQUIRED as u32
+        ),
+    }
+}
+
+impl Role {
+    /// The filesystem rights this kind of directory actually needs.
+    ///
+    /// Derived from what the daemon does, not from a convenient superset. What is
+    /// *absent* is the point, so the notable omissions are named in place.
+    #[cfg(target_os = "linux")]
+    fn rights(self) -> landlock::BitFlags<landlock::AccessFs> {
+        use landlock::{AccessFs, make_bitflags};
+        match self {
+            // Everything a state directory and a download tree need between
+            // them. `Truncate` covers both `O_TRUNC` on an atomic-write temp file
+            // and `set_len` under `preallocate yes`.
+            //
+            // Absent, and each for a reason: `Execute`, so bytes a peer sent
+            // cannot be run or mapped executable — which `seccomp`'s `execve`
+            // denial does not cover, since it says nothing about
+            // `mmap(PROT_EXEC)`. `MakeSym`, so the daemon cannot create the
+            // symlink that `storage`'s `O_NOFOLLOW` walk exists to refuse.
+            // `MakeChar`, `MakeBlock`, `MakeFifo` and `MakeSock`, none of which a
+            // torrent is made of. `IoctlDev`, since there are no device files
+            // here. And `Refer`: every rename in the daemon is within one
+            // directory — the atomic-write temp, the resume file, the identity —
+            // and Landlock only requires `Refer` to link or rename *across*
+            // directories.
+            Role::State => make_bitflags!(AccessFs::{
+                ReadFile | WriteFile | ReadDir | MakeReg | MakeDir
+                    | RemoveFile | RemoveDir | Truncate
+            }),
+            // List the directory, read what was dropped in, and rename it to
+            // `.added` or `.rejected` in place — which needs `MakeReg` for the
+            // new name and `RemoveFile` for the old one, both in this directory,
+            // and so again no `Refer`. No `MakeDir`: nothing here creates one.
+            Role::Watch => make_bitflags!(AccessFs::{
+                ReadDir | ReadFile | MakeReg | RemoveFile
+            }),
+        }
     }
 }
 
@@ -330,9 +430,23 @@ mod seccomp {
             rules.insert(nr, Vec::new());
         }
         // Conditions within one rule are ANDed; the rules for one syscall are
-        // ORed. So three one-condition rules read "the family is one of these
-        // three" — and, since the match action is `Allow` and the default is
+        // ORed. So one rule per permitted family reads "the family is one of
+        // these" — and, since the match action is `Allow` and the default is
         // `EPERM`, any other family is refused.
+        //
+        // **`AF_INET` alone.** `AF_UNIX` and `AF_INET6` were here and are not
+        // needed: every `socket(2)` the daemon makes after this filter installs
+        // is `AF_INET` — 8 of 8 in the measured trace — because the only unix
+        // socket in the process is the control listener, which is *bound* during
+        // initialisation and only `accept4`-ed afterwards, and `accept4` creates
+        // no socket of its own. `AF_INET6` has no caller at all today: the SAM
+        // backend dials `127.0.0.1` by construction.
+        //
+        // What this costs if it is ever wrong: wiring up `i2pnet`'s loopback-TCP
+        // API listener on `[::1]` would need `AF_INET6` back, and a daemon that
+        // learned to *connect* to a unix socket would need `AF_UNIX`. Both are
+        // one line here, and `ci/router.sh --trace` fails loudly rather than
+        // leaving it to be discovered in the field.
         let family = |af: libc::c_int| {
             SeccompRule::new(vec![SeccompCondition::new(
                 0,
@@ -341,14 +455,7 @@ mod seccomp {
                 af.try_into().unwrap_or(u64::MAX),
             )?])
         };
-        rules.insert(
-            libc::SYS_socket,
-            vec![
-                family(libc::AF_UNIX)?,
-                family(libc::AF_INET)?,
-                family(libc::AF_INET6)?,
-            ],
-        );
+        rules.insert(libc::SYS_socket, vec![family(libc::AF_INET)?]);
         let filter = SeccompFilter::new(
             rules,
             // Mismatch — not on the list — is refused.
@@ -390,6 +497,92 @@ mod tests {
     /// and every later test with it. Each mechanism is asserted only when the
     /// running kernel actually applied it, so the test proves confinement
     /// where it exists instead of failing on a kernel that has neither.
+    /// The rights each role withholds, asserted as the property rather than as a
+    /// list compared against itself.
+    ///
+    /// Landlock behaviour cannot be exercised everywhere — a kernel with it
+    /// disabled runs these paths unrestricted — so this is the part of the policy
+    /// that can be checked without one. Every absence below is load-bearing, and
+    /// each would be easy to undo by reaching for a convenient `from_all()`.
+    #[test]
+    fn the_narrowed_roles_withhold_what_they_should() {
+        use landlock::AccessFs;
+
+        for (role, name) in [(Role::State, "state"), (Role::Watch, "watch")] {
+            let rights = role.rights();
+            // Peer-supplied bytes land under the state directory, and the watch
+            // directory holds files somebody else wrote. Neither may be run —
+            // and unlike seccomp's `execve` denial, this also covers mapping a
+            // file executable.
+            assert!(
+                !rights.contains(AccessFs::Execute),
+                "{name} may execute files"
+            );
+            // The symlink escape `storage`'s O_NOFOLLOW walk exists to refuse;
+            // this stops the daemon being a source of one.
+            assert!(
+                !rights.contains(AccessFs::MakeSym),
+                "{name} may create symlinks"
+            );
+            // Every rename the daemon performs is within one directory, so the
+            // cross-directory right is not needed — and it is the one that would
+            // let a rename leave the tree.
+            assert!(!rights.contains(AccessFs::Refer), "{name} may refer out");
+            // A torrent is regular files and directories. Nothing here is a
+            // device, a socket or a pipe.
+            for forbidden in [
+                AccessFs::MakeChar,
+                AccessFs::MakeBlock,
+                AccessFs::MakeFifo,
+                AccessFs::MakeSock,
+                AccessFs::IoctlDev,
+            ] {
+                assert!(
+                    !rights.contains(forbidden),
+                    "{name} may {forbidden:?}, which no torrent needs"
+                );
+            }
+            // Connecting to a unix socket is handled and granted to nothing; a
+            // role that granted it would undo that.
+            assert!(
+                !rights.contains(AccessFs::ResolveUnix),
+                "{name} may connect to unix sockets"
+            );
+        }
+
+        // And the positive half, so this cannot pass by granting nothing: the
+        // state directory must still be able to do the daemon's actual work.
+        let state = Role::State.rights();
+        for needed in [
+            AccessFs::ReadFile,
+            AccessFs::WriteFile,
+            AccessFs::ReadDir,
+            AccessFs::MakeReg,
+            AccessFs::MakeDir,
+            AccessFs::RemoveFile,
+            AccessFs::RemoveDir,
+            AccessFs::Truncate,
+        ] {
+            assert!(state.contains(needed), "state cannot {needed:?}");
+        }
+        // The watch directory is read-and-rename only: it never creates a
+        // directory, which is what separates it from the state role.
+        let watch = Role::Watch.rights();
+        assert!(!watch.contains(AccessFs::MakeDir), "watch may create dirs");
+        assert!(
+            !watch.contains(AccessFs::WriteFile),
+            "watch may write files"
+        );
+        for needed in [
+            AccessFs::ReadDir,
+            AccessFs::ReadFile,
+            AccessFs::MakeReg,
+            AccessFs::RemoveFile,
+        ] {
+            assert!(watch.contains(needed), "watch cannot {needed:?}");
+        }
+    }
+
     #[test]
     fn restricts_the_filesystem_in_a_child() {
         let Ok(exe) = std::env::current_exe() else {
@@ -426,14 +619,26 @@ mod tests {
         let outside = std::env::temp_dir().join(format!("clove-outside-{}", std::process::id()));
         std::fs::create_dir_all(&outside).expect("outside dir");
 
-        let allowed: &[&Path] = &[&dir];
+        // Bound *before* restricting, because that is when the daemon binds its
+        // control socket. After this point it only ever accepts on it — which is
+        // why `socket(AF_UNIX)` is not on the allowlist, and why a test that
+        // bound one here would be testing something the daemon does not do.
+        let control = std::os::unix::net::UnixListener::bind(dir.join("api.sock"))
+            .expect("bind the control socket during initialisation");
+        control
+            .set_nonblocking(true)
+            .expect("a listener that can be polled without a client");
+
+        let paths: &[(&Path, Role)] = &[(dir.as_path(), Role::State)];
         let line = enter_post_init(&Limits {
-            read_write: allowed,
-            read_only: &[],
+            paths,
             connect_tcp: None,
         });
 
-        let landlocked = line.contains("landlock enforced") || line.contains("partially enforced");
+        // "landlock enforced" prefixes both the fully- and partially-enforced
+        // messages, the difference between them being only whether the kernel
+        // took the ABI 9 addition — so one substring covers both.
+        let landlocked = line.contains("landlock enforced");
         let seccomped = line.contains("seccomp filter installed");
         if !landlocked && !seccomped {
             println!("SKIP {line}");
@@ -476,7 +681,7 @@ mod tests {
             );
             // And the daemon's own work still runs. This is the half an
             // allowlist can get wrong, and the half a deny list never could.
-            exercise_the_daemons_syscalls(&dir);
+            exercise_the_daemons_syscalls(&dir, &control);
         }
         println!("CONFINED {line}");
     }
@@ -497,7 +702,7 @@ mod tests {
                   every expect here names the syscall group it is asserting, which is the \
                   whole content of the test"
     )]
-    fn exercise_the_daemons_syscalls(dir: &Path) {
+    fn exercise_the_daemons_syscalls(dir: &Path, control: &std::os::unix::net::UnixListener) {
         use std::io::{Read as _, Write as _};
         use std::os::unix::fs::FileExt as _;
 
@@ -539,30 +744,23 @@ mod tests {
         assert!(rx.recv().is_ok(), "a worker thread could not report back");
         worker.join().expect("join a worker thread");
 
-        // The control socket's transport, in the shape the daemon really uses
-        // it: bind a pathname socket, connect, accept. Deliberately *not*
-        // `UnixStream::pair`, which is `socketpair(2)` — a call `cloved` never
-        // makes, so it is not on the allowlist, and the first version of this
-        // test failed here for exactly that reason. The test's job is to
-        // exercise what the daemon does, not to widen the filter to fit it.
-        let sock_path = dir.join("api.sock");
-        let listener =
-            std::os::unix::net::UnixListener::bind(&sock_path).expect("bind a unix socket");
-        // No `set_permissions` here, though `ApiListener::bind_unix` does one:
-        // that runs during initialisation, before the filter, so `chmod` is not
-        // a post-init capability and is not on the allowlist. The trace agrees —
-        // it saw `chmod` only before the cut.
-        let mut client =
-            std::os::unix::net::UnixStream::connect(&sock_path).expect("connect to a unix socket");
-        let (mut server, _) = listener.accept().expect("accept a unix connection");
-        client.write_all(b"ping").expect("write to a unix socket");
-        let mut got = [0u8; 4];
-        server
-            .read_exact(&mut got)
-            .expect("read from a unix socket");
-        assert_eq!(&got, b"ping");
-        drop((client, server, listener));
-        std::fs::remove_file(&sock_path).expect("unlink the unix socket");
+        // The control socket. The daemon's *only* post-init operation on it is
+        // `accept4` — it was bound during initialisation, and `socket(AF_UNIX)`,
+        // `connect` to a unix path and `chmod` all happen before the filter, so
+        // none of the three is on the allowlist. Two earlier versions of this
+        // test failed here for precisely that reason, first reaching for
+        // `socketpair(2)` and then for a post-init `chmod`; both times the test
+        // was wrong and the filter stayed narrow.
+        //
+        // A non-blocking accept with nobody dialling must come back `WouldBlock`
+        // — the syscall ran and found no connection — and not `PermissionDenied`,
+        // which is what a filter missing `accept4` would return. That distinction
+        // is the whole assertion.
+        match control.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("accept4 on the control socket was refused: {e}"),
+            Ok(_) => panic!("a connection arrived on a socket nothing dialled"),
+        }
 
         // The SAM bridge's transport: a loopback TCP socket, bound, listened,
         // connected and accepted. Through `i2pnet`'s own API rather than

@@ -97,19 +97,20 @@ created, token loaded, torrents loaded, control socket bound \(em
 drops the capabilities it no longer needs, before it starts any thread.
 On Linux this is
 .Xr landlock 7 ,
-confining the filesystem to the data directory and the control socket's
-directory, and, on kernels with Landlock ABI 4 or later, confining outbound
-TCP to the single SAM port; plus a
+confining the filesystem to the data directory \(em and the watch directory when
+one is configured \(em each to the rights that kind of directory needs rather
+than to all of them, confining outbound TCP to the single SAM port, and, on
+Landlock ABI 9 or later, refusing to connect to any
+.Xr unix 7
+socket; plus a
 .Xr seccomp 2
 allowlist: every syscall the daemon no longer needs returns
 .Er EPERM ,
 and
 .Xr socket 2
 is permitted only for
-.Dv AF_UNIX ,
-.Dv AF_INET
-and
-.Dv AF_INET6 .
+.Dv AF_INET ,
+the one family the daemon opens a socket in after this point.
 .Pp
 An allowlist rather than a list of refusals, because a list of refusals can only
 name what somebody thought of.
@@ -127,10 +128,16 @@ Neither mechanism is allowed to fail startup.
 What was actually applied is reported in one line on standard error, for
 example
 .Bd -literal -offset indent
-cloved: sandbox: landlock enforced; seccomp filter installed
+cloved: sandbox: landlock enforced (unix-socket connects denied too); seccomp filter installed
 .Ed
 .Pp
-On a kernel without Landlock the same line says so, and the daemon continues:
+On a kernel below Landlock ABI 9 the same line says that unix-socket connects
+are unrestricted; on one that cannot provide ABI 6 \(em which is Linux 6.12, the
+version
+.Nm
+requires \(em it says that instead, and distinguishes it from Landlock being
+present but disabled in the kernel's LSM list.
+Either way the daemon continues:
 this is one of three independent layers, and no layer assumes another is
 present.
 The others are the by-construction restrictions above and the OS sandbox in
