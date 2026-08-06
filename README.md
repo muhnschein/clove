@@ -107,14 +107,15 @@ No layer assumes another is present.
    used, and non-I2P trackers are discarded. Lints and
    [`ci/check-net-deps.sh`](ci/check-net-deps.sh) enforce the dependency
    boundary in CI.
-2. **Self-restriction.** After initialization, `cloved` confines its filesystem
-   and outbound TCP with Landlock, and drops every syscall it no longer needs
-   with a `seccomp` **allowlist** — anything not on the list returns `EPERM`,
-   and `socket(2)` is limited to `AF_UNIX`/`AF_INET`/`AF_INET6`. The list is
-   measured from a traced run rather than guessed, and the daemon's own tests
-   perform that workload under the live filter. These mechanisms are still
-   best-effort at runtime: the daemon reports what was applied and continues if
-   the running kernel cannot provide them.
+2. **Self-restriction.** After initialization, `cloved` confines itself with
+   Landlock — each directory to the rights that kind of directory actually needs,
+   outbound TCP to the SAM port, and, on a new enough kernel, no connecting to
+   any unix socket — and drops every syscall it no longer needs with a `seccomp`
+   **allowlist**: anything not on the list returns `EPERM`, and `socket(2)` is
+   limited to `AF_INET`. The syscall list is measured from a traced run rather
+   than guessed, and the daemon's own tests perform that workload under the live
+   filter. The daemon reports in one line what was actually applied, and
+   continues either way — no layer assumes another is present.
 3. **OS sandbox.** The [systemd unit](contrib/systemd/clove.service) provides a
    separate deployment-level clearnet lock (`IPAddressDeny=any`) and further
    process hardening.
@@ -147,6 +148,7 @@ All routine tests run without an I2P router:
 $ make test       # unit, model, hostile-input, and evil-peer tests
 $ make smoke      # daemon and CLI end to end
 $ make chaos      # crash and failed-state-write scenarios
+$ make router     # the SAM path against a fake bridge (no router needed)
 $ make man-lint   # mdoc validation, when mandoc is installed
 $ make doc-lint   # rustdoc links and warnings
 $ make lint       # clippy with warnings denied

@@ -22,7 +22,7 @@ rustix = { version = "1", default-features = false, features = ["fs", "process",
 # syscall numbers and address-family constants the seccomp filter names — it
 # is already in the tree under both of the others, so this adds no crate.
 [target.'cfg(target_os = "linux")'.dependencies]
-landlock = "0.4"
+landlock = "0.4.7"  # 0.4.7: ABI::V9 / ResolveUnix and CompatLevel (DEPENDENCIES.md)
 seccompiler = "0.5"
 libc = "0.2"
 

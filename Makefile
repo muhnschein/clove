@@ -4,8 +4,8 @@
 # for the unit and engine suites, `make smoke` for the binaries end to end,
 # `make chaos` for crash resilience, `make fuzz` for the parsers.
 
-.PHONY: test smoke chaos fmt lint man-lint doc-lint fuzz fuzz-all fuzz-seed \
-        install uninstall
+.PHONY: test smoke chaos router router-trace fmt lint man-lint doc-lint fuzz \
+        fuzz-all fuzz-seed install uninstall
 
 # Install layout. Override on the command line, e.g.
 #   make install PREFIX=/usr DESTDIR=$(CURDIR)/pkg
@@ -31,6 +31,23 @@ smoke:
 chaos:
 	cargo build --workspace
 	./ci/chaos.sh
+
+## The network path against a fake SAM bridge: session creation, the forwarded
+## inbound listener, naming lookup, an announce, a peer. `make smoke` points the
+## daemon at a dead port on purpose, so this is the only thing that reaches past
+## "waiting-for-router" without a router.
+##
+## `make router-trace` additionally traces the daemon and fails if the post-init
+## seccomp allowlist refused anything it actually needed — which is also how that
+## list is re-derived when the daemon learns to do something new (SCOPE §5).
+## Needs strace; skips that half without it.
+router:
+	cargo build --workspace
+	./ci/router.sh
+
+router-trace:
+	cargo build --workspace
+	./ci/router.sh --trace
 
 ## Deep, coverage-guided fuzzing (nightly toolchain + cargo-fuzz). The
 ## every-push parser coverage is `make test`; see fuzz/README.md.
