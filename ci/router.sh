@@ -90,7 +90,18 @@ sam_pid=$!
 sleep 0.5
 
 if [ "$trace" = yes ]; then
-    strace -f -qq -o "$work/trace.txt" -s 200 "$cloved" >"$work/daemon.log" 2>&1 &
+    # -D matters, and not for tidiness: it runs the tracer as a detached
+    # grandchild so the *daemon* is this shell's direct child, and `$!` below is
+    # the daemon's pid rather than strace's.
+    #
+    # Without it the TERM below lands on strace, which catches it, detaches from
+    # the tracee and exits. Three consequences, all of them silent: the daemon
+    # kept running (CI reaped fourteen orphan thread-pids after every traced
+    # job), this script spent ten seconds waiting on a pid that would never die,
+    # and the trace stopped wherever strace happened to let go — so the daemon's
+    # last moments were never in it. With -D the TERM reaches the daemon and the
+    # trace runs to the end of its life.
+    strace -D -f -qq -o "$work/trace.txt" -s 200 "$cloved" >"$work/daemon.log" 2>&1 &
 else
     "$cloved" >"$work/daemon.log" 2>&1 &
 fi
@@ -155,9 +166,11 @@ echo "router: inbound forward accepted"
 
 run remove "$info_hash" --data >/dev/null || fail "could not remove the torrent"
 
-# Ask the daemon to leave, so the shutdown path is traced too. Bounded rather
-# than a bare `wait`: under --trace this pid is strace's, and a tracer that
-# declines to exit would hang the script rather than fail it.
+# Ask the daemon to leave. It has no TERM handler, so every thread dies by the
+# default disposition and there is no graceful path here to measure — what this
+# buys is a trace that reaches the daemon's last syscall instead of stopping
+# wherever the tracer was cut loose. Bounded rather than a bare `wait`, so a
+# daemon that declines to exit fails the script instead of hanging it.
 kill -TERM "$daemon_pid" 2>/dev/null
 waited=0
 while kill -0 "$daemon_pid" 2>/dev/null; do
