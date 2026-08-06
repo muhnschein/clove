@@ -105,12 +105,27 @@ Landlock ABI 9 or later, refusing to connect to any
 socket; plus a
 .Xr seccomp 2
 allowlist: every syscall the daemon no longer needs returns
-.Er EPERM ,
-and
+.Er ENOSYS ,
+the answer a libc's fallback paths are written for.
+Four calls that the daemon does still need are restricted by argument as well:
 .Xr socket 2
-is permitted only for
-.Dv AF_INET ,
-the one family the daemon opens a socket in after this point.
+to
+.Dv AF_INET
+and
+.Dv SOCK_STREAM ,
+the only combination it opens a socket with after this point \(em which is also
+what keeps a UDP datagram from reaching anywhere Landlock's TCP rule does not
+cover;
+.Xr ioctl 2
+to
+.Dv FIONBIO ,
+its only use here, closing off interface enumeration through
+.Dv SIOCGIFCONF ;
+and
+.Xr mmap 2
+and
+.Xr mprotect 2
+to mappings that are never writable and executable at once.
 .Pp
 An allowlist rather than a list of refusals, because a list of refusals can only
 name what somebody thought of.
@@ -141,7 +156,13 @@ Either way the daemon continues:
 this is one of three independent layers, and no layer assumes another is
 present.
 The others are the by-construction restrictions above and the OS sandbox in
-.Pa contrib/systemd .
+.Pa contrib/systemd ,
+which ships a system unit and a user unit:
+only the system one can apply the
+.Va IPAddressDeny=
+clearnet lock, which systemd offers to system services alone.
+.Nm make Cm install
+picks between them by prefix.
 .Sh FILES
 .Bl -tag -width Ds -compact
 .It Pa ~/.config/clove/clove.conf

@@ -111,14 +111,21 @@ No layer assumes another is present.
    Landlock — each directory to the rights that kind of directory actually needs,
    outbound TCP to the SAM port, and, on a new enough kernel, no connecting to
    any unix socket — and drops every syscall it no longer needs with a `seccomp`
-   **allowlist**: anything not on the list returns `EPERM`, and `socket(2)` is
-   limited to `AF_INET`. The syscall list is measured from a traced run rather
+   **allowlist**: anything not on the list returns `ENOSYS`. A few calls that
+   are on it are restricted by argument as well, where the syscall number alone
+   says too little: `socket(2)` to `AF_INET`/`SOCK_STREAM` (so no UDP, which
+   Landlock's TCP rule does not reach), `ioctl(2)` to `FIONBIO`, and
+   `mmap(2)`/`mprotect(2)` to mappings never writable and executable at once.
+   The syscall list is measured from a traced run rather
    than guessed, and the daemon's own tests perform that workload under the live
    filter. The daemon reports in one line what was actually applied, and
    continues either way — no layer assumes another is present.
-3. **OS sandbox.** The [systemd unit](contrib/systemd/clove.service) provides a
-   separate deployment-level clearnet lock (`IPAddressDeny=any`) and further
-   process hardening.
+3. **OS sandbox.** Two systemd units, and `make install` picks by prefix:
+   [system](contrib/systemd/system/clove.service) provides a separate
+   deployment-level clearnet lock (`IPAddressDeny=any`) and further process
+   hardening; [user](contrib/systemd/user/clove.service) provides the part a
+   user manager can enforce, which does *not* include that lock — systemd
+   offers it to system services only.
 
 This model does not protect against a compromised kernel or I2P router,
 resource exhaustion in general, an attacker who already controls the daemon's

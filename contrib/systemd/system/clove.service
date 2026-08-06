@@ -1,0 +1,137 @@
+# System-wide clove service (Layer 3 of the no-clearnet defence, SCOPE §5).
+#
+# `make install` puts this file in place with @BINDIR@ and @SYSCONFDIR@ filled
+# in, but only for a system prefix; a prefix under $HOME gets the user unit
+# beside this one instead. See contrib/systemd/user/clove.service for what that
+# one can and cannot enforce — the difference is not cosmetic.
+#
+#   sudo make install PREFIX=/usr/local
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now clove
+#
+# By hand, without make:
+#
+#   sed -e 's|@BINDIR@|/usr/local/bin|' -e 's|@SYSCONFDIR@|/etc|' \
+#       contrib/systemd/system/clove.service \
+#       | sudo tee /etc/systemd/system/clove.service
+#
+# The daemon needs no privilege beyond its own state directory and the router's
+# SAM port, so it runs as a dedicated system user created by DynamicUser= with
+# a persistent StateDirectory. Point clove.conf's data_dir at that directory:
+#
+#   # @SYSCONFDIR@/clove/clove.conf
+#   data_dir /var/lib/clove
+#   api_socket /run/clove/clove.sock
+#
+# Layer 3 is a belt-and-braces sandbox. clove is already I2P-only by
+# construction (Layer 1) and does not rely on this unit being present — but
+# when it is, the kernel enforces the same promise independently.
+
+[Unit]
+Description=clove, an I2P-only BitTorrent daemon
+Documentation=man:clove(1) man:clove.conf(5) man:clove-api(7) man:cloved(8)
+After=network.target i2pd.service
+Wants=i2pd.service
+
+[Service]
+Type=exec
+ExecStart=@BINDIR@/cloved -c @SYSCONFDIR@/clove/clove.conf
+Restart=on-failure
+RestartSec=5s
+
+# Identity and state. DynamicUser gives a per-service uid; StateDirectory and
+# RuntimeDirectory are created with the right ownership on every start.
+DynamicUser=yes
+StateDirectory=clove
+StateDirectoryMode=0700
+RuntimeDirectory=clove
+RuntimeDirectoryMode=0755
+# Anything the daemon creates without saying otherwise is private. It already
+# chmods the files that matter (0700 on the data directory, 0600 on the token
+# and the destination key); this is the backstop for the ones nobody thought
+# about, a torrent's payload among them.
+UMask=0077
+
+# --- The clearnet lock ---
+# clove may speak to loopback (the SAM bridge) and nothing else. If a leak-class
+# bug ever existed, this is where the kernel stops it.
+#
+# Not available to the user unit: these are cgroup BPF filters, and
+# systemd.resource-control(5) says the functionality "is currently only
+# available for system services, not for per-user services". It is the main
+# reason to prefer this unit over that one.
+IPAddressDeny=any
+IPAddressAllow=localhost
+# AF_UNIX for the control socket, AF_INET for the loopback SAM connection.
+# Nothing else — no packet sockets, no netlink, and no AF_INET6: the SAM
+# backend dials 127.0.0.1 by construction, so the daemon's own seccomp filter
+# stopped permitting AF_INET6 and this now matches it. Restoring one means
+# restoring both.
+RestrictAddressFamilies=AF_UNIX AF_INET
+
+# --- Filesystem ---
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/var/lib/clove
+# Config is read once at start and never written.
+ReadOnlyPaths=@SYSCONFDIR@/clove
+# NoExecPaths= on the download tree is deliberately absent. It looks free and
+# is not: with DynamicUser= the state directory is a symlink into
+# /var/lib/private, and a namespace that fails to set up is a service that does
+# not start — a poor trade for a path already closed three other ways (Landlock
+# withholds Execute on it, the daemon's seccomp filter denies W^X, and execve
+# is not on its allowlist at all).
+
+# --- Privilege ---
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateUsers=yes
+RestrictSUIDSGID=yes
+
+# --- Kernel and process surface ---
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateIPC=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @debug @swap @cpu-emulation @raw-io
+# EPERM here, ENOSYS in the daemon's own filter, and the difference is
+# deliberate: @system-service is a broad, long-tested set nothing is expected to
+# probe past, whereas cloved's list is short and hand-maintained, so a libc
+# looking for a call it does not name needs the answer that means "use the old
+# way". crates/cloved/src/sandbox.rs carries the whole argument.
+SystemCallErrorNumber=EPERM
+# cloved also restricts itself after start-up (Layer 2, cloved(8) SECURITY).
+# That needs the seccomp and landlock_* syscalls, which live in systemd's
+# @sandbox group. Recent systemd folds @sandbox into @system-service; if the
+# daemon's startup line reports the sandbox as not applied under this unit,
+# add:
+#   SystemCallFilter=@sandbox
+# Layer 2 failing here costs Layer 2 only — the unit's own restrictions and
+# Layer 1 are unaffected.
+
+# --- Resources ---
+# clove is thread-per-peer; the default file limit is ample for I2P swarm
+# sizes, but pin something explicit rather than inherit a surprise.
+LimitNOFILE=8192
+TasksMax=1024
+# No core dumps. The daemon's address space holds the destination key and the
+# API token, and a core file writes both somewhere neither belongs — where
+# systemd-coredump would then keep them.
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

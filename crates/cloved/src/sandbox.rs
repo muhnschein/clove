@@ -20,9 +20,11 @@
 //!   ABI 6 — Linux 6.12, the floor in `docs/SCOPE.md` §0 — is a hard
 //!   requirement; only the ABI 9 addition is best-effort.
 //! - **seccomp** installs an *allowlist* over the syscalls in `ALLOWED`:
-//!   anything not on it returns `EPERM`, and `socket(2)` is further restricted
-//!   to `AF_INET`, the only family the daemon creates a socket in after this
-//!   point.
+//!   anything not on it returns `ENOSYS`. Four calls that *are* on it are
+//!   narrowed further by argument, because a syscall number on its own is too
+//!   coarse to describe what the daemon does with them: `socket(2)` to
+//!   `AF_INET`/`SOCK_STREAM`, `ioctl(2)` to `FIONBIO`, and `mmap(2)` and
+//!   `mprotect(2)` to mappings that are never writable and executable at once.
 //!
 //! The daemon was run under `strace`
 //! against a SAM bridge complete enough to bring the whole network path up —
@@ -269,9 +271,10 @@ mod seccomp {
         SeccompRule, TargetArch,
     };
 
-    /// Everything the daemon still needs after initialisation, named rather than
-    /// numbered so the list reads as the policy it is. Anything absent returns
-    /// `EPERM`.
+    /// Everything the daemon still needs after initialisation *whatever
+    /// arguments it passes*, named rather than numbered so the list reads as the
+    /// policy it is. Anything absent from both this and `argument_restricted`
+    /// returns `ENOSYS`.
     ///
     /// Portable across the three architectures this module is compiled for; the
     /// legacy non-`at` spellings that exist only on x86-64 are in
@@ -302,10 +305,9 @@ mod seccomp {
         // Newer glibc reaches for this instead. A wait primitive, and denying it
         // would wedge whatever was waiting.
         libc::SYS_futex_waitv,
-        // --- Memory. The allocator's, mostly.
-        libc::SYS_mmap,
+        // --- Memory. The allocator's, mostly. `mmap` and `mprotect` are not
+        // here: they are allowed by argument, in `argument_restricted`.
         libc::SYS_munmap,
-        libc::SYS_mprotect,
         libc::SYS_madvise,
         libc::SYS_mremap,
         // glibc's main arena grows with `brk`, not `mmap`. It appeared only
@@ -355,7 +357,7 @@ mod seccomp {
         libc::SYS_fsync,
         libc::SYS_getdents64,
         libc::SYS_fcntl,
-        libc::SYS_ioctl,
+        // `ioctl` is not here either — see `argument_restricted`.
         // The `at`-relative forms: what `storage`'s `openat` walk uses directly,
         // and what glibc uses for the legacy names on every architecture that
         // has no legacy names. `mkdirat` is absent from the trace because the
@@ -413,15 +415,157 @@ mod seccomp {
     #[cfg(not(target_arch = "x86_64"))]
     const ALLOWED_LEGACY: &[libc::c_long] = &[];
 
-    /// Build the program: everything in [`ALLOWED`] (plus [`ALLOWED_LEGACY`])
-    /// unconditionally, and `socket(2)` only for the three address families the
-    /// client speaks. Everything else is `EPERM`.
+    /// The `socket(2)` type argument is `type | flags`; this masks the flags
+    /// (`SOCK_CLOEXEC`, `SOCK_NONBLOCK`) off and leaves the type. glibc spells
+    /// it `SOCK_TYPE_MASK` in `bits/socket.h`; `libc` does not re-export it.
+    const SOCK_TYPE_MASK: u64 = 0xf;
+
+    /// One condition of the form `(arg & mask) == value`.
     ///
-    /// What this denies is now everything nobody thought to allow, which
-    /// includes — and is no longer limited to — the groups the old deny list
-    /// named: exec, `ptrace`, module and BPF loading, mount and namespace
-    /// manipulation, kernel replacement, the keyring and tracing interfaces, and
-    /// `io_uring`, whose absence from that list was the reason for this change.
+    /// The conversion fails *closed*: a constant that did not fit becomes
+    /// `u64::MAX`, which no real argument is equal to, so a botched conversion
+    /// refuses the call rather than waving it through.
+    fn masked(
+        arg: u8,
+        len: SeccompCmpArgLen,
+        mask: u64,
+        value: libc::c_int,
+    ) -> Result<SeccompCondition, seccompiler::Error> {
+        Ok(SeccompCondition::new(
+            arg,
+            len,
+            SeccompCmpOp::MaskedEq(mask),
+            value.try_into().unwrap_or(u64::MAX),
+        )?)
+    }
+
+    /// The calls the daemon needs, but only with certain arguments.
+    ///
+    /// Conditions within one rule are combined with AND, and the rules for one
+    /// syscall with OR. Since the match action is `Allow` and the mismatch
+    /// action refuses, a rule here reads as "allowed when — and only when —
+    /// this holds".
+    ///
+    /// Everything below was read off the same traced run that produced
+    /// [`ALLOWED`], and `ci/router.sh --trace` re-reads it on every CI run: a
+    /// daemon that starts passing an argument this refuses fails the job rather
+    /// than the field. The numbers quoted are from that trace.
+    fn argument_restricted() -> Result<Vec<(libc::c_long, Vec<SeccompRule>)>, seccompiler::Error> {
+        use SeccompCmpArgLen::{Dword, Qword};
+
+        Ok(vec![
+            // **`AF_INET` and `SOCK_STREAM`.** Every `socket(2)` the daemon
+            // makes after this filter installs is both — 6 of 6 in the measured
+            // trace, all of them `AF_INET, SOCK_STREAM|SOCK_CLOEXEC`. The only
+            // unix socket in the process is the control listener, which is
+            // *bound* during initialisation and only `accept4`-ed afterwards,
+            // and `accept4` creates no socket of its own; `AF_INET6` has no
+            // caller at all, the SAM backend dialling `127.0.0.1` by
+            // construction.
+            //
+            // The type half is the one that matters most here, and it is not
+            // redundant with Landlock: `AccessNet::ConnectTcp` mediates TCP and
+            // says nothing about UDP, so without this a `SOCK_DGRAM` socket and
+            // a `sendto` would reach any address on the internet with only
+            // Layer 1 and Layer 3 in the way. This is Layer 2 closing its own
+            // half of the clearnet lock (`docs/SCOPE.md` §5).
+            //
+            // What it costs if it is ever wrong: `i2pnet`'s loopback-TCP API
+            // listener on `[::1]` would need `AF_INET6`, a daemon that learned
+            // to *connect* to a unix socket would need `AF_UNIX`, and datagram
+            // announces (Prop 160, a §2 non-goal today) would need
+            // `SOCK_DGRAM`. Each is one line here.
+            (
+                libc::SYS_socket,
+                vec![SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        0,
+                        Dword,
+                        SeccompCmpOp::Eq,
+                        libc::AF_INET.try_into().unwrap_or(u64::MAX),
+                    )?,
+                    masked(1, Dword, SOCK_TYPE_MASK, libc::SOCK_STREAM)?,
+                ])?],
+            ),
+            // **`FIONBIO` and nothing else.** All 8 `ioctl` calls in the trace
+            // set a socket non-blocking; the daemon has no other use for the
+            // call. It is worth narrowing rather than leaving open because
+            // `ioctl` is a multiplexer over the whole kernel, and one of the
+            // things reachable through it on a socket is `SIOCGIFCONF` — the
+            // list of this machine's network interfaces and their addresses.
+            // Landlock does not cover socket ioctls (`IoctlDev` is about device
+            // files), and `/proc/net` is already outside the domain, so this is
+            // the last route by which a client with no IP vocabulary could ask
+            // what its IP is.
+            //
+            // `Qword`: the request argument is an `unsigned long`, so comparing
+            // the low 32 bits alone would let `0x1_00005421` through. It is
+            // also why `FIONBIO` needs no conversion — `libc::Ioctl` is
+            // `c_ulong`, which is already the `u64` a condition takes, on all
+            // three architectures this module is compiled for.
+            (
+                libc::SYS_ioctl,
+                vec![SeccompRule::new(vec![SeccompCondition::new(
+                    1,
+                    Qword,
+                    SeccompCmpOp::Eq,
+                    libc::FIONBIO,
+                )?])?],
+            ),
+            // **W^X.** No mapping may be writable and executable at once, and
+            // nothing may be made executable that was not already. With
+            // `execve` off the list and `AccessFs::Execute` granted to no path,
+            // this closes the last way to get new code into the process:
+            // memory it can already write.
+            //
+            // The measured trace does not come near the boundary — `mmap` is
+            // `PROT_NONE` (22) or `PROT_READ|PROT_WRITE` (15), `mprotect` the
+            // same, and `PROT_EXEC` appears in neither. The rule is deliberately
+            // not "no `PROT_EXEC` at all", though, which the trace would also
+            // support: these are exactly the semantics of the
+            // `MemoryDenyWriteExecute=yes` the systemd unit has been setting all
+            // along, so Layer 2 is asking for what Layer 3 already proves the
+            // daemon runs under. Denying `PROT_EXEC` outright would additionally
+            // bet that no library is ever loaded lazily — including the
+            // unwinder, on a path only a panic in a peer thread reaches, which
+            // is a routine event here and not one this trace exercised.
+            //
+            // `pkey_mprotect` and `shmat`, the other two ways to the same place,
+            // are on neither list and so are refused outright.
+            (
+                libc::SYS_mmap,
+                vec![
+                    SeccompRule::new(vec![masked(2, Dword, exec_mask(), 0)?])?,
+                    SeccompRule::new(vec![masked(2, Dword, write_mask(), 0)?])?,
+                ],
+            ),
+            (
+                libc::SYS_mprotect,
+                vec![SeccompRule::new(vec![masked(2, Dword, exec_mask(), 0)?])?],
+            ),
+        ])
+    }
+
+    /// `PROT_EXEC` as a mask, failing closed to "compare every bit" — which no
+    /// `prot` value matches, so a botched conversion refuses the mapping.
+    fn exec_mask() -> u64 {
+        libc::PROT_EXEC.try_into().unwrap_or(u64::MAX)
+    }
+
+    /// `PROT_WRITE` as a mask, on the same terms as [`exec_mask`].
+    fn write_mask() -> u64 {
+        libc::PROT_WRITE.try_into().unwrap_or(u64::MAX)
+    }
+
+    /// Build the program: everything in [`ALLOWED`] (plus [`ALLOWED_LEGACY`])
+    /// whatever its arguments, everything in [`argument_restricted`] only with
+    /// the arguments named there. Everything else is `ENOSYS`.
+    ///
+    /// What this denies is everything nobody thought to allow, which includes —
+    /// and is no longer limited to — the groups the old deny list named: exec,
+    /// `ptrace`, module and BPF loading, mount and namespace manipulation,
+    /// kernel replacement, the keyring and tracing interfaces, and `io_uring`,
+    /// whose absence from that list was the reason for this change.
     fn build() -> Result<Vec<seccompiler::sock_filter>, seccompiler::Error> {
         let arch = TargetArch::try_from(std::env::consts::ARCH)?;
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
@@ -429,37 +573,21 @@ mod seccomp {
             // An empty rule vector matches the syscall whatever its arguments.
             rules.insert(nr, Vec::new());
         }
-        // Conditions within one rule are ANDed; the rules for one syscall are
-        // ORed. So one rule per permitted family reads "the family is one of
-        // these" — and, since the match action is `Allow` and the default is
-        // `EPERM`, any other family is refused.
-        //
-        // **`AF_INET` alone.** `AF_UNIX` and `AF_INET6` were here and are not
-        // needed: every `socket(2)` the daemon makes after this filter installs
-        // is `AF_INET` — 8 of 8 in the measured trace — because the only unix
-        // socket in the process is the control listener, which is *bound* during
-        // initialisation and only `accept4`-ed afterwards, and `accept4` creates
-        // no socket of its own. `AF_INET6` has no caller at all today: the SAM
-        // backend dials `127.0.0.1` by construction.
-        //
-        // What this costs if it is ever wrong: wiring up `i2pnet`'s loopback-TCP
-        // API listener on `[::1]` would need `AF_INET6` back, and a daemon that
-        // learned to *connect* to a unix socket would need `AF_UNIX`. Both are
-        // one line here, and `ci/router.sh --trace` fails loudly rather than
-        // leaving it to be discovered in the field.
-        let family = |af: libc::c_int| {
-            SeccompRule::new(vec![SeccompCondition::new(
-                0,
-                SeccompCmpArgLen::Dword,
-                SeccompCmpOp::Eq,
-                af.try_into().unwrap_or(u64::MAX),
-            )?])
-        };
-        rules.insert(libc::SYS_socket, vec![family(libc::AF_INET)?]);
+        for (nr, conditional) in argument_restricted()? {
+            // A syscall in both lists is a bug in the lists, not a hole: this
+            // runs second, so the narrow rule wins and the effect is to refuse
+            // more than intended. Worth catching all the same, because reading
+            // `ALLOWED` would then describe a policy the filter does not have.
+            debug_assert!(
+                !rules.contains_key(&nr),
+                "{nr} is in both ALLOWED and argument_restricted"
+            );
+            rules.insert(nr, conditional);
+        }
         let filter = SeccompFilter::new(
             rules,
-            // Mismatch — not on the list — is refused.
-            SeccompAction::Errno(u32::try_from(libc::EPERM).unwrap_or(1)),
+            // Mismatch — not on the list, or on it with the wrong arguments.
+            SeccompAction::Errno(u32::try_from(libc::ENOSYS).unwrap_or(1)),
             // Match is allowed.
             SeccompAction::Allow,
             arch,
@@ -469,10 +597,27 @@ mod seccomp {
 
     /// Install the deny filter on every thread, and say what happened.
     ///
-    /// `EPERM`, not `SIGSYS`: the filter is a backstop behind Layers 1 and 3,
-    /// and a refused syscall that shows up in a log is worth more than a
-    /// corpse. Nothing on the list has a legitimate caller in this process, so
+    /// **An errno, not `SIGSYS`:** the filter is a backstop behind Layers 1
+    /// and 3, and a daemon that refuses one call is worth more than a corpse.
+    /// Nothing missing from the list has a legitimate caller in this process, so
     /// none of it is a call that "might" happen and must be tolerated.
+    ///
+    /// **`ENOSYS`, not `EPERM`:** this is what a libc gets from a kernel that
+    /// does not have the call, and so the answer its fallback paths are written
+    /// for. glibc reaches for `clone3` and falls back to `clone` on `ENOSYS`
+    /// alone — under `EPERM` it does not fall back, it fails, which is how
+    /// Docker's default profile broke thread creation when glibc adopted
+    /// `clone3`. This list is hand-maintained and deliberately short, so the
+    /// next call a libc probes for and does not find is a question of when; it
+    /// should get the answer that means "use the old way". The cost is that a
+    /// call refused over its *arguments* also reports `ENOSYS`, which reads
+    /// oddly in a log — `seccompiler` takes one mismatch action for the whole
+    /// program, so that is the trade, and it is the right way round.
+    ///
+    /// Neither is logged anywhere: `SECCOMP_RET_ERRNO` is silent, and
+    /// `seccompiler` does not set `SECCOMP_FILTER_FLAG_LOG`. A refusal surfaces
+    /// as whatever the daemon reports about the operation that failed, and
+    /// `ci/router.sh --trace` is what turns it into an answer in CI.
     pub(super) fn restrict() -> String {
         match build() {
             Ok(program) => match seccompiler::apply_filter_all_threads(&program) {
@@ -679,6 +824,16 @@ mod tests {
                 std::os::unix::fs::symlink(&target, dir.join("soft")).is_err(),
                 "symlinkat succeeded under the filter"
             );
+            // And the `socket(2)` rule is closed on both halves. This asks for
+            // `AF_UNIX` and `SOCK_DGRAM` at once, and either alone is enough to
+            // refuse it; isolating the type half would want a UDP socket, and
+            // `std::net::UdpSocket` is banned workspace-wide by the Layer 1
+            // lint — a test is not a reason to poke a hole in it. The permitted
+            // combination is exercised positively below.
+            assert!(
+                std::os::unix::net::UnixDatagram::unbound().is_err(),
+                "socket(AF_UNIX, SOCK_DGRAM) succeeded under the filter"
+            );
             // And the daemon's own work still runs. This is the half an
             // allowlist can get wrong, and the half a deny list never could.
             exercise_the_daemons_syscalls(&dir, &control);
@@ -761,6 +916,13 @@ mod tests {
             Err(e) => panic!("accept4 on the control socket was refused: {e}"),
             Ok(_) => panic!("a connection arrived on a socket nothing dialled"),
         }
+        // The daemon's only `ioctl`, and now the only one the filter permits:
+        // `FIONBIO`. Asserted here because the request number is compared
+        // exactly, and a wrong constant would be indistinguishable from a
+        // missing entry at runtime — both are a refusal on a rare path.
+        control
+            .set_nonblocking(true)
+            .expect("ioctl(FIONBIO) on the control socket");
 
         // The SAM bridge's transport: a loopback TCP socket, bound, listened,
         // connected and accepted. Through `i2pnet`'s own API rather than
