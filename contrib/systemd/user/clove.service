@@ -18,25 +18,44 @@
 #
 # HOW THIS DIFFERS FROM THE SYSTEM UNIT, AND WHY IT IS NOT ONE FILE.
 #
-# A user manager cannot enforce two of the things the system unit does, and
-# systemd does not degrade quietly when asked for them — a namespace it cannot
-# set up is a service that does not start, not a service that starts with less.
+# A user manager cannot enforce two of the things the system unit does. The
+# trap is that it does not refuse them either: both degrade *quietly*, so a
+# unit that asked for them would start, look healthy, and enforce neither.
 #
 #   * The clearnet lock. IPAddressDeny=/IPAddressAllow= are cgroup BPF filters,
 #     and systemd.resource-control(5) says the functionality "is currently only
-#     available for system services, not for per-user services". They are
-#     omitted here rather than left in place to give false comfort. **If you
-#     want the kernel-enforced clearnet lock, use the system unit.**
+#     available for system services, not for per-user services". A user manager
+#     logs "unit configures an IP firewall, but not running as root" — once per
+#     boot, for the first such unit on the system, and at debug level in a
+#     container — then starts the service with every packet allowed. Omitted
+#     here rather than left in place to give exactly that false comfort. **If
+#     you want the kernel-enforced clearnet lock, use the system unit.**
 #
-#   * Filesystem namespacing. systemd.exec(5): "the various settings requiring
-#     file system namespacing support (such as ProtectSystem=) are not
-#     available, as the underlying kernel functionality is only accessible to
-#     privileged processes. However, most namespacing settings, that will not
-#     work on their own in user services, will work when used in conjunction
-#     with PrivateUsers=true." That block is at the bottom of this file,
-#     commented out, because PrivateUsers= needs unprivileged user namespaces
-#     to be permitted and several distributions (Ubuntu 24.04 among them)
-#     restrict them by default. Uncomment it if yours does not.
+#   * Filesystem namespacing. ProtectSystem=, ProtectHome=, PrivateTmp=,
+#     PrivateDevices=, ProtectProc=, ProtectKernel*= and ReadWritePaths= need a
+#     mount namespace, which an unprivileged manager cannot unshare.
+#     systemd.exec(5) says these "are not available, as the underlying kernel
+#     functionality is only accessible to privileged processes. However, most
+#     namespacing settings ... will work when used in conjunction with
+#     PrivateUsers=true." Not available does not mean refused: for settings
+#     that only make things read-only or invisible, systemd logs at *debug*
+#     level ("Failed to set up namespace, assuming containerized execution and
+#     ignoring") and runs the service unconfined. Recent versions first try an
+#     implicit user namespace, so on a host permitting unprivileged user
+#     namespaces they may genuinely apply — and on one that does not, nothing
+#     above debug tells you they did not.
+#
+# So the block at the bottom of this file is commented out, and the
+# PrivateUsers=yes at the top of it is the part that matters: setting it
+# explicitly is the fail-closed switch. A user namespace that cannot then be
+# established is EXIT_USER — status=217/USER, service does not start — instead
+# of a log notice and a service that runs with none of this applied.
+#
+# Two files rather than one because the system-only settings cannot be made
+# conditional inside a unit: DynamicUser=, StateDirectory=, and the
+# @SYSCONFDIR@ config path. DynamicUser= also decides the question above — it
+# is one of the settings for which an un-unshareable mount namespace is fatal
+# rather than ignorable, so the system unit really would not start here.
 #
 # Everything left active below needs neither privilege nor a namespace: it is
 # seccomp and resource limits, which a user manager applies in full. clove
@@ -83,11 +102,12 @@ TasksMax=1024
 LimitCORE=0
 
 # --- Filesystem namespacing, opt-in ---
-# Uncomment as a block. PrivateUsers= is what makes the rest work in a user
-# manager (systemd.exec(5), quoted above); without it they are not available
-# here, and with it they need unprivileged user namespaces to be permitted. If
-# the service then fails to start with status=226/NAMESPACE, that is what is
-# missing — comment the block out again.
+# Uncomment as a block, PrivateUsers= included: it is what makes the rest work
+# in a user manager (systemd.exec(5), quoted above), and what makes a failure
+# to do so visible instead of a debug line. If the service then refuses to
+# start with status=217/USER, this host does not permit unprivileged user
+# namespaces — comment the block out again and accept that these lines were
+# doing nothing anyway.
 #PrivateUsers=yes
 #ProtectSystem=strict
 #ProtectHome=read-only
