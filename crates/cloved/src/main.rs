@@ -171,11 +171,22 @@ fn run() -> Result<(), String> {
     if let Some(dir) = &config.watch_dir {
         read_write.push(dir);
     }
+    // Nothing read-only. `/dev/urandom` used to be here, and it was pure
+    // self-reference: the daemon takes its randomness from `getrandom(2)`, which
+    // needs no file at all, and the device is only a fallback for kernels before
+    // 3.17 — three major versions below the 6.12 floor (SCOPE §0), so
+    // unreachable. A traced run says the same thing more bluntly: the one and
+    // only `/dev/urandom` open in it is Landlock's own `O_PATH` open, made while
+    // adding the rule that grants access to `/dev/urandom`.
+    //
+    // Granting it also cost more than it looked. `AccessFs::from_read` is
+    // `Execute | ReadFile | ReadDir`, so the rule handed out execute on a
+    // character device to buy a file the daemon never opens.
     eprintln!(
         "cloved: {}",
         sandbox::enter_post_init(&sandbox::Limits {
             read_write: &read_write,
-            read_only: &[Path::new("/dev/urandom")],
+            read_only: &[],
             connect_tcp: sam_tcp_port(&config.sam_address),
         })
     );

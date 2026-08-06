@@ -48,7 +48,11 @@ pub(crate) struct Limits<'a> {
     /// Directories it may read and write beneath (state, downloads, the
     /// control socket's directory so the socket can be unlinked at exit).
     pub(crate) read_write: &'a [&'a Path],
-    /// Paths it may only read.
+    /// Paths it may only read. Empty today: the daemon reads nothing outside its
+    /// own data directory, and the `/dev/urandom` that used to be here was a
+    /// grant nothing consumed (see the caller). Kept as a mechanism rather than
+    /// deleted, because "read this, write nothing" is the shape any future
+    /// read-only path wants and rediscovering it is worse than carrying it.
     pub(crate) read_only: &'a [&'a Path],
     /// The one TCP port it may connect to: the SAM bridge. `None` when the
     /// port could not be determined, in which case outbound TCP is left alone
