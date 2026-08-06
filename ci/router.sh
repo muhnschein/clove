@@ -106,6 +106,18 @@ while ! grep -q "router connected" "$work/daemon.log" 2>/dev/null; do
 done
 echo "router: session up"
 
+# What the daemon's sandbox actually came to, echoed on the way past rather than
+# only in `fail`'s log dump. Nothing else in CI reports it: the unit test prints
+# its verdict to a stdout cargo swallows when the test passes, so on a green run
+# the one interesting question — did the kernel under this job enforce Landlock,
+# or quietly decline — had no answer anywhere. A policy that never applied looks
+# exactly like one that did.
+#
+# Reported, not asserted. `landlock unavailable` here is a fact about the runner's
+# kernel (ABI 6 wants 6.12; SCOPE §0), not a defect in the daemon, and failing the
+# network test over it would be blaming the wrong thing.
+sed -n 's/^cloved: sandbox:/router: daemon sandbox:/p' "$work/daemon.log"
+
 run() { timeout 20 "$clove" "$@" 2>/dev/null; }
 
 run add "$work/t.torrent" >/dev/null || fail "could not add a torrent"
