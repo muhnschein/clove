@@ -1,0 +1,53 @@
+# Per-user clove service, for running clove as yourself with the XDG defaults.
+#
+# `make install PREFIX="$HOME/.local"` puts this file in place with @BINDIR@
+# filled in; a system prefix gets contrib/systemd/system/clove.service instead.
+#
+#   make install PREFIX="$HOME/.local"
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now clove
+#
+# By hand, without make:
+#
+#   sed 's|@BINDIR@|'"$HOME"'/.local/bin|' contrib/systemd/user/clove.service \
+#       > ~/.config/systemd/user/clove.service
+
+[Unit]
+Description=clove, an I2P-only BitTorrent daemon
+Documentation=man:clove(1) man:clove.conf(5) man:clove-api(7) man:cloved(8)
+After=default.target
+
+[Service]
+Type=exec
+ExecStart=@BINDIR@/cloved
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+# --- Privilege ---
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+
+# --- Kernel and process surface (seccomp; no privilege required) ---
+# AF_UNIX for the control socket, AF_INET for the loopback SAM connection.
+RestrictAddressFamilies=AF_UNIX AF_INET
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @debug @swap @cpu-emulation @raw-io
+SystemCallErrorNumber=EPERM
+# See the system unit: if cloved's startup line reports its own Layer-2
+# sandbox as not applied, this filter is missing systemd's @sandbox group
+# (the seccomp and landlock_* syscalls) — add SystemCallFilter=@sandbox.
+
+# --- Resources ---
+LimitNOFILE=8192
+TasksMax=1024
+# No core dumps: the address space holds the destination key and the API token.
+LimitCORE=0
+
+[Install]
+WantedBy=default.target

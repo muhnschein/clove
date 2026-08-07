@@ -109,6 +109,19 @@ pub struct Config {
     /// A directory to watch for `.torrent` files to add, or `None` to watch
     /// none — the default.
     pub watch_dir: Option<PathBuf>,
+    /// What to do when the Layer-2 self-restriction cannot be applied.
+    pub sandbox: SandboxPolicy,
+}
+
+/// What `cloved` does when Landlock or `seccomp` does not apply (SCOPE §5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SandboxPolicy {
+    /// Apply what the kernel allows, report the rest, and run either way.
+    #[default]
+    BestEffort,
+    /// Refuse to start unless both Landlock and `seccomp` applied. Covers
+    /// Layer 2 only; the daemon cannot see whether Layer 3 took effect.
+    Require,
 }
 
 /// Client-wide peer ceiling when the config does not say otherwise.
@@ -168,6 +181,8 @@ pub enum Problem {
     DuplicateKey,
     /// Boolean value other than `yes` or `no`.
     BadBool,
+    /// `sandbox` value other than `best-effort` or `require`.
+    BadSandboxPolicy,
     /// A count that is not a positive number, or is absurdly large.
     BadCount,
     /// A ratio that is not a non-negative decimal, or is absurdly large.
@@ -210,6 +225,9 @@ impl fmt::Display for Problem {
             Problem::MissingValue => write!(f, "key has no value"),
             Problem::DuplicateKey => write!(f, "key already set earlier in the file"),
             Problem::BadBool => write!(f, "expected \"yes\" or \"no\""),
+            Problem::BadSandboxPolicy => {
+                write!(f, "expected \"best-effort\" or \"require\"")
+            }
             Problem::BadCount => write!(f, "expected a number from 1 to {MAX_PEER_LIMIT}"),
             Problem::BadRatio => write!(
                 f,
@@ -259,6 +277,7 @@ struct Draft {
     seed_ratio_milli: Option<(usize, u64)>,
     seed_idle_minutes: Option<(usize, u64)>,
     watch_dir: Option<(usize, PathBuf)>,
+    sandbox: Option<(usize, SandboxPolicy)>,
 }
 
 impl Draft {
@@ -307,6 +326,14 @@ impl Draft {
                 set(&mut self.seed_ratio_milli, line, milli)?;
             }
             "watch_dir" => set(&mut self.watch_dir, line, absolute(value, line)?)?,
+            "sandbox" => {
+                let policy = match value {
+                    "best-effort" => SandboxPolicy::BestEffort,
+                    "require" => SandboxPolicy::Require,
+                    _ => return Err(at(Problem::BadSandboxPolicy)),
+                };
+                set(&mut self.sandbox, line, policy)?;
+            }
             "seed_idle_minutes" => {
                 let minutes = value
                     .parse::<u64>()
@@ -365,6 +392,7 @@ impl Config {
             seed_ratio_milli,
             seed_idle_minutes,
             watch_dir,
+            sandbox,
         } = draft;
 
         let i_know_sam_is_remote = i_know_sam_is_remote.is_some_and(|(_, v)| v);
@@ -414,6 +442,7 @@ impl Config {
             seed_ratio_milli: seed_ratio_milli.map_or(0, |(_, v)| v),
             seed_idle_minutes: seed_idle_minutes.map_or(0, |(_, v)| v),
             watch_dir: watch_dir.map(|(_, v)| v),
+            sandbox: sandbox.map_or(SandboxPolicy::BestEffort, |(_, v)| v),
         })
     }
 }
@@ -631,6 +660,26 @@ preallocate yes
         assert!(c.preallocate);
     }
 
+    /// The sandbox policy, and in particular that the default is permissive.
+    /// Asserted so that changing it has to be somebody's decision.
+    #[test]
+    fn the_sandbox_policy_defaults_to_best_effort() {
+        let d = defaults();
+        assert_eq!(
+            Config::parse("", &d).unwrap().sandbox,
+            SandboxPolicy::BestEffort,
+            "an empty config must not refuse to start on a kernel without Landlock"
+        );
+        assert_eq!(
+            Config::parse("sandbox best-effort\n", &d).unwrap().sandbox,
+            SandboxPolicy::BestEffort
+        );
+        assert_eq!(
+            Config::parse("sandbox require\n", &d).unwrap().sandbox,
+            SandboxPolicy::Require
+        );
+    }
+
     #[test]
     fn peer_ceilings_are_counts_with_a_refused_zero() {
         let d = defaults();
@@ -733,6 +782,13 @@ preallocate yes
             ("ephemeral", Problem::MissingValue),
             ("ephemeral \t", Problem::MissingValue),
             ("ephemeral maybe", Problem::BadBool),
+            ("sandbox", Problem::MissingValue),
+            ("sandbox maybe", Problem::BadSandboxPolicy),
+            // Near-misses: a silently-ignored typo here is the whole bug.
+            ("sandbox yes", Problem::BadSandboxPolicy),
+            ("sandbox required", Problem::BadSandboxPolicy),
+            ("sandbox best_effort", Problem::BadSandboxPolicy),
+            ("sandbox require\nsandbox require", Problem::DuplicateKey),
             ("data_dir relative/path", Problem::RelativePath),
             ("sam_address 127.0.0.1", Problem::BadSamAddress),
             ("sam_address 127.0.0.1:0", Problem::BadSamAddress),

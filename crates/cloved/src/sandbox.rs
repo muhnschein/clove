@@ -20,9 +20,8 @@
 //!   ABI 6 — Linux 6.12, the floor in `docs/SCOPE.md` §0 — is a hard
 //!   requirement; only the ABI 9 addition is best-effort.
 //! - **seccomp** installs an *allowlist* over the syscalls in `ALLOWED`:
-//!   anything not on it returns `EPERM`, and `socket(2)` is further restricted
-//!   to `AF_INET`, the only family the daemon creates a socket in after this
-//!   point.
+//!   anything not on it returns `ENOSYS`. Four of them are narrowed by
+//!   argument as well; see `argument_restricted`.
 //!
 //! The daemon was run under `strace`
 //! against a SAM bridge complete enough to bring the whole network path up —
@@ -80,19 +79,45 @@ pub(crate) enum Role {
     Watch,
 }
 
-/// Drop the capabilities the daemon no longer needs, and describe what
-/// actually happened in one line for the operator.
+/// What the two mechanisms actually came to.
 ///
-/// Never fails: an unavailable or partial mechanism is reported, not raised.
-pub(crate) fn enter_post_init(limits: &Limits) -> String {
-    let fs = landlock_restrict(limits);
-    let syscalls = seccomp_restrict();
-    format!("sandbox: {fs}; {syscalls}")
+/// Booleans as well as prose, so `sandbox require` and `GET /v1/status` do not
+/// have to read the message to know what happened.
+pub(crate) struct Verdict {
+    /// The operator-facing summary, without the `sandbox:` prefix the startup
+    /// line adds.
+    pub(crate) line: String,
+    /// Landlock is enforcing. Partial enforcement counts: only the ABI 9
+    /// addition is best-effort, and the ABI 6 floor cannot be partially met.
+    pub(crate) landlock: bool,
+    /// The seccomp filter is installed.
+    pub(crate) seccomp: bool,
+}
+
+impl Verdict {
+    /// Whether both mechanisms applied, which is what `sandbox require` means.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.landlock && self.seccomp
+    }
+}
+
+/// Drop the capabilities the daemon no longer needs, and report what happened.
+///
+/// Never fails: an unavailable mechanism is reported, not raised. Whether that
+/// is enough is the caller's decision — see `sandbox require`.
+pub(crate) fn enter_post_init(limits: &Limits) -> Verdict {
+    let (landlock, fs) = landlock_restrict(limits);
+    let (seccomp, syscalls) = seccomp_restrict();
+    Verdict {
+        line: format!("{fs}; {syscalls}"),
+        landlock,
+        seccomp,
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn landlock_restrict(_limits: &Limits) -> String {
-    "landlock unavailable (not Linux)".to_owned()
+fn landlock_restrict(_limits: &Limits) -> (bool, String) {
+    (false, "landlock unavailable (not Linux)".to_owned())
 }
 
 /// Confine the filesystem, outbound TCP, and — where the kernel has it — the
@@ -118,7 +143,7 @@ fn landlock_restrict(_limits: &Limits) -> String {
 /// narrowing belongs in the per-path rules, never in the handled set.
 #[cfg(target_os = "linux")]
 #[allow(clippy::needless_pass_by_value)] // the landlock builders consume self
-fn landlock_restrict(limits: &Limits) -> String {
+fn landlock_restrict(limits: &Limits) -> (bool, String) {
     use landlock::{
         ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, Ruleset, RulesetAttr,
         RulesetCreatedAttr, RulesetStatus, Scope, path_beneath_rules,
@@ -166,26 +191,56 @@ fn landlock_restrict(limits: &Limits) -> String {
     };
 
     match restrict() {
-        Ok(RulesetStatus::FullyEnforced) => {
-            "landlock enforced (unix-socket connects denied too)".to_owned()
-        }
+        Ok(RulesetStatus::FullyEnforced) => (
+            true,
+            "landlock enforced (unix-socket connects denied too)".to_owned(),
+        ),
         // The required tier is a hard requirement, so nothing in it can be
         // missing here: the only access asked for best-effort is `ResolveUnix`,
         // and the only kernels that decline it are those below ABI 9.
-        Ok(RulesetStatus::PartiallyEnforced) => {
-            "landlock enforced; unix-socket connects unrestricted (kernel below ABI 9)".to_owned()
-        }
-        Ok(RulesetStatus::NotEnforced) => {
-            "landlock not applied (built in but disabled — check the kernel's LSM list)".to_owned()
-        }
-        // A compatibility error means the running kernel could not provide ABI 6.
-        // That is a kernel below the 6.12 this project requires, or Landlock
-        // missing entirely — different from "disabled", and worth different words.
-        Err(e) => format!(
-            "landlock unavailable: this kernel cannot provide ABI {} (clove requires Linux 6.12; \
-             see docs/SCOPE.md §0) — {e}",
-            REQUIRED as u32
+        Ok(RulesetStatus::PartiallyEnforced) => (
+            true,
+            "landlock enforced; unix-socket connects unrestricted (kernel below ABI 9)".to_owned(),
         ),
+        Ok(RulesetStatus::NotEnforced) => (
+            false,
+            "landlock not applied (the kernel accepted the ruleset and enforced nothing)"
+                .to_owned(),
+        ),
+        Err(e) => (false, why_landlock_is_unavailable(&e)),
+    }
+}
+
+/// Say *why* the ruleset could not be applied, having asked the kernel.
+///
+/// `RestrictSelf` reports the running kernel's Landlock status without building
+/// a domain; `no_new_privs(false)` keeps the probe from touching the process.
+/// Blaming the kernel version for all three causes was wrong on two of them.
+#[cfg(target_os = "linux")]
+fn why_landlock_is_unavailable(e: &landlock::RulesetError) -> String {
+    use landlock::{ABI, LandlockStatus, RestrictSelf};
+
+    match RestrictSelf::default().no_new_privs(false).apply() {
+        Ok(status) => match status.landlock {
+            // No mention of the 6.12 floor: a 6.18 kernel built without
+            // `CONFIG_SECURITY_LANDLOCK` lands here too.
+            LandlockStatus::NotImplemented => "landlock unavailable: this kernel has no Landlock \
+                 at all (CONFIG_SECURITY_LANDLOCK is off, or the kernel predates it) — clove \
+                 expects it, see docs/SCOPE.md §0"
+                .to_owned(),
+            LandlockStatus::NotEnabled => "landlock unavailable: built into this kernel but not \
+                 enabled — add it to the lsm= boot parameter or CONFIG_LSM"
+                .to_owned(),
+            // The genuine too-old case; name the ABI found, not the one wanted.
+            LandlockStatus::Available { effective_abi, .. } => format!(
+                "landlock unavailable: this kernel offers ABI {}, below the {} clove requires \
+                 (Linux 6.12; see docs/SCOPE.md §0)",
+                effective_abi as u32,
+                ABI::V6 as u32
+            ),
+        },
+        // Both failed; report both rather than choose which to believe.
+        Err(probe) => format!("landlock unavailable: {e} (probing why also failed: {probe})"),
     }
 }
 
@@ -249,8 +304,11 @@ use seccomp::restrict as seccomp_restrict;
         target_arch = "riscv64"
     )
 )))]
-fn seccomp_restrict() -> String {
-    "seccomp unavailable (unsupported platform)".to_owned()
+fn seccomp_restrict() -> (bool, String) {
+    (
+        false,
+        "seccomp unavailable (unsupported platform)".to_owned(),
+    )
 }
 
 #[cfg(all(
@@ -269,9 +327,10 @@ mod seccomp {
         SeccompRule, TargetArch,
     };
 
-    /// Everything the daemon still needs after initialisation, named rather than
-    /// numbered so the list reads as the policy it is. Anything absent returns
-    /// `EPERM`.
+    /// Everything the daemon still needs after initialisation *whatever
+    /// arguments it passes*, named rather than numbered so the list reads as the
+    /// policy it is. Anything absent from both this and `argument_restricted`
+    /// returns `ENOSYS`.
     ///
     /// Portable across the three architectures this module is compiled for; the
     /// legacy non-`at` spellings that exist only on x86-64 are in
@@ -302,10 +361,9 @@ mod seccomp {
         // Newer glibc reaches for this instead. A wait primitive, and denying it
         // would wedge whatever was waiting.
         libc::SYS_futex_waitv,
-        // --- Memory. The allocator's, mostly.
-        libc::SYS_mmap,
+        // --- Memory. The allocator's, mostly. `mmap` and `mprotect` are not
+        // here: they are allowed by argument, in `argument_restricted`.
         libc::SYS_munmap,
-        libc::SYS_mprotect,
         libc::SYS_madvise,
         libc::SYS_mremap,
         // glibc's main arena grows with `brk`, not `mmap`. It appeared only
@@ -355,7 +413,7 @@ mod seccomp {
         libc::SYS_fsync,
         libc::SYS_getdents64,
         libc::SYS_fcntl,
-        libc::SYS_ioctl,
+        // `ioctl` is not here either — see `argument_restricted`.
         // The `at`-relative forms: what `storage`'s `openat` walk uses directly,
         // and what glibc uses for the legacy names on every architecture that
         // has no legacy names. `mkdirat` is absent from the trace because the
@@ -413,15 +471,102 @@ mod seccomp {
     #[cfg(not(target_arch = "x86_64"))]
     const ALLOWED_LEGACY: &[libc::c_long] = &[];
 
-    /// Build the program: everything in [`ALLOWED`] (plus [`ALLOWED_LEGACY`])
-    /// unconditionally, and `socket(2)` only for the three address families the
-    /// client speaks. Everything else is `EPERM`.
+    /// Masks `SOCK_CLOEXEC`/`SOCK_NONBLOCK` off `socket(2)`'s type argument.
+    /// glibc spells it `SOCK_TYPE_MASK`; `libc` does not re-export it.
+    const SOCK_TYPE_MASK: u64 = 0xf;
+
+    /// One condition of the form `(arg & mask) == value`. Fails closed: a
+    /// constant that did not fit becomes `u64::MAX`, which nothing equals.
+    fn masked(
+        arg: u8,
+        len: SeccompCmpArgLen,
+        mask: u64,
+        value: libc::c_int,
+    ) -> Result<SeccompCondition, seccompiler::Error> {
+        Ok(SeccompCondition::new(
+            arg,
+            len,
+            SeccompCmpOp::MaskedEq(mask),
+            value.try_into().unwrap_or(u64::MAX),
+        )?)
+    }
+
+    /// The calls the daemon needs, but only with certain arguments.
     ///
-    /// What this denies is now everything nobody thought to allow, which
-    /// includes — and is no longer limited to — the groups the old deny list
-    /// named: exec, `ptrace`, module and BPF loading, mount and namespace
-    /// manipulation, kernel replacement, the keyring and tracing interfaces, and
-    /// `io_uring`, whose absence from that list was the reason for this change.
+    /// Conditions within a rule are combined with AND, rules for one syscall
+    /// with OR, and the mismatch action refuses — so each rule reads "allowed
+    /// only when this holds". Measured from the same traced run as [`ALLOWED`].
+    fn argument_restricted() -> Result<Vec<(libc::c_long, Vec<SeccompRule>)>, seccompiler::Error> {
+        use SeccompCmpArgLen::{Dword, Qword};
+
+        Ok(vec![
+            // 6 of 6 sockets in the trace are `AF_INET, SOCK_STREAM`. The
+            // type half is not redundant with Landlock: `ConnectTcp` says
+            // nothing about UDP, so this is where Layer 2 closes datagram
+            // egress (`docs/SCOPE.md` §5).
+            (
+                libc::SYS_socket,
+                vec![SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        0,
+                        Dword,
+                        SeccompCmpOp::Eq,
+                        libc::AF_INET.try_into().unwrap_or(u64::MAX),
+                    )?,
+                    masked(1, Dword, SOCK_TYPE_MASK, libc::SOCK_STREAM)?,
+                ])?],
+            ),
+            // All 8 `ioctl` calls in the trace set a socket non-blocking.
+            // Narrowed because `SIOCGIFCONF` is reachable the same way, and
+            // Landlock's `IoctlDev` covers device files, not socket ioctls.
+            // `Qword` because the request is an `unsigned long`.
+            (
+                libc::SYS_ioctl,
+                vec![SeccompRule::new(vec![SeccompCondition::new(
+                    1,
+                    Qword,
+                    SeccompCmpOp::Eq,
+                    libc::FIONBIO,
+                )?])?],
+            ),
+            // W^X, the semantics of `MemoryDenyWriteExecute=yes`. Not the
+            // stricter "no `PROT_EXEC` at all", which would bet that no library
+            // is ever loaded lazily — the unwinder among them, on a path only a
+            // panic in a peer thread reaches. `pkey_mprotect` and `shmat` are
+            // on neither list.
+            (
+                libc::SYS_mmap,
+                vec![
+                    SeccompRule::new(vec![masked(2, Dword, exec_mask(), 0)?])?,
+                    SeccompRule::new(vec![masked(2, Dword, write_mask(), 0)?])?,
+                ],
+            ),
+            (
+                libc::SYS_mprotect,
+                vec![SeccompRule::new(vec![masked(2, Dword, exec_mask(), 0)?])?],
+            ),
+        ])
+    }
+
+    /// `PROT_EXEC` as a mask, failing closed like [`masked`].
+    fn exec_mask() -> u64 {
+        libc::PROT_EXEC.try_into().unwrap_or(u64::MAX)
+    }
+
+    /// `PROT_WRITE` as a mask, on the same terms as [`exec_mask`].
+    fn write_mask() -> u64 {
+        libc::PROT_WRITE.try_into().unwrap_or(u64::MAX)
+    }
+
+    /// Build the program: everything in [`ALLOWED`] (plus [`ALLOWED_LEGACY`])
+    /// whatever its arguments, everything in [`argument_restricted`] only with
+    /// the arguments named there. Everything else is `ENOSYS`.
+    ///
+    /// What this denies is everything nobody thought to allow, which includes —
+    /// and is no longer limited to — the groups the old deny list named: exec,
+    /// `ptrace`, module and BPF loading, mount and namespace manipulation,
+    /// kernel replacement, the keyring and tracing interfaces, and `io_uring`,
+    /// whose absence from that list was the reason for this change.
     fn build() -> Result<Vec<seccompiler::sock_filter>, seccompiler::Error> {
         let arch = TargetArch::try_from(std::env::consts::ARCH)?;
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
@@ -429,37 +574,19 @@ mod seccomp {
             // An empty rule vector matches the syscall whatever its arguments.
             rules.insert(nr, Vec::new());
         }
-        // Conditions within one rule are ANDed; the rules for one syscall are
-        // ORed. So one rule per permitted family reads "the family is one of
-        // these" — and, since the match action is `Allow` and the default is
-        // `EPERM`, any other family is refused.
-        //
-        // **`AF_INET` alone.** `AF_UNIX` and `AF_INET6` were here and are not
-        // needed: every `socket(2)` the daemon makes after this filter installs
-        // is `AF_INET` — 8 of 8 in the measured trace — because the only unix
-        // socket in the process is the control listener, which is *bound* during
-        // initialisation and only `accept4`-ed afterwards, and `accept4` creates
-        // no socket of its own. `AF_INET6` has no caller at all today: the SAM
-        // backend dials `127.0.0.1` by construction.
-        //
-        // What this costs if it is ever wrong: wiring up `i2pnet`'s loopback-TCP
-        // API listener on `[::1]` would need `AF_INET6` back, and a daemon that
-        // learned to *connect* to a unix socket would need `AF_UNIX`. Both are
-        // one line here, and `ci/router.sh --trace` fails loudly rather than
-        // leaving it to be discovered in the field.
-        let family = |af: libc::c_int| {
-            SeccompRule::new(vec![SeccompCondition::new(
-                0,
-                SeccompCmpArgLen::Dword,
-                SeccompCmpOp::Eq,
-                af.try_into().unwrap_or(u64::MAX),
-            )?])
-        };
-        rules.insert(libc::SYS_socket, vec![family(libc::AF_INET)?]);
+        for (nr, conditional) in argument_restricted()? {
+            // In both lists is a bug in the lists, not a hole: this runs
+            // second, so the narrow rule wins and refuses more than intended.
+            debug_assert!(
+                !rules.contains_key(&nr),
+                "{nr} is in both ALLOWED and argument_restricted"
+            );
+            rules.insert(nr, conditional);
+        }
         let filter = SeccompFilter::new(
             rules,
-            // Mismatch — not on the list — is refused.
-            SeccompAction::Errno(u32::try_from(libc::EPERM).unwrap_or(1)),
+            // Mismatch — not on the list, or on it with the wrong arguments.
+            SeccompAction::Errno(u32::try_from(libc::ENOSYS).unwrap_or(1)),
             // Match is allowed.
             SeccompAction::Allow,
             arch,
@@ -469,17 +596,17 @@ mod seccomp {
 
     /// Install the deny filter on every thread, and say what happened.
     ///
-    /// `EPERM`, not `SIGSYS`: the filter is a backstop behind Layers 1 and 3,
-    /// and a refused syscall that shows up in a log is worth more than a
-    /// corpse. Nothing on the list has a legitimate caller in this process, so
-    /// none of it is a call that "might" happen and must be tolerated.
-    pub(super) fn restrict() -> String {
+    /// An errno rather than `SIGSYS`, and `ENOSYS` rather than `EPERM`: it is
+    /// what a libc's fallback paths are written for — glibc falls back from
+    /// `clone3` to `clone` on `ENOSYS` alone. Neither is logged anywhere;
+    /// `ci/router.sh --trace` is what turns a refusal into an answer.
+    pub(super) fn restrict() -> (bool, String) {
         match build() {
             Ok(program) => match seccompiler::apply_filter_all_threads(&program) {
-                Ok(()) => "seccomp filter installed".to_owned(),
-                Err(e) => format!("seccomp filter not installed ({e})"),
+                Ok(()) => (true, "seccomp filter installed".to_owned()),
+                Err(e) => (false, format!("seccomp filter not installed ({e})")),
             },
-            Err(e) => format!("seccomp filter not built ({e})"),
+            Err(e) => (false, format!("seccomp filter not built ({e})")),
         }
     }
 }
@@ -488,22 +615,11 @@ mod seccomp {
 mod tests {
     use super::*;
 
-    /// The point of the exercise: after `enter_post_init`, the daemon cannot
-    /// exec and cannot write outside the directories it was given, while a
-    /// write inside them still works.
+    /// The rights each role withholds, asserted as the property rather than as
+    /// a list compared against itself.
     ///
-    /// Restriction is irreversible and process-wide, so this runs in a child
-    /// process — `cargo test` would otherwise confine the whole test binary
-    /// and every later test with it. Each mechanism is asserted only when the
-    /// running kernel actually applied it, so the test proves confinement
-    /// where it exists instead of failing on a kernel that has neither.
-    /// The rights each role withholds, asserted as the property rather than as a
-    /// list compared against itself.
-    ///
-    /// Landlock behaviour cannot be exercised everywhere — a kernel with it
-    /// disabled runs these paths unrestricted — so this is the part of the policy
-    /// that can be checked without one. Every absence below is load-bearing, and
-    /// each would be easy to undo by reaching for a convenient `from_all()`.
+    /// The part of the policy checkable without a kernel that has Landlock.
+    /// Every absence below is load-bearing and easy to undo with `from_all()`.
     #[test]
     fn the_narrowed_roles_withhold_what_they_should() {
         use landlock::AccessFs;
@@ -630,7 +746,7 @@ mod tests {
             .expect("a listener that can be polled without a client");
 
         let paths: &[(&Path, Role)] = &[(dir.as_path(), Role::State)];
-        let line = enter_post_init(&Limits {
+        let verdict = enter_post_init(&Limits {
             paths,
             connect_tcp: None,
         });
@@ -638,10 +754,10 @@ mod tests {
         // "landlock enforced" prefixes both the fully- and partially-enforced
         // messages, the difference between them being only whether the kernel
         // took the ABI 9 addition — so one substring covers both.
-        let landlocked = line.contains("landlock enforced");
-        let seccomped = line.contains("seccomp filter installed");
+        // The booleans, not the prose meant for operators.
+        let (landlocked, seccomped) = (verdict.landlock, verdict.seccomp);
         if !landlocked && !seccomped {
-            println!("SKIP {line}");
+            println!("SKIP {}", verdict.line);
             return;
         }
         if landlocked {
@@ -679,11 +795,18 @@ mod tests {
                 std::os::unix::fs::symlink(&target, dir.join("soft")).is_err(),
                 "symlinkat succeeded under the filter"
             );
+            // `AF_UNIX` and `SOCK_DGRAM` at once, either enough to refuse it.
+            // Isolating the type half wants `std::net::UdpSocket`, which the
+            // Layer 1 lint bans workspace-wide.
+            assert!(
+                std::os::unix::net::UnixDatagram::unbound().is_err(),
+                "socket(AF_UNIX, SOCK_DGRAM) succeeded under the filter"
+            );
             // And the daemon's own work still runs. This is the half an
             // allowlist can get wrong, and the half a deny list never could.
             exercise_the_daemons_syscalls(&dir, &control);
         }
-        println!("CONFINED {line}");
+        println!("CONFINED {}", verdict.line);
     }
 
     /// A representative slice of what `cloved` does after initialisation, so a
@@ -761,6 +884,12 @@ mod tests {
             Err(e) => panic!("accept4 on the control socket was refused: {e}"),
             Ok(_) => panic!("a connection arrived on a socket nothing dialled"),
         }
+        // The daemon's only `ioctl`, and the only one the filter permits. The
+        // request number is compared exactly, so a wrong constant would look
+        // like a missing entry: a refusal on a rare path.
+        control
+            .set_nonblocking(true)
+            .expect("ioctl(FIONBIO) on the control socket");
 
         // The SAM bridge's transport: a loopback TCP socket, bound, listened,
         // connected and accepted. Through `i2pnet`'s own API rather than

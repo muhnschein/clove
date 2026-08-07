@@ -1,15 +1,23 @@
 # System-wide clove service (Layer 3 of the no-clearnet defence, SCOPE §5).
 #
-# Install:
-#   install -m 0644 contrib/systemd/clove.service /etc/systemd/system/
-#   systemctl daemon-reload
-#   systemctl enable --now clove
+# `make install` puts this in place with @BINDIR@ and @SYSCONFDIR@ filled in,
+# for a system prefix; a prefix under $HOME gets contrib/systemd/user instead.
+#
+#   sudo make install PREFIX=/usr/local
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now clove
+#
+# By hand, without make:
+#
+#   sed -e 's|@BINDIR@|/usr/local/bin|' -e 's|@SYSCONFDIR@|/etc|' \
+#       contrib/systemd/system/clove.service \
+#       | sudo tee /etc/systemd/system/clove.service
 #
 # The daemon needs no privilege beyond its own state directory and the router's
 # SAM port, so it runs as a dedicated system user created by DynamicUser= with
 # a persistent StateDirectory. Point clove.conf's data_dir at that directory:
 #
-#   # /etc/clove/clove.conf
+#   # @SYSCONFDIR@/clove/clove.conf
 #   data_dir /var/lib/clove
 #   api_socket /run/clove/clove.sock
 #
@@ -25,7 +33,7 @@ Wants=i2pd.service
 
 [Service]
 Type=exec
-ExecStart=/usr/local/bin/cloved -c /etc/clove/clove.conf
+ExecStart=@BINDIR@/cloved -c @SYSCONFDIR@/clove/clove.conf
 Restart=on-failure
 RestartSec=5s
 
@@ -36,15 +44,17 @@ StateDirectory=clove
 StateDirectoryMode=0700
 RuntimeDirectory=clove
 RuntimeDirectoryMode=0755
+# The daemon chmods the files that matter; this covers the rest.
+UMask=0077
 
 # --- The clearnet lock ---
-# clove may speak to loopback (the SAM bridge) and nothing else. If a leak-class
-# bug ever existed, this is where the kernel stops it.
+# clove may speak to loopback (the SAM bridge) and nothing else. Unavailable to
+# the user unit — systemd offers it to system services only — which is the main
+# reason to prefer this one.
 IPAddressDeny=any
 IPAddressAllow=localhost
-# AF_UNIX for the control socket, AF_INET/AF_INET6 for the loopback SAM
-# connection. Nothing else — no packet sockets, no netlink.
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_UNIX for the control socket, AF_INET for the loopback SAM connection.
+RestrictAddressFamilies=AF_UNIX AF_INET
 
 # --- Filesystem ---
 ProtectSystem=strict
@@ -55,7 +65,10 @@ ProtectProc=invisible
 ProcSubset=pid
 ReadWritePaths=/var/lib/clove
 # Config is read once at start and never written.
-ReadOnlyPaths=/etc/clove
+ReadOnlyPaths=@SYSCONFDIR@/clove
+# NoExecPaths= on the download tree is deliberately absent: DynamicUser= makes
+# the state directory a symlink into /var/lib/private, and a namespace that
+# fails to set up is a service that does not start.
 
 # --- Privilege ---
 NoNewPrivileges=yes
@@ -71,13 +84,16 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
+PrivateIPC=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources @obsolete @mount @debug @swap
+SystemCallFilter=~@privileged @resources @obsolete @mount @debug @swap @cpu-emulation @raw-io
+# EPERM here, ENOSYS in the daemon's own filter: @system-service is broad and
+# long-tested, cloved's list is short and hand-maintained. See sandbox.rs.
 SystemCallErrorNumber=EPERM
 # cloved also restricts itself after start-up (Layer 2, cloved(8) SECURITY).
 # That needs the seccomp and landlock_* syscalls, which live in systemd's
@@ -93,6 +109,8 @@ SystemCallErrorNumber=EPERM
 # sizes, but pin something explicit rather than inherit a surprise.
 LimitNOFILE=8192
 TasksMax=1024
+# No core dumps: the address space holds the destination key and the API token.
+LimitCORE=0
 
 [Install]
 WantedBy=multi-user.target

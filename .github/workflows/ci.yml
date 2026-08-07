@@ -1,12 +1,20 @@
 name: ci
 
 on:
+  # `main` only: a bare `push:` beside `pull_request:` runs everything twice.
   push:
+    branches: [main]
   pull_request:
   schedule:
-    # Nightly deep fuzzing; everything else runs on push.
+    # Nightly deep fuzzing; everything else runs per push and pull request.
     - cron: '17 3 * * *'
   workflow_dispatch:
+
+# A pull request groups by branch, so a new push supersedes the run in flight.
+# Everything else falls through to `run_id`: a group of one, never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

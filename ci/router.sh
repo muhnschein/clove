@@ -201,32 +201,37 @@ if cut is None:
     print("router: FAIL: the filter was never installed in this trace", file=sys.stderr)
     sys.exit(1)
 
-seen, eperm = Counter(), Counter()
+# ENOSYS is what the filter answers now; EPERM is what it used to, so a stale
+# binary does not read as a clean run.
+refused = re.compile(r"=\s*-1\s+(?:ENOSYS|EPERM)")
+
+seen, denied = Counter(), Counter()
 for line in lines[cut + 1:]:
     m = call.match(line)
     if not m:
         continue
     seen[m.group(1)] += 1
-    if re.search(r"=\s*-1\s+EPERM", line):
-        eperm[m.group(1)] += 1
+    if refused.search(line):
+        denied[m.group(1)] += 1
 
 for name, n in sorted(seen.items()):
     print(f"  {name:20} {n:7}")
 print(f"  ({len(seen)} distinct, filter installed at trace line {cut})")
 
-if eperm:
+if denied:
     print(
-        "router: FAIL: the allowlist refused syscalls the daemon actually makes: "
-        + ", ".join(f"{n} x{c}" for n, c in sorted(eperm.items())),
+        "router: FAIL: the filter refused calls the daemon actually makes: "
+        + ", ".join(f"{n} x{c}" for n, c in sorted(denied.items())),
         file=sys.stderr,
     )
     print(
         "  Add them to ALLOWED in crates/cloved/src/sandbox.rs, with a reason, "
+        "or widen the rule in argument_restricted() that refused the arguments, "
         "or stop making them.",
         file=sys.stderr,
     )
     sys.exit(1)
-print("router: the allowlist covers every syscall the daemon made")
+print("router: the filter permits every call the daemon made")
 PY
 fi
 

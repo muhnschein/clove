@@ -66,9 +66,18 @@ These are enforced in the codebase and checked in CI, not merely intended:
   never contacted, never logged beyond a count.
 - State files are written temp-then-rename, so a crash cannot corrupt them.
 - After initialisation the daemon holds a `seccomp` **allowlist**: a syscall it
-  does not need returns `EPERM`, whether or not anyone thought to name it. The
+  does not need returns `ENOSYS`, whether or not anyone thought to name it. The
   permitted set is measured from a traced run rather than guessed, and the test
   suite performs that workload under the live filter.
+- **What the sandbox came to is observable and can be demanded.** Which of
+  Landlock and `seccomp` applied is reported at startup and, for the life of the
+  process, in `clove status` and `GET /v1/status`. `sandbox require` makes an
+  incomplete confinement a refusal to start; it is off by default.
+- **No post-initialisation UDP.** `socket(2)` is permitted only for
+  `AF_INET`/`SOCK_STREAM`, so the datagram path a Landlock TCP rule cannot
+  reach is closed by the syscall filter instead. `ioctl(2)` is likewise
+  permitted only for `FIONBIO`, which leaves no route to `SIOCGIFCONF` and the
+  local interface addresses.
 - **One peer destination cannot take over a torrent.** It may hold at most a
   couple of concurrent connections, so it can neither fill the peer table nor
   become the only availability the piece picker can see.

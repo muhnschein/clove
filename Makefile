@@ -12,7 +12,27 @@
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 MANDIR ?= $(PREFIX)/share/man
+SYSCONFDIR ?= /etc
 DESTDIR ?=
+
+# Which systemd unit to install (Layer 3, SCOPE §5). A user manager cannot
+# apply IPAddressDeny=, so the two are not interchangeable. Keyed on the prefix
+# rather than `id -u`: a packaging build runs unprivileged into a DESTDIR and
+# still wants the system unit, and an unset HOME reads as a system install.
+USER_PREFIX := $(if $(HOME),$(filter $(HOME) $(HOME)/%,$(PREFIX)))
+ifeq ($(USER_PREFIX),)
+UNIT_KIND := system
+UNIT_SRC := contrib/systemd/system/clove.service
+# Both this and /usr/lib/systemd/system are on systemd's search path.
+UNITDIR ?= $(PREFIX)/lib/systemd/system
+UNIT_ENABLE := systemctl daemon-reload && systemctl enable --now clove
+else
+UNIT_KIND := user
+UNIT_SRC := contrib/systemd/user/clove.service
+# share/, not lib/: $XDG_DATA_HOME/systemd/user is searched, ~/.local/lib is not.
+UNITDIR ?= $(PREFIX)/share/systemd/user
+UNIT_ENABLE := systemctl --user daemon-reload && systemctl --user enable --now clove
+endif
 
 ## Unit + engine tests over the mock network.
 test:
@@ -110,6 +130,15 @@ install:
 	install -m 0644 man/clove.conf.5 $(DESTDIR)$(MANDIR)/man5/clove.conf.5
 	install -m 0644 man/clove-api.7 $(DESTDIR)$(MANDIR)/man7/clove-api.7
 	install -m 0644 man/cloved.8 $(DESTDIR)$(MANDIR)/man8/cloved.8
+	install -d $(DESTDIR)$(UNITDIR)
+	sed -e 's|@BINDIR@|$(BINDIR)|g' -e 's|@SYSCONFDIR@|$(SYSCONFDIR)|g' \
+		$(UNIT_SRC) > $(DESTDIR)$(UNITDIR)/clove.service
+	chmod 0644 $(DESTDIR)$(UNITDIR)/clove.service
+	@echo
+	@echo "installed the $(UNIT_KIND) unit at $(DESTDIR)$(UNITDIR)/clove.service"
+	@echo "to run clove under it:  $(UNIT_ENABLE)"
+	@[ "$(UNIT_KIND)" = system ] || echo "note: a user unit cannot apply the \
+IPAddressDeny= clearnet lock (Layer 3); see the comments at the top of it"
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/cloved $(DESTDIR)$(BINDIR)/clove
@@ -117,6 +146,7 @@ uninstall:
 		$(DESTDIR)$(MANDIR)/man5/clove.conf.5 \
 		$(DESTDIR)$(MANDIR)/man7/clove-api.7 \
 		$(DESTDIR)$(MANDIR)/man8/cloved.8
+	rm -f $(DESTDIR)$(UNITDIR)/clove.service
 
 ## CI-parity convenience.
 fmt:

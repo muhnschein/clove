@@ -804,9 +804,17 @@ fn render_status(status: &Value, torrents: &Value) -> String {
         ("router".to_owned(), field_str(status, "router")),
         ("sam".to_owned(), field_str(status, "sam_address")),
         ("uptime".to_owned(), human_duration(num("uptime_secs"))),
+    ];
+    // Omitted when the daemon does not report it, rather than rendered as the
+    // "-" a missing field gives: a dash here reads as "nothing applied", and an
+    // old daemon should not be able to say that.
+    if status.get("sandbox").is_some() {
+        rows.push(("sandbox".to_owned(), field_str(status, "sandbox")));
+    }
+    rows.extend([
         (String::new(), String::new()),
         ("torrents".to_owned(), items.len().to_string()),
-    ];
+    ]);
     rows.extend(
         by_state
             .iter()

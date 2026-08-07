@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use clove_core::config::{Config, Defaults};
+use clove_core::config::{Config, Defaults, SandboxPolicy};
 use clove_core::http::{self, Response};
 use clove_core::json::Value;
 use clove_core::swarm::{InboundDemux, SwarmConfig};
@@ -85,6 +85,75 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Args, String> 
     Ok(Args { check, config_path })
 }
 
+/// Enter the post-initialisation confinement, and hold the daemon to whatever
+/// `sandbox` in `clove.conf` says about the result.
+fn confine(config: &Config) -> Result<sandbox::Verdict, String> {
+    // Initialisation is over: everything that needs a path outside the data
+    // directory, or a capability beyond talking to the router and its own
+    // files, has already happened. Drop the rest (SCOPE §5 Layer 2). This runs
+    // before any thread is spawned — a Landlock domain covers the calling
+    // thread and its descendants, not siblings that already exist.
+    let mut paths: Vec<(&Path, sandbox::Role)> =
+        vec![(config.data_dir.as_path(), sandbox::Role::State)];
+    // The watch directory, if there is one, is the one path an operator names
+    // that is deliberately *outside* the data directory — and the daemon both
+    // reads it and renames within it. Granted here, before the domain closes,
+    // which is the whole discipline this layer runs on: what is not unveiled
+    // before the restriction cannot be reached after it.
+    //
+    // Getting this wrong is silent in the worst way. Landlock is best-effort,
+    // so on a kernel without it the watcher works and on a kernel with it the
+    // directory simply reads as empty — nothing added, nothing logged, no
+    // error anywhere. CI found it; a local run had not.
+    if let Some(dir) = &config.watch_dir {
+        paths.push((dir.as_path(), sandbox::Role::Watch));
+    }
+    // The control socket's directory is deliberately *not* here, and used to be.
+    //
+    // It was granted so the socket "could be unlinked at exit" — but nothing
+    // unlinks it: `ApiListener` has no `Drop`, and the stale socket is cleared by
+    // the *next* start's `bind_unix`, which runs long before this line. So the
+    // grant bought nothing, and it was not cheap: with `XDG_RUNTIME_DIR` set the
+    // directory is `/run/user/<uid>`, shared with every other application's
+    // runtime state, and the daemon held read, write, create and delete over all
+    // of it.
+    //
+    // If unlink-at-exit is ever added, this is what has to come back — as
+    // `Role::Watch`-like rights on that one directory, not as everything.
+    //
+    // Nothing read-only either. `/dev/urandom` used to be listed, and it was pure
+    // self-reference: randomness comes from `getrandom(2)`, which needs no file,
+    // and the device is only a fallback for kernels before 3.17 — far below the
+    // 6.12 floor (SCOPE §0). A traced run puts it bluntly: the one and only
+    // `/dev/urandom` open in it is Landlock's own `O_PATH` open, made while adding
+    // the rule granting access to `/dev/urandom`.
+    let verdict = sandbox::enter_post_init(&sandbox::Limits {
+        paths: &paths,
+        connect_tcp: sam_tcp_port(&config.sam_address),
+    });
+    eprintln!("cloved: sandbox: {}", verdict.line);
+    honour_sandbox_policy(config.sandbox, &verdict)?;
+
+    Ok(verdict)
+}
+
+/// Decide whether the confinement achieved is good enough to run with.
+///
+/// Split from [`confine`] so it can be tested: applying the sandbox is
+/// irreversible and process-wide. Off by default — Landlock is absent under
+/// plenty of container runtimes, and a client that will not start there is one
+/// nobody runs.
+fn honour_sandbox_policy(policy: SandboxPolicy, verdict: &sandbox::Verdict) -> Result<(), String> {
+    if policy == SandboxPolicy::Require && !verdict.is_complete() {
+        return Err(format!(
+            "sandbox require is set and the confinement is incomplete — {}. Fix the kernel or \
+             the container runtime, or set `sandbox best-effort` in clove.conf to run anyway",
+            verdict.line
+        ));
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     let defaults = Defaults::from_env().map_err(|e| e.to_string())?;
@@ -126,15 +195,20 @@ fn run() -> Result<(), String> {
     // created before this, or by a permissive umask, is the case worth fixing.
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|e| format!("creating data dir {}: {e}", config.data_dir.display()))?;
-    if let Err(e) = std::fs::set_permissions(
+    // Fatal, unlike the rest of this layer: the local filesystem refusing the
+    // owner permission to make this directory private is a broken install, and
+    // it is about to hold the destination key and the API token.
+    std::fs::set_permissions(
         &config.data_dir,
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    ) {
-        eprintln!(
-            "cloved: could not restrict {} to 0700: {e}",
+    )
+    .map_err(|e| {
+        format!(
+            "could not restrict {} to 0700: {e}; refusing to keep the destination key and API \
+             token in a directory this daemon cannot make private",
             config.data_dir.display()
-        );
-    }
+        )
+    })?;
     if let Some(parent) = config.api_socket.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating socket dir {}: {e}", parent.display()))?;
@@ -149,56 +223,12 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("binding {}: {e}", config.api_socket.display()))?;
     eprintln!("cloved: listening on {}", config.api_socket.display());
 
-    // Initialisation is over: everything that needs a path outside the data
-    // directory, or a capability beyond talking to the router and its own
-    // files, has already happened. Drop the rest (SCOPE §5 Layer 2). This runs
-    // before any thread is spawned — a Landlock domain covers the calling
-    // thread and its descendants, not siblings that already exist.
-    let mut paths: Vec<(&Path, sandbox::Role)> =
-        vec![(config.data_dir.as_path(), sandbox::Role::State)];
-    // The watch directory, if there is one, is the one path an operator names
-    // that is deliberately *outside* the data directory — and the daemon both
-    // reads it and renames within it. Granted here, before the domain closes,
-    // which is the whole discipline this layer runs on: what is not unveiled
-    // before the restriction cannot be reached after it.
-    //
-    // Getting this wrong is silent in the worst way. Landlock is best-effort,
-    // so on a kernel without it the watcher works and on a kernel with it the
-    // directory simply reads as empty — nothing added, nothing logged, no
-    // error anywhere. CI found it; a local run had not.
-    if let Some(dir) = &config.watch_dir {
-        paths.push((dir.as_path(), sandbox::Role::Watch));
-    }
-    // The control socket's directory is deliberately *not* here, and used to be.
-    //
-    // It was granted so the socket "could be unlinked at exit" — but nothing
-    // unlinks it: `ApiListener` has no `Drop`, and the stale socket is cleared by
-    // the *next* start's `bind_unix`, which runs long before this line. So the
-    // grant bought nothing, and it was not cheap: with `XDG_RUNTIME_DIR` set the
-    // directory is `/run/user/<uid>`, shared with every other application's
-    // runtime state, and the daemon held read, write, create and delete over all
-    // of it.
-    //
-    // If unlink-at-exit is ever added, this is what has to come back — as
-    // `Role::Watch`-like rights on that one directory, not as everything.
-    //
-    // Nothing read-only either. `/dev/urandom` used to be listed, and it was pure
-    // self-reference: randomness comes from `getrandom(2)`, which needs no file,
-    // and the device is only a fallback for kernels before 3.17 — far below the
-    // 6.12 floor (SCOPE §0). A traced run puts it bluntly: the one and only
-    // `/dev/urandom` open in it is Landlock's own `O_PATH` open, made while adding
-    // the rule granting access to `/dev/urandom`.
-    eprintln!(
-        "cloved: {}",
-        sandbox::enter_post_init(&sandbox::Limits {
-            paths: &paths,
-            connect_tcp: sam_tcp_port(&config.sam_address),
-        })
-    );
+    let verdict = confine(&config)?;
 
     let daemon = Arc::new(Daemon {
         start: Instant::now(),
         sam_address: config.sam_address.clone(),
+        sandbox: verdict.line.clone(),
         token,
         peer_id: build_peer_id().map_err(|e| e.to_string())?,
         registry: Mutex::new(registry),
@@ -317,6 +347,9 @@ fn scan_watch_dir(daemon: &Arc<Daemon>, dir: &Path) {
 struct Daemon {
     start: Instant,
     sam_address: String,
+    /// What the Layer-2 self-restriction came to, kept so `GET /v1/status` can
+    /// answer it rather than it being printed once and discarded.
+    sandbox: String,
     token: String,
     /// Our wire identity for this run, decided before anything can need it.
     peer_id: [u8; 20],
@@ -1207,6 +1240,9 @@ fn status_json(daemon: &Daemon) -> Vec<u8> {
             "router".to_owned(),
             Value::from(lock(&daemon.router).clone()),
         ),
+        // Fixed at startup, served here because a log line is not something
+        // an operator can go and ask for later.
+        ("sandbox".to_owned(), Value::from(daemon.sandbox.clone())),
     ])
     .encode()
     .into_bytes()
@@ -1453,6 +1489,7 @@ mod tests {
         Arc::new(Daemon {
             start: Instant::now(),
             sam_address: "127.0.0.1:7656".to_owned(),
+            sandbox: "not applied (test daemon)".to_owned(),
             token: TOKEN.to_owned(),
             peer_id: *b"-CV0001-testtesttes\0",
             registry: Mutex::new(
@@ -1964,6 +2001,7 @@ mod tests {
         let d = Arc::new(Daemon {
             start: Instant::now(),
             sam_address: "127.0.0.1:7656".to_owned(),
+            sandbox: "not applied (test daemon)".to_owned(),
             token: String::new(),
             peer_id: *b"-CV0001-testtesttes\0",
             registry: Mutex::new(
@@ -2056,6 +2094,62 @@ mod tests {
         let mut nearly = "a".repeat(TOKEN_HEX_LEN - 1);
         nearly.push('-');
         assert!(!is_well_formed_token(&nearly));
+    }
+
+    // ------------------------------------------------- sandbox policy
+
+    /// An incomplete confinement must stop the daemon under `require`, and
+    /// either mechanism missing counts.
+    #[test]
+    fn sandbox_require_refuses_an_incomplete_confinement() {
+        let verdict = |landlock, seccomp| sandbox::Verdict {
+            line: "sandbox: whatever happened".to_owned(),
+            landlock,
+            seccomp,
+        };
+
+        // Both applied: the only combination `require` accepts.
+        assert!(honour_sandbox_policy(SandboxPolicy::Require, &verdict(true, true)).is_ok());
+
+        // The three ways to be short of it.
+        for (landlock, seccomp) in [(false, true), (true, false), (false, false)] {
+            let e = honour_sandbox_policy(SandboxPolicy::Require, &verdict(landlock, seccomp))
+                .expect_err("require accepted an incomplete sandbox");
+            assert!(
+                e.contains("sandbox require"),
+                "the error does not name the setting that caused it: {e}"
+            );
+            assert!(
+                e.contains("best-effort"),
+                "the error does not say how to run anyway: {e}"
+            );
+        }
+
+        // best-effort accepts all four; that is what makes it the default.
+        for (landlock, seccomp) in [(true, true), (false, true), (true, false), (false, false)] {
+            assert!(
+                honour_sandbox_policy(SandboxPolicy::BestEffort, &verdict(landlock, seccomp))
+                    .is_ok(),
+                "best-effort refused to start"
+            );
+        }
+    }
+
+    /// The verdict reaches `GET /v1/status`, the only way to ask a running
+    /// daemon whether anything is confining it.
+    #[test]
+    fn the_status_reports_the_sandbox_verdict() {
+        let dir = TempDir::new("sandbox-status");
+        let d = daemon(&dir);
+        let body = String::from_utf8(status_json(&d)).expect("utf-8");
+        assert!(
+            body.contains("\"sandbox\""),
+            "status does not carry the sandbox verdict: {body}"
+        );
+        assert!(
+            body.contains("test daemon"),
+            "status does not carry this daemon's own verdict: {body}"
+        );
     }
 
     // ------------------------------------------------- identity (Q4)

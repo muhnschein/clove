@@ -8,9 +8,11 @@ A modern I2P-only BitTorrent client.
 > 🤖 **Vibe-coded:** Much of this project was developed using AI.
 > If that provenance troubles you, use something else.
 
-> 🐧 **Linux-only:** clove requires a modern Linux kernel (6.12),
-> seccomp, Landlock, and systemd, and relies on them for two of its three
-> security layers. No effort is made to accommodate other platforms.
+> 🐧 **Linux-only:** clove targets a modern Linux kernel (6.12), seccomp,
+> Landlock, and systemd, and two of its three security layers are built on
+> them. Layer 2 applies what the running kernel offers and reports the rest —
+> `sandbox require` in `clove.conf` turns anything less into a refusal to
+> start. No effort is made to accommodate other platforms.
 
 ## Overview
 
@@ -111,14 +113,22 @@ No layer assumes another is present.
    Landlock — each directory to the rights that kind of directory actually needs,
    outbound TCP to the SAM port, and, on a new enough kernel, no connecting to
    any unix socket — and drops every syscall it no longer needs with a `seccomp`
-   **allowlist**: anything not on the list returns `EPERM`, and `socket(2)` is
-   limited to `AF_INET`. The syscall list is measured from a traced run rather
-   than guessed, and the daemon's own tests perform that workload under the live
-   filter. The daemon reports in one line what was actually applied, and
-   continues either way — no layer assumes another is present.
-3. **OS sandbox.** The [systemd unit](contrib/systemd/clove.service) provides a
-   separate deployment-level clearnet lock (`IPAddressDeny=any`) and further
-   process hardening.
+   **allowlist**: anything not on the list returns `ENOSYS`. A few calls that
+   are on it are restricted by argument as well, where the syscall number alone
+   says too little: `socket(2)` to `AF_INET`/`SOCK_STREAM` (so no UDP, which
+   Landlock's TCP rule does not reach), `ioctl(2)` to `FIONBIO`, and
+   `mmap(2)`/`mprotect(2)` to mappings never writable and executable at once.
+   The syscall list is measured from a traced run rather than guessed, and the
+   daemon's own tests perform that workload under the live filter. What was
+   actually applied stays available from `clove status` and `/v1/status`, since
+   an unconfined daemon otherwise looks exactly like a confined one; `sandbox
+   require` refuses to start instead.
+3. **OS sandbox.** Two systemd units, and `make install` picks by prefix:
+   [system](contrib/systemd/system/clove.service) provides a separate
+   deployment-level clearnet lock (`IPAddressDeny=any`) and further process
+   hardening; [user](contrib/systemd/user/clove.service) provides the part a
+   user manager can enforce, which does *not* include that lock — systemd
+   offers it to system services only.
 
 This model does not protect against a compromised kernel or I2P router,
 resource exhaustion in general, an attacker who already controls the daemon's
