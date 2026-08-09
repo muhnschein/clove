@@ -1,0 +1,37 @@
+# Tokens the SAM address codecs actually look for.
+#
+# The base64 and base32 alphabets are recovered by the mutator on its own —
+# they are byte-by-byte table lookups over a dense range, which is the one
+# thing random mutation is good at. What it will not stumble on is *structure*:
+# the certificate header 384 bytes into a destination, the suffixes SAM
+# appends, and the padding that ends a base64 run.
+
+# The certificate header: type byte, then a two-byte big-endian payload
+# length. Type 0 (NULL) with a zero-length payload is what almost every
+# destination on the network carries, and it is the boundary between the
+# public destination and the private key blob behind it.
+"\x00\x00\x00"
+# Type 5 (KEY certificate), the other one in live use, with the payload
+# lengths its variants declare.
+"\x05\x00\x04"
+"\x05\x00\x08"
+# A payload length that runs past any plausible blob, which is the arithmetic
+# the target is really about.
+"\xff\xff"
+
+# Suffixes SAM appends, and the ones we strip.
+".b32.i2p"
+".i2p"
+"b32.i2p"
+
+# Base64 padding, and the two characters that make I2P's alphabet its own.
+"="
+"=="
+"-"
+"~"
+
+# A `SILENT=false` destination line is the blob followed by space-separated
+# parameters; the cut happens at the first character outside the alphabet.
+" FROM_PORT="
+" TO_PORT="
+"\x0a"

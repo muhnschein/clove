@@ -19,7 +19,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-TARGETS_ALL='bencode metainfo resume json http wire tracker extensions magnet'
+TARGETS_ALL='bencode metainfo resume json http wire tracker extensions magnet dest'
 SCALE=1
 QUICK=no
 SEED=no
@@ -61,22 +61,29 @@ done
 # Per-target budget in seconds. Deliberately not flat, and set from what the
 # reports measured rather than from taste.
 #
-# The 2026-07-30T11:37Z scale-8 sweep is where these come from, and it asked a
-# different question from the pair before it. Those two started from the same
-# corpus and differed only in time. This one started from the corpus the
-# scale-8 sweep *produced* — its INITED coverage was that sweep's final figure
-# in all nine targets, so the seed round-tripped exactly — which asks what
-# eight times the budget is still worth once the corpus is as good as we have
-# managed to make it. The answer was almost nothing, in eight targets:
+# The 2026-07-31T08:38Z sweep is where these come from, and it ran at
+# `--scale 80` — a budget nobody would schedule, which is the point. It is the
+# far end of the curve, and what a target does with eighty times its budget
+# settles whether the budget is short. Against the corpus the previous sweep
+# left, at plateaus this report measures in seconds:
 #
-#   tracker  +193 edges, still gaining at ~5470s      resume  +5, at ~4180s
-#   http     +2, all by ~300s                         everything else  0
+#   resume  +11 edges, still gaining at ~42717s    extensions  +8, all by ~4214s
+#   tracker  +1, all by ~14242s                    everything else  0
 #
-# So six targets returned zero edges for 8x their budget, from the best corpus
-# the project has, and `extensions` — which was still worth +9 last time — has
-# joined them. They drop to a 120s floor and `tracker` takes what they give up.
+# Two of these overturn the previous table, and one of them was this file's
+# mistake. `extensions` had just been cut to 240s on the strength of a flat
+# scale-8 run; its gains here land at ~4214s, seventeen times that, so the cut
+# was made where the evidence ran out rather than where the target stopped.
+# It goes up. `tracker`, which took most of the last reallocation on +193
+# edges, returned exactly +1 for 2.2 *billion* executions — the `magnet`
+# lesson again, one revision later and from the other direction.
 #
-# That floor is a choice, and worth being honest about: it is not a measured
+# So the three that still convert seconds into edges — `resume`, `extensions`,
+# `tracker` — take the budget, and everything flat at 8x *and* 80x sits at the
+# floor. `http` joins them: flat at both scales now, from a corpus that starts
+# it at its ceiling.
+#
+# The floor is a choice, and worth being honest about: it is not a measured
 # plateau. With the seed already at a target's ceiling, no budget buys another
 # edge, so no report can say how few seconds are enough — what the seconds
 # still buy there is crash search, which the coverage figures cannot price.
@@ -85,33 +92,59 @@ done
 # question. `wire` is the standing warning: it sat at a plateau for three
 # sweeps because the target was too narrow, not because the codec was clean.
 #
-# `http` and `resume` keep theirs: both gains landed inside the budget they
-# already have (`http` at ~300s of 420s) or trail off so late that no plausible
-# budget catches them (`resume`, +5 edges with the last at ~4180s). Total is
-# unchanged at 3360s: a reallocation, not a bigger bill.
+# None of the three raised budgets reaches its plateau, and they are not meant
+# to. What carries a gain forward between runs is the seed corpus, which the
+# 11:37Z sweep proved round-trips exactly; a budget only has to keep finding
+# *some* of the ground each run for the corpus to accumulate it. Total is
+# unchanged at 3360s, now across ten targets: a reallocation, not a bigger bill.
 budget_for() {
     case "$1" in
-        # +0 at 8x, from a corpus that starts them at their ceiling. Floor.
-        wire|magnet|bencode|json|metainfo) echo 120 ;;
-        # +0 at 8x too, but at 1914 execs/s it buys a fortieth of the
-        # executions `json` gets per second — cut, not floored, until the
-        # throughput question in fuzz/README.md is answered.
-        extensions) echo 240 ;;
-        http) echo 420 ;;                       # +2, all of them by ~300s
-        resume) echo 600 ;;                     # +5, trailing off at ~4180s
-        tracker) echo 1500 ;;                   # +193 and still gaining at ~5470s
+        # +0 at 8x and again at 80x, from a corpus that starts them at their
+        # ceiling. Floor.
+        wire|magnet|bencode|json|metainfo|http) echo 120 ;;
+        # New surface, provisional until a report speaks for it — the same
+        # footing `wire` was on when it was rewritten.
+        dest) echo 120 ;;
+        resume) echo 720 ;;                     # +11, still gaining at ~42717s
+        tracker) echo 900 ;;                    # +1 for 80x; was +193 for 8x
+        extensions) echo 900 ;;                 # +8, all by ~4214s — the 240s
+                                                # cut was below the evidence
         *) echo 300 ;;
     esac
 }
 
-# libFuzzer's own default, passed explicitly. The value is not the point — the
-# visibility is. A target that crosses this is killed and its input written to
-# `fuzz/artifacts`, so it arrives in the report as a *crash*, which is a
-# confusing way to be told a fuzzer grew a large corpus in memory. `resume`
-# peaked at 1371 MiB in the 2026-07-30T11:37Z sweep, two thirds of the way
-# here, and nothing in the report said what the ceiling was. Now the header
-# carries it and every target reports its peak against it.
-RSS_LIMIT=2048
+# libFuzzer's own default, scaled with the run. The visibility was the point
+# when this was pinned; the scaling is what the 2026-07-31T08:38Z sweep bought.
+#
+# `resume` tripped the limit there and the run was reported as a crash. It was
+# not one. The named input replays in 1 ms on a fresh process, no allocation in
+# the target exceeds 64 MiB under `-malloc_limit_mb`, and the same target
+# without a sanitizer does 12M executions flat at 31 MiB. Under ASan the
+# process grows monotonically with executions — 53 MiB at INITED, 553 at 2M,
+# 702 at 5.4M — and crosses 2048 MiB somewhere around 90M. That is the
+# sanitizer's allocator, which does not return freed pages, and it will cross
+# *any* fixed ceiling given a long enough run.
+#
+# So a fixed limit turns a long campaign into a guaranteed false crash, while
+# still being the thing that catches a genuine runaway allocation. Scaling it
+# with the budget keeps both: at `--scale 1` this is libFuzzer's own default,
+# and a `--scale 80` run gets the headroom its execution count implies. It is a
+# ceiling on the harness, not on clove — an input that allocates unboundedly
+# blows any of these limits in one execution.
+#
+# libFuzzer's proper answer is `-fork=1`, which runs batches in child
+# processes so RSS resets; it was measured here and works. It also replaces
+# every progress line with a different format that carries no `INITED` and no
+# `stat::` block, which is the whole input to the results section below. Worth
+# doing, not worth doing silently — see fuzz/README.md.
+#
+# Capped, because a limit above what the machine has is not a limit: past the
+# point where the kernel's OOM killer gets there first, raising this only
+# changes which process reports the death, and libFuzzer's report is the one
+# that names an input. 16 GiB is chosen to sit under the RAM of a machine
+# anybody would run a scale-80 campaign on.
+RSS_LIMIT=$((2048 * SCALE))
+[ "$RSS_LIMIT" -le 16384 ] || RSS_LIMIT=16384
 
 # CI asks for the budget rather than carrying its own copy of the table. The
 # two used to be duplicated, with a comment in each telling the reader they
@@ -245,11 +278,17 @@ for t in $sched; do
     corpus_count "$t" > "$logs/$t.before"
     say "fuzz: $t (${secs}s)"
     (
+        # `|| rc=$?` rather than `; echo "$?"`: under `set -e` a failing
+        # command aborts the subshell on the spot, so the status file was
+        # never written and the report said `FAIL resume (exit ?)` the first
+        # time a target actually failed. The one line that has to survive a
+        # failure was the one the failure skipped.
+        rc=0
         # shellcheck disable=SC2086  # $dict is one flag or nothing
         cargo +nightly fuzz run "$t" -- $dict \
             -max_total_time="$secs" -rss_limit_mb="$RSS_LIMIT" -print_final_stats=1 \
-            >"$logs/$t.log" 2>&1
-        echo "$?" > "$logs/$t.status"
+            >"$logs/$t.log" 2>&1 || rc=$?
+        echo "$rc" > "$logs/$t.status"
     ) &
     started="$started $t"
     while [ "$(unfinished "$started")" -ge "$jobs" ]; do sleep 1; done
@@ -376,16 +415,46 @@ if [ -z "$artifacts" ]; then
 else
     for a in $artifacts; do
         t=$(basename "$(dirname "$a")")
+        # libFuzzer names the artifact after what went wrong, and the four
+        # kinds do not call for the same thing. A `crash-` is a defect in the
+        # parser and the advice at the foot of this report is exactly right for
+        # it. An `oom-` may not be a defect at all: the RSS ceiling is checked
+        # by a watchdog thread against the *process*, so the input it names is
+        # whichever one happened to be executing, not necessarily the one that
+        # grew anything. The 2026-07-31T08:38Z sweep's only finding was one of
+        # these, and the named 264-byte input replays in a millisecond.
+        kind=$(basename "$a" | sed -n 's/^\([a-z]*\)-[0-9a-f]*$/\1/p')
         note "target    $t"
         note "artifact  $a"
+        note "kind      ${kind:-unknown}"
         note "size      $(wc -c < "$a" | tr -d ' ') bytes"
         note "reproduce cargo +nightly fuzz run $t $a"
         note "minimise  cargo +nightly fuzz tmin $t $a"
+        case "$kind" in
+            oom)
+                note ""
+                note "          An OOM names the unit that was running when the process"
+                note "          crossed the RSS ceiling, which need not be the unit that"
+                note "          grew it. Check that it reproduces on its own before"
+                note "          treating it as a parser bug: the command above on a fresh"
+                note "          process either blows up or it does not. If it does not,"
+                note "          the growth is the run's, not the input's — see the RSS"
+                note "          note in fuzz/README.md before writing a regression test."
+                ;;
+            timeout)
+                note ""
+                note "          A timeout is a slow unit, not necessarily a hang. Compare"
+                note "          it against the target's usual exec rate above before"
+                note "          calling it a loop."
+                ;;
+        esac
         note ""
         note "input (base64, so the report is enough to reconstruct it):"
         base64 < "$a" >> "$OUT"
         note ""
-        note "panic:"
+        # "panic:" over an out-of-memory summary is a small lie that costs a
+        # reader time, since the two call for different reading.
+        if [ "$kind" = crash ]; then note "panic:"; else note "output:"; fi
         # From the panic line onward, not a grep for it: the *message* — which
         # is the one line that says what invariant broke — is printed on the
         # line after "panicked at", and a pattern match on the panic line alone
@@ -435,9 +504,13 @@ note ""
 
 note "--- what to do with a crash ---"
 note ""
-note "Reproduce it, minimise it, then put the minimised input in the module's"
-note "own tests as a regression case. That is where it belongs permanently:"
-note "the fuzzer finds a bug once, a unit test keeps it dead."
+note "Reproduce it first, on a fresh process, from the command in the section"
+note "above. That step is not a formality: the first finding this fuzzer ever"
+note "produced was an out-of-memory naming an input that does not reproduce."
+note ""
+note "Once it reproduces, minimise it, then put the minimised input in the"
+note "module's own tests as a regression case. That is where it belongs"
+note "permanently: the fuzzer finds a bug once, a unit test keeps it dead."
 
 say ""
 if [ "$fail" -eq 0 ] && [ -z "$artifacts" ]; then

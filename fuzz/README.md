@@ -89,10 +89,68 @@ beyond "did not panic":
 | `tracker` | announce responses | a hostile `interval` cannot make us announce inside the local floor |
 | `extensions` | `i2p_pex`, `ut_metadata`, BEP 10 handshake | the PEX peer cap holds |
 | `magnet` | magnet URIs | non-I2P trackers are filtered out |
+| `dest` | SAM base64 destinations and b32 labels | both codecs round trip; a truncated destination is still a whole destination |
 
 The properties matter as much as the crashes: a parser that accepts a torrent
 whose paths escape the download directory has not crashed, and is still a
 serious bug.
+
+### Is this list still the whole surface?
+
+Worth re-asking whenever the code has moved, because a target set is only
+current until someone adds a parser. Checked against `main` on 2026-07-31, the
+public parse entry points across all four crates are:
+
+`bencode::{decode, decode_prefix}`, `config::{parse, parse_seed_ratio}`,
+`extension::Handshake::parse`, `http::{read_response, read_request}`,
+`json::parse`, `magnet::parse`, `metadata::MetadataMessage::parse`,
+`metainfo::MetaInfo::{parse, from_info_dict}`, `pex::PexMessage::parse`,
+`resume::Resume::decode`, `tracker::parse_response`,
+`wire::{Message::parse, Handshake::parse, read_frame}`, and in `i2pnet`,
+`addr::{destination_bytes, destination_len, base32_decode, base32_encode,
+i2p_base64_decode, i2p_base64_encode}` with `DestHash::{from_b32,
+from_b64_destination}`.
+
+The `clove-core` half has kept up on its own — `cargo check --manifest-path
+fuzz/Cargo.toml` runs on every push, so a changed signature breaks the build
+rather than rotting a target, and the `metainfo` target has grown alongside the
+code it covers. What had *not* kept up was the crate list: the fuzz crate
+depended on `clove-core` alone, so `i2pnet` had no coverage at all. That is
+what `dest` closes, and it is not a hypothetical surface — see below.
+
+Two gaps are known and left open:
+
+- **`config::parse`.** A parser, and uncovered. Its input is a file the
+  operator writes, which puts it below everything above on the list of things
+  an attacker reaches.
+- **The SAM line protocol** — `read_sam_line`, `parse_session_status`,
+  `read_dest_line` in `crates/i2pnet/src/sam.rs`. These read from the router's
+  socket and are genuinely untrusted, but they are private, so a target needs a
+  seam in production code. `dest` covers the parsing they delegate to; the
+  line framing around it is still uncovered.
+
+### `dest`
+
+The one parser here whose mis-reading has already cost something. A destination
+and a *private key blob* are both one long base64 run; what separates them is a
+length-prefixed certificate header 384 bytes in. Before `destination_len`
+existed nobody looked, and every announce carried our private keys in the `ip`
+parameter until postman's tracker refused them — `crates/i2pnet/src/addr.rs`
+carries the full account, dated 2026-07-27.
+
+The arithmetic that tells the two apart reads an attacker-supplied 16-bit
+length and slices with it, which is the shape a fuzzer exists for. The target
+asserts what that incident violated: a blob truncated to its destination is
+itself a whole destination, the length never runs past the input, and
+`destination_bytes` and `from_b64_destination` agree about whether the input
+was a destination at all. Around it sit the two codecs, asserted as round
+trips in the direction we control — whatever bytes we hold, the text we emit
+must decode back to exactly them, because a codec that loses a byte corrupts a
+peer identity rather than failing.
+
+It reaches 366 edges from a 494-file seed. The 120s budget is provisional, on
+the same footing `wire` was given when it was rewritten: a floor to re-derive
+from the first report that has something to say about it.
 
 There was one more, `keys`, over the terminal escape-sequence decoder behind
 `clove top` — the one target whose input was a keyboard rather than an
@@ -142,30 +200,38 @@ reader that did not exist yet. It does now; see Budgets.
 
 Not flat, and set from what the reports measured rather than from taste.
 
-The 2026-07-30T11:37Z scale-8 sweep is what the current table rests on, and it
-asked a different question from the pair before it. Those two started from the
-same corpus and differed only in time. This one started from the corpus the
-scale-8 sweep *produced*, which asks the question that actually matters once a
-seed corpus is being carried forward: what is eight times the budget still
-worth when the corpus is already as good as we have managed to make it?
+The 2026-07-31T08:38Z sweep is what the current table rests on, and it ran at
+`--scale 80` — a budget nobody would schedule, which is exactly the point. It
+is the far end of the curve, and what a target does with eighty times its
+budget settles whether that budget is short.
 
 | Target | Budget | Seed cov | Final cov | Gained | Last new edge |
 |---|---:|---:|---:|---:|---:|
-| `tracker` | 900s → **1500s** | 689 | 882 | +193 | ~5470s of 7200s |
-| `resume` | 600s | 353 | 358 | +5 | ~4180s of 4800s |
-| `http` | 420s | 560 | 562 | +2 | ~300s of 3360s |
-| `extensions` | 420s → **240s** | 425 | 425 | 0 | — |
-| `metainfo` | 240s → **120s** | 456 | 456 | 0 | — |
-| `magnet` | 240s → **120s** | 498 | 498 | 0 | — |
-| `json` | 240s → **120s** | 735 | 735 | 0 | — |
-| `bencode` | 180s → **120s** | 389 | 389 | 0 | — |
+| `resume` | 600s → **720s** | 357 | 368 | +11 | ~42717s of 48000s |
+| `extensions` | 240s → **900s** | 425 | 433 | +8 | ~4214s of 19200s |
+| `tracker` | 1500s → **900s** | 882 | 883 | +1 | ~14242s of 120000s |
+| `http` | 420s → **120s** | 562 | 562 | 0 | — |
+| `bencode` | 120s | 389 | 389 | 0 | — |
+| `metainfo` | 120s | 456 | 456 | 0 | — |
+| `magnet` | 120s | 498 | 498 | 0 | — |
+| `json` | 120s | 735 | 735 | 0 | — |
 | `wire` | 120s | 337 | 337 | 0 | — |
+| `dest` | **120s** | — | — | — | new target, see below |
 
-Six targets returned nothing for eight times their budget, from the best corpus
-the project has, and `extensions` — worth +9 in the sweep before — has joined
-them. They go to a 120s floor. `tracker` takes what they give up: it was the
-one target still clearly paying at the far end last time, and from a corpus 47
-edges better it returned four times as much again and had not stopped.
+Two rows overturn the previous table, and one of them was this file's mistake.
+`extensions` had just been cut to 240s on the strength of a flat scale-8 run,
+and its gains here land at ~4214s — seventeen times that. The cut was made
+where the evidence ran out rather than where the target stopped, which is the
+one thing the floor rule was written to avoid. It goes up.
+
+`tracker` is the other. It took most of the last reallocation on +193 edges and
+returned **+1 edge for 2.2 billion executions**. That is the `magnet` lesson
+again, one revision later and from the opposite direction: a target that was
+genuinely still climbing can be finished by the next sweep, and a budget set on
+a gain rather than on a margin will always be a sweep behind.
+
+So the three that still convert seconds into edges take the budget, and
+everything flat at 8x *and* 80x sits at the floor — `http` joins them.
 
 That floor is a choice, and worth being plain about: it is not a measured
 plateau. Once the seed reaches a target's ceiling no budget buys another edge,
@@ -175,12 +241,55 @@ cheap and long enough to be a real hunt. `wire` is the standing warning against
 reading a floor as a finished target: it sat flat for three sweeps because the
 target was too narrow, not because the codec was clean.
 
-`http` and `resume` keep what they have. `http`'s gain arrived at ~300s, inside
-the 420s it already gets. `resume`'s five edges trail off so late — the last at
-~4180s — that no budget anyone would write catches them, and the two below it
-in the table are worth less.
+None of the three raised budgets reaches its plateau, and none is meant to.
+What carries a gain between runs is the seed corpus, which round-trips exactly;
+a budget only has to keep finding *some* of the ground each run for the corpus
+to accumulate the rest.
 
-The total is unchanged at 3360s: a reallocation, not a bigger bill.
+The total is unchanged at 3360s, now across ten targets: a reallocation, not a
+bigger bill.
+
+### The first crash, and what it was not
+
+The 08:38Z sweep produced this fuzzer's first failure: `resume`, an
+`oom-` artifact, 264 bytes, with the run reported as `FAIL`. It was not a bug
+in `Resume::decode`, and the chain that establishes that is worth keeping
+because the next OOM will look identical:
+
+- The named input **replays in 1 ms** on a fresh process. Nothing grows.
+- No allocation anywhere in the target exceeds 64 MiB, under
+  `-malloc_limit_mb=64` across the whole corpus and a 300s run.
+- The same target built with `--sanitizer none` does **12M executions flat at
+  31 MiB**.
+- Under ASan the process grows monotonically with executions — 53 MiB at
+  `INITED`, 553 at 2M, 702 at 5.4M — and crosses 2048 MiB somewhere near 90M.
+
+So the growth is the sanitizer's allocator, which does not return freed pages,
+and it will cross *any* fixed ceiling given a long enough run. `resume` reached
+it first because it decodes, re-encodes and re-decodes on every execution,
+which is the most allocation per unit of any target here.
+
+Two things follow. The RSS limit now scales with `--scale`, so a long campaign
+is not a guaranteed false crash while a genuine runaway — which blows any of
+these limits in a single execution — is still caught. And the report now names
+the artifact's *kind*: an `oom-` carries a note saying to check that it
+reproduces standalone before treating it as a parser bug, because libFuzzer's
+RSS watchdog names whichever unit was executing when the ceiling was crossed,
+not the unit that grew anything.
+
+libFuzzer's own answer to this is `-fork=1`, which runs batches in child
+processes so RSS resets per job. It was measured here and it works. It also
+replaces every progress line with a format carrying no `INITED` line and no
+`stat::` block — which is the entire input to the report's results section — so
+adopting it means rewriting that parsing. Worth doing; not worth doing
+silently.
+
+The same run exposed a second thing, which is that the report had never
+actually been read on a failure. It printed `FAIL resume (exit ?)`: the target
+runs in a subshell that writes its exit status to a file afterwards, and under
+`set -e` a non-zero exit aborted that subshell before the write. The one line
+that had to survive a failure was the line the failure skipped, and it took the
+first real failure in the fuzzer's history to notice. It records the code now.
 
 ### The seed round-tripped exactly
 
@@ -198,6 +307,13 @@ previous seed's files per target and replaced them with new ones. So
 coverage each target starts from, and `ci/fuzz.sh` reports coverage as
 `cov 689 -> 882` so the same check on the next sweep is a glance rather than
 arithmetic across two reports.
+
+One caveat on reading those figures across time: an edge count is a property of
+the corpus **and** the code, so a target's seed coverage moves when either
+does. `resume` sat at 358 when the corpus was packed and reads 357 against
+today's `main`, having lost an edge to a change in `resume.rs` rather than to
+anything about the corpus. A figure that drops without the corpus changing is a
+question for `git log`, not a corpus regression.
 
 The table lives in exactly one place, `budget_for` in `ci/fuzz.sh`. CI asks for
 it — `./ci/fuzz.sh --budget magnet` — rather than keeping a second copy in the

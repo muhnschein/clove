@@ -69,12 +69,12 @@ jobs:
   fuzz:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    # Headroom over the largest budget, not a number to itself. `tracker` is
-    # 1500s = 25 minutes, and the job pays for a nightly install, a
-    # `cargo install cargo-fuzz` and a sanitizer build before any of it, then
-    # `cmin` over the largest corpus in the set afterwards. At 60 this was
-    # comfortable when the largest budget was 900s; it is the budget that grew,
-    # so this grows with it rather than finding out at 3am.
+    # Headroom over the largest budget, not a number to itself. The two
+    # largest are `tracker` and `extensions` at 900s, and the job pays for a
+    # nightly install, a `cargo install cargo-fuzz` and a sanitizer build
+    # before any of it, then `cmin` over the largest corpus in the set
+    # afterwards. Kept at 75 through a budget that went to 1500s and back:
+    # this is headroom, and trimming it buys nothing.
     timeout-minutes: 75
     strategy:
       fail-fast: false
@@ -95,6 +95,7 @@ jobs:
           - tracker
           - resume
           - magnet
+          - dest
     steps:
       - uses: actions/checkout@v4
       # The committed seed corpus starts each run warm; this carries what the
