@@ -7,7 +7,7 @@
 # smuggling socket capability into the tree.
 #
 # Maintained by hand, reviewed with DEPENDENCIES.md. When a legitimately
-# needed crate trips this (e.g. yosemite), add it to ALLOW with a matching
+# needed crate trips this, add it to ALLOW with a matching
 # DEPENDENCIES.md entry in the same commit.
 set -eu
 
@@ -15,7 +15,7 @@ lock="${1:-Cargo.lock}"
 [ -f "$lock" ] || { echo "check-net-deps: $lock not found (run cargo build first)" >&2; exit 1; }
 
 # Exact crate names permitted to have socket capability.
-ALLOW='yosemite rustix'
+ALLOW='rustix'
 
 # Known socket-capable / net-stack crates. Extend freely: a false positive
 # costs one allowlist review; a false negative costs the whole point.

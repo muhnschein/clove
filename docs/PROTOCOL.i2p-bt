@@ -466,7 +466,9 @@ describing anything clove does.
     that would have settled it was being read and discarded rather than not
     being available.
 
-    yosemite is left with `NAMING LOOKUP` alone.
+    `NAMING LOOKUP` was the last exchange left to the SAM library, and
+    `sam::naming_lookup` now speaks it too: one HELLO, one command, one reply,
+    on a socket of its own. There is no SAM library in the tree.
 
 
 2.13a [decided] **Reading the router's account of a dead session is not the

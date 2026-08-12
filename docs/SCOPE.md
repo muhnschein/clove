@@ -4,7 +4,7 @@
 
 **Language:** Rust (stable toolchain) 
 
-**SAM library:** yosemite (eepnet/yosemite)
+**SAM library:** none — `i2pnet` speaks `SAMv3` directly
 
 **Engineering ethos:** see §9 — OpenBSD/OpenSSH/doas/opentracker/SQLite as the quality reference class
 
@@ -102,17 +102,17 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 +-------------------------------------------------------+
 |                 i2pnet module (THE ONLY                 |
 |              NETWORK-TOUCHING CODE, wraps               |
-|                      yosemite)                          |
+|                   speaks SAMv3)                         |
 +-------------------------------------------------------+
                     | SAMv3 (localhost)
                     v
                 I2P router
 ```
 
-- **`i2pnet` module boundary.** All of yosemite is consumed behind our own trait (`I2pDialer`, `I2pListener`, `I2pNamingLookup`, later `I2pDatagram`). Rationale: yosemite is young and small; if it stalls or we outgrow it, we swap the impl without touching the engine. Also gives us a mock implementation for engine tests without a router.
+- **`i2pnet` module boundary.** All network access is behind our own traits (`I2pDialer`, `I2pListener`, `I2pNamingLookup`, later `I2pDatagram`). `i2pnet` speaks `SAMv3` to the bridge itself over sockets it owns, with no SAM library in the tree. The traits also give us a mock implementation for engine tests without a router.
 - **Session topology:** one SAM PRIMARY session per client identity, with stream subsession for peer traffic. Tracker announces share the peer session's destination (this is what i2psnark does and what trackers expect — announced identity must match peer identity).
 - **Reconnect discipline:** the SAM control socket, sessions, and forwarded listeners are supervised. Router restart ⇒ exponential-backoff resurrection of the full session tree, torrents transition to a visible "waiting for router" state, no thundering-herd re-announce. This state machine gets designed and tested explicitly.
-- **Concurrency model:** synchronous, thread-per-peer with blocking I/O — the most simple and mostauditable; entirely viable at I2P scale (50–200 peers, high tunnel latency makes per-connection thread cost irrelevant). yosemite ships a first-class `sync` feature. Fallback if a concrete wall is hit: smol via yosemite's `smol` feature. The engine is written against narrow internal traits so this choice stays swappable longer than usual.
+- **Concurrency model:** synchronous, thread-per-peer with blocking I/O — the most simple and most auditable; entirely viable at I2P scale (50–200 peers, high tunnel latency makes per-connection thread cost irrelevant). The engine is written against narrow internal traits so this choice stays swappable longer than usual.
 - **Storage:** file-backed with preallocation option; mmap explicitly out (predictable memory > speed here). Disk I/O and hashing on dedicated worker threads; bounded queues everywhere (no unbounded channels anywhere in the engine — lint-enforced).
 
 ## 5. No-Clearnet Enforcement (defense in depth, three independent layers)
@@ -173,9 +173,9 @@ covered by any test in this repo — `crates/clove-core`'s loopback download is
 
 | # | Item | Plan |
 |---|---|---|
-| R1 | yosemite maturity (v0.7, few users) | Wrap behind `i2pnet` trait; vendor if needed; upstream fixes (author is responsive/active) |
+| R1 | [Closed] No SAM library: `i2pnet` speaks the protocol itself | [Closed] |
 | R2 | [Outdated] | [Outdated] |
-| R3 | Datagram2/3 availability in yosemite + routers (gates future UDP announces, DHT) | Not needed for v1; track upstream |
+| R3 | Datagram2/3 availability in routers (gates future UDP announces, DHT) | Not needed for v1; track upstream |
 | R4 | i2p_pex flag semantics underspecified ("review libtorrent source") | Conformance testing vs i2psnark; treat i2psnark behavior as normative |
 | R5 | Tunnel latency vs choker/timeout tuning (clearnet BT timing assumptions are wrong on I2P) | Make all timeouts config-tunable; benchmark on live swarms; expect several rounds |
 | R6 | Naming lookups for large peer sets (b32 resolution latency/failures) | Cache aggressively, cap concurrent lookups, negative caching |
