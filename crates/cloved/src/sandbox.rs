@@ -254,8 +254,9 @@ impl Role {
         use landlock::{AccessFs, make_bitflags};
         match self {
             // Everything a state directory and a download tree need between
-            // them. `Truncate` covers both `O_TRUNC` on an atomic-write temp file
-            // and `set_len` under `preallocate yes`.
+            // them. `Truncate` covers `O_TRUNC` on an atomic-write temp file and
+            // the `ftruncate` fallback under `preallocate yes`; `fallocate`
+            // itself rides the write right the descriptor was opened with.
             //
             // Absent, and each for a reason: `Execute`, so bytes a peer sent
             // cannot be run or mapped executable — which `seccomp`'s `execve`
@@ -407,8 +408,10 @@ mod seccomp {
         // What glibc used for the `stat` family before 2.33, and what aarch64
         // uses regardless.
         libc::SYS_newfstatat,
-        // `File::set_len`, for `preallocate yes`. Not exercised by the trace
+        // `preallocate yes`: `fallocate` claims the blocks, and `ftruncate` is
+        // the fallback where a filesystem cannot. Not exercised by the trace
         // because preallocation is off by default.
+        libc::SYS_fallocate,
         libc::SYS_ftruncate,
         libc::SYS_fsync,
         libc::SYS_getdents64,
@@ -838,7 +841,11 @@ mod tests {
             .truncate(true)
             .open(&path)
             .expect("open a data file");
-        file.set_len(4096).expect("preallocate");
+        // Both spellings of `preallocate yes`: the reservation the daemon makes
+        // and the fallback where a filesystem cannot.
+        rustix::fs::fallocate(&file, rustix::fs::FallocateFlags::empty(), 0, 4096)
+            .expect("fallocate a data file");
+        file.set_len(4096).expect("ftruncate a data file");
         file.write_all_at(b"block", 1024).expect("pwrite a block");
         let mut buf = [0u8; 5];
         file.read_exact_at(&mut buf, 1024).expect("pread a block");

@@ -458,9 +458,9 @@ wait "$conf_pid" 2>/dev/null || true
 
 # `preallocate` is the one config key with a visible effect on disk, so it is
 # the one that can be checked rather than merely parsed. Without it a fresh
-# torrent's files are created empty and grow as blocks land; with it they are
-# at full length from the moment the torrent is added, before any peer exists.
-echo "smoke: preallocate lays files out at full length"
+# torrent's files are created empty and grow as blocks land; with it the blocks
+# are claimed from the moment the torrent is added, before any peer exists.
+echo "smoke: preallocate claims the disk up front"
 pre_dir="$work/prealloc"
 mkdir -p "$pre_dir/data" "$pre_dir/run"
 cat >"$pre_dir/clove.conf" <<EOF
@@ -489,6 +489,9 @@ until [ -f "$laid_out" ]; do
 done
 size=$(stat -c '%s' "$laid_out")
 [ "$size" = "75" ] || fail "preallocated file is $size bytes, expected the full 75"
+# Length alone is what a sparse file also has. Blocks are what was promised.
+blocks=$(stat -c '%b' "$laid_out")
+[ "$blocks" -gt 0 ] || fail "preallocated file holds no blocks; the space was not claimed"
 kill "$pre_pid" 2>/dev/null
 wait "$pre_pid" 2>/dev/null || true
 

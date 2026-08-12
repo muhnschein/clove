@@ -98,7 +98,7 @@ Default:
 A transient identity is unlinkable across restarts, at the cost of losing
 your standing in swarms and having to re-announce as a new peer each time.
 .It Ic preallocate Ar yes | Ar no
-Grow each of a torrent's files to its full length when the torrent is added,
+Claim the disk for each of a torrent's files when the torrent is added,
 instead of letting the file stay sparse and fill in as pieces arrive.
 Default:
 .Ar no .
@@ -109,9 +109,10 @@ fail part-way through with
 because the space was already claimed, and files that are laid out more
 contiguously, which matters on rotational disks and for playing media while
 it downloads.
-Leave it off on a filesystem where sparse files are cheap and free space is
-tight, and on one that does not support sparse files it changes nothing —
-the space is taken either way.
+Leave it off where free space is tight and sparse files are cheap.
+.Pp
+A filesystem that cannot reserve space says so on stderr and the file is left
+sparse, so the download can still run out of disk.
 .It Ic peer_limit Ar count
 The greatest number of peer connections
 .Xr cloved 8
