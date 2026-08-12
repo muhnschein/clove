@@ -78,9 +78,6 @@ pub struct Config {
     /// SAM bridge address: `host:port` (loopback unless overridden) or an
     /// absolute unix-socket path.
     pub sam_address: String,
-    /// The explicit, ugly, dangerous override for a non-loopback SAM
-    /// address (`i_know_sam_is_remote yes`).
-    pub i_know_sam_is_remote: bool,
     /// Client state directory (destination keys, resume data, torrents).
     pub data_dir: PathBuf,
     /// Control socket path for the local HTTP API.
@@ -106,9 +103,6 @@ pub struct Config {
     /// Stop seeding after this many minutes with no peer attached; `0` never
     /// stops.
     pub seed_idle_minutes: u64,
-    /// A directory to watch for `.torrent` files to add, or `None` to watch
-    /// none — the default.
-    pub watch_dir: Option<PathBuf>,
     /// What to do when the Layer-2 self-restriction cannot be applied.
     pub sandbox: SandboxPolicy,
 }
@@ -189,8 +183,6 @@ pub enum Problem {
     BadRatio,
     /// SAM address is neither `host:port` nor an absolute socket path.
     BadSamAddress,
-    /// SAM address is not loopback and `i_know_sam_is_remote` is not set.
-    RemoteSam,
     /// A path value that is not absolute.
     RelativePath,
     /// A `sam_address` this build cannot actually dial.
@@ -244,10 +236,6 @@ impl fmt::Display for Problem {
                 f,
                 "sam_address: {what} (this build dials 127.0.0.1 only; see clove.conf(5))"
             ),
-            Problem::RemoteSam => write!(
-                f,
-                "sam_address is not loopback; if you really run SAM remotely, set i_know_sam_is_remote yes (dangerous: your traffic to the router is unprotected)"
-            ),
             Problem::RelativePath => write!(f, "path must be absolute"),
         }
     }
@@ -265,7 +253,6 @@ impl std::error::Error for Error {}
 #[derive(Default)]
 struct Draft {
     sam_address: Option<(usize, String)>,
-    i_know_sam_is_remote: Option<(usize, bool)>,
     data_dir: Option<(usize, PathBuf)>,
     api_socket: Option<(usize, PathBuf)>,
     ephemeral: Option<(usize, bool)>,
@@ -276,7 +263,6 @@ struct Draft {
     max_active_seeds: Option<(usize, usize)>,
     seed_ratio_milli: Option<(usize, u64)>,
     seed_idle_minutes: Option<(usize, u64)>,
-    watch_dir: Option<(usize, PathBuf)>,
     sandbox: Option<(usize, SandboxPolicy)>,
 }
 
@@ -290,10 +276,6 @@ impl Draft {
                     return Err(at(Problem::BadSamAddress));
                 }
                 set(&mut self.sam_address, line, value.to_owned())?;
-            }
-            "i_know_sam_is_remote" => {
-                let flag = parse_bool(value).ok_or_else(|| at(Problem::BadBool))?;
-                set(&mut self.i_know_sam_is_remote, line, flag)?;
             }
             "data_dir" => set(&mut self.data_dir, line, absolute(value, line)?)?,
             "api_socket" => set(&mut self.api_socket, line, absolute(value, line)?)?,
@@ -325,7 +307,6 @@ impl Draft {
                 let milli = parse_seed_ratio(value).ok_or_else(|| at(Problem::BadRatio))?;
                 set(&mut self.seed_ratio_milli, line, milli)?;
             }
-            "watch_dir" => set(&mut self.watch_dir, line, absolute(value, line)?)?,
             "sandbox" => {
                 let policy = match value {
                     "best-effort" => SandboxPolicy::BestEffort,
@@ -380,7 +361,6 @@ impl Config {
 
         let Draft {
             sam_address,
-            i_know_sam_is_remote,
             data_dir,
             api_socket,
             ephemeral,
@@ -391,18 +371,10 @@ impl Config {
             max_active_seeds,
             seed_ratio_milli,
             seed_idle_minutes,
-            watch_dir,
             sandbox,
         } = draft;
 
-        let i_know_sam_is_remote = i_know_sam_is_remote.is_some_and(|(_, v)| v);
         let (sam_line, sam_address) = sam_address.unwrap_or((0, DEFAULT_SAM_ADDRESS.to_owned()));
-        if !i_know_sam_is_remote && !is_loopback_sam(&sam_address) {
-            return Err(Error::Line {
-                line: sam_line,
-                problem: Problem::RemoteSam,
-            });
-        }
         // Refuse here what the runtime cannot do, rather than accepting it and
         // doing something else. `cloved -C` exists to tell an operator their
         // configuration is good; it should not say so about an address that
@@ -429,7 +401,6 @@ impl Config {
 
         Ok(Config {
             sam_address,
-            i_know_sam_is_remote,
             data_dir,
             api_socket,
             ephemeral: ephemeral.is_some_and(|(_, v)| v),
@@ -441,7 +412,6 @@ impl Config {
             max_active_seeds: max_active_seeds.map_or(DEFAULT_MAX_ACTIVE_SEEDS, |(_, v)| v),
             seed_ratio_milli: seed_ratio_milli.map_or(0, |(_, v)| v),
             seed_idle_minutes: seed_idle_minutes.map_or(0, |(_, v)| v),
-            watch_dir: watch_dir.map(|(_, v)| v),
             sandbox: sandbox.map_or(SandboxPolicy::BestEffort, |(_, v)| v),
         })
     }
@@ -602,7 +572,6 @@ mod tests {
     fn empty_config_is_the_working_default() {
         let c = Config::parse("", &defaults()).unwrap();
         assert_eq!(c.sam_address, DEFAULT_SAM_ADDRESS);
-        assert!(!c.i_know_sam_is_remote);
         assert!(!c.ephemeral);
         // Sparse by default: preallocation costs the full size at add time,
         // which is a deviation an operator opts into, not basic function.
@@ -615,7 +584,6 @@ mod tests {
         // operator opts into.
         assert_eq!(c.seed_ratio_milli, 0);
         assert_eq!(c.seed_idle_minutes, 0);
-        assert_eq!(c.watch_dir, None);
         assert_eq!(c.data_dir, PathBuf::from("/home/u/.local/share/clove"));
         assert_eq!(c.api_socket, PathBuf::from("/run/user/1000/clove.sock"));
     }
@@ -808,22 +776,12 @@ preallocate yes
     }
 
     #[test]
-    fn remote_sam_needs_the_ugly_flag() {
+    fn a_sam_address_this_build_cannot_dial_is_refused() {
         let d = defaults();
-        let err = Config::parse("sam_address 10.0.0.2:7656\n", &d).unwrap_err();
+        // This build dials 127.0.0.1 and cannot do otherwise, so a remote
+        // bridge is refused rather than accepted and quietly redirected.
         assert_eq!(
-            err,
-            Error::Line {
-                line: 1,
-                problem: Problem::RemoteSam
-            }
-        );
-
-        // The ugly flag gets you past the loopback rule and straight into the
-        // truth: this build dials 127.0.0.1 and cannot do otherwise, so saying
-        // "I know" does not make a remote bridge work.
-        assert_eq!(
-            Config::parse("sam_address 10.0.0.2:7656\ni_know_sam_is_remote yes\n", &d).unwrap_err(),
+            Config::parse("sam_address 10.0.0.2:7656\n", &d).unwrap_err(),
             Error::Line {
                 line: 1,
                 problem: Problem::UnsupportedSamTransport("a remote SAM bridge is not supported")

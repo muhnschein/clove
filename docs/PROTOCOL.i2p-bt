@@ -66,14 +66,9 @@ describing anything clove does.
 
 2.1 [decided] The SAM host is 127.0.0.1; only the TCP port is configurable.
     This happens to enforce Layer 1's loopback-only rule for free.
-    Consequence: the documented `--i-know-sam-is-remote` escape hatch
-    (SCOPE §5) is NOT expressible — a remote SAM bridge would need the
-    backend to dial elsewhere. Noted rather than worked around.
-
-    Originally this was yosemite's constraint. It is now clove's own:
-    `sam::dial_stream` builds the loopback connection itself, and yosemite
-    is down to `NAMING LOOKUP`, which also takes only a port. The
-    consequence is unchanged; the reason has moved.
+    Consequence: a remote SAM bridge is NOT reachable — it would need the
+    backend to dial elsewhere. Refused at parse time rather than worked
+    around, and there is no escape hatch for it.
 
     Since 2026-07-29 the configuration says so rather than implying
     otherwise. A remote address and a unix-socket path are both refused at

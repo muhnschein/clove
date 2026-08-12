@@ -145,7 +145,10 @@ peer_limit 80
 torrent_peer_limit 12
 EOF
 timeout 20 "$cloved" -C -c "$work/limits.conf" >/dev/null || fail "valid peer limits rejected"
-for bad in "peer_limit 0" "peer_limit lots" "torrent_peer_limit 0"; do
+# A key that no longer exists must fail the start loudly rather than be
+# read past — the whole point of unknown keys being fatal.
+for bad in "peer_limit 0" "peer_limit lots" "torrent_peer_limit 0" \
+    "watch_dir /srv/torrents/inbox" "i_know_sam_is_remote yes"; do
     printf 'data_dir %s\n%s\n' "$work/limits-data" "$bad" >"$work/bad.conf"
     set +e
     timeout 20 "$cloved" -C -c "$work/bad.conf" >/dev/null 2>&1
@@ -360,39 +363,6 @@ for removed in top watch stats announce peer; do
     expect_status "$code" 2 "$removed is no longer a command"
 done
 
-echo "smoke: a watch directory picks up what is dropped in it"
-wdir="$work/watched"
-mkdir -p "$wdir" "$work/watch-data" "$work/watch-run"
-cat >"$work/watch.conf" <<EOF
-data_dir $work/watch-data
-api_socket $work/watch-run/clove.sock
-watch_dir $wdir
-EOF
-timeout 60 "$cloved" -c "$work/watch.conf" >"$work/daemon-watch.log" 2>&1 &
-watch_pid=$!
-i=0
-until timeout 5 "$clove" -c "$work/watch.conf" status >/dev/null 2>&1; do
-    i=$((i + 1))
-    [ "$i" -gt 200 ] && fail "watch daemon never answered (log: $(cat "$work/daemon-watch.log"))"
-    sleep 0.05
-done
-# The watch directory is outside the data directory on purpose: this is the
-# case Landlock silently breaks if the path is not granted before the daemon
-# restricts itself, and where a kernel with Landlock and one without would
-# otherwise disagree with no error either way.
-cp "$work/demo.torrent" "$wdir/dropped.torrent"
-printf 'not a torrent at all' >"$wdir/junk.torrent"
-i=0
-until [ -f "$wdir/dropped.torrent.added" ] && [ -f "$wdir/junk.torrent.rejected" ]; do
-    i=$((i + 1))
-    [ "$i" -gt 300 ] && fail "watch_dir did not take the files (log: $(cat "$work/daemon-watch.log"))"
-    sleep 0.1
-done
-expect_contains "$(timeout 5 "$clove" -c "$work/watch.conf" list)" "smoke.txt" \
-    "the dropped torrent was added"
-# Renamed, so it is offered once rather than every few seconds forever.
-[ ! -f "$wdir/dropped.torrent" ] || fail "the taken file was left in place"
-
 echo "smoke: add --paused and --sequential apply at add time"
 flagged=$(run add --paused --sequential "$work/second.torrent") || fail "add with flags failed"
 flagged_hash=$(printf '%s' "$flagged" | awk '{print $2}')
@@ -400,8 +370,6 @@ flagged_hash=$(printf '%s' "$flagged" | awk '{print $2}')
 expect_contains "$(run show "$flagged_hash" --json)" '"state":"paused"' "added paused"
 expect_contains "$(run show "$flagged_hash" --json)" '"sequential":true' "added sequential"
 run remove "$flagged_hash" >/dev/null || fail "removing the flagged torrent"
-kill "$watch_pid" 2>/dev/null
-wait "$watch_pid" 2>/dev/null || true
 
 echo "smoke: resume, then remove both torrents"
 run resume "$info_hash" >/dev/null || fail "resume failed"

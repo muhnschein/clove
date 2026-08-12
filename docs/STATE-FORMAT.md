@@ -69,8 +69,8 @@ timestamp; **v5** added the optional `pause_reason` and `seed_ratio_milli`.
 
 `added` is milliseconds rather than seconds on purpose. Ordering is the only
 thing it is for, and at one-second resolution every torrent of a bulk add — a
-scripted loop, or a watch directory picking up a batch — shares a timestamp,
-falls through to the info-hash tie-break, and comes out in hash order: exactly
+scripted loop, say — shares a timestamp, falls through to the info-hash
+tie-break, and comes out in hash order: exactly
 the shuffle the field exists to remove. Ties still break on info-hash, so the
 order is total whatever the clock does.
 

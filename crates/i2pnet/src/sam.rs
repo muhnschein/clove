@@ -32,9 +32,8 @@
 //!   which we derive its [`DestHash`] (`docs/PROTOCOL.i2p-bt` §1.3, §2.5).
 //!
 //! Every socket here is opened to `127.0.0.1` by construction, which is
-//! Layer 1's loopback-only rule; the `--i-know-sam-is-remote` escape hatch
-//! (SCOPE §5) is therefore not expressible through this backend and is noted
-//! as such.
+//! Layer 1's loopback-only rule. A remote SAM bridge is not reachable through
+//! this backend and is refused at configuration time.
 
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};

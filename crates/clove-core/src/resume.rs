@@ -61,8 +61,8 @@ pub struct Resume {
     ///
     /// Milliseconds rather than seconds because the resolution is the whole
     /// point: at one-second granularity every torrent of a bulk add — a
-    /// scripted loop, or a watch directory picking up a batch — shares a
-    /// timestamp, falls through to the info-hash tie-break, and comes out
+    /// scripted loop, say — shares a timestamp, falls through to the
+    /// info-hash tie-break, and comes out
     /// shuffled again. Adds are serialised by the registry lock and each does
     /// file I/O, so a millisecond collision needs two adds inside the same
     /// millisecond; ties still break on info-hash, so the order stays total

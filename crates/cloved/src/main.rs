@@ -10,7 +10,6 @@
 mod registry;
 mod sandbox;
 
-use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -93,21 +92,8 @@ fn confine(config: &Config) -> Result<sandbox::Verdict, String> {
     // files, has already happened. Drop the rest (SCOPE §5 Layer 2). This runs
     // before any thread is spawned — a Landlock domain covers the calling
     // thread and its descendants, not siblings that already exist.
-    let mut paths: Vec<(&Path, sandbox::Role)> =
+    let paths: Vec<(&Path, sandbox::Role)> =
         vec![(config.data_dir.as_path(), sandbox::Role::State)];
-    // The watch directory, if there is one, is the one path an operator names
-    // that is deliberately *outside* the data directory — and the daemon both
-    // reads it and renames within it. Granted here, before the domain closes,
-    // which is the whole discipline this layer runs on: what is not unveiled
-    // before the restriction cannot be reached after it.
-    //
-    // Getting this wrong is silent in the worst way. Landlock is best-effort,
-    // so on a kernel without it the watcher works and on a kernel with it the
-    // directory simply reads as empty — nothing added, nothing logged, no
-    // error anywhere. CI found it; a local run had not.
-    if let Some(dir) = &config.watch_dir {
-        paths.push((dir.as_path(), sandbox::Role::Watch));
-    }
     // The control socket's directory is deliberately *not* here, and used to be.
     //
     // It was granted so the socket "could be unlinked at exit" — but nothing
@@ -119,7 +105,7 @@ fn confine(config: &Config) -> Result<sandbox::Verdict, String> {
     // of it.
     //
     // If unlink-at-exit is ever added, this is what has to come back — as
-    // `Role::Watch`-like rights on that one directory, not as everything.
+    // narrow rights on that one directory, not as everything.
     //
     // Nothing read-only either. `/dev/urandom` used to be listed, and it was pure
     // self-reference: randomness comes from `getrandom(2)`, which needs no file,
@@ -265,82 +251,7 @@ fn run() -> Result<(), String> {
         Identity::new(&config.data_dir, config.ephemeral),
     );
     spawn_persist_loop(&daemon);
-    if let Some(dir) = config.watch_dir.clone() {
-        spawn_watch_dir(&daemon, dir);
-    }
     serve(&listener, &daemon)
-}
-
-/// How often the watch directory is looked at.
-///
-/// Polling, not `inotify`: a directory listing on a timer is a `read_dir` and
-/// no new dependency, against a watch API that would be one. Nobody notices
-/// five seconds on a torrent that is about to spend minutes building tunnels.
-const WATCH_DIR_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Watch a directory for `.torrent` files and add each one it finds.
-///
-/// The file is renamed to `<name>.added` once it has been taken, which is what
-/// stops the same torrent being offered every five seconds forever. A file
-/// that fails to parse becomes `<name>.rejected` for the same reason — it is
-/// not going to start parsing, and retrying it every tick would fill the log
-/// with one complaint.
-///
-/// This is how external tooling drives clove without an API of its own, and it
-/// is deliberately the dumbest thing that works.
-fn spawn_watch_dir(daemon: &Arc<Daemon>, dir: PathBuf) {
-    let daemon = Arc::clone(daemon);
-    std::thread::spawn(move || {
-        loop {
-            scan_watch_dir(&daemon, &dir);
-            std::thread::sleep(WATCH_DIR_INTERVAL);
-        }
-    });
-}
-
-/// One pass over the watch directory.
-fn scan_watch_dir(daemon: &Arc<Daemon>, dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        // Not readable, or not there yet. Said once per tick would be noise;
-        // an operator who set the key and mistyped it sees nothing added,
-        // which is the same information.
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("torrent") {
-            continue;
-        }
-        // The watch directory is the one path an operator points *outward*, so
-        // its filenames are chosen by whoever produced the file — a browser
-        // download, a script, a stranger. Scrubbed once here for the three log
-        // lines below (`clove_core::text`).
-        let shown = clove_core::text::scrub(&path.display().to_string());
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
-        };
-        let added = lock(&daemon.registry).add_torrent(&bytes, registry::AddOptions::default());
-        let suffix = match added {
-            Ok((info_hash, job)) => {
-                // Same as the API path: the initial hash of whatever is
-                // already on disk runs with the registry unlocked.
-                let _ = run_scan(daemon, &job);
-                eprintln!("cloved: added {} from {shown}", registry::hex(&info_hash));
-                "added"
-            }
-            // A duplicate is not a failure: the operator dropped in something
-            // already hosted, and the file has still been dealt with.
-            Err(AddError::Duplicate) => "added",
-            Err(e) => {
-                eprintln!("cloved: not adding {shown}: {e}");
-                "rejected"
-            }
-        };
-        let taken = path.with_extension(format!("torrent.{suffix}"));
-        if let Err(e) = fs::rename(&path, &taken) {
-            eprintln!("cloved: leaving {shown} where it is: {e}");
-        }
-    }
 }
 
 /// Daemon state shared across connection threads.

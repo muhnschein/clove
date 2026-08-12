@@ -3129,8 +3129,7 @@ mod tests {
         // added inside the same second, and at one-second resolution they
         // shared a timestamp, fell through to the info-hash tie-break, and
         // came out shuffled — which is the exact failure the field exists to
-        // fix, and what a watch directory picking up a batch would hit every
-        // time.
+        // fix, and what any scripted bulk add would hit every time.
         assert_eq!(added.len(), 3);
     }
 

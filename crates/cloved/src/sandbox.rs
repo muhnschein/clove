@@ -73,10 +73,6 @@ pub(crate) enum Role {
     /// key, and the downloads themselves. Read, write, create and delete both
     /// files and directories, and truncate.
     State,
-    /// The watch directory: list it, read what is dropped in, and rename a file
-    /// within it once taken. Nothing else — no directories are created here and
-    /// nothing is executed.
-    Watch,
 }
 
 /// What the two mechanisms actually came to.
@@ -272,13 +268,6 @@ impl Role {
             Role::State => make_bitflags!(AccessFs::{
                 ReadFile | WriteFile | ReadDir | MakeReg | MakeDir
                     | RemoveFile | RemoveDir | Truncate
-            }),
-            // List the directory, read what was dropped in, and rename it to
-            // `.added` or `.rejected` in place — which needs `MakeReg` for the
-            // new name and `RemoveFile` for the old one, both in this directory,
-            // and so again no `Refer`. No `MakeDir`: nothing here creates one.
-            Role::Watch => make_bitflags!(AccessFs::{
-                ReadDir | ReadFile | MakeReg | RemoveFile
             }),
         }
     }
@@ -618,21 +607,21 @@ mod seccomp {
 mod tests {
     use super::*;
 
-    /// The rights each role withholds, asserted as the property rather than as
-    /// a list compared against itself.
+    /// The rights the state role withholds, asserted as the property rather
+    /// than as a list compared against itself.
     ///
     /// The part of the policy checkable without a kernel that has Landlock.
     /// Every absence below is load-bearing and easy to undo with `from_all()`.
     #[test]
-    fn the_narrowed_roles_withhold_what_they_should() {
+    fn the_narrowed_state_role_withholds_what_it_should() {
         use landlock::AccessFs;
 
-        for (role, name) in [(Role::State, "state"), (Role::Watch, "watch")] {
-            let rights = role.rights();
-            // Peer-supplied bytes land under the state directory, and the watch
-            // directory holds files somebody else wrote. Neither may be run —
-            // and unlike seccomp's `execve` denial, this also covers mapping a
-            // file executable.
+        {
+            let name = "state";
+            let rights = Role::State.rights();
+            // Peer-supplied bytes land under the state directory and may not be
+            // run — and unlike seccomp's `execve` denial, this also covers
+            // mapping a file executable.
             assert!(
                 !rights.contains(AccessFs::Execute),
                 "{name} may execute files"
@@ -683,22 +672,6 @@ mod tests {
             AccessFs::Truncate,
         ] {
             assert!(state.contains(needed), "state cannot {needed:?}");
-        }
-        // The watch directory is read-and-rename only: it never creates a
-        // directory, which is what separates it from the state role.
-        let watch = Role::Watch.rights();
-        assert!(!watch.contains(AccessFs::MakeDir), "watch may create dirs");
-        assert!(
-            !watch.contains(AccessFs::WriteFile),
-            "watch may write files"
-        );
-        for needed in [
-            AccessFs::ReadDir,
-            AccessFs::ReadFile,
-            AccessFs::MakeReg,
-            AccessFs::RemoveFile,
-        ] {
-            assert!(watch.contains(needed), "watch cannot {needed:?}");
         }
     }
 
