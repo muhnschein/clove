@@ -568,6 +568,10 @@ fn spawn_metadata_fetch(daemon: &Arc<Daemon>, info_hash: [u8; 20]) {
     });
 }
 
+/// How long a magnet's announce may spend reaching a tracker. The same budget
+/// the announcer gives a hosted torrent's dial.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// What one fetch round did, so the caller can log it and publish it.
 #[derive(Default)]
 pub(crate) struct FetchRound {
@@ -624,7 +628,7 @@ fn try_fetch_round<D>(
 where
     D: i2pnet::I2pDialer + i2pnet::I2pNamingLookup + Clone + Send + Sync + 'static,
 {
-    use clove_core::tracker;
+    use clove_core::{swarm, tracker};
 
     let mut round = FetchRound::default();
     let mut peers: Vec<DestHash> = Vec::new();
@@ -640,55 +644,21 @@ where
             } else {
                 tracker::Event::Periodic
             },
-            numwant: 30,
+            numwant: swarm::AnnouncerConfig::default().numwant,
             our_dest_b64: &ctx.dest_b64,
         };
-        let (host, request) = match tracker::build_announce(url, &params) {
-            Ok(built) => built,
-            Err(e) => {
-                round.trackers_failed += 1;
-                round.fail("tracker URL", url, &e);
-                continue;
-            }
-        };
-        let dest = match i2pnet::I2pNamingLookup::lookup(&ctx.naming, &host) {
-            Ok(dest) => dest,
-            Err(e) => {
-                round.trackers_failed += 1;
-                round.fail("resolving tracker", &host, &e);
-                continue;
-            }
-        };
-        let mut stream = match i2pnet::I2pDialer::dial(&ctx.dialer, dest, Duration::from_secs(120))
-        {
-            Ok(stream) => stream,
-            Err(e) => {
-                round.trackers_failed += 1;
-                round.fail("dialing tracker", &host, &e);
-                continue;
-            }
-        };
-        // A magnet's rounds are sequential, so one tracker that accepts the
-        // stream and then says nothing stops this magnet resolving at all —
-        // not just against that tracker.
-        let _ = i2pnet::I2pStream::set_timeouts(&stream, Some(tracker::ANNOUNCE_IO_TIMEOUT));
-        match tracker::announce_over(&mut stream, &request) {
+        // The same announce a hosted torrent makes, including the I/O timeout:
+        // a magnet's rounds are sequential, so one tracker that accepts the
+        // stream and then says nothing stops this magnet resolving at all, not
+        // just against that tracker.
+        match swarm::contact_tracker(url, &params, &ctx.dialer, &ctx.naming, DIAL_TIMEOUT) {
             Ok(response) => {
                 round.trackers_ok += 1;
                 peers.extend(response.peers);
             }
-            Err(e) => {
+            Err(failed) => {
                 round.trackers_failed += 1;
-                round.fail("announcing to", &host, &e);
-                // The literal URL, for pasting into a browser aimed at the
-                // same tracker. A tracker that refuses an announce as a
-                // policy violation will not say which part it objected to,
-                // and deleting parameters one at a time is the only thing
-                // that finds out.
-                eprintln!(
-                    "cloved: the announce that failed was {}",
-                    clove_core::text::scrub(&clove_core::tracker::announced_url(&host, &request))
-                );
+                round.fail(failed.stage.as_str(), url, &failed.error);
             }
         }
     }

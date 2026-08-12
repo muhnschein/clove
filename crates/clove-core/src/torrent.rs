@@ -657,12 +657,6 @@ impl Torrent {
         Ok(before)
     }
 
-    /// How many pieces we want at all, held or not.
-    #[must_use]
-    pub fn wanted_pieces(&self) -> u32 {
-        lock(&self.shared.state).picker.wanted_count()
-    }
-
     /// Start the periodic work this torrent needs: keep-alives to peers we have
     /// nothing else to say to, dropping peers that have gone silent, and choke
     /// rounds.
@@ -2068,7 +2062,6 @@ mod tests {
         );
         // And the torrent is finished once the two wanted pieces land, rather
         // than waiting for a piece it will never ask for.
-        assert_eq!(torrent.wanted_pieces(), 2);
         assert_eq!(torrent.bytes_left(), 2 * u64::from(BLOCK_LEN));
     }
 
@@ -2089,17 +2082,14 @@ mod tests {
             *b"-CV0001-priolivepri0",
         );
 
-        assert_eq!(torrent.wanted_pieces(), 3);
         assert_eq!(torrent.bytes_left(), 3 * u64::from(BLOCK_LEN));
         assert!(!torrent.is_complete());
 
         torrent.set_piece_priorities(&meta.piece_priorities(&[0, 0, 1]));
-        assert_eq!(torrent.wanted_pieces(), 1);
         assert_eq!(torrent.bytes_left(), u64::from(BLOCK_LEN));
 
         // Skipping everything finishes it: there is nothing left to wait for.
         torrent.set_piece_priorities(&meta.piece_priorities(&[0, 0, 0]));
-        assert_eq!(torrent.wanted_pieces(), 0);
         assert_eq!(torrent.bytes_left(), 0);
         assert!(torrent.is_complete());
     }

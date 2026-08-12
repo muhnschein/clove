@@ -31,9 +31,6 @@ use crate::http;
 /// prefix (`-CV0001-`, Q7) so a tracker operator sees one name, not two.
 pub const USER_AGENT: &str = concat!("clove/", env!("CARGO_PKG_VERSION"));
 
-/// Default peers to request per announce.
-pub const DEFAULT_NUMWANT: u32 = 200;
-
 /// Minimum interval clove will wait between announces regardless of what a
 /// tracker asks for, to avoid hammering (a floor, not the tracker's own
 /// `min interval`).
@@ -748,7 +745,7 @@ mod tests {
             downloaded: 200,
             left: 300,
             event: Event::Started,
-            numwant: DEFAULT_NUMWANT,
+            numwant: 50,
             our_dest_b64: "MYDESTb64",
         }
     }
