@@ -438,7 +438,6 @@ impl Hosted {
             priorities: self.priorities.clone(),
             uploaded: self.uploaded,
             downloaded: self.downloaded,
-            trackers: self.meta.trackers.clone(),
             paused: matches!(self.wanted, Wanted::Paused(_)),
             pause_reason: match self.wanted {
                 Wanted::Paused(why) => why.code(),

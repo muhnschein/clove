@@ -3,7 +3,7 @@
 clove's on-disk state is an **API**, not an implementation detail (the SQLite
 doctrine, `SCOPE.md` §3). This file specifies it. The rules:
 
-- Every resume file carries an integer `version` (currently **5**).
+- Every resume file carries an integer `version` (currently **6**).
 - **Newer clove reads older state.** Older clove **refuses newer state
   cleanly** — a clear error, no write, no corruption (worst case: you downgrade
   and re-add the torrent).
@@ -56,7 +56,6 @@ key means version discipline failed somewhere:
 | `priorities` | bytes | One byte per file, on-wire order: 0 skip, 1 normal, 2 high. |
 | `uploaded` | int | Lifetime bytes uploaded. |
 | `downloaded` | int | Lifetime bytes downloaded. |
-| `trackers` | list of list of byte-strings | Announce tiers (BEP 12) in current order. |
 | `paused` | int (optional, v2+) | `1` if paused. Absent (a v1 file) reads as `0`. |
 | `sequential` | int (optional, v3+) | `1` to pick pieces in file order instead of rarest-first. Absent (a v1 or v2 file) reads as `0`. |
 | `pause_reason` | int (optional, v5+) | Why the torrent is paused, when it is: `0` the operator, `1` its seed ratio, `2` the seed idle limit. Meaningless unless `paused` is set. An unknown code reads as `0` — a paused torrent is paused whatever the label says, and refusing to load one over a label would be the wrong trade. |
@@ -65,7 +64,13 @@ key means version discipline failed somewhere:
 
 Version history: **v1** initial; **v2** added the optional `paused` flag; **v3**
 added the optional `sequential` flag; **v4** added the optional `added`
-timestamp; **v5** added the optional `pause_reason` and `seed_ratio_milli`.
+timestamp; **v5** added the optional `pause_reason` and `seed_ratio_milli`;
+**v6** removed `trackers`.
+
+`trackers` held the announce tiers and was never read back — the URLs come from
+the sibling `.torrent`. A v1–v5 file still carries it, so the key remains
+*accepted and ignored* on read; it is not written, and re-saving a torrent
+drops it.
 
 `added` is milliseconds rather than seconds on purpose. Ordering is the only
 thing it is for, and at one-second resolution every torrent of a bulk add — a

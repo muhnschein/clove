@@ -21,7 +21,7 @@ use crate::bencode::{self, Value};
 /// optional `sequential` flag; v4 added the optional `added` timestamp;
 /// v5 added the optional `pause_reason` and `seed_ratio` (an earlier file
 /// reads as paused by the operator, with no per-torrent ratio).
-pub const VERSION: i64 = 5;
+pub const VERSION: i64 = 6;
 
 /// Everything clove needs to pick a torrent back up after a restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,8 +43,6 @@ pub struct Resume {
     pub uploaded: u64,
     /// Lifetime bytes downloaded.
     pub downloaded: u64,
-    /// Announce tiers in their current (BEP 12 shuffled) order.
-    pub trackers: Vec<Vec<String>>,
     /// Whether the torrent is paused. Optional on disk (added in v2); a v1
     /// file, or any file omitting it, reads as `false`.
     pub paused: bool,
@@ -141,6 +139,9 @@ const KEYS: [&[u8]; 14] = [
     b"priorities",
     b"uploaded",
     b"downloaded",
+    // Retired in v6, still accepted: a v1-v5 file carries it and unknown keys
+    // are refused, so reading one would fail without this. The value is
+    // ignored — announce URLs come from the sibling `.torrent`.
     b"trackers",
     b"paused",
     b"sequential",
@@ -225,18 +226,6 @@ impl Resume {
             b"downloaded",
             Value::Int(i64::try_from(self.downloaded).unwrap_or(i64::MAX)),
         );
-        let tiers = self
-            .trackers
-            .iter()
-            .map(|tier| {
-                Value::List(
-                    tier.iter()
-                        .map(|url| Value::Bytes(url.clone().into_bytes()))
-                        .collect(),
-                )
-            })
-            .collect();
-        put(b"trackers", Value::List(tiers));
         put(b"paused", Value::Int(i64::from(self.paused)));
         put(b"sequential", Value::Int(i64::from(self.sequential)));
         put(
@@ -321,26 +310,6 @@ impl Resume {
         let uploaded = counter(&root, b"uploaded")?;
         let downloaded = counter(&root, b"downloaded")?;
 
-        let mut trackers = Vec::new();
-        let tiers = root
-            .get(b"trackers")
-            .and_then(Value::as_list)
-            .ok_or(Error::Invalid("missing trackers"))?;
-        for tier in tiers {
-            let tier = tier
-                .as_list()
-                .ok_or(Error::Invalid("tracker tier is not a list"))?;
-            let mut urls = Vec::with_capacity(tier.len());
-            for url in tier {
-                urls.push(
-                    url.as_str()
-                        .ok_or(Error::Invalid("tracker URL is not UTF-8"))?
-                        .to_owned(),
-                );
-            }
-            trackers.push(urls);
-        }
-
         let Optional {
             paused,
             sequential,
@@ -357,7 +326,6 @@ impl Resume {
             priorities,
             uploaded,
             downloaded,
-            trackers,
             paused,
             sequential,
             added,
@@ -405,7 +373,6 @@ mod tests {
             priorities: vec![1, 0, 2],
             uploaded: 12345,
             downloaded: 67890,
-            trackers: vec![vec!["http://t.i2p/a".into()], vec!["http://u.i2p/a".into()]],
             paused: true,
             sequential: true,
             added: 1_800_000_000,
@@ -515,6 +482,43 @@ mod tests {
         }
         // The current version is of course still readable.
         assert!(Resume::decode(&encoded).is_ok());
+    }
+
+    /// A v5 file still carries `trackers`, and unknown keys are refused — so
+    /// dropping the field from the encoder without keeping it readable would
+    /// make every state file written before v6 unloadable.
+    #[test]
+    fn a_v5_file_with_its_trackers_still_loads() {
+        // A real v5 file: the current encoding, with the retired key spliced
+        // back in and the version wound back. Bencode keys are sorted, and
+        // `trackers` sits immediately before `uploaded`.
+        let encoded = sample().encode();
+        let at = encoded
+            .windows(10)
+            .position(|w| w == b"8:uploaded")
+            .expect("the encoder writes `uploaded`");
+        let mut v5 = encoded[..at].to_vec();
+        v5.extend_from_slice(b"8:trackersll21:http://tracker.i2p/aeee");
+        v5.extend_from_slice(&encoded[at..]);
+
+        let current = format!("7:versioni{VERSION}e").into_bytes();
+        let pos = v5
+            .windows(current.len())
+            .position(|w| w == current.as_slice())
+            .expect("the encoder writes the current version");
+        let mut older = v5[..pos].to_vec();
+        older.extend_from_slice(b"7:versioni5e");
+        older.extend_from_slice(&v5[pos + current.len()..]);
+
+        let read = Resume::decode(&older).expect("a v5 file must still load");
+        assert_eq!(read.info_hash, sample().info_hash);
+        assert_eq!(read.uploaded, sample().uploaded);
+        // And re-encoding drops the retired key rather than carrying it on.
+        let rewritten = read.encode();
+        assert!(
+            !rewritten.windows(8).any(|w| w == b"trackers"),
+            "the retired key was written back out"
+        );
     }
 
     #[test]

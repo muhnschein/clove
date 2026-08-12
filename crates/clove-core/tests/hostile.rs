@@ -143,7 +143,6 @@ fn resume_bytes() -> Vec<u8> {
         priorities: vec![1, 0, 2],
         uploaded: 4_096,
         downloaded: 8_192,
-        trackers: vec![vec!["http://tracker.i2p/announce".to_owned()]],
         paused: false,
         sequential: false,
         added: 1_800_000_000,
