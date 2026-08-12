@@ -1427,7 +1427,7 @@ mod tests {
             let _ = client_w.write_all(&body);
             let _ = client_w.shutdown(std::net::Shutdown::Write);
         });
-        handle(ApiStream::Unix(server), daemon).expect("handle");
+        handle(ApiStream::from_unix(server), daemon).expect("handle");
         let mut reply = Vec::new();
         let mut client_r = client;
         client_r.read_to_end(&mut reply).expect("read response");

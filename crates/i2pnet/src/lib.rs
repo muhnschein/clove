@@ -11,10 +11,9 @@
 //! - The one permitted IP socket is a TCP connection to the configured SAM
 //!   bridge, which must be loopback; a remote address is refused at
 //!   configuration time and there is no override.
-//! - The local HTTP API's opt-in localhost-TCP listener is also created
-//!   *here* (a planned `bind_local_api()` that refuses non-loopback
-//!   addresses), so every IP-socket construction site in the codebase lives
-//!   in this crate. `cloved` gets a listener handle, never a socket API.
+//! - The local HTTP API's unix-socket listener is also created *here*
+//!   ([`api`]), so every socket construction site in the codebase lives in
+//!   this crate. `cloved` gets a listener handle, never a socket API.
 //! - No DNS: names are I2P names, resolved via SAM `NAMING LOOKUP` only.
 //!
 //! Peer addressing uses [`DestHash`] exclusively — there is no `IpAddr`

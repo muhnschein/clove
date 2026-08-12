@@ -80,14 +80,14 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 - All defaults documented in `clove.conf(5)`, actual-default values stated, not prose-approximated.
 
 ### CLI
-- Daemon `cloved` + control CLI `clove`, speaking to the local HTTP API over a unix socket (default) or localhost TCP (opt-in).
+- Daemon `cloved` + control CLI `clove`, speaking to the local HTTP API over a unix socket.
 - Commands: add (file/magnet), remove (with/without data), list, status (per torrent: peers, tunnels, speeds, availability), pause/resume, verify, set file priorities, client-level stats.
 - Human-friendly default output (aligned tables, progress, rates); `--json` on every read command for scripting.
 - Sensible exit codes, shell completion generation.
 - Peer identity on the wire: Azureus-style peer-ID prefix and client name string chosen per Q7 and kept stable thereafter; checked against the informal BEP 20 registry to avoid collisions.
 
 ### HTTP API
-- Local-only (unix socket default). Token auth even on localhost TCP.
+- Local-only: a unix socket, created `0600`, and nothing else. Token auth on top of that.
 - REST-ish JSON; versioned under `/v1/`. Explicitly not compatible with the Transmission/qBittorrent APIs in v1. Another project can add this if need be. This is not that project.
 
 ## 4. Architecture
@@ -119,7 +119,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 
 **Layer 1 — by construction:**
 - Only the `i2pnet` crate may depend on socket-capable APIs. The engine crates forbid `std::net` and `socket2` via `clippy` `disallowed_types`/`disallowed_methods` config + a CI grep gate over `Cargo.lock` (`ci/check-net-deps.sh`).
-- `i2pnet` itself may open exactly one kind of socket: a TCP connection to the configured SAM address, which must be loopback — a remote address and a unix-socket path are both refused at parse time, and there is no override. The opt-in localhost-TCP listener for the local HTTP API is also constructed inside `i2pnet` (loopback-validating helper), so every IP-socket construction site is in one crate.
+- `i2pnet` itself may open exactly one kind of socket: a TCP connection to the configured SAM address, which must be loopback — a remote address and a unix-socket path are both refused at parse time, and there is no override. The local HTTP API's unix-socket listener is also constructed inside `i2pnet`, so every socket construction site is in one crate.
 - No DNS resolution code paths: hostnames are rejected in config except `localhost`; naming is I2P naming only.
 - Dependency budget: every new transitive dependency with network capability requires justification in the PR. `cargo deny` config committed in-repo.
 

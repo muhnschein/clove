@@ -25,7 +25,8 @@ chunked transfer encoding.
 .Pp
 Every request must carry the API token in an
 .Sy X-Clove-Token
-header, including over the unix socket.
+header.
+The socket is owner-only, and the token is checked on top of that.
 The token is the contents of
 .Pa <data_dir>/token ,
 which the daemon writes mode 0600 on first start.

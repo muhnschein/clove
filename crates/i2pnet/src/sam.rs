@@ -950,6 +950,25 @@ pub fn poke_listener(port: u16) -> io::Result<()> {
     Ok(())
 }
 
+/// A connected loopback TCP pair: the shape every socket this crate opens has.
+///
+/// Test support for `cloved`'s confinement test, which has to make a real
+/// `AF_INET` connection under the live seccomp filter to prove the allowlist
+/// and its argument restriction let the SAM transport through. Behind the
+/// `mock` feature, so it is not in the daemon, and here rather than in the
+/// caller because Layer 1 keeps socket construction in this crate.
+///
+/// # Errors
+///
+/// The bind, connect or accept fails.
+#[cfg(feature = "mock")]
+pub fn loopback_pair() -> io::Result<(TcpStream, TcpStream)> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let client = TcpStream::connect(listener.local_addr()?)?;
+    let (server, _) = listener.accept()?;
+    Ok((client, server))
+}
+
 impl I2pListener for SamListener {
     type Stream = ForwardedStream;
 

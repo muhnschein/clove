@@ -872,26 +872,19 @@ mod tests {
             .expect("ioctl(FIONBIO) on the control socket");
 
         // The SAM bridge's transport: a loopback TCP socket, bound, listened,
-        // connected and accepted. Through `i2pnet`'s own API rather than
-        // `std::net`, because the workspace clippy type ban is Layer 1 and a
-        // test is not a reason to poke a hole in it — the first version of this
-        // used `TcpListener` directly and the lint refused it, which is the lint
-        // working. Landlock's `connect_tcp` is unrestricted in this child
-        // (`connect_tcp: None`), so this exercises the seccomp side alone.
-        let listener = i2pnet::api::ApiListener::bind_loopback_tcp("127.0.0.1:0")
-            .expect("bind a loopback listener");
-        let port = listener
-            .local_port()
-            .expect("getsockname")
-            .expect("a TCP listener has a port");
-        let mut client = i2pnet::api::connect_loopback_tcp(&format!("127.0.0.1:{port}"))
-            .expect("connect over loopback");
-        let mut server = listener.accept().expect("accept a loopback connection");
+        // connected and accepted. Through `i2pnet` rather than `std::net`,
+        // because the workspace clippy type ban is Layer 1 and a test is not a
+        // reason to poke a hole in it. This is the one thing here that needs an
+        // `AF_INET` socket, so it is also what proves `socket(2)`'s argument
+        // restriction admits the family the daemon actually uses. Landlock's
+        // `connect_tcp` is unrestricted in this child (`connect_tcp: None`), so
+        // this exercises the seccomp side alone.
+        let (mut client, mut server) = i2pnet::sam::loopback_pair().expect("a loopback TCP pair");
         client.write_all(b"sam").expect("write over loopback");
         let mut three = [0u8; 3];
         server.read_exact(&mut three).expect("read over loopback");
         assert_eq!(&three, b"sam");
-        drop((client, server, listener));
+        drop((client, server));
 
         // Randomness (the API token and the peer id) and a clock read.
         let mut seed = [0u8; 16];
