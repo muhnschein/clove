@@ -26,6 +26,8 @@ libc = "0.2"
 # Tests build real .torrent fixtures, which need SHA-1 piece hashes. Already
 # in the tree via clove-core; dev-only, not part of the runtime budget.
 sha1 = "0.11"
+# The registry's tests run against the in-memory network rather than a router.
+i2pnet = { path = "../i2pnet", features = ["mock"] }
 
 [lints]
 workspace = true

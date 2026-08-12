@@ -115,7 +115,9 @@ man-lint:
 ## `missing_docs = "deny"` enforces for presence — this is the half that keeps
 ## what is there from pointing at items that were renamed or made private.
 doc-lint:
-	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+	# --all-features so the docs cover the mock network too; it is behind a
+	# feature flag and would otherwise be an unresolved link.
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
 ## Install the binaries and manuals. Release build; strip nothing, so a
 ## crash report from a user still carries symbols.

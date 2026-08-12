@@ -9,8 +9,8 @@
 //! Invariants this crate owns:
 //!
 //! - The one permitted IP socket is a TCP connection to the configured SAM
-//!   bridge, which must be loopback (or a unix socket) unless the operator
-//!   sets the explicit, documented-as-dangerous remote-SAM override.
+//!   bridge, which must be loopback; a remote address is refused at
+//!   configuration time and there is no override.
 //! - The local HTTP API's opt-in localhost-TCP listener is also created
 //!   *here* (a planned `bind_local_api()` that refuses non-loopback
 //!   addresses), so every IP-socket construction site in the codebase lives
@@ -29,6 +29,7 @@ use std::time::Duration;
 
 pub mod addr;
 pub mod api;
+#[cfg(feature = "mock")]
 pub mod mock;
 pub mod naming;
 pub mod sam;
