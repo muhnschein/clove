@@ -92,11 +92,6 @@ pub struct Config {
     /// Ceiling on peer connections for any one torrent, applied under
     /// [`peer_limit`](Config::peer_limit).
     pub torrent_peer_limit: usize,
-    /// How many incomplete torrents may run at once; the rest wait in the
-    /// queue.
-    pub max_active_downloads: usize,
-    /// How many complete torrents may seed at once.
-    pub max_active_seeds: usize,
     /// Stop seeding at this uploaded/downloaded ratio, in **thousandths**;
     /// `0` seeds without limit. Per-torrent overrides sit under it.
     pub seed_ratio_milli: u64,
@@ -124,20 +119,6 @@ pub const DEFAULT_PEER_LIMIT: usize = 200;
 /// Per-torrent peer ceiling when the config does not say otherwise. The
 /// long-standing `SwarmConfig::max_peers` default.
 pub const DEFAULT_TORRENT_PEER_LIMIT: usize = 50;
-
-/// Concurrently downloading torrents when the config does not say otherwise.
-///
-/// Three, because on I2P the scarce thing is tunnels rather than bandwidth:
-/// three torrents each holding a healthy peer set finish sooner, one after
-/// another, than twenty sharing the same ceiling and all crawling.
-pub const DEFAULT_MAX_ACTIVE_DOWNLOADS: usize = 3;
-
-/// Concurrently seeding torrents when the config does not say otherwise.
-///
-/// Higher than the download limit: a seed answers requests rather than chasing
-/// pieces, so it costs peers but little else, and being a good swarm citizen
-/// is most of what an I2P client is for.
-pub const DEFAULT_MAX_ACTIVE_SEEDS: usize = 5;
 
 /// Largest accepted seed ratio, in thousandths (1000 = 1.0).
 ///
@@ -259,8 +240,6 @@ struct Draft {
     preallocate: Option<(usize, bool)>,
     peer_limit: Option<(usize, usize)>,
     torrent_peer_limit: Option<(usize, usize)>,
-    max_active_downloads: Option<(usize, usize)>,
-    max_active_seeds: Option<(usize, usize)>,
     seed_ratio_milli: Option<(usize, u64)>,
     seed_idle_minutes: Option<(usize, u64)>,
     sandbox: Option<(usize, SandboxPolicy)>,
@@ -294,14 +273,6 @@ impl Draft {
             "torrent_peer_limit" => {
                 let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
                 set(&mut self.torrent_peer_limit, line, count)?;
-            }
-            "max_active_downloads" => {
-                let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
-                set(&mut self.max_active_downloads, line, count)?;
-            }
-            "max_active_seeds" => {
-                let count = parse_count(value).ok_or_else(|| at(Problem::BadCount))?;
-                set(&mut self.max_active_seeds, line, count)?;
             }
             "seed_ratio" => {
                 let milli = parse_seed_ratio(value).ok_or_else(|| at(Problem::BadRatio))?;
@@ -367,8 +338,6 @@ impl Config {
             preallocate,
             peer_limit,
             torrent_peer_limit,
-            max_active_downloads,
-            max_active_seeds,
             seed_ratio_milli,
             seed_idle_minutes,
             sandbox,
@@ -407,9 +376,6 @@ impl Config {
             preallocate: preallocate.is_some_and(|(_, v)| v),
             peer_limit: peer_limit.map_or(DEFAULT_PEER_LIMIT, |(_, v)| v),
             torrent_peer_limit: torrent_peer_limit.map_or(DEFAULT_TORRENT_PEER_LIMIT, |(_, v)| v),
-            max_active_downloads: max_active_downloads
-                .map_or(DEFAULT_MAX_ACTIVE_DOWNLOADS, |(_, v)| v),
-            max_active_seeds: max_active_seeds.map_or(DEFAULT_MAX_ACTIVE_SEEDS, |(_, v)| v),
             seed_ratio_milli: seed_ratio_milli.map_or(0, |(_, v)| v),
             seed_idle_minutes: seed_idle_minutes.map_or(0, |(_, v)| v),
             sandbox: sandbox.map_or(SandboxPolicy::BestEffort, |(_, v)| v),
@@ -578,8 +544,6 @@ mod tests {
         assert!(!c.preallocate);
         assert_eq!(c.peer_limit, DEFAULT_PEER_LIMIT);
         assert_eq!(c.torrent_peer_limit, DEFAULT_TORRENT_PEER_LIMIT);
-        assert_eq!(c.max_active_downloads, DEFAULT_MAX_ACTIVE_DOWNLOADS);
-        assert_eq!(c.max_active_seeds, DEFAULT_MAX_ACTIVE_SEEDS);
         // Seeding without limit is the default: stopping is a deviation an
         // operator opts into.
         assert_eq!(c.seed_ratio_milli, 0);

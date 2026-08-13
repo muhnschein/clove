@@ -3,7 +3,7 @@
 # Install: clove completions zsh > "${fpath[1]}/_clove"
 _clove() {
     local -a cmds
-    cmds=(status list show add remove pause resume start verify priorities sequential seed-ratio completions)
+    cmds=(status list show add remove pause resume verify priorities sequential seed-ratio completions)
     _arguments '1: :->command' '*:: :->args'
     case $state in
         command) _describe 'clove command' cmds ;;
@@ -16,7 +16,7 @@ _clove() {
                 # nothing here can enumerate without talking to the daemon;
                 # the flags are what completion can usefully offer.
                 remove) _values 'flag' --all --data ;;
-                pause|resume|start|verify) _values 'flag' --all ;;
+                pause|resume|verify) _values 'flag' --all ;;
             esac
             ;;
     esac

@@ -3,7 +3,7 @@
 //! A thin client: hand-rolled arg parsing, one request per invocation over the
 //! local API (unix socket), rendering the daemon's JSON (`--json` passes it
 //! through). Commands: `status`, `list`, `show`, `add`, `remove`, `pause`,
-//! `resume`, `start`, `verify`, `priorities`, `sequential`, `seed-ratio`,
+//! `resume`, `verify`, `priorities`, `sequential`, `seed-ratio`,
 //! `completions`.
 //!
 //! One view concept, deliberately. `list` is a one-shot table under a summary
@@ -101,7 +101,6 @@ fn run() -> Result<(), Fail> {
         Some("show") => cmd_show(&where_, json, &operands),
         Some("pause") => cmd_action(&where_, &operands, "pause", "paused"),
         Some("resume") => cmd_action(&where_, &operands, "resume", "resumed"),
-        Some("start") => cmd_action(&where_, &operands, "start", "started"),
         Some("verify") => cmd_verify(&where_, &operands),
         Some("priorities") => cmd_priorities(&where_, &operands),
         Some("sequential") => cmd_sequential(&where_, &operands),
@@ -135,7 +134,6 @@ fn print_help() {
     println!("  remove <torrent…> [--data]     remove torrents (--data also deletes files)");
     println!("  pause <torrent…>               pause torrents");
     println!("  resume <torrent…>              resume torrents");
-    println!("  start <torrent…>               resume and jump the queue");
     println!("  verify <torrent…>              re-check data on disk");
     println!("  priorities <torrent> <spec>    set per-file priorities (e.g. 1,0,2)");
     println!("  sequential <torrent> on|off    pick pieces in order instead of rarest-first");

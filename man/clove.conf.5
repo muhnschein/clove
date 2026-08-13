@@ -126,43 +126,18 @@ the whole allowance, and is what an operator running many torrents at once
 should lower.
 Both keys take a number from 1 to 10000.
 .Pp
+Every torrent that is not paused runs, so these two keys are what bounds the
+client: there is no limit on how many torrents are active at once.
+.Pp
 There is deliberately no fair share between torrents.
 With the defaults, four saturated torrents can hold the entire
 .Ic peer_limit
-and a fifth waits for peers to churn; if that is your situation, lower
+and the rest wait for peers to churn.
+If you run many torrents and would rather each held a smaller but working peer
+set, lower
 .Ic torrent_peer_limit
 rather than raising
 .Ic peer_limit .
-.It Ic max_active_downloads Ar count
-How many incomplete torrents run at once.
-Default:
-.Ar 3 .
-.Pp
-The rest are
-.Sy queued :
-listed and persisted, but holding no peers, no tunnels and no threads.
-Three because the scarce thing on I2P is tunnels rather than bandwidth — three
-torrents each holding a healthy peer set finish sooner, one after another, than
-twenty sharing the same ceiling and all crawling.
-.It Ic max_active_seeds Ar count
-How many complete torrents seed at once.
-Default:
-.Ar 5 .
-.Pp
-A separate allowance from
-.Ic max_active_downloads ,
-which is what stops a queue of downloads from also stopping the client seeding
-what it has already finished.
-When a download completes it moves from one allowance to the other, freeing its
-download slot for whatever is next in the queue.
-.Pp
-The queue order is the order torrents were added, and it does not change:
-resuming a paused torrent returns it to its own place rather than to the back,
-which can displace a newer torrent that had been promoted in its absence.
-That torrent keeps everything it downloaded; what it loses is its peers and an
-announce.
-.Ic clove start
-puts one torrent at the head of the queue when that is not what you want.
 .It Ic seed_ratio Ar ratio
 Stop seeding a torrent once it has uploaded this multiple of what it
 downloaded.
@@ -260,7 +235,6 @@ torrent from taking most of them.
 .Bd -literal -offset indent
 peer_limit 80
 torrent_peer_limit 12
-max_active_downloads 2
 .Ed
 .Pp
 A system-wide instance with a fixed socket path, so a service manager and its

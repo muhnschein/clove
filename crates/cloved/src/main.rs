@@ -912,7 +912,6 @@ fn torrent_action(
         ("POST", Some("resume")) => {
             action_result(lock(&daemon.registry).set_paused(&info_hash, false))
         }
-        ("POST", Some("start")) => action_result(lock(&daemon.registry).force_start(&info_hash)),
         ("PUT", Some("seed-ratio")) => match parse_ratio_body(&request.body) {
             Some(milli) => action_result(lock(&daemon.registry).set_seed_ratio(&info_hash, milli)),
             None => error(

@@ -148,7 +148,8 @@ timeout 20 "$cloved" -C -c "$work/limits.conf" >/dev/null || fail "valid peer li
 # A key that no longer exists must fail the start loudly rather than be
 # read past — the whole point of unknown keys being fatal.
 for bad in "peer_limit 0" "peer_limit lots" "torrent_peer_limit 0" \
-    "watch_dir /srv/torrents/inbox" "i_know_sam_is_remote yes"; do
+    "watch_dir /srv/torrents/inbox" "i_know_sam_is_remote yes" \
+    "max_active_downloads 3" "max_active_seeds 5"; do
     printf 'data_dir %s\n%s\n' "$work/limits-data" "$bad" >"$work/bad.conf"
     set +e
     timeout 20 "$cloved" -C -c "$work/bad.conf" >/dev/null 2>&1
@@ -320,42 +321,13 @@ run resume --all >/dev/null || fail "resume --all failed"
 expect_contains "$(run show "$info_hash" --json)" '"state":"waiting-for-router"' "resumed by --all"
 run remove "$second_hash" >/dev/null || fail "removing the second torrent failed"
 
-echo "smoke: the queue holds torrents past the active limit"
-# A daemon of its own, so the tight limit does not disturb everything above.
-qdir="$work/queue"
-mkdir -p "$qdir/data" "$qdir/run"
-cat >"$qdir/clove.conf" <<EOF
-data_dir $qdir/data
-api_socket $qdir/run/clove.sock
-max_active_downloads 1
-EOF
-timeout 60 "$cloved" -c "$qdir/clove.conf" >"$work/daemon-queue.log" 2>&1 &
-queue_pid=$!
-i=0
-until timeout 5 "$clove" -c "$qdir/clove.conf" status >/dev/null 2>&1; do
-    i=$((i + 1))
-    [ "$i" -gt 200 ] && fail "queue daemon never answered (log: $(cat "$work/daemon-queue.log"))"
-    sleep 0.05
-done
-qrun() { timeout 20 "$clove" -c "$qdir/clove.conf" "$@"; }
-qrun add "$work/demo.torrent" >/dev/null || fail "queue add 1"
-qrun add "$work/second.torrent" >/dev/null || fail "queue add 2"
-# No router here either, so neither is "queued" — the limit is not why they
-# are stopped, and saying so would send an operator chasing the wrong thing.
-expect_contains "$(qrun list)" "waiting-for-router" "no router means no queue"
-# `start` works whatever the router is doing, and is a real endpoint.
-qrun start 1 >/dev/null || fail "start by position failed"
-expect_contains "$(qrun list)" "waiting-for-router" "still waiting on the router"
-kill "$queue_pid" 2>/dev/null
-wait "$queue_pid" 2>/dev/null || true
-
 echo "smoke: status totals the client as well as the daemon"
 expect_contains "$(run status)" "router" "status reports the router state"
 expect_contains "$(run status)" "torrents" "status reports a torrent count"
 expect_contains "$(run status)" "peers" "status reports peers against the budget"
 expect_contains "$(run status)" "uploaded" "status reports lifetime bytes"
 # The commands that went with the simplification must be gone, not aliased.
-for removed in top watch stats announce peer; do
+for removed in top watch stats announce peer start; do
     set +e
     run "$removed" >/dev/null 2>&1
     code=$?
