@@ -357,24 +357,13 @@ impl AnnounceState {
         now >= self.next_due
     }
 
-    /// Make an announce due immediately, bypassing both the tracker's
-    /// interval and any failure backoff.
-    ///
-    /// This exists for one caller: an operator asking for a re-announce
-    /// through the API. Nothing automatic may use it — the interval a
-    /// tracker hands back is an instruction, and the whole point of
-    /// [`on_success`](Self::on_success) is to obey it. The one automatic
-    /// bypass there is has its own, much narrower door:
-    /// [`completion_due`](Self::completion_due).
-    pub fn make_due(&mut self) {
-        self.next_due = 0;
-    }
-
     /// Bring forward the one announce that is owed on an event rather than on
     /// a clock: the `completed` that BEP 3 wants when a download finishes.
     ///
-    /// Deliberately *not* [`make_due`](Self::make_due), whose contract is that
-    /// nothing automatic may use it. `completed` is an event, in the same
+    /// The only bypass of the tracker's own interval there is, and deliberately
+    /// narrow. The interval a tracker hands back is an instruction, and the
+    /// whole point of [`on_success`](Self::on_success) is to obey it.
+    /// `completed` is an event, in the same
     /// class as `started` (the first announce, which no interval governs) and
     /// `stopped` (sent on teardown regardless of one) — not a periodic report
     /// whose cadence the tracker gets to set. Waiting for the next interval to

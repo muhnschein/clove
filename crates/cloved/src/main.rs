@@ -920,19 +920,6 @@ fn torrent_action(
                 "body must be a ratio like 2 or 1.75, or 0 to follow the daemon's seed_ratio",
             ),
         },
-        ("POST", Some("peers")) => {
-            let text = String::from_utf8_lossy(&request.body);
-            let Some(peer) = DestHash::from_b32(&text) else {
-                return error(
-                    400,
-                    "body must be a peer's b32 address (52 chars, .b32.i2p optional)",
-                );
-            };
-            action_result(lock(&daemon.registry).add_peer(&info_hash, peer))
-        }
-        ("POST", Some("announce")) => {
-            action_result(lock(&daemon.registry).announce_now(&info_hash))
-        }
         ("PUT", Some("sequential")) => match parse_bool_body(&request.body) {
             Some(on) => action_result(lock(&daemon.registry).set_sequential(&info_hash, on)),
             None => error(400, "body must be \"true\" or \"false\""),
@@ -1471,6 +1458,26 @@ mod tests {
         let delete_status =
             format!("DELETE /v1/status HTTP/1.1\r\nx-clove-token: {TOKEN}\r\n\r\n").into_bytes();
         assert_eq!(status_of(&speak(&d, &delete_status)), 405);
+    }
+
+    /// The retired endpoints answer as retired rather than doing something.
+    /// A client written against them gets a refusal, not a silent success.
+    #[test]
+    fn the_removed_endpoints_are_gone() {
+        let dir = TempDir::new("retired");
+        let d = daemon(&dir);
+        let hash = "a".repeat(40);
+        for path in [
+            format!("/v1/torrents/{hash}/peers"),
+            format!("/v1/torrents/{hash}/announce"),
+        ] {
+            let raw = format!(
+                "POST {path} HTTP/1.1\r\nx-clove-token: {TOKEN}\r\ncontent-length: 0\r\n\r\n"
+            )
+            .into_bytes();
+            let code = status_of(&speak(&d, &raw));
+            assert!(code == 404 || code == 405, "{path} answered {code}");
+        }
     }
 
     #[test]

@@ -233,18 +233,6 @@ throughout, and every other request is answered as usual.
 A second verify for the same torrent while one is running is
 .Sy 400 ,
 and the torrent cannot be resumed until it finishes.
-.It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /peers
-Hand a running torrent a peer to dial.
-The body is a b32 address, with or without the
-.Pa .b32.i2p
-suffix.
-.Pp
-This endpoint is the whole surface for the operation: there is no
-.Xr clove 1
-command for it.
-Normal peer acquisition is tracker replies, inbound connections and I2P PEX;
-supplying an address by hand is a private-swarm and laboratory operation, and
-one the local API is sufficient for.
 .It Sy PUT Pa /v1/torrents/ Ns Ar info-hash Ns Pa /priorities
 Set per-file priorities.
 The body is a comma-separated list, one value per file in the torrent's own
@@ -256,19 +244,6 @@ normal,
 .Sy 2
 high.
 The count must equal the file count.
-.It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /announce
-Announce to every tracker now, ignoring the intervals they gave us.
-Refused with
-.Sy 400
-if the torrent is paused, has no running engine, has no I2P trackers, or was
-already forced within the last minute.
-.Pp
-This endpoint is the whole surface for the operation: there is no
-.Xr clove 1
-command for it.
-Scheduled, event-driven, completion and shutdown announces are unaffected and
-happen without asking; this is the manual override, rate-limited so a script
-cannot turn it into a tracker flood.
 .It Sy PUT Pa /v1/torrents/ Ns Ar info-hash Ns Pa /sequential
 Switch piece selection between file order and rarest-first.
 The body is exactly

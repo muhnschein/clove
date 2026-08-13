@@ -39,9 +39,12 @@ use clove_core::swarm::{
     AnnounceTarget, Announcer, AnnouncerConfig, InboundDemux, Swarm, SwarmConfig,
 };
 use clove_core::torrent::{DEFAULT_MAINTENANCE_INTERVAL, Maintenance, Torrent};
-use clove_core::tracker::MIN_ANNOUNCE_INTERVAL;
 use i2pnet::naming::NamingCache;
-use i2pnet::{DestHash, I2pDialer, I2pNamingLookup};
+use i2pnet::{I2pDialer, I2pNamingLookup};
+// Only the test-support `add_peer` and the tests themselves name a peer
+// directly; the daemon learns peers from announces, PEX and inbound streams.
+#[cfg(test)]
+use i2pnet::DestHash;
 
 /// The `clove.conf` tunables the registry acts on.
 ///
@@ -377,9 +380,6 @@ struct Live {
     /// Lifetime (uploaded, downloaded) at engine start; the torrent's own
     /// counters are per-run deltas on top of these.
     stats_base: (u64, u64),
-    /// When the operator last forced an announce, so a script cannot turn
-    /// the manual announce endpoint into a tracker flood.
-    last_forced_announce: Option<Instant>,
 }
 
 impl Hosted {
@@ -910,7 +910,6 @@ where
             announcer,
             _maintenance: maintenance,
             stats_base: (hosted.uploaded, hosted.downloaded),
-            last_forced_announce: None,
         });
         Ok(())
     }
@@ -1052,12 +1051,17 @@ where
         }
     }
 
-    /// Hand a live torrent an operator-supplied peer to dial.
+    /// Hand a live torrent a peer to dial.
+    ///
+    /// Test support: the engine tests need a peer from somewhere, and on the
+    /// mock network there is no tracker to get one from. The daemon has no
+    /// path to this — its peers come from announces, PEX and inbound streams.
     ///
     /// # Errors
     ///
     /// [`ActionError::NotFound`], or [`ActionError::BadInput`] when the
     /// torrent is not running (paused, or no router yet).
+    #[cfg(test)]
     pub(crate) fn add_peer(
         &mut self,
         info_hash: &[u8; 20],
@@ -1398,48 +1402,6 @@ where
         }
         let resume = hosted.resume(*info_hash);
         write_resume_file(&self.state_dir, info_hash, &resume).map_err(ActionError::Io)
-    }
-
-    /// Force an immediate announce to every tracker (SCOPE §3's operator
-    /// re-announce), bypassing the intervals trackers gave us.
-    ///
-    /// Rate-limited to one forced announce per
-    /// [`clove_core::tracker::MIN_ANNOUNCE_INTERVAL`]:
-    /// the command exists for an operator who suspects a stale peer set, not
-    /// as something to put in a loop.
-    ///
-    /// # Errors
-    ///
-    /// [`ActionError::NotFound`], or [`ActionError::BadInput`] when the
-    /// torrent has no running announcer or was asked too recently.
-    pub(crate) fn announce_now(&mut self, info_hash: &[u8; 20]) -> Result<(), ActionError> {
-        let hosted = self
-            .torrents
-            .get_mut(info_hash)
-            .ok_or(ActionError::NotFound)?;
-        if matches!(hosted.wanted, Wanted::Paused(_)) {
-            return Err(ActionError::BadInput("torrent is paused"));
-        }
-        let Some(live) = &mut hosted.live else {
-            return Err(ActionError::BadInput(
-                "torrent is not running yet (waiting for the router)",
-            ));
-        };
-        let Some(announcer) = &live.announcer else {
-            return Err(ActionError::BadInput(
-                "torrent has no I2P trackers to announce to",
-            ));
-        };
-        if let Some(last) = live.last_forced_announce
-            && last.elapsed() < MIN_ANNOUNCE_INTERVAL
-        {
-            return Err(ActionError::BadInput(
-                "an announce was already forced in the last minute",
-            ));
-        }
-        announcer.announce_now();
-        live.last_forced_announce = Some(Instant::now());
-        Ok(())
     }
 
     /// Claim a torrent for re-verification and hand back the pass to run.
@@ -2458,29 +2420,6 @@ mod tests {
         assert_eq!(sequential_flag(&mut reopened, &info_hash), Some(true));
         reopened.set_sequential(&info_hash, false).unwrap();
         assert_eq!(sequential_flag(&mut reopened, &info_hash), Some(false));
-    }
-
-    #[test]
-    fn announce_now_refuses_a_torrent_that_is_not_running() {
-        let (_content, bytes) = fixture("announce-demo");
-        let data = TempDir::new("data");
-        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
-        let info_hash = add_and_scan(&mut registry, &bytes);
-        // No router yet: the error names that, rather than pretending to
-        // announce into a void.
-        assert!(matches!(
-            registry.announce_now(&info_hash),
-            Err(ActionError::BadInput(_))
-        ));
-        registry.set_paused(&info_hash, true).unwrap();
-        assert!(matches!(
-            registry.announce_now(&info_hash),
-            Err(ActionError::BadInput(_))
-        ));
-        assert!(matches!(
-            registry.announce_now(&[0xAB; 20]),
-            Err(ActionError::NotFound)
-        ));
     }
 
     fn sequential_flag(registry: &mut Registry<MockDialer>, info_hash: &[u8; 20]) -> Option<bool> {
