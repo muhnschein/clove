@@ -2,30 +2,20 @@
 //!
 //! `cloved` serves its `/v1/` API here and `clove` connects here, so — like
 //! every other socket in clove — the construction lives in `i2pnet` (Layer 1,
-//! SCOPE §5). Two transports:
-//!
-//! - **unix socket** (default): local by nature, created `0600`.
-//! - **loopback TCP** (opt-in): the address is parsed and *rejected unless it
-//!   is a loopback IP*, so this is the loopback-validating helper the crate
-//!   root promises. Token auth (in `cloved`) applies regardless.
+//! SCOPE §5). One transport: a **unix socket**, local by nature, created
+//! `0600`. Token auth (in `cloved`) applies on top of that.
 //!
 //! An [`ApiStream`] is a plain blocking `Read + Write`; the API is one request
 //! and one response per connection, so no split is needed.
 
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
-/// A bound control-API listener: unix socket or loopback TCP.
+/// A bound control-API listener.
 #[derive(Debug)]
-pub enum ApiListener {
-    /// A unix-domain socket listener.
-    Unix(UnixListener),
-    /// A loopback TCP listener.
-    Tcp(TcpListener),
-}
+pub struct ApiListener(UnixListener);
 
 impl ApiListener {
     /// Bind a unix-socket listener at `path`, replacing any stale socket file
@@ -44,34 +34,7 @@ impl ApiListener {
         }
         let listener = UnixListener::bind(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(ApiListener::Unix(listener))
-    }
-
-    /// Bind a TCP listener at `addr`, refusing any non-loopback address.
-    ///
-    /// # Errors
-    ///
-    /// `addr` is not a valid `host:port`, is not a loopback address, or the
-    /// bind fails.
-    pub fn bind_loopback_tcp(addr: &str) -> io::Result<ApiListener> {
-        let parsed = parse_loopback(addr)?;
-        Ok(ApiListener::Tcp(TcpListener::bind(parsed)?))
-    }
-
-    /// The TCP port this listener is bound to, or `None` for a unix socket.
-    ///
-    /// Chiefly for a listener bound to port 0, where the kernel chose the port
-    /// and only it knows which — a test that then dials itself, and an operator
-    /// who needs the daemon to say where it is listening.
-    ///
-    /// # Errors
-    ///
-    /// The underlying `getsockname` fails.
-    pub fn local_port(&self) -> io::Result<Option<u16>> {
-        match self {
-            ApiListener::Unix(_) => Ok(None),
-            ApiListener::Tcp(l) => Ok(Some(l.local_addr()?.port())),
-        }
+        Ok(ApiListener(listener))
     }
 
     /// Accept one connection.
@@ -80,77 +43,44 @@ impl ApiListener {
     ///
     /// The underlying accept fails.
     pub fn accept(&self) -> io::Result<ApiStream> {
-        match self {
-            ApiListener::Unix(l) => Ok(ApiStream::Unix(l.accept()?.0)),
-            ApiListener::Tcp(l) => Ok(ApiStream::Tcp(l.accept()?.0)),
-        }
+        Ok(ApiStream(self.0.accept()?.0))
     }
 }
 
-/// Connect to a unix-socket control API at `path`.
+/// Connect to the control API at `path`.
 ///
 /// # Errors
 ///
 /// The daemon is not listening there, or the connect fails.
 pub fn connect_unix(path: &Path) -> io::Result<ApiStream> {
-    Ok(ApiStream::Unix(UnixStream::connect(path)?))
-}
-
-/// Connect to a loopback-TCP control API at `addr` (validates loopback).
-///
-/// # Errors
-///
-/// `addr` is not a valid loopback `host:port`, or the connect fails.
-pub fn connect_loopback_tcp(addr: &str) -> io::Result<ApiStream> {
-    let parsed = parse_loopback(addr)?;
-    Ok(ApiStream::Tcp(TcpStream::connect(parsed)?))
-}
-
-/// Parse `host:port` and require a loopback IP.
-fn parse_loopback(addr: &str) -> io::Result<SocketAddr> {
-    let parsed: SocketAddr = addr.parse().map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "API address must be host:port")
-    })?;
-    if !parsed.ip().is_loopback() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "API TCP address must be a loopback address",
-        ));
-    }
-    Ok(parsed)
+    Ok(ApiStream(UnixStream::connect(path)?))
 }
 
 /// An accepted or dialed control-API connection.
 #[derive(Debug)]
-pub enum ApiStream {
-    /// A unix-socket connection.
-    Unix(UnixStream),
-    /// A loopback-TCP connection.
-    Tcp(TcpStream),
+pub struct ApiStream(UnixStream);
+
+impl ApiStream {
+    /// Wrap an already-connected socket, for tests that make their own pair.
+    #[must_use]
+    pub fn from_unix(stream: UnixStream) -> ApiStream {
+        ApiStream(stream)
+    }
 }
 
 impl Read for ApiStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            ApiStream::Unix(s) => s.read(buf),
-            ApiStream::Tcp(s) => s.read(buf),
-        }
+        self.0.read(buf)
     }
 }
 
 impl Write for ApiStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            ApiStream::Unix(s) => s.write(buf),
-            ApiStream::Tcp(s) => s.write(buf),
-        }
+        self.0.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self {
-            ApiStream::Unix(s) => s.flush(),
-            ApiStream::Tcp(s) => s.flush(),
-        }
+        self.0.flush()
     }
 }
 
@@ -158,31 +88,6 @@ impl Write for ApiStream {
 mod tests {
     use super::*;
     use std::thread;
-
-    #[test]
-    fn loopback_tcp_binds_and_rejects_public() {
-        // Loopback binds.
-        assert!(ApiListener::bind_loopback_tcp("127.0.0.1:0").is_ok());
-        // Non-loopback and garbage are refused before any bind.
-        assert_eq!(
-            ApiListener::bind_loopback_tcp("0.0.0.0:0")
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(
-            ApiListener::bind_loopback_tcp("8.8.8.8:80")
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(
-            ApiListener::bind_loopback_tcp("not-an-addr")
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
-    }
 
     #[test]
     fn unix_socket_round_trips() {
@@ -205,6 +110,17 @@ mod tests {
         assert_eq!(&back, b"ping");
 
         server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_socket_is_owner_only() {
+        let dir = std::env::temp_dir().join(format!("clove-api-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("api.sock");
+        let _listener = ApiListener::bind_unix(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the control socket is not owner-only");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

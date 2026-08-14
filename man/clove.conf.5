@@ -55,24 +55,6 @@ is the only hostname clove accepts anywhere: there is no DNS resolution.
 Exotic loopback spellings such as
 .Pa 127.0.0.2
 are refused rather than given the benefit of the doubt.
-.It Ic i_know_sam_is_remote Ar yes | Ar no
-Acknowledge that a non-loopback
-.Ic sam_address
-is intended.
-Default:
-.Ar no .
-.Pp
-This is dangerous and deliberately ugly to type.
-Traffic between clove and a remote SAM bridge is unprotected: anyone who can
-see that link sees which destinations you talk to, defeating the point of
-running over I2P.
-.Pp
-It is currently of no use: this build dials
-.Pa 127.0.0.1
-and nothing else, so a remote address is refused whether or not the flag is
-set, rather than being accepted and quietly redirected to the local router.
-The flag is kept so an existing configuration still parses, and so the
-refusal can say what was meant.
 .It Ic data_dir Ar path
 Absolute path of the state directory: destination keys, per-torrent resume
 data, the API token, and downloaded files.
@@ -98,7 +80,7 @@ Default:
 A transient identity is unlinkable across restarts, at the cost of losing
 your standing in swarms and having to re-announce as a new peer each time.
 .It Ic preallocate Ar yes | Ar no
-Grow each of a torrent's files to its full length when the torrent is added,
+Claim the disk for each of a torrent's files when the torrent is added,
 instead of letting the file stay sparse and fill in as pieces arrive.
 Default:
 .Ar no .
@@ -109,9 +91,10 @@ fail part-way through with
 because the space was already claimed, and files that are laid out more
 contiguously, which matters on rotational disks and for playing media while
 it downloads.
-Leave it off on a filesystem where sparse files are cheap and free space is
-tight, and on one that does not support sparse files it changes nothing —
-the space is taken either way.
+Leave it off where free space is tight and sparse files are cheap.
+.Pp
+A filesystem that cannot reserve space says so on stderr and the file is left
+sparse, so the download can still run out of disk.
 .It Ic peer_limit Ar count
 The greatest number of peer connections
 .Xr cloved 8
@@ -143,43 +126,18 @@ the whole allowance, and is what an operator running many torrents at once
 should lower.
 Both keys take a number from 1 to 10000.
 .Pp
+Every torrent that is not paused runs, so these two keys are what bounds the
+client: there is no limit on how many torrents are active at once.
+.Pp
 There is deliberately no fair share between torrents.
 With the defaults, four saturated torrents can hold the entire
 .Ic peer_limit
-and a fifth waits for peers to churn; if that is your situation, lower
+and the rest wait for peers to churn.
+If you run many torrents and would rather each held a smaller but working peer
+set, lower
 .Ic torrent_peer_limit
 rather than raising
 .Ic peer_limit .
-.It Ic max_active_downloads Ar count
-How many incomplete torrents run at once.
-Default:
-.Ar 3 .
-.Pp
-The rest are
-.Sy queued :
-listed and persisted, but holding no peers, no tunnels and no threads.
-Three because the scarce thing on I2P is tunnels rather than bandwidth — three
-torrents each holding a healthy peer set finish sooner, one after another, than
-twenty sharing the same ceiling and all crawling.
-.It Ic max_active_seeds Ar count
-How many complete torrents seed at once.
-Default:
-.Ar 5 .
-.Pp
-A separate allowance from
-.Ic max_active_downloads ,
-which is what stops a queue of downloads from also stopping the client seeding
-what it has already finished.
-When a download completes it moves from one allowance to the other, freeing its
-download slot for whatever is next in the queue.
-.Pp
-The queue order is the order torrents were added, and it does not change:
-resuming a paused torrent returns it to its own place rather than to the back,
-which can displace a newer torrent that had been promoted in its absence.
-That torrent keeps everything it downloaded; what it loses is its peers and an
-announce.
-.Ic clove start
-puts one torrent at the head of the queue when that is not what you want.
 .It Ic seed_ratio Ar ratio
 Stop seeding a torrent once it has uploaded this multiple of what it
 downloaded.
@@ -250,29 +208,6 @@ Layer 3 belongs to the service manager, and nothing the daemon can observe
 tells it whether the unit's
 .Va IPAddressDeny=
 took effect.
-.It Ic watch_dir Ar path
-Absolute path of a directory to watch for
-.Pa .torrent
-files.
-Default: none, and nothing is watched.
-.Pp
-Every few seconds each
-.Pa .torrent
-in it is added and the file renamed to
-.Pa .torrent.added ,
-which is what stops the same torrent being offered forever.
-One that does not parse becomes
-.Pa .torrent.rejected ,
-for the same reason: it is not going to start parsing, and retrying it every
-few seconds would fill the log with one complaint.
-A torrent that is already hosted counts as added.
-.Pp
-Polled rather than watched through the kernel: a directory listing on a timer
-needs nothing that is not already here, and nobody notices five seconds on a
-torrent about to spend minutes building tunnels.
-.Pp
-This is how other tooling drives clove without an API of its own.
-The daemon needs write access to the directory, since it renames what it takes.
 .El
 .Sh EXAMPLES
 The recommended configuration is no file at all.
@@ -284,10 +219,8 @@ sam_address 127.0.0.1:7000
 data_dir /srv/clove
 .Ed
 .Pp
-Driven by other tooling: pick up torrents dropped in a directory, and stop
-seeding at twice what was downloaded or after a day with nobody asking.
+Stop seeding at twice what was downloaded, or after a day with nobody asking.
 .Bd -literal -offset indent
-watch_dir /srv/torrents/inbox
 seed_ratio 2
 seed_idle_minutes 1440
 .Ed
@@ -302,7 +235,6 @@ torrent from taking most of them.
 .Bd -literal -offset indent
 peer_limit 80
 torrent_peer_limit 12
-max_active_downloads 2
 .Ed
 .Pp
 A system-wide instance with a fixed socket path, so a service manager and its

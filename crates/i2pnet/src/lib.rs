@@ -2,19 +2,18 @@
 //! open sockets (Layer 1 no-clearnet enforcement, `docs/SCOPE.md` §5).
 //!
 //! Everything network-shaped in clove goes through the traits defined here.
-//! The production implementation ([`sam`]) wraps the `yosemite` `SAMv3`
-//! library with its `sync` feature; [`mock`] provides an
-//! in-memory implementation so the engine is testable without a router.
+//! The production implementation ([`sam`]) speaks `SAMv3` to the bridge
+//! directly; [`mock`] provides an in-memory implementation so the engine is
+//! testable without a router.
 //!
 //! Invariants this crate owns:
 //!
 //! - The one permitted IP socket is a TCP connection to the configured SAM
-//!   bridge, which must be loopback (or a unix socket) unless the operator
-//!   sets the explicit, documented-as-dangerous remote-SAM override.
-//! - The local HTTP API's opt-in localhost-TCP listener is also created
-//!   *here* (a planned `bind_local_api()` that refuses non-loopback
-//!   addresses), so every IP-socket construction site in the codebase lives
-//!   in this crate. `cloved` gets a listener handle, never a socket API.
+//!   bridge, which must be loopback; a remote address is refused at
+//!   configuration time and there is no override.
+//! - The local HTTP API's unix-socket listener is also created *here*
+//!   ([`api`]), so every socket construction site in the codebase lives in
+//!   this crate. `cloved` gets a listener handle, never a socket API.
 //! - No DNS: names are I2P names, resolved via SAM `NAMING LOOKUP` only.
 //!
 //! Peer addressing uses [`DestHash`] exclusively — there is no `IpAddr`
@@ -29,6 +28,7 @@ use std::time::Duration;
 
 pub mod addr;
 pub mod api;
+#[cfg(feature = "mock")]
 pub mod mock;
 pub mod naming;
 pub mod sam;
@@ -47,9 +47,9 @@ pub struct DestHash(pub [u8; 32]);
 ///
 /// A connection is used duplex for the handshake, then [`split`](Self::split)
 /// into independent read and write halves so a peer's reader and writer run
-/// on separate threads. This mirrors `yosemite`'s `Stream::split` (the real
-/// backend cannot hand out two duplex clones — see `docs/PROTOCOL.i2p-bt`),
-/// so the abstraction stays honest across the mock and SAM implementations.
+/// on separate threads. Splitting consumes the stream rather than handing out
+/// two duplex clones, which is what the SAM backend can actually provide, so
+/// the abstraction stays honest across the mock and SAM implementations.
 pub trait I2pStream: Read + Write + Send + Sized {
     /// The read half yielded by [`split`](Self::split).
     type Reader: Read + Send + 'static;

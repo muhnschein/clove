@@ -19,38 +19,6 @@ commit. Closure sizes are recorded when the dependency is actually added.
   (`i2pnet::addr`). Kept on the same major as `sha1` so the two share one
   `digest` tree instead of pulling a second copy; when one moves, both move.
   No new socket-capable crates.
-- **`yosemite` 0.7** (features = `["sync"]`, `i2pnet`).
-  The reason this project is buildable: SAMv3 sessions/streams/naming.
-  MIT, responsive author (R1); consumed only inside `i2pnet` behind our
-  traits, vendorable if upstream stalls. The only socket-capable
-  dependency — allowlisted in `ci/check-net-deps.sh`. Its closure is the
-  largest single cost in the tree (~24 crates: `rand`, `thiserror`, `nom`,
-  `tracing`, and the `syn`/`proc-macro2`/`quote` proc-macro trio via
-  `thiserror-impl`/`tracing-attributes`). This exceeds the §9 "no
-  proc-macro-heavy frameworks" preference, but it is the accepted price of
-  the one library that speaks SAM, and it is wrapped so the engine never
-  sees it. Reviewed for socket capability: none of the closure beyond
-  `yosemite` itself opens sockets.
-
-  **Narrowed to `NAMING LOOKUP` alone**, over two steps on 2026-07-27/28.
-  Dialing left first: yosemite's session controller is one state machine shared
-  by the control connection and every stream operation, and a stream failure on
-  an unexpected path poisons it for the life of the session
-  (`docs/PROTOCOL.i2p-bt` §2.12). `SESSION CREATE` and `STREAM FORWARD`
-  followed, for a different reason — clove has to *read* its own control
-  connection for the life of the session, to answer the router's `PING` (Java
-  I2P ends a session that does not) and to hear what the router says when a
-  session ends, and yosemite owns that socket and exposes it only through a
-  write-then-read-one-line call (§2.13). Closing §2.7's `SESSION CREATE` hang
-  fell out of the same change, the deadline now being ours to set.
-
-  What remains is `RouterApi::lookup_name`: one socket, opened and closed per
-  lookup, with no session state behind it — the shape yosemite is unambiguously
-  good at. Still worth its place for that, but it now carries very little of
-  clove's runtime, and R1's "vendor if upstream stalls" is cheaper than it was.
-  The closure has not shrunk: `yosemite` is one crate in the `Cargo.toml`
-  either way, and the ~24-crate cost above is unchanged.
-
 - **`landlock` 0.4** (`cloved`, Linux only). Layer-2
   filesystem (and, on ABI 4+, outbound-TCP) self-restriction; see
   `crates/cloved/src/sandbox.rs`. The raw `landlock_*` syscalls are unsafe and
@@ -105,8 +73,5 @@ commit. Closure sizes are recorded when the dependency is actually added.
 - **`getrandom` 0.2** (`cloved`). The API token and the
   peer-ID suffix are bytes straight from the OS RNG; `getrandom` is the
   maintained thin wrapper over `getrandom(2)`/`/dev/urandom`, exactly the
-  syscall access we do not want to hand-roll. **Deliberately held at 0.2**
-  rather than 0.3+: yosemite's `rand` already pulls 0.2, so sharing it costs
-  one call-site API name and saves a duplicate crate in the tree. Revisit when
-  yosemite moves to a `rand` built on 0.3. Tiny closure (`cfg-if`, `libc`);
-  not socket-capable.
+  syscall access we do not want to hand-roll. Tiny closure (`cfg-if`, `libc`,
+  both already in the tree); not socket-capable.

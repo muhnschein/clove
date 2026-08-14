@@ -31,9 +31,6 @@ use crate::http;
 /// prefix (`-CV0001-`, Q7) so a tracker operator sees one name, not two.
 pub const USER_AGENT: &str = concat!("clove/", env!("CARGO_PKG_VERSION"));
 
-/// Default peers to request per announce.
-pub const DEFAULT_NUMWANT: u32 = 200;
-
 /// Minimum interval clove will wait between announces regardless of what a
 /// tracker asks for, to avoid hammering (a floor, not the tracker's own
 /// `min interval`).
@@ -360,24 +357,13 @@ impl AnnounceState {
         now >= self.next_due
     }
 
-    /// Make an announce due immediately, bypassing both the tracker's
-    /// interval and any failure backoff.
-    ///
-    /// This exists for one caller: an operator asking for a re-announce
-    /// through the API. Nothing automatic may use it — the interval a
-    /// tracker hands back is an instruction, and the whole point of
-    /// [`on_success`](Self::on_success) is to obey it. The one automatic
-    /// bypass there is has its own, much narrower door:
-    /// [`completion_due`](Self::completion_due).
-    pub fn make_due(&mut self) {
-        self.next_due = 0;
-    }
-
     /// Bring forward the one announce that is owed on an event rather than on
     /// a clock: the `completed` that BEP 3 wants when a download finishes.
     ///
-    /// Deliberately *not* [`make_due`](Self::make_due), whose contract is that
-    /// nothing automatic may use it. `completed` is an event, in the same
+    /// The only bypass of the tracker's own interval there is, and deliberately
+    /// narrow. The interval a tracker hands back is an instruction, and the
+    /// whole point of [`on_success`](Self::on_success) is to obey it.
+    /// `completed` is an event, in the same
     /// class as `started` (the first announce, which no interval governs) and
     /// `stopped` (sent on teardown regardless of one) — not a periodic report
     /// whose cadence the tracker gets to set. Waiting for the next interval to
@@ -748,7 +734,7 @@ mod tests {
             downloaded: 200,
             left: 300,
             event: Event::Started,
-            numwant: DEFAULT_NUMWANT,
+            numwant: 50,
             our_dest_b64: "MYDESTb64",
         }
     }

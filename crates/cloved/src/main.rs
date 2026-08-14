@@ -10,7 +10,6 @@
 mod registry;
 mod sandbox;
 
-use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -93,21 +92,8 @@ fn confine(config: &Config) -> Result<sandbox::Verdict, String> {
     // files, has already happened. Drop the rest (SCOPE §5 Layer 2). This runs
     // before any thread is spawned — a Landlock domain covers the calling
     // thread and its descendants, not siblings that already exist.
-    let mut paths: Vec<(&Path, sandbox::Role)> =
+    let paths: Vec<(&Path, sandbox::Role)> =
         vec![(config.data_dir.as_path(), sandbox::Role::State)];
-    // The watch directory, if there is one, is the one path an operator names
-    // that is deliberately *outside* the data directory — and the daemon both
-    // reads it and renames within it. Granted here, before the domain closes,
-    // which is the whole discipline this layer runs on: what is not unveiled
-    // before the restriction cannot be reached after it.
-    //
-    // Getting this wrong is silent in the worst way. Landlock is best-effort,
-    // so on a kernel without it the watcher works and on a kernel with it the
-    // directory simply reads as empty — nothing added, nothing logged, no
-    // error anywhere. CI found it; a local run had not.
-    if let Some(dir) = &config.watch_dir {
-        paths.push((dir.as_path(), sandbox::Role::Watch));
-    }
     // The control socket's directory is deliberately *not* here, and used to be.
     //
     // It was granted so the socket "could be unlinked at exit" — but nothing
@@ -119,7 +105,7 @@ fn confine(config: &Config) -> Result<sandbox::Verdict, String> {
     // of it.
     //
     // If unlink-at-exit is ever added, this is what has to come back — as
-    // `Role::Watch`-like rights on that one directory, not as everything.
+    // narrow rights on that one directory, not as everything.
     //
     // Nothing read-only either. `/dev/urandom` used to be listed, and it was pure
     // self-reference: randomness comes from `getrandom(2)`, which needs no file,
@@ -265,82 +251,7 @@ fn run() -> Result<(), String> {
         Identity::new(&config.data_dir, config.ephemeral),
     );
     spawn_persist_loop(&daemon);
-    if let Some(dir) = config.watch_dir.clone() {
-        spawn_watch_dir(&daemon, dir);
-    }
     serve(&listener, &daemon)
-}
-
-/// How often the watch directory is looked at.
-///
-/// Polling, not `inotify`: a directory listing on a timer is a `read_dir` and
-/// no new dependency, against a watch API that would be one. Nobody notices
-/// five seconds on a torrent that is about to spend minutes building tunnels.
-const WATCH_DIR_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Watch a directory for `.torrent` files and add each one it finds.
-///
-/// The file is renamed to `<name>.added` once it has been taken, which is what
-/// stops the same torrent being offered every five seconds forever. A file
-/// that fails to parse becomes `<name>.rejected` for the same reason — it is
-/// not going to start parsing, and retrying it every tick would fill the log
-/// with one complaint.
-///
-/// This is how external tooling drives clove without an API of its own, and it
-/// is deliberately the dumbest thing that works.
-fn spawn_watch_dir(daemon: &Arc<Daemon>, dir: PathBuf) {
-    let daemon = Arc::clone(daemon);
-    std::thread::spawn(move || {
-        loop {
-            scan_watch_dir(&daemon, &dir);
-            std::thread::sleep(WATCH_DIR_INTERVAL);
-        }
-    });
-}
-
-/// One pass over the watch directory.
-fn scan_watch_dir(daemon: &Arc<Daemon>, dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        // Not readable, or not there yet. Said once per tick would be noise;
-        // an operator who set the key and mistyped it sees nothing added,
-        // which is the same information.
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("torrent") {
-            continue;
-        }
-        // The watch directory is the one path an operator points *outward*, so
-        // its filenames are chosen by whoever produced the file — a browser
-        // download, a script, a stranger. Scrubbed once here for the three log
-        // lines below (`clove_core::text`).
-        let shown = clove_core::text::scrub(&path.display().to_string());
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
-        };
-        let added = lock(&daemon.registry).add_torrent(&bytes, registry::AddOptions::default());
-        let suffix = match added {
-            Ok((info_hash, job)) => {
-                // Same as the API path: the initial hash of whatever is
-                // already on disk runs with the registry unlocked.
-                let _ = run_scan(daemon, &job);
-                eprintln!("cloved: added {} from {shown}", registry::hex(&info_hash));
-                "added"
-            }
-            // A duplicate is not a failure: the operator dropped in something
-            // already hosted, and the file has still been dealt with.
-            Err(AddError::Duplicate) => "added",
-            Err(e) => {
-                eprintln!("cloved: not adding {shown}: {e}");
-                "rejected"
-            }
-        };
-        let taken = path.with_extension(format!("torrent.{suffix}"));
-        if let Err(e) = fs::rename(&path, &taken) {
-            eprintln!("cloved: leaving {shown} where it is: {e}");
-        }
-    }
 }
 
 /// Daemon state shared across connection threads.
@@ -657,6 +568,10 @@ fn spawn_metadata_fetch(daemon: &Arc<Daemon>, info_hash: [u8; 20]) {
     });
 }
 
+/// How long a magnet's announce may spend reaching a tracker. The same budget
+/// the announcer gives a hosted torrent's dial.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// What one fetch round did, so the caller can log it and publish it.
 #[derive(Default)]
 pub(crate) struct FetchRound {
@@ -713,7 +628,7 @@ fn try_fetch_round<D>(
 where
     D: i2pnet::I2pDialer + i2pnet::I2pNamingLookup + Clone + Send + Sync + 'static,
 {
-    use clove_core::tracker;
+    use clove_core::{swarm, tracker};
 
     let mut round = FetchRound::default();
     let mut peers: Vec<DestHash> = Vec::new();
@@ -729,55 +644,21 @@ where
             } else {
                 tracker::Event::Periodic
             },
-            numwant: 30,
+            numwant: swarm::AnnouncerConfig::default().numwant,
             our_dest_b64: &ctx.dest_b64,
         };
-        let (host, request) = match tracker::build_announce(url, &params) {
-            Ok(built) => built,
-            Err(e) => {
-                round.trackers_failed += 1;
-                round.fail("tracker URL", url, &e);
-                continue;
-            }
-        };
-        let dest = match i2pnet::I2pNamingLookup::lookup(&ctx.naming, &host) {
-            Ok(dest) => dest,
-            Err(e) => {
-                round.trackers_failed += 1;
-                round.fail("resolving tracker", &host, &e);
-                continue;
-            }
-        };
-        let mut stream = match i2pnet::I2pDialer::dial(&ctx.dialer, dest, Duration::from_secs(120))
-        {
-            Ok(stream) => stream,
-            Err(e) => {
-                round.trackers_failed += 1;
-                round.fail("dialing tracker", &host, &e);
-                continue;
-            }
-        };
-        // A magnet's rounds are sequential, so one tracker that accepts the
-        // stream and then says nothing stops this magnet resolving at all —
-        // not just against that tracker.
-        let _ = i2pnet::I2pStream::set_timeouts(&stream, Some(tracker::ANNOUNCE_IO_TIMEOUT));
-        match tracker::announce_over(&mut stream, &request) {
+        // The same announce a hosted torrent makes, including the I/O timeout:
+        // a magnet's rounds are sequential, so one tracker that accepts the
+        // stream and then says nothing stops this magnet resolving at all, not
+        // just against that tracker.
+        match swarm::contact_tracker(url, &params, &ctx.dialer, &ctx.naming, DIAL_TIMEOUT) {
             Ok(response) => {
                 round.trackers_ok += 1;
                 peers.extend(response.peers);
             }
-            Err(e) => {
+            Err(failed) => {
                 round.trackers_failed += 1;
-                round.fail("announcing to", &host, &e);
-                // The literal URL, for pasting into a browser aimed at the
-                // same tracker. A tracker that refuses an announce as a
-                // policy violation will not say which part it objected to,
-                // and deleting parameters one at a time is the only thing
-                // that finds out.
-                eprintln!(
-                    "cloved: the announce that failed was {}",
-                    clove_core::text::scrub(&clove_core::tracker::announced_url(&host, &request))
-                );
+                round.fail(failed.stage.as_str(), url, &failed.error);
             }
         }
     }
@@ -1031,7 +912,6 @@ fn torrent_action(
         ("POST", Some("resume")) => {
             action_result(lock(&daemon.registry).set_paused(&info_hash, false))
         }
-        ("POST", Some("start")) => action_result(lock(&daemon.registry).force_start(&info_hash)),
         ("PUT", Some("seed-ratio")) => match parse_ratio_body(&request.body) {
             Some(milli) => action_result(lock(&daemon.registry).set_seed_ratio(&info_hash, milli)),
             None => error(
@@ -1039,19 +919,6 @@ fn torrent_action(
                 "body must be a ratio like 2 or 1.75, or 0 to follow the daemon's seed_ratio",
             ),
         },
-        ("POST", Some("peers")) => {
-            let text = String::from_utf8_lossy(&request.body);
-            let Some(peer) = DestHash::from_b32(&text) else {
-                return error(
-                    400,
-                    "body must be a peer's b32 address (52 chars, .b32.i2p optional)",
-                );
-            };
-            action_result(lock(&daemon.registry).add_peer(&info_hash, peer))
-        }
-        ("POST", Some("announce")) => {
-            action_result(lock(&daemon.registry).announce_now(&info_hash))
-        }
         ("PUT", Some("sequential")) => match parse_bool_body(&request.body) {
             Some(on) => action_result(lock(&daemon.registry).set_sequential(&info_hash, on)),
             None => error(400, "body must be \"true\" or \"false\""),
@@ -1516,7 +1383,7 @@ mod tests {
             let _ = client_w.write_all(&body);
             let _ = client_w.shutdown(std::net::Shutdown::Write);
         });
-        handle(ApiStream::Unix(server), daemon).expect("handle");
+        handle(ApiStream::from_unix(server), daemon).expect("handle");
         let mut reply = Vec::new();
         let mut client_r = client;
         client_r.read_to_end(&mut reply).expect("read response");
@@ -1590,6 +1457,26 @@ mod tests {
         let delete_status =
             format!("DELETE /v1/status HTTP/1.1\r\nx-clove-token: {TOKEN}\r\n\r\n").into_bytes();
         assert_eq!(status_of(&speak(&d, &delete_status)), 405);
+    }
+
+    /// The retired endpoints answer as retired rather than doing something.
+    /// A client written against them gets a refusal, not a silent success.
+    #[test]
+    fn the_removed_endpoints_are_gone() {
+        let dir = TempDir::new("retired");
+        let d = daemon(&dir);
+        let hash = "a".repeat(40);
+        for path in [
+            format!("/v1/torrents/{hash}/peers"),
+            format!("/v1/torrents/{hash}/announce"),
+        ] {
+            let raw = format!(
+                "POST {path} HTTP/1.1\r\nx-clove-token: {TOKEN}\r\ncontent-length: 0\r\n\r\n"
+            )
+            .into_bytes();
+            let code = status_of(&speak(&d, &raw));
+            assert!(code == 404 || code == 405, "{path} answered {code}");
+        }
     }
 
     #[test]

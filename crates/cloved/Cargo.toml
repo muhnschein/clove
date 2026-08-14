@@ -10,10 +10,6 @@ publish.workspace = true
 [dependencies]
 clove-core = { path = "../clove-core" }
 i2pnet = { path = "../i2pnet" }
-# Pinned to 0.2 so we share the copy yosemite's `rand` already pulls in,
-# rather than adding a second getrandom to the tree for one call — the same
-# reasoning that keeps sha2 on sha1's `digest` version. Revisit when yosemite
-# moves to a rand that uses getrandom 0.3+.
 getrandom = "0.2"
 rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
 
@@ -30,6 +26,8 @@ libc = "0.2"
 # Tests build real .torrent fixtures, which need SHA-1 piece hashes. Already
 # in the tree via clove-core; dev-only, not part of the runtime budget.
 sha1 = "0.11"
+# The registry's tests run against the in-memory network rather than a router.
+i2pnet = { path = "../i2pnet", features = ["mock"] }
 
 [lints]
 workspace = true

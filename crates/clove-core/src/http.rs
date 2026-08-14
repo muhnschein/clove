@@ -5,7 +5,7 @@
 //! - **Client** ([`Request::encode`], [`read_response`]) — the tracker client
 //!   (announces are HTTP GETs over an I2P stream).
 //! - **Server** ([`read_request`], [`Response::encode`]) — the local `/v1/`
-//!   API in `cloved`, served over a unix socket / loopback TCP.
+//!   API in `cloved`, served over a unix socket.
 //!
 //! It stays transport-agnostic: everything reads from and writes to any
 //! `Read`/`Write` — an `i2pnet` stream, a unix socket, or a cursor in tests.

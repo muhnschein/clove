@@ -4,7 +4,7 @@
 
 **Language:** Rust (stable toolchain) 
 
-**SAM library:** yosemite (eepnet/yosemite)
+**SAM library:** none — `i2pnet` speaks `SAMv3` directly
 
 **Engineering ethos:** see §9 — OpenBSD/OpenSSH/doas/opentracker/SQLite as the quality reference class
 
@@ -80,14 +80,14 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 - All defaults documented in `clove.conf(5)`, actual-default values stated, not prose-approximated.
 
 ### CLI
-- Daemon `cloved` + control CLI `clove`, speaking to the local HTTP API over a unix socket (default) or localhost TCP (opt-in).
+- Daemon `cloved` + control CLI `clove`, speaking to the local HTTP API over a unix socket.
 - Commands: add (file/magnet), remove (with/without data), list, status (per torrent: peers, tunnels, speeds, availability), pause/resume, verify, set file priorities, client-level stats.
 - Human-friendly default output (aligned tables, progress, rates); `--json` on every read command for scripting.
 - Sensible exit codes, shell completion generation.
 - Peer identity on the wire: Azureus-style peer-ID prefix and client name string chosen per Q7 and kept stable thereafter; checked against the informal BEP 20 registry to avoid collisions.
 
 ### HTTP API
-- Local-only (unix socket default). Token auth even on localhost TCP.
+- Local-only: a unix socket, created `0600`, and nothing else. Token auth on top of that.
 - REST-ish JSON; versioned under `/v1/`. Explicitly not compatible with the Transmission/qBittorrent APIs in v1. Another project can add this if need be. This is not that project.
 
 ## 4. Architecture
@@ -102,30 +102,30 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 +-------------------------------------------------------+
 |                 i2pnet module (THE ONLY                 |
 |              NETWORK-TOUCHING CODE, wraps               |
-|                      yosemite)                          |
+|                   speaks SAMv3)                         |
 +-------------------------------------------------------+
                     | SAMv3 (localhost)
                     v
                 I2P router
 ```
 
-- **`i2pnet` module boundary.** All of yosemite is consumed behind our own trait (`I2pDialer`, `I2pListener`, `I2pNamingLookup`, later `I2pDatagram`). Rationale: yosemite is young and small; if it stalls or we outgrow it, we swap the impl without touching the engine. Also gives us a mock implementation for engine tests without a router.
+- **`i2pnet` module boundary.** All network access is behind our own traits (`I2pDialer`, `I2pListener`, `I2pNamingLookup`, later `I2pDatagram`). `i2pnet` speaks `SAMv3` to the bridge itself over sockets it owns, with no SAM library in the tree. The traits also give us a mock implementation for engine tests without a router.
 - **Session topology:** one SAM PRIMARY session per client identity, with stream subsession for peer traffic. Tracker announces share the peer session's destination (this is what i2psnark does and what trackers expect — announced identity must match peer identity).
 - **Reconnect discipline:** the SAM control socket, sessions, and forwarded listeners are supervised. Router restart ⇒ exponential-backoff resurrection of the full session tree, torrents transition to a visible "waiting for router" state, no thundering-herd re-announce. This state machine gets designed and tested explicitly.
-- **Concurrency model:** synchronous, thread-per-peer with blocking I/O — the most simple and mostauditable; entirely viable at I2P scale (50–200 peers, high tunnel latency makes per-connection thread cost irrelevant). yosemite ships a first-class `sync` feature. Fallback if a concrete wall is hit: smol via yosemite's `smol` feature. The engine is written against narrow internal traits so this choice stays swappable longer than usual.
+- **Concurrency model:** synchronous, thread-per-peer with blocking I/O — the most simple and most auditable; entirely viable at I2P scale (50–200 peers, high tunnel latency makes per-connection thread cost irrelevant). The engine is written against narrow internal traits so this choice stays swappable longer than usual.
 - **Storage:** file-backed with preallocation option; mmap explicitly out (predictable memory > speed here). Disk I/O and hashing on dedicated worker threads; bounded queues everywhere (no unbounded channels anywhere in the engine — lint-enforced).
 
 ## 5. No-Clearnet Enforcement (defense in depth, three independent layers)
 
 **Layer 1 — by construction:**
 - Only the `i2pnet` crate may depend on socket-capable APIs. The engine crates forbid `std::net` and `socket2` via `clippy` `disallowed_types`/`disallowed_methods` config + a CI grep gate over `Cargo.lock` (`ci/check-net-deps.sh`).
-- `i2pnet` itself may open exactly one kind of socket: a TCP connection to the configured SAM address, which must be a loopback address or unix socket unless `--i-know-sam-is-remote` (explicit, ugly, documented as dangerous) is set. The opt-in localhost-TCP listener for the local HTTP API is also constructed inside `i2pnet` (loopback-validating helper), so every IP-socket construction site is in one crate.
+- `i2pnet` itself may open exactly one kind of socket: a TCP connection to the configured SAM address, which must be loopback — a remote address and a unix-socket path are both refused at parse time, and there is no override. The local HTTP API's unix-socket listener is also constructed inside `i2pnet`, so every socket construction site is in one crate.
 - No DNS resolution code paths: hostnames are rejected in config except `localhost`; naming is I2P naming only.
 - Dependency budget: every new transitive dependency with network capability requires justification in the PR. `cargo deny` config committed in-repo.
 
 **Layer 2 — runtime self-restriction (pledge/unveil doctrine, Linux mechanisms):**
 - The daemon restricts *itself* as it passes lifecycle phases, OpenSSH-style. After initialization (config read, data directory opened, SAM connected, control socket bound), it applies:
-  - **Landlock**: filesystem access reduced to the data directory (and the watch directory, when one is configured), each to the rights that kind of directory actually needs — not `from_all()`. The state role gets 8 of the 16 filesystem rights; the watch role gets 4. What is withheld is the point: no `Execute` (which also denies mapping a file executable, something `seccomp`'s `execve` denial does not reach), no `MakeSym`, no device/socket/FIFO creation, and no `Refer`, since every rename the daemon makes is within one directory. Outbound TCP is confined to the SAM port (ABI 4), and reaching outside the domain by abstract unix socket or signal is scoped off (ABI 6). On ABI 9 (Linux 7.1) connecting to any *pathname* unix socket is denied too — handled and granted to nothing, since the control socket is bound before this point and only accepted on afterwards.
+  - **Landlock**: filesystem access reduced to the data directory, to the rights it actually needs — not `from_all()`. The state role gets 8 of the 16 filesystem rights. What is withheld is the point: no `Execute` (which also denies mapping a file executable, something `seccomp`'s `execve` denial does not reach), no `MakeSym`, no device/socket/FIFO creation, and no `Refer`, since every rename the daemon makes is within one directory. Outbound TCP is confined to the SAM port (ABI 4), and reaching outside the domain by abstract unix socket or signal is scoped off (ABI 6). On ABI 9 (Linux 7.1) connecting to any *pathname* unix socket is denied too — handled and granted to nothing, since the control socket is bound before this point and only accepted on afterwards.
   - ABI 6 is the floor §0 commits to, so it is asked for as a `HardRequirement`; only the ABI 9 addition is best-effort. That is what makes the reported status mean something: the required tier cannot be partial, so a partial result has exactly one cause and the log line can name it. A kernel that cannot provide ABI 6 is reported as below the documented baseline, distinctly from Landlock being present but disabled. Still never fails startup, per the no-layer-assumes-another rule.
   - The control socket's directory is deliberately *not* granted. It was, so the socket "could be unlinked at exit" — but nothing unlinks it, and with `XDG_RUNTIME_DIR` set that directory is `/run/user/<uid>`, shared with every other application's runtime state.
   - **seccomp**: post-init syscall **allowlist** — anything not needed after initialization returns `ENOSYS`, which is the answer a libc's fallback paths are written for; `EPERM` is what stops glibc falling back from `clone3` to `clone`, and a hand-maintained list this short will be probed past eventually.
@@ -173,9 +173,9 @@ covered by any test in this repo — `crates/clove-core`'s loopback download is
 
 | # | Item | Plan |
 |---|---|---|
-| R1 | yosemite maturity (v0.7, few users) | Wrap behind `i2pnet` trait; vendor if needed; upstream fixes (author is responsive/active) |
+| R1 | [Closed] No SAM library: `i2pnet` speaks the protocol itself | [Closed] |
 | R2 | [Outdated] | [Outdated] |
-| R3 | Datagram2/3 availability in yosemite + routers (gates future UDP announces, DHT) | Not needed for v1; track upstream |
+| R3 | Datagram2/3 availability in routers (gates future UDP announces, DHT) | Not needed for v1; track upstream |
 | R4 | i2p_pex flag semantics underspecified ("review libtorrent source") | Conformance testing vs i2psnark; treat i2psnark behavior as normative |
 | R5 | Tunnel latency vs choker/timeout tuning (clearnet BT timing assumptions are wrong on I2P) | Make all timeouts config-tunable; benchmark on live swarms; expect several rounds |
 | R6 | Naming lookups for large peer sets (b32 resolution latency/failures) | Cache aggressively, cap concurrent lookups, negative caching |

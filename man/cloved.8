@@ -97,8 +97,7 @@ created, token loaded, torrents loaded, control socket bound \(em
 drops the capabilities it no longer needs, before it starts any thread.
 On Linux this is
 .Xr landlock 7 ,
-confining the filesystem to the data directory \(em and the watch directory when
-one is configured \(em each to the rights that kind of directory needs rather
+confining the filesystem to the data directory, to the rights it needs rather
 than to all of them, confining outbound TCP to the single SAM port, and, on
 Landlock ABI 9 or later, refusing to connect to any
 .Xr unix 7

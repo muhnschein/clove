@@ -39,8 +39,8 @@ pub struct Storage {
 
 impl Storage {
     /// Create (or open) the torrent's files under `root`, creating parent
-    /// directories as needed. With `preallocate`, each file is grown to its
-    /// full length up front; otherwise files grow as blocks are written.
+    /// directories as needed. With `preallocate`, each file's blocks are
+    /// claimed up front; otherwise files grow as blocks are written.
     ///
     /// # Errors
     ///
@@ -55,7 +55,7 @@ impl Storage {
             // check that could be stale by the time we act on it.
             let file = open_beneath(root, &entry.path)?;
             if preallocate && entry.length > 0 {
-                file.set_len(entry.length)?;
+                claim_blocks(&file, entry.length, &entry.path)?;
             }
             regions.push(Region {
                 file,
@@ -333,6 +333,34 @@ fn open_beneath(root: &Path, components: &[String]) -> io::Result<File> {
     Ok(File::from(fd))
 }
 
+/// Claim `length` bytes of disk for `file`, so the download cannot later fail
+/// part-way through for want of space.
+///
+/// `fallocate(2)` reserves blocks; setting the length alone would leave the
+/// file sparse, which reserves nothing and is what `preallocate no` already
+/// does. A filesystem that cannot reserve says `EOPNOTSUPP`, and there the
+/// length is set instead and the operator is told the space is not claimed.
+///
+/// # Errors
+///
+/// Out of space, or any other filesystem error.
+fn claim_blocks(file: &File, length: u64, components: &[String]) -> io::Result<()> {
+    use rustix::fs::{FallocateFlags, fallocate};
+
+    match fallocate(file, FallocateFlags::empty(), 0, length) {
+        Ok(()) => Ok(()),
+        Err(rustix::io::Errno::OPNOTSUPP) => {
+            eprintln!(
+                "clove: {}: this filesystem cannot reserve space; the file is sparse and the \
+                 download can still run out of disk",
+                crate::text::scrub(&components.join("/"))
+            );
+            file.set_len(length)
+        }
+        Err(e) => Err(io::Error::from(e)),
+    }
+}
+
 /// Delete the file `components` names beneath `root`, if it is there.
 ///
 /// Deleting through a symbolic link is the same escape pointed the other way,
@@ -416,6 +444,43 @@ mod tests {
             trackers: vec![],
             skipped_trackers: 0,
             raw_info: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn preallocation_reserves_blocks_rather_than_leaving_a_hole() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Big enough that a sparse file and a reserved one cannot be confused:
+        // a hole costs no blocks at all.
+        const LEN: u64 = 1 << 20;
+        let content = vec![0u8; usize::try_from(LEN).unwrap()];
+
+        for (preallocate, why) in [(true, "reserved"), (false, "sparse")] {
+            let dir = TempDir::new();
+            let meta = meta_for(
+                vec![FileEntry {
+                    path: vec!["big.bin".into()],
+                    length: LEN,
+                }],
+                1 << 14,
+                &content,
+            );
+            Storage::create(&meta, &dir.0, preallocate).unwrap();
+
+            let md = std::fs::metadata(dir.0.join("big.bin")).unwrap();
+            // Both spellings claim the length; only one claims the disk.
+            assert_eq!(md.len(), if preallocate { LEN } else { 0 }, "{why}: length");
+            let claimed = md.blocks() * 512;
+            if preallocate {
+                assert!(
+                    claimed >= LEN,
+                    "{why}: {claimed} bytes of blocks for a {LEN}-byte file — \
+                     the space was not actually claimed"
+                );
+            } else {
+                assert_eq!(claimed, 0, "{why}: an untouched file took disk");
+            }
         }
     }
 

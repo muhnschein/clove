@@ -145,7 +145,11 @@ peer_limit 80
 torrent_peer_limit 12
 EOF
 timeout 20 "$cloved" -C -c "$work/limits.conf" >/dev/null || fail "valid peer limits rejected"
-for bad in "peer_limit 0" "peer_limit lots" "torrent_peer_limit 0"; do
+# A key that no longer exists must fail the start loudly rather than be
+# read past — the whole point of unknown keys being fatal.
+for bad in "peer_limit 0" "peer_limit lots" "torrent_peer_limit 0" \
+    "watch_dir /srv/torrents/inbox" "i_know_sam_is_remote yes" \
+    "max_active_downloads 3" "max_active_seeds 5"; do
     printf 'data_dir %s\n%s\n' "$work/limits-data" "$bad" >"$work/bad.conf"
     set +e
     timeout 20 "$cloved" -C -c "$work/bad.conf" >/dev/null 2>&1
@@ -317,81 +321,19 @@ run resume --all >/dev/null || fail "resume --all failed"
 expect_contains "$(run show "$info_hash" --json)" '"state":"waiting-for-router"' "resumed by --all"
 run remove "$second_hash" >/dev/null || fail "removing the second torrent failed"
 
-echo "smoke: the queue holds torrents past the active limit"
-# A daemon of its own, so the tight limit does not disturb everything above.
-qdir="$work/queue"
-mkdir -p "$qdir/data" "$qdir/run"
-cat >"$qdir/clove.conf" <<EOF
-data_dir $qdir/data
-api_socket $qdir/run/clove.sock
-max_active_downloads 1
-EOF
-timeout 60 "$cloved" -c "$qdir/clove.conf" >"$work/daemon-queue.log" 2>&1 &
-queue_pid=$!
-i=0
-until timeout 5 "$clove" -c "$qdir/clove.conf" status >/dev/null 2>&1; do
-    i=$((i + 1))
-    [ "$i" -gt 200 ] && fail "queue daemon never answered (log: $(cat "$work/daemon-queue.log"))"
-    sleep 0.05
-done
-qrun() { timeout 20 "$clove" -c "$qdir/clove.conf" "$@"; }
-qrun add "$work/demo.torrent" >/dev/null || fail "queue add 1"
-qrun add "$work/second.torrent" >/dev/null || fail "queue add 2"
-# No router here either, so neither is "queued" — the limit is not why they
-# are stopped, and saying so would send an operator chasing the wrong thing.
-expect_contains "$(qrun list)" "waiting-for-router" "no router means no queue"
-# `start` works whatever the router is doing, and is a real endpoint.
-qrun start 1 >/dev/null || fail "start by position failed"
-expect_contains "$(qrun list)" "waiting-for-router" "still waiting on the router"
-kill "$queue_pid" 2>/dev/null
-wait "$queue_pid" 2>/dev/null || true
-
 echo "smoke: status totals the client as well as the daemon"
 expect_contains "$(run status)" "router" "status reports the router state"
 expect_contains "$(run status)" "torrents" "status reports a torrent count"
 expect_contains "$(run status)" "peers" "status reports peers against the budget"
 expect_contains "$(run status)" "uploaded" "status reports lifetime bytes"
 # The commands that went with the simplification must be gone, not aliased.
-for removed in top watch stats announce peer; do
+for removed in top watch stats announce peer start; do
     set +e
     run "$removed" >/dev/null 2>&1
     code=$?
     set -e
     expect_status "$code" 2 "$removed is no longer a command"
 done
-
-echo "smoke: a watch directory picks up what is dropped in it"
-wdir="$work/watched"
-mkdir -p "$wdir" "$work/watch-data" "$work/watch-run"
-cat >"$work/watch.conf" <<EOF
-data_dir $work/watch-data
-api_socket $work/watch-run/clove.sock
-watch_dir $wdir
-EOF
-timeout 60 "$cloved" -c "$work/watch.conf" >"$work/daemon-watch.log" 2>&1 &
-watch_pid=$!
-i=0
-until timeout 5 "$clove" -c "$work/watch.conf" status >/dev/null 2>&1; do
-    i=$((i + 1))
-    [ "$i" -gt 200 ] && fail "watch daemon never answered (log: $(cat "$work/daemon-watch.log"))"
-    sleep 0.05
-done
-# The watch directory is outside the data directory on purpose: this is the
-# case Landlock silently breaks if the path is not granted before the daemon
-# restricts itself, and where a kernel with Landlock and one without would
-# otherwise disagree with no error either way.
-cp "$work/demo.torrent" "$wdir/dropped.torrent"
-printf 'not a torrent at all' >"$wdir/junk.torrent"
-i=0
-until [ -f "$wdir/dropped.torrent.added" ] && [ -f "$wdir/junk.torrent.rejected" ]; do
-    i=$((i + 1))
-    [ "$i" -gt 300 ] && fail "watch_dir did not take the files (log: $(cat "$work/daemon-watch.log"))"
-    sleep 0.1
-done
-expect_contains "$(timeout 5 "$clove" -c "$work/watch.conf" list)" "smoke.txt" \
-    "the dropped torrent was added"
-# Renamed, so it is offered once rather than every few seconds forever.
-[ ! -f "$wdir/dropped.torrent" ] || fail "the taken file was left in place"
 
 echo "smoke: add --paused and --sequential apply at add time"
 flagged=$(run add --paused --sequential "$work/second.torrent") || fail "add with flags failed"
@@ -400,8 +342,6 @@ flagged_hash=$(printf '%s' "$flagged" | awk '{print $2}')
 expect_contains "$(run show "$flagged_hash" --json)" '"state":"paused"' "added paused"
 expect_contains "$(run show "$flagged_hash" --json)" '"sequential":true' "added sequential"
 run remove "$flagged_hash" >/dev/null || fail "removing the flagged torrent"
-kill "$watch_pid" 2>/dev/null
-wait "$watch_pid" 2>/dev/null || true
 
 echo "smoke: resume, then remove both torrents"
 run resume "$info_hash" >/dev/null || fail "resume failed"
@@ -458,9 +398,9 @@ wait "$conf_pid" 2>/dev/null || true
 
 # `preallocate` is the one config key with a visible effect on disk, so it is
 # the one that can be checked rather than merely parsed. Without it a fresh
-# torrent's files are created empty and grow as blocks land; with it they are
-# at full length from the moment the torrent is added, before any peer exists.
-echo "smoke: preallocate lays files out at full length"
+# torrent's files are created empty and grow as blocks land; with it the blocks
+# are claimed from the moment the torrent is added, before any peer exists.
+echo "smoke: preallocate claims the disk up front"
 pre_dir="$work/prealloc"
 mkdir -p "$pre_dir/data" "$pre_dir/run"
 cat >"$pre_dir/clove.conf" <<EOF
@@ -489,6 +429,9 @@ until [ -f "$laid_out" ]; do
 done
 size=$(stat -c '%s' "$laid_out")
 [ "$size" = "75" ] || fail "preallocated file is $size bytes, expected the full 75"
+# Length alone is what a sparse file also has. Blocks are what was promised.
+blocks=$(stat -c '%b' "$laid_out")
+[ "$blocks" -gt 0 ] || fail "preallocated file holds no blocks; the space was not claimed"
 kill "$pre_pid" 2>/dev/null
 wait "$pre_pid" 2>/dev/null || true
 

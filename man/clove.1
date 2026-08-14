@@ -220,21 +220,12 @@ Stop peer acquisition and disconnect these torrents' peers.
 The paused state persists across daemon restarts.
 .It Cm resume Ar torrent ... | Fl -all
 Bring paused torrents back online.
-A torrent returns to its own place in the queue, which is the order torrents
-were added; if the active limit is already met it waits there as
-.Sy queued .
-.It Cm start Ar torrent ... | Fl -all
-Resume a torrent and put it at the head of the queue, ahead of everything
-waiting.
-.Pp
-For when the queue order is not the order you want right now.
-Only one torrent is at the head at a time — a second
-.Cm start
-means that one instead, not both — and the position is not remembered across a
-restart of
-.Xr cloved 8 ,
-because forcing is a statement about the moment rather than a property of the
-torrent.
+Resuming one torrent stops nothing else: every torrent that is not paused
+runs, and what bounds the client is
+.Ic peer_limit
+and
+.Ic torrent_peer_limit
+.Pq Xr clove.conf 5 .
 .It Cm verify Ar torrent ... | Fl -all
 Re-read each torrent's data from disk and re-check every piece against the
 metainfo hashes.

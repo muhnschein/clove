@@ -10,6 +10,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+# The in-memory network in `mock`. Off by default so it stays out of the
+# binaries; the crates that test against it turn it on as a dev-dependency.
+[features]
+mock = []
+
 [dependencies]
 sha2 = { version = "0.11", default-features = false }
-yosemite = { version = "0.7.0", default-features = false, features = ["sync"] }

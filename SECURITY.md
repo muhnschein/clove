@@ -47,9 +47,6 @@ communicate outside I2P, or that ties an I2P identity to a network identity:
   someone who can read the data directory.
 - Deanonymisation inherent to running a public BitTorrent swarm — that your
   destination is visible to peers you connect to is how the protocol works.
-- Setting `i_know_sam_is_remote yes` and then observing that traffic to a
-  remote SAM bridge is unprotected. That is documented, and the option is
-  deliberately hard to type.
 
 ## Design guarantees a report can hold us to
 

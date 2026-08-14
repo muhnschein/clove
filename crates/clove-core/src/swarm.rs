@@ -217,14 +217,6 @@ impl Announcer {
         self.stop.raise();
     }
 
-    /// Announce to every tracker now, ignoring the intervals they gave us and
-    /// any failure backoff — the operator's manual announce, and nothing
-    /// else. Returns as soon as the loop is woken; the announces themselves
-    /// happen on the announcer's own thread.
-    pub fn announce_now(&self) {
-        self.stop.nudge();
-    }
-
     /// Signal the loop to stop and wait for it to finish.
     pub fn shutdown(mut self) {
         self.stop.raise();
@@ -360,16 +352,8 @@ fn announce_loop<D, N>(
                 }
             }
         }
-        match stop.wait_for(config.poll_interval) {
-            Wake::Stopped => return,
-            // An operator asked for a re-announce: make every tracker due,
-            // then fall through to the top of the loop.
-            Wake::Nudged => {
-                for state in &mut states {
-                    state.make_due();
-                }
-            }
-            Wake::Elapsed => {}
+        if stop.wait(config.poll_interval) {
+            return;
         }
     }
 }
@@ -409,33 +393,107 @@ where
         numwant: config.numwant,
         our_dest_b64: &target.our_dest_b64,
     };
-    let (host, request) = tracker::build_announce(url, &params)?;
-    let dest = naming.lookup(&host).map_err(tracker::Error::Io)?;
-    let mut stream = dialer
-        .dial(dest, config.dial_timeout)
-        .map_err(tracker::Error::Io)?;
+    let response = contact_tracker(url, &params, dialer, naming, config.dial_timeout)?;
+    torrent.add_peers(&response.peers);
+    Ok((response.interval, event))
+}
+
+/// How far an announce got before it failed. Four failures that read alike in
+/// an error text and mean different things to whoever has to fix them: a URL
+/// that is not one, a host the address book has never heard of, a tracker that
+/// is down, and a tracker that answered with something else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stage {
+    /// The URL could not be turned into an announce.
+    Url,
+    /// The tracker's host did not resolve.
+    Resolving,
+    /// The tracker did not accept a stream.
+    Dialing,
+    /// The exchange failed, or the tracker refused it.
+    Announcing,
+}
+
+impl Stage {
+    /// What to call this in a log line, reading as `<stage> <the tracker>`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Stage::Url => "tracker URL",
+            Stage::Resolving => "resolving tracker",
+            Stage::Dialing => "dialing tracker",
+            Stage::Announcing => "announcing to",
+        }
+    }
+}
+
+/// A failed announce, and how far it got.
+#[derive(Debug)]
+pub struct Failed {
+    /// Where it stopped.
+    pub stage: Stage,
+    /// Why it stopped there.
+    pub error: tracker::Error,
+}
+
+impl From<Failed> for tracker::Error {
+    fn from(failed: Failed) -> tracker::Error {
+        failed.error
+    }
+}
+
+/// Make one announce to one tracker: resolve its host, dial it, and carry the
+/// exchange, returning what the tracker said.
+///
+/// Every announce clove makes goes through here — a hosted torrent's, and a
+/// magnet's while it is still looking for someone with the metadata — so the
+/// timeouts, and what is said when the announce fails, are the same for both.
+///
+/// # Errors
+///
+/// A [`Failed`] naming the [`Stage`] it stopped at.
+pub fn contact_tracker<D, N>(
+    url: &str,
+    params: &tracker::AnnounceParams,
+    dialer: &D,
+    naming: &N,
+    dial_timeout: Duration,
+) -> Result<tracker::AnnounceResponse, Failed>
+where
+    D: I2pDialer,
+    N: I2pNamingLookup,
+{
+    let at = |stage: Stage| move |error: tracker::Error| Failed { stage, error };
+
+    let (host, request) = tracker::build_announce(url, params).map_err(at(Stage::Url))?;
+    let dest = naming.lookup(&host).map_err(|e| Failed {
+        stage: Stage::Resolving,
+        error: tracker::Error::Io(e),
+    })?;
+    let mut stream = dialer.dial(dest, dial_timeout).map_err(|e| Failed {
+        stage: Stage::Dialing,
+        error: tracker::Error::Io(e),
+    })?;
     // The dial timeout covered getting here; nothing covered what follows, so
     // a tracker that accepted the stream and then went quiet held this thread
     // — and with it this torrent's announces — for the life of the process.
     let _ = stream.set_timeouts(Some(tracker::ANNOUNCE_IO_TIMEOUT));
-    // Which destination the host resolved to, on every announce that then
-    // goes wrong.
-    let response = tracker::announce_over(&mut stream, &request).inspect_err(|_| {
-        // Both carry the torrent's own text — the host, and the announce path
-        // it came with. See the scrub in `announce_loop` for why the URL
-        // filter is not enough on its own.
-        eprintln!(
-            "clove: {} resolved to {}",
-            crate::text::scrub(&host),
-            dest.to_b32()
-        );
-        eprintln!(
-            "clove: the announce that failed was {}",
-            crate::text::scrub(&tracker::announced_url(&host, &request))
-        );
-    })?;
-    torrent.add_peers(&response.peers);
-    Ok((response.interval, event))
+    tracker::announce_over(&mut stream, &request)
+        .inspect_err(|_| {
+            // Both carry the torrent's own text — the host, and the announce
+            // path it came with. See the scrub in `announce_loop` for why the
+            // URL filter is not enough on its own.
+            eprintln!(
+                "clove: {} resolved to {}",
+                crate::text::scrub(&host),
+                dest.to_b32()
+            );
+            eprintln!(
+                "clove: the announce that failed was {}",
+                crate::text::scrub(&tracker::announced_url(&host, &request))
+            );
+        })
+        .map_err(at(Stage::Announcing))
 }
 
 /// One dial sweep after another until stopped, with per-peer retry backoff.
@@ -731,24 +789,11 @@ struct StopFlag {
     cv: Condvar,
 }
 
-/// The two things a sleeping loop can be woken for.
+/// What a sleeping loop can be woken for.
 #[derive(Default)]
 struct Flags {
     /// Shut down and return.
     stopped: bool,
-    /// Stop waiting and do a round now. Consumed by the waiter.
-    nudged: bool,
-}
-
-/// Why a nudgeable wait returned.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Wake {
-    /// The flag was raised; the loop must return.
-    Stopped,
-    /// Someone asked for a round now.
-    Nudged,
-    /// The timeout expired, which is the ordinary case.
-    Elapsed,
 }
 
 impl StopFlag {
@@ -761,39 +806,19 @@ impl StopFlag {
         self.lock().stopped
     }
 
-    /// Ask a waiter to wake and run a round immediately. The flag stays set
-    /// until a waiter consumes it, so a nudge that arrives mid-round is not
-    /// lost.
-    fn nudge(&self) {
-        self.lock().nudged = true;
-        self.cv.notify_all();
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, Flags> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Wait up to `timeout`; returns whether the flag is raised.
     fn wait(&self, timeout: Duration) -> bool {
-        self.wait_for(timeout) == Wake::Stopped
-    }
-
-    /// Wait up to `timeout`, returning what woke it. A nudge is consumed on
-    /// the way out so the next wait sleeps again.
-    fn wait_for(&self, timeout: Duration) -> Wake {
         let guard = self.lock();
-        let (mut guard, result) = self
+        let (guard, result) = self
             .cv
-            .wait_timeout_while(guard, timeout, |f| !f.stopped && !f.nudged)
+            .wait_timeout_while(guard, timeout, |f| !f.stopped)
             .unwrap_or_else(PoisonError::into_inner);
-        if guard.stopped {
-            return Wake::Stopped;
-        }
-        if std::mem::take(&mut guard.nudged) {
-            return Wake::Nudged;
-        }
-        debug_assert!(result.timed_out());
-        Wake::Elapsed
+        debug_assert!(guard.stopped || result.timed_out());
+        guard.stopped
     }
 }
 

@@ -25,7 +25,8 @@ chunked transfer encoding.
 .Pp
 Every request must carry the API token in an
 .Sy X-Clove-Token
-header, including over the unix socket.
+header.
+The socket is owner-only, and the token is checked on top of that.
 The token is the contents of
 .Pa <data_dir>/token ,
 which the daemon writes mode 0600 on first start.
@@ -136,8 +137,6 @@ is one of
 .Sy complete
 .Pq complete but offline ,
 .Sy paused ,
-.Sy queued
-.Pq wanted, but past Ic max_active_downloads No or Ic max_active_seeds ,
 .Sy waiting-for-router ,
 .Sy verifying
 .Pq its data is being hashed ,
@@ -197,9 +196,7 @@ its downloaded files are deleted too.
 .It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /resume
 Take the torrent offline or bring it back.
 Pausing disconnects its peers and persists across restarts.
-A resumed torrent returns to its place in the queue, which may be
-.Sy queued
-rather than running.
+Resuming one torrent stops nothing else.
 .It Sy PUT Pa /v1/torrents/ Ns Ar info-hash Ns Pa /seed-ratio
 Set this torrent's seeding ratio.
 The body is a ratio written as a decimal
@@ -212,9 +209,6 @@ Reported as
 .Sy seed_ratio
 in thousandths, beside the torrent's current
 .Sy ratio .
-.It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /start
-Resume the torrent and move it to the head of the queue.
-At most one torrent is at the head; the position is not persisted.
 .It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /verify
 Re-check every piece against the metainfo hashes and answer with the
 .Sy verified
@@ -232,18 +226,6 @@ throughout, and every other request is answered as usual.
 A second verify for the same torrent while one is running is
 .Sy 400 ,
 and the torrent cannot be resumed until it finishes.
-.It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /peers
-Hand a running torrent a peer to dial.
-The body is a b32 address, with or without the
-.Pa .b32.i2p
-suffix.
-.Pp
-This endpoint is the whole surface for the operation: there is no
-.Xr clove 1
-command for it.
-Normal peer acquisition is tracker replies, inbound connections and I2P PEX;
-supplying an address by hand is a private-swarm and laboratory operation, and
-one the local API is sufficient for.
 .It Sy PUT Pa /v1/torrents/ Ns Ar info-hash Ns Pa /priorities
 Set per-file priorities.
 The body is a comma-separated list, one value per file in the torrent's own
@@ -255,19 +237,6 @@ normal,
 .Sy 2
 high.
 The count must equal the file count.
-.It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /announce
-Announce to every tracker now, ignoring the intervals they gave us.
-Refused with
-.Sy 400
-if the torrent is paused, has no running engine, has no I2P trackers, or was
-already forced within the last minute.
-.Pp
-This endpoint is the whole surface for the operation: there is no
-.Xr clove 1
-command for it.
-Scheduled, event-driven, completion and shutdown announces are unaffected and
-happen without asking; this is the manual override, rate-limited so a script
-cannot turn it into a tracker flood.
 .It Sy PUT Pa /v1/torrents/ Ns Ar info-hash Ns Pa /sequential
 Switch piece selection between file order and rarest-first.
 The body is exactly

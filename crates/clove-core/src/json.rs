@@ -179,15 +179,6 @@ impl Value {
         }
     }
 
-    /// The fields, if this is an [`Object`](Value::Object).
-    #[must_use]
-    pub fn as_object(&self) -> Option<&[(String, Value)]> {
-        match self {
-            Value::Object(fields) => Some(fields),
-            _ => None,
-        }
-    }
-
     /// A compact one-line human rendering for table cells: a string bare
     /// (unquoted), `null` as `-`, and anything else as its JSON.
     #[must_use]

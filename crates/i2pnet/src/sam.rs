@@ -12,8 +12,8 @@
 //!   §2.7, §2.13). Dialing likewise speaks SAM on a socket opened per stream
 //!   (see the private `dial_stream`), so a stream is a [`ForwardedStream`] — a plain TCP
 //!   socket to the bridge, with real timeouts, a real `split`, and
-//!   close-on-drop. yosemite is left with `NAMING LOOKUP` alone, which is a
-//!   one-shot on a socket of its own.
+//!   close-on-drop. `NAMING LOOKUP` is likewise a one-shot on a socket of its
+//!   own (the private `naming_lookup`), with no session behind it.
 //! - The control connection is **read continuously** by a watchdog thread for
 //!   as long as the session lives (the private `watch_control` thread). That
 //!   is not a nicety:
@@ -27,14 +27,13 @@
 //!   over `STREAM ACCEPT`, and the reason is concurrency: `accept` takes
 //!   `&mut self` and serializes every inbound stream on the one session,
 //!   whereas `forward` lets the router fan connections into a plain accept
-//!   loop. With `SILENT=false` (yosemite's default) the router prepends each
+//!   loop. With `SILENT=false` the router prepends each
 //!   forwarded connection with the peer's base64 destination line, from
 //!   which we derive its [`DestHash`] (`docs/PROTOCOL.i2p-bt` §1.3, §2.5).
 //!
 //! Every socket here is opened to `127.0.0.1` by construction, which is
-//! Layer 1's loopback-only rule; the `--i-know-sam-is-remote` escape hatch
-//! (SCOPE §5) is therefore not expressible through this backend and is noted
-//! as such.
+//! Layer 1's loopback-only rule. A remote SAM bridge is not reachable through
+//! this backend and is refused at configuration time.
 
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
@@ -189,32 +188,17 @@ const MAX_STATUS_LINE: usize = 1024;
 
 /// Open an outbound virtual stream to `peer`, by speaking SAM ourselves.
 ///
-/// **Why clove does this rather than asking its SAM library.** yosemite 0.7's
-/// session controller is a single state machine shared by the control
-/// connection and every stream operation, and each entry point begins
-/// `mem::replace(&mut self.state, Poisoned)`, restoring the state only on
-/// paths it expects. One unparseable reply — or a write that fails partway —
-/// therefore leaves the controller poisoned, and *every subsequent dial on
-/// that session fails forever* (`docs/PROTOCOL.i2p-bt` §2.12). Live, that cost
-/// a session rebuild every 60–90 seconds: a new destination each time, all
-/// known peers discarded, and a fresh announce needed before anything could
-/// resume. There is no way to reset the state from outside the library.
+/// A stream is its own connection: dial the bridge, `HELLO VERSION`, `STREAM
+/// CONNECT`, and the socket being held *is* the stream. Nothing is shared
+/// between dials, so one failure cannot affect another.
 ///
-/// `SAMv3` does not require any of that. A stream is its own connection: dial
-/// the bridge, `HELLO VERSION`, `STREAM CONNECT`, and the socket you are
-/// holding *is* the stream. Nothing is shared, so nothing can be poisoned by
-/// somebody else's failure — which is how XD does it too, and it cannot have
-/// this bug for the same reason.
+/// Owning the socket is what makes two things possible:
 ///
-/// Owning the socket buys two more things clove could not have before:
-///
-/// - **The dial timeout is real.** yosemite's `connect` takes no timeout and
-///   the caller's was documented as advisory (§2.3). Here it bounds the wait
-///   for `STREAM STATUS`, which is where a leaseSet lookup spends its time.
-/// - **The stream is closeable and boundable.** A dialled peer that goes
-///   silent parked a thread and leaked a socket for the life of the process
-///   (§2.7a); the returned [`ForwardedStream`] takes read and write timeouts
-///   like any other socket, and dropping it closes it.
+/// - **The dial timeout is real.** It bounds the wait for `STREAM STATUS`,
+///   which is where a leaseSet lookup spends its time.
+/// - **The stream is closeable and boundable.** The returned
+///   [`ForwardedStream`] takes read and write timeouts like any other socket,
+///   and dropping it closes it.
 ///
 /// # Errors
 ///
@@ -365,7 +349,7 @@ pub fn unique_nickname(base: &str) -> String {
 /// How to bring up the SAM session.
 #[derive(Clone, Debug)]
 pub struct SamConfig {
-    /// SAM control port on `127.0.0.1` (yosemite is loopback-only).
+    /// SAM control port on `127.0.0.1`.
     pub samv3_tcp_port: u16,
     /// SAM session nickname.
     pub nickname: String,
@@ -481,11 +465,8 @@ impl SessionLife {
 ///   nothing could ever reply. i2pd does not ping, so this costs nothing
 ///   there — and is the whole session on Java I2P.
 /// - **Notice, immediately and with a reason, when the session ends.** The
-///   old 30-second `PING` probe took up to three rounds to report a dead
-///   session, because yosemite's `read_line` maps end-of-file to `Ok("")` and
-///   `is_ok()` called that healthy. Sixty seconds of a torrent dialling into a
-///   session the router had already destroyed, then a rebuild that said only
-///   "router lost".
+///   alternative is a torrent dialling into a session the router has already
+///   destroyed, and a rebuild that can say only "router lost".
 fn watch_control(mut socket: TcpStream, port: u16, alive: &SessionLife) {
     // A PONG must not park this thread forever if the bridge stops reading;
     // a bridge that will not take ten bytes in ten seconds is gone.
@@ -615,9 +596,8 @@ impl SamSession {
         debug_assert!(hello.contains("RESULT=OK"));
 
         let destination = config.persistent_key.as_deref().unwrap_or("TRANSIENT");
-        // The parameter set is yosemite's, kept term for term: it is what a
-        // live i2pd accepts today, and quietly changing a destination's tunnel
-        // shape or lease-set encryption is not this commit's business.
+        // The parameter set a live i2pd accepts today. A destination's tunnel
+        // shape and lease-set encryption are not changed casually.
         let command = format!(
             "SESSION CREATE STYLE=STREAM ID={} DESTINATION={destination} \
              i2cp.leaseSetEncType=6,4 inbound.length=3 inbound.quantity=2 \
@@ -970,6 +950,25 @@ pub fn poke_listener(port: u16) -> io::Result<()> {
     Ok(())
 }
 
+/// A connected loopback TCP pair: the shape every socket this crate opens has.
+///
+/// Test support for `cloved`'s confinement test, which has to make a real
+/// `AF_INET` connection under the live seccomp filter to prove the allowlist
+/// and its argument restriction let the SAM transport through. Behind the
+/// `mock` feature, so it is not in the daemon, and here rather than in the
+/// caller because Layer 1 keeps socket construction in this crate.
+///
+/// # Errors
+///
+/// The bind, connect or accept fails.
+#[cfg(feature = "mock")]
+pub fn loopback_pair() -> io::Result<(TcpStream, TcpStream)> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let client = TcpStream::connect(listener.local_addr()?)?;
+    let (server, _) = listener.accept()?;
+    Ok((client, server))
+}
+
 impl I2pListener for SamListener {
     type Stream = ForwardedStream;
 
@@ -1111,11 +1110,10 @@ impl I2pDialer for SamSession {
 
     /// Dial `peer` on a socket of our own (see the private `dial_stream`).
     ///
-    /// No session mutex is taken and no library state is touched, so dials
-    /// are genuinely concurrent — `PROTOCOL.i2p-bt` §2.6a's serialization
-    /// point was yosemite's `&mut self`, and it is gone with it. The session
-    /// is consulted for exactly one thing, its nickname, which SAM needs to
-    /// attach the new stream to the right session.
+    /// No session mutex is taken and no shared state is touched, so dials are
+    /// genuinely concurrent. The session is consulted for exactly one thing,
+    /// its nickname, which SAM needs to attach the new stream to the right
+    /// session.
     fn dial(&self, peer: DestHash, timeout: Duration) -> io::Result<ForwardedStream> {
         dial_stream(self.samv3_tcp_port, &self.nickname, peer, timeout).map_err(|failed| {
             // `INVALID_ID` is the router saying this session no longer
@@ -1146,22 +1144,114 @@ impl I2pDialer for SamSession {
     }
 }
 
-impl I2pNamingLookup for SamSession {
-    fn lookup(&self, name: &str) -> io::Result<DestHash> {
-        let dest = yosemite::RouterApi::new(self.samv3_tcp_port)
-            .lookup_name(name)
-            .map_err(map_err)?;
-        DestHash::from_b64_destination(&dest).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "naming lookup returned garbage")
-        })
+/// Cap on a `NAMING REPLY` line. It carries a whole destination — around 516
+/// base64 characters for the common key types, more for larger certificates —
+/// so it needs far more room than a status line, but not an unbounded amount.
+const MAX_NAMING_LINE: usize = 8192;
+
+/// Longest name accepted for a lookup. A b32 address is 60 characters and no
+/// registered hostname comes near this.
+const MAX_LOOKUP_NAME: usize = 255;
+
+/// Refuse a name that cannot go into a `NAMING LOOKUP` as a single field.
+///
+/// SAM is a line protocol of space-separated fields, so a name carrying a space
+/// or a newline is not one argument — it is a second command of the sender's
+/// choosing. Announce URLs reach here out of `.torrent` files written by
+/// strangers, and this crate does not assume the parser two crates away already
+/// refused them (SCOPE §5: no layer assumes another is present).
+fn check_lookup_name(name: &str) -> io::Result<()> {
+    let bad = |why: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "not a name clove will look up ({why}): {:?}",
+                name.chars().map(scrub_char).collect::<String>()
+            ),
+        )
+    };
+    if name.is_empty() {
+        return Err(bad("empty"));
     }
+    if name.len() > MAX_LOOKUP_NAME {
+        return Err(bad("longer than a hostname"));
+    }
+    if name.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(bad("contains a space or a control character"));
+    }
+    Ok(())
 }
 
-/// Map a yosemite error into an `io::Error` with operator-readable text.
-fn map_err(e: yosemite::Error) -> io::Error {
-    match e {
-        yosemite::Error::IoError(io) => io,
-        other => io::Error::other(other),
+/// Pull the destination out of a `NAMING REPLY`, or say what the router said
+/// instead.
+///
+/// The success shape is `NAMING REPLY RESULT=OK NAME=<name> VALUE=<destination>`.
+/// A destination contains no spaces, so the field split is exact.
+fn parse_naming_reply<'a>(reply: &'a str, name: &str) -> io::Result<&'a str> {
+    let asked = name.chars().map(scrub_char).collect::<String>();
+    if !reply.starts_with("NAMING REPLY") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "SAM bridge answered {:?} where a NAMING REPLY belongs",
+                scrub_control_line(reply)
+            ),
+        ));
+    }
+    let result = reply
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("RESULT="))
+        .unwrap_or("MISSING");
+    if result != "OK" {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("router could not resolve {asked}: {result}"),
+        ));
+    }
+    reply
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("VALUE="))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("router resolved {asked} but sent no destination"),
+            )
+        })
+}
+
+/// Resolve `name` through the bridge, on a socket of its own.
+///
+/// One `HELLO VERSION`, one `NAMING LOOKUP`, one reply: no session is involved,
+/// so nothing here can disturb one.
+fn naming_lookup(port: u16, name: &str, timeout: Duration) -> io::Result<DestHash> {
+    check_lookup_name(name)?;
+    let (mut stream, _) = sam_hello(port, timeout, "HELLO (for NAMING LOOKUP)")?;
+    stream.write_all(format!("NAMING LOOKUP NAME={name}\n").as_bytes())?;
+
+    let deadline = Instant::now() + timeout;
+    let reply = read_sam_line(
+        &mut stream,
+        port,
+        MAX_NAMING_LINE,
+        Some(deadline),
+        "NAMING LOOKUP",
+    )?;
+    let value = parse_naming_reply(&reply, name)?;
+    DestHash::from_b64_destination(value).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "router resolved {} to something that is not a destination",
+                name.chars().map(scrub_char).collect::<String>()
+            ),
+        )
+    })
+}
+
+impl I2pNamingLookup for SamSession {
+    fn lookup(&self, name: &str) -> io::Result<DestHash> {
+        naming_lookup(self.samv3_tcp_port, name, self.probe_timeout)
     }
 }
 
@@ -1280,7 +1370,7 @@ mod hostile_bridge_tests {
 
     /// Anything a bridge can do wrong before a session exists.
     #[derive(Clone, Copy, Debug)]
-    enum Misbehaviour {
+    pub(super) enum Misbehaviour {
         /// Accept, then close without a word.
         CloseImmediately,
         /// Accept and never say anything, holding the connection open.
@@ -1304,7 +1394,7 @@ mod hostile_bridge_tests {
     ///
     /// The listener thread is detached and the process ends the test binary;
     /// nothing here outlives the run.
-    fn fake_bridge(how: Misbehaviour) -> u16 {
+    pub(super) fn fake_bridge(how: Misbehaviour) -> u16 {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -1406,10 +1496,8 @@ mod hostile_bridge_tests {
 
     #[test]
     fn connect_fails_in_bounded_time_against_a_broken_bridge() {
-        // The regression this locks down: before clove spoke the handshake
-        // itself, Silence, Garbage, Flood and Dribble all blocked in
-        // yosemite's Session::new forever, and cloved sat in "connecting"
-        // with nothing in its log until someone restarted it.
+        // Every one of these must fail rather than block: a daemon stuck in
+        // "connecting" with nothing in its log is worse than an error.
         for how in [
             Misbehaviour::CloseImmediately,
             Misbehaviour::Silence,
@@ -1458,14 +1546,9 @@ mod hostile_bridge_tests {
         assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
     }
 
-    /// `PROTOCOL.i2p-bt` §2.7's residual gap, now closed and pinned shut.
-    ///
     /// A bridge that answers `HELLO` correctly and *then* stalls on `SESSION
-    /// CREATE` used to hang forever inside yosemite, which set no read timeout
-    /// on its control socket. It was recorded as a known gap because the probe
-    /// could not see that far and nothing outside the library could bound it.
-    /// clove owns the control socket now, so the second half is bounded like
-    /// the first.
+    /// CREATE` passes the handshake half, which is what makes it easy to miss.
+    /// Both halves are bounded (`PROTOCOL.i2p-bt` §2.7).
     #[test]
     fn a_bridge_that_passes_hello_and_then_stalls_no_longer_hangs() {
         let port = fake_bridge(Misbehaviour::HelloThenStall);
@@ -1642,15 +1725,316 @@ mod hostile_bridge_tests {
 }
 
 #[cfg(test)]
+mod naming_tests {
+    //! `NAMING LOOKUP`: the name check that keeps somebody else's text out of
+    //! the command, the reply parser on its own, and the whole exchange
+    //! against a bridge that answers well and bridges that do not.
+    //!
+    //! The name reaching [`naming_lookup`] is a tracker host out of a
+    //! `.torrent` a stranger wrote, so every case here is an input clove does
+    //! not control.
+
+    use super::hostile_bridge_tests::{Misbehaviour, fake_bridge};
+    use super::*;
+    use crate::addr::i2p_base64_encode;
+    use std::sync::mpsc;
+
+    /// Short: the misbehaving bridges below stall by design.
+    const PROBE: Duration = Duration::from_millis(600);
+
+    /// Long enough to clear `PROBE`, short enough that a hang fails the run.
+    const LIMIT: Duration = Duration::from_secs(25);
+
+    /// A destination-shaped blob and the hash it must resolve to.
+    fn destination() -> (String, DestHash) {
+        let mut bytes = vec![0x42u8; 384];
+        bytes.extend_from_slice(&[0x05, 0x00, 0x04, 0x00, 0x07, 0x00, 0x00]);
+        let b64 = i2p_base64_encode(&bytes);
+        let hash = DestHash::from_b64_destination(&b64).expect("a destination");
+        (b64, hash)
+    }
+
+    /// Read one `\n`-terminated line, as a bridge does.
+    fn take_line(sock: &mut TcpStream) -> String {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while sock.read(&mut byte).unwrap_or(0) == 1 {
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+        }
+        String::from_utf8_lossy(&line).into_owned()
+    }
+
+    /// A bridge that completes `HELLO`, reports the command it was sent, and
+    /// answers with `reply`.
+    fn naming_bridge(reply: &str) -> (u16, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel();
+        let reply = reply.to_owned();
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                let (reply, tx) = (reply.clone(), tx.clone());
+                std::thread::spawn(move || {
+                    let _ = take_line(&mut sock); // HELLO VERSION
+                    let _ = sock.write_all(b"HELLO REPLY RESULT=OK VERSION=3.3\n");
+                    let _ = tx.send(take_line(&mut sock)); // NAMING LOOKUP
+                    let _ = sock.write_all(reply.as_bytes());
+                    std::thread::sleep(Duration::from_secs(30));
+                });
+            }
+        });
+        (port, rx)
+    }
+
+    /// Run `f` on a thread and give it `limit`; `None` means it never returned.
+    fn within<T: Send + 'static>(
+        limit: Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(limit).ok()
+    }
+
+    // ---- the name check -------------------------------------------------
+
+    #[test]
+    fn ordinary_names_are_accepted() {
+        for name in [
+            "tracker.postman.i2p",
+            "opentracker.dg2.i2p",
+            "ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.b32.i2p",
+            &"a".repeat(MAX_LOOKUP_NAME),
+        ] {
+            check_lookup_name(name).unwrap_or_else(|e| panic!("{name:?} refused: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_name_that_would_forge_a_second_command_is_refused() {
+        // The attack this exists for: SAM is a line protocol, so a newline in
+        // a tracker host appends a command of the sender's choosing to ours.
+        for name in [
+            "tracker.i2p\nSESSION CREATE STYLE=STREAM ID=evil DESTINATION=TRANSIENT",
+            "tracker.i2p\r\nDEST GENERATE",
+            "tracker.i2p SILENT=true",
+            "tracker.i2p\tX",
+            "tracker.i2p\0",
+            "tracker.i2p\x7f",
+        ] {
+            let e = check_lookup_name(name)
+                .expect_err(&format!("{name:?} was accepted into a SAM command"));
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            // The rejection is readable and cannot itself forge a log line.
+            assert!(
+                !e.to_string().contains('\n'),
+                "the error repeated the newline: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_or_overlong_name_is_refused() {
+        assert_eq!(
+            check_lookup_name("").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let long = "a".repeat(MAX_LOOKUP_NAME + 1);
+        assert_eq!(
+            check_lookup_name(&long).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn a_refused_name_never_reaches_a_socket() {
+        // Nothing is listening on this port, so a connection error would prove
+        // the name check ran too late. It must fail before the dial.
+        let port = {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let e = naming_lookup(port, "tracker.i2p\nDEST GENERATE", PROBE)
+            .expect_err("an injecting name resolved");
+        assert_eq!(
+            e.kind(),
+            io::ErrorKind::InvalidInput,
+            "the name was checked only after dialling: {e}"
+        );
+    }
+
+    // ---- the reply parser ------------------------------------------------
+
+    #[test]
+    fn a_good_reply_yields_its_value() {
+        let (b64, _) = destination();
+        let reply = format!("NAMING REPLY RESULT=OK NAME=tracker.i2p VALUE={b64}");
+        assert_eq!(parse_naming_reply(&reply, "tracker.i2p").unwrap(), b64);
+    }
+
+    #[test]
+    fn field_order_does_not_matter() {
+        let (b64, _) = destination();
+        let reply = format!("NAMING REPLY VALUE={b64} RESULT=OK NAME=tracker.i2p");
+        assert_eq!(parse_naming_reply(&reply, "tracker.i2p").unwrap(), b64);
+    }
+
+    #[test]
+    fn a_refusal_carries_the_routers_own_word() {
+        for result in ["KEY_NOT_FOUND", "INVALID_KEY", "I2P_ERROR"] {
+            let reply = format!("NAMING REPLY RESULT={result} NAME=tracker.i2p");
+            let e = parse_naming_reply(&reply, "tracker.i2p")
+                .expect_err("a refusal resolved to something");
+            assert_eq!(e.kind(), io::ErrorKind::NotFound);
+            assert!(e.to_string().contains(result), "{result} not reported: {e}");
+        }
+    }
+
+    #[test]
+    fn replies_that_are_not_replies_are_refused() {
+        for reply in [
+            "",
+            "HELLO REPLY RESULT=OK VERSION=3.3",
+            "STREAM STATUS RESULT=OK",
+            "NAMING",
+            "naming reply RESULT=OK VALUE=x", // SAM is upper-case
+            "\u{1b}[2JNAMING REPLY RESULT=OK VALUE=x",
+        ] {
+            let e = parse_naming_reply(reply, "tracker.i2p")
+                .expect_err(&format!("{reply:?} was read as a NAMING REPLY"));
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn a_reply_with_no_usable_value_is_refused() {
+        for reply in [
+            "NAMING REPLY RESULT=OK NAME=tracker.i2p",
+            "NAMING REPLY RESULT=OK NAME=tracker.i2p VALUE=",
+        ] {
+            let e = parse_naming_reply(reply, "tracker.i2p")
+                .expect_err(&format!("{reply:?} yielded a destination"));
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        }
+        // A missing RESULT is a refusal, not an accident to be read past.
+        let e = parse_naming_reply("NAMING REPLY NAME=t.i2p VALUE=x", "t.i2p")
+            .expect_err("a reply with no RESULT was accepted");
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_reply_cannot_forge_a_log_line_or_leak_a_blob() {
+        // The reply is the bridge's text and reaches an operator's terminal.
+        let e = parse_naming_reply("NAMING\u{1b}[2J REPLY RESULT=OK", "t.i2p").unwrap_err();
+        assert!(!e.to_string().contains('\u{1b}'), "escape survived: {e}");
+        // A key-shaped run in an unexpected place is redacted, not printed.
+        let blob = "A".repeat(200);
+        let e =
+            parse_naming_reply(&format!("SESSION STATUS DESTINATION={blob}"), "t.i2p").unwrap_err();
+        assert!(!e.to_string().contains(&blob), "a blob was printed: {e}");
+    }
+
+    // ---- the whole exchange ---------------------------------------------
+
+    #[test]
+    fn a_good_bridge_resolves_a_name() {
+        let (b64, expected) = destination();
+        let (port, sent) = naming_bridge(&format!(
+            "NAMING REPLY RESULT=OK NAME=tracker.postman.i2p VALUE={b64}\n"
+        ));
+        let got = naming_lookup(port, "tracker.postman.i2p", PROBE).expect("resolved");
+        assert_eq!(got, expected);
+        // And the command was the one SAM specifies, on one line.
+        assert_eq!(
+            sent.recv_timeout(LIMIT).expect("the bridge saw a command"),
+            "NAMING LOOKUP NAME=tracker.postman.i2p"
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_destination_is_refused() {
+        // A certificate claiming more payload than the blob carries: the
+        // length field is the router's word for how long this is, and taking
+        // it on trust is how a short read becomes a long one.
+        let mut truncated = vec![0x11u8; 384];
+        truncated.extend_from_slice(&[0x05, 0xFF, 0xFF]); // 65535 bytes promised, none sent
+        let truncated = i2p_base64_encode(&truncated);
+
+        for value in [
+            "not-a-destination",
+            "AAAA",
+            // 384 bytes: the key fields with no room for a certificate header.
+            &"A".repeat(512),
+            &truncated,
+        ] {
+            let (port, _sent) = naming_bridge(&format!("NAMING REPLY RESULT=OK VALUE={value}\n"));
+            let e = naming_lookup(port, "tracker.i2p", PROBE)
+                .expect_err(&format!("{value:?} was accepted as a destination"));
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn a_reply_with_no_newline_is_capped_rather_than_buffered() {
+        // No terminator, more than the cap: the byte bound is what ends this,
+        // since a timeout alone would let a bridge stream for its whole budget.
+        let (port, _sent) = naming_bridge(&"A".repeat(MAX_NAMING_LINE + 1024));
+        let e = within(LIMIT, move || naming_lookup(port, "tracker.i2p", PROBE))
+            .expect("the lookup returned")
+            .expect_err("an unterminated reply resolved");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn every_broken_bridge_fails_in_bounded_time() {
+        for how in [
+            Misbehaviour::CloseImmediately,
+            Misbehaviour::Silence,
+            Misbehaviour::Garbage,
+            Misbehaviour::Flood,
+            Misbehaviour::RefuseHello,
+            Misbehaviour::Dribble,
+            Misbehaviour::HelloThenStall,
+        ] {
+            let port = fake_bridge(how);
+            let Some(result) = within(LIMIT, move || naming_lookup(port, "tracker.i2p", PROBE))
+            else {
+                panic!("{how:?}: the lookup never returned");
+            };
+            let e = result.expect_err(&format!("{how:?} resolved a name"));
+            assert_ne!(
+                e.kind(),
+                io::ErrorKind::InvalidInput,
+                "{how:?}: blamed the name for a bridge fault: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_listening_is_a_fast_clean_error() {
+        let port = {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let start = Instant::now();
+        naming_lookup(port, "tracker.i2p", PROBE).expect_err("resolved with no router");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
 mod session_tests {
     //! The control connection: `SESSION CREATE`, the watchdog, and what the
     //! session says when it ends.
     //!
-    //! None of this needed a router before either — it was simply never
-    //! reachable, because the exchange happened inside yosemite and the only
-    //! code clove had on the control connection was a `PING` probe whose reply
-    //! it never looked at. The cost was four live runs that died on the same
-    //! ~90 second cycle and could not say why (`PROTOCOL.i2p-bt` §2.13).
+    //! A session that ends without a reported reason is one nobody can
+    //! diagnose, so what the router says on the way out is asserted here
+    //! (`PROTOCOL.i2p-bt` §2.13).
 
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1857,9 +2241,8 @@ mod session_tests {
         );
     }
 
-    /// End-of-file is not health. yosemite's `read_line` returns `Ok("")` at
-    /// end-of-file and the old probe called that success, so a session the
-    /// router had already destroyed read as healthy for two more rounds.
+    /// End-of-file is not health: a reader that maps it to an empty line reads
+    /// a destroyed session as a healthy one.
     #[test]
     fn a_control_connection_at_end_of_file_is_dead_not_healthy() {
         let (port, _sent) = session_bridge(ok_status(), AfterSession::ExplainAndClose);
