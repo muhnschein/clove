@@ -165,8 +165,8 @@ impl Picker {
     /// verified or abandoned.
     ///
     /// Bounded by what the peer table can have outstanding, never by the length
-    /// of the torrent, which is the property [`progress`](Picker::progress)
-    /// exists to have and the one a test can check.
+    /// of the torrent. That is the property the block-progress store exists to
+    /// have, and this is how a test holds it to it.
     #[must_use]
     pub fn started_pieces(&self) -> usize {
         self.progress.len()
