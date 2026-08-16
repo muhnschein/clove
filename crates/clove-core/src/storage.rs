@@ -7,18 +7,25 @@
 //! disjoint regions needs no lock — the sync engine's disk worker and peer
 //! threads can touch different pieces at once (SCOPE §4).
 //!
-//! mmap is deliberately not used (predictable memory over speed, SCOPE §4).
-//! Verification reads a whole piece and compares its SHA-1 to the metainfo
-//! expectation; a download is only trusted after it verifies.
+//! mmap is deliberately not used (predictable memory over speed, SCOPE §4),
+//! and for the same reason nothing here reads a whole piece at once:
+//! verification streams it through a block-sized buffer into SHA-1 and
+//! compares that to the metainfo expectation. A download is only trusted
+//! after it verifies.
 
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use sha1::{Digest, Sha1};
 
 use crate::metainfo::MetaInfo;
+
+/// How much of a piece is read at a time when verifying it. The block size, so
+/// the read pattern is the one the rest of the engine already makes.
+const VERIFY_CHUNK: u32 = crate::wire::BLOCK_LEN;
 
 /// One file's placement in the torrent's global byte space.
 struct Region {
@@ -34,7 +41,9 @@ pub struct Storage {
     regions: Vec<Region>,
     piece_length: u64,
     total_length: u64,
-    piece_hashes: Vec<[u8; 20]>,
+    /// Shared with the [`MetaInfo`] it came from rather than copied: see
+    /// [`MetaInfo::pieces`].
+    piece_hashes: Arc<[[u8; 20]]>,
 }
 
 impl Storage {
@@ -68,7 +77,7 @@ impl Storage {
             regions,
             piece_length: u64::from(meta.piece_length),
             total_length: meta.total_length,
-            piece_hashes: meta.pieces.clone(),
+            piece_hashes: Arc::clone(&meta.pieces),
         })
     }
 
@@ -115,18 +124,40 @@ impl Storage {
     /// torrent's byte space, or any underlying read error (including a file
     /// shorter than the requested range — an unwritten region).
     pub fn read_block(&self, index: u32, begin: u32, len: u32) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.read_block_into(index, begin, len, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`read_block`](Storage::read_block) into a caller-owned buffer, which is
+    /// resized to exactly `len` bytes and filled.
+    ///
+    /// For callers that read block after block, so the buffer is allocated
+    /// once rather than once per block.
+    ///
+    /// # Errors
+    ///
+    /// As [`read_block`](Storage::read_block). On error the buffer's contents
+    /// are unspecified; it is scratch space, not a result.
+    pub fn read_block_into(
+        &self,
+        index: u32,
+        begin: u32,
+        len: u32,
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
         let start = u64::from(index) * self.piece_length + u64::from(begin);
-        // Check the range before allocating for it. `len` is a u32 from the
-        // wire, so an unbounded caller would otherwise reserve up to 4 GiB on
-        // its way to being told the range does not exist.
+        // Check the range before sizing the buffer for it. `len` is a u32 from
+        // the wire, so an unbounded caller would otherwise reserve up to 4 GiB
+        // on its way to being told the range does not exist.
         self.check_range(start, u64::from(len))?;
-        let mut out = vec![0u8; len as usize];
+        out.clear();
+        out.resize(len as usize, 0);
         self.for_each_segment(start, out.len(), |file, file_off, seg| {
             let lo = usize::try_from(seg.start).unwrap_or(usize::MAX);
             let hi = usize::try_from(seg.end).unwrap_or(usize::MAX);
             file.read_exact_at(&mut out[lo..hi], file_off)
-        })?;
-        Ok(out)
+        })
     }
 
     /// Whether piece `index` currently on disk matches its expected SHA-1.
@@ -137,17 +168,45 @@ impl Storage {
     /// piece reads short and is reported as unverified (`Ok(false)`), not an
     /// error.
     pub fn verify_piece(&self, index: u32) -> io::Result<bool> {
+        let mut scratch = Vec::new();
+        self.verify_piece_into(index, &mut scratch)
+    }
+
+    /// [`verify_piece`](Storage::verify_piece), reusing `scratch` as the read
+    /// buffer.
+    ///
+    /// The buffer is the point. This used to read the whole piece into a fresh
+    /// allocation — a size the *torrent* names, up to
+    /// [`MAX_PIECE_LENGTH`](crate::metainfo::MAX_PIECE_LENGTH)'s 128 MiB, once
+    /// per piece on every recheck. SHA-1 streams, so the peak is a constant
+    /// instead of a number an attacker picks.
+    ///
+    /// # Errors
+    ///
+    /// As [`verify_piece`](Storage::verify_piece).
+    pub fn verify_piece_into(&self, index: u32, scratch: &mut Vec<u8>) -> io::Result<bool> {
         let len = self.piece_len(index);
         if len == 0 {
             return Ok(false);
         }
-        let data = match self.read_block(index, 0, len) {
-            Ok(data) => data,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
-            Err(e) => return Err(e),
+        let Some(expected) = self.piece_hashes.get(index as usize) else {
+            return Ok(false);
         };
-        let got: [u8; 20] = Sha1::digest(&data).into();
-        Ok(self.piece_hashes.get(index as usize) == Some(&got))
+        let mut hasher = Sha1::new();
+        let mut done = 0u32;
+        while done < len {
+            let chunk = (len - done).min(VERIFY_CHUNK);
+            match self.read_block_into(index, done, chunk, scratch) {
+                Ok(()) => hasher.update(&scratch[..chunk as usize]),
+                // A piece that has not been written yet reads short. Not an
+                // error: it is simply a piece we do not hold.
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+                Err(e) => return Err(e),
+            }
+            done += chunk;
+        }
+        let got: [u8; 20] = hasher.finalize().into();
+        Ok(*expected == got)
     }
 
     /// Verify every piece, returning the set that currently matches — a full
@@ -158,8 +217,10 @@ impl Storage {
     /// Any read error other than short/absent regions.
     pub fn verify_all(&self) -> io::Result<crate::bitfield::Bitfield> {
         let mut have = crate::bitfield::Bitfield::empty(self.num_pieces());
+        // One buffer for the whole pass, not one per piece.
+        let mut scratch = Vec::new();
         for index in 0..self.num_pieces() {
-            if self.verify_piece(index)? {
+            if self.verify_piece_into(index, &mut scratch)? {
                 have.set(index);
             }
         }
@@ -437,13 +498,13 @@ mod tests {
             info_hash: InfoHash([0; 20]),
             name: "t".into(),
             piece_length,
-            pieces,
+            pieces: pieces.into(),
             files,
             total_length: total,
             private: true,
             trackers: vec![],
             skipped_trackers: 0,
-            raw_info: Vec::new(),
+            raw_info: Arc::from([].as_slice()),
         }
     }
 
@@ -575,6 +636,86 @@ mod tests {
         // Flip a byte: verification must now fail.
         st.write_block(0, 5, &[0]).unwrap();
         assert!(!st.verify_piece(0).unwrap());
+    }
+
+    /// Pieces of three chunks and a bit, so the streaming loop runs four times
+    /// with a short final read — where a dropped, repeated or reordered chunk
+    /// would show.
+    #[test]
+    fn a_piece_longer_than_one_chunk_verifies_chunk_by_chunk() {
+        let dir = TempDir::new();
+        let piece_length = VERIFY_CHUNK * 3 + 1024;
+        // Two full pieces and a short one.
+        let total = piece_length as usize * 2 + 777;
+        let content: Vec<u8> = (0..total).map(|i| u8::try_from(i % 251).unwrap()).collect();
+        let meta = meta_for(
+            vec![FileEntry {
+                path: vec!["big.bin".into()],
+                length: total as u64,
+            }],
+            piece_length,
+            &content,
+        );
+        let st = Storage::create(&meta, &dir.0, false).unwrap();
+        assert_eq!(st.num_pieces(), 3);
+
+        // A partly written piece reads short: not held, and not an error.
+        st.write_block(0, 0, &content[..VERIFY_CHUNK as usize])
+            .unwrap();
+        assert!(!st.verify_piece(0).unwrap(), "a partial piece is not held");
+
+        for p in 0..st.num_pieces() {
+            let start = p as usize * piece_length as usize;
+            let len = st.piece_len(p) as usize;
+            st.write_block(p, 0, &content[start..start + len]).unwrap();
+        }
+        assert!(st.verify_all().unwrap().is_full());
+
+        // A flipped byte in the last chunk: a loop that stopped early would
+        // call this piece good.
+        let last_chunk_start = piece_length - 1;
+        st.write_block(0, last_chunk_start, &[0xFF]).unwrap();
+        assert!(
+            !st.verify_piece(0).unwrap(),
+            "corruption in a piece's final chunk went unnoticed"
+        );
+    }
+
+    /// A shorter piece after a longer one must hash its own bytes and nothing
+    /// left in the reused buffer.
+    #[test]
+    fn a_reused_verify_buffer_does_not_leak_the_previous_piece() {
+        let dir = TempDir::new();
+        let content: Vec<u8> = (0..50u8).collect();
+        let meta = meta_for(
+            vec![FileEntry {
+                path: vec!["a.bin".into()],
+                length: 50,
+            }],
+            16,
+            &content,
+        );
+        let st = Storage::create(&meta, &dir.0, false).unwrap();
+        for p in 0..st.num_pieces() {
+            let start = p as usize * 16;
+            let len = st.piece_len(p) as usize;
+            st.write_block(p, 0, &content[start..start + len]).unwrap();
+        }
+        // Pieces 0..2 are 16 bytes, piece 3 is 2. Forwards is what
+        // `verify_all` does; backwards leaves the buffer oversized.
+        let mut scratch = Vec::new();
+        for p in 0..st.num_pieces() {
+            assert!(
+                st.verify_piece_into(p, &mut scratch).unwrap(),
+                "piece {p} through a reused buffer"
+            );
+        }
+        for p in (0..st.num_pieces()).rev() {
+            assert!(
+                st.verify_piece_into(p, &mut scratch).unwrap(),
+                "piece {p} through an oversized reused buffer"
+            );
+        }
     }
 
     #[test]

@@ -14,6 +14,8 @@
 //! reports back [`Picker::set_have`] (passed) or [`Picker::reset_piece`]
 //! (failed — re-download).
 
+use std::collections::BTreeMap;
+
 use crate::bitfield::Bitfield;
 use crate::wire::{BLOCK_LEN, BlockRequest};
 
@@ -65,8 +67,14 @@ pub struct Picker {
     availability: Vec<u32>,
     /// Pieces we have fully verified.
     have: Bitfield,
-    /// Block state for started-but-incomplete pieces, indexed by piece.
-    progress: Vec<Option<Progress>>,
+    /// Block state for started-but-incomplete pieces, keyed by piece index.
+    ///
+    /// A map, not a slot per piece: a piece is in here only between its first
+    /// requested block and its verification, so the set is bounded by what the
+    /// peer table can have outstanding, not by the length of the torrent. As a
+    /// `Vec<Option<Progress>>` it cost 48 bytes per piece of every hosted
+    /// torrent, touched or not.
+    progress: BTreeMap<u32, Progress>,
     /// What each piece is worth to us: `0` skip, `1` normal, `2` high.
     ///
     /// Derived from the user's per-file priorities by
@@ -99,16 +107,12 @@ impl Picker {
             "availability table does not span the torrent"
         );
         assert_eq!(self.have.len(), self.num_pieces, "have field is missized");
-        assert_eq!(
-            self.progress.len(),
-            self.num_pieces as usize,
-            "progress table does not span the torrent"
-        );
 
-        for index in 0..self.num_pieces {
-            let Some(progress) = &self.progress[index as usize] else {
-                continue;
-            };
+        for (&index, progress) in &self.progress {
+            assert!(
+                index < self.num_pieces,
+                "piece {index}: block progress for a piece outside the torrent"
+            );
             let blocks = self.blocks_in_piece(index) as usize;
             assert_eq!(
                 progress.received.len(),
@@ -150,14 +154,21 @@ impl Picker {
         }
     }
 
+    /// How many pieces currently carry block accounting — started, not yet
+    /// verified or abandoned. Exposed so a test can hold that set to its
+    /// bound.
+    #[must_use]
+    pub fn started_pieces(&self) -> usize {
+        self.progress.len()
+    }
+
     /// Total in-flight block requests the picker believes are outstanding.
     /// Cross-checked against the peer table in debug builds — the two must
     /// agree, or blocks have leaked (never re-offered) or been double-counted.
     #[must_use]
     pub fn in_flight_total(&self) -> u64 {
         self.progress
-            .iter()
-            .flatten()
+            .values()
             .flat_map(|p| p.in_flight.iter())
             .map(|&n| u64::from(n))
             .sum()
@@ -181,7 +192,7 @@ impl Picker {
             endgame_blocks: DEFAULT_ENDGAME_BLOCKS,
             availability: vec![0u32; num_pieces as usize],
             have: Bitfield::empty(num_pieces),
-            progress: (0..num_pieces).map(|_| None).collect(),
+            progress: BTreeMap::new(),
             priority: vec![1u8; num_pieces as usize],
         }
     }
@@ -343,7 +354,7 @@ impl Picker {
     pub fn set_have(&mut self, index: u32) {
         if index < self.num_pieces {
             self.have.set(index);
-            self.progress[index as usize] = None;
+            self.progress.remove(&index);
         }
         self.debug_check();
     }
@@ -357,7 +368,7 @@ impl Picker {
     /// re-download it.
     pub fn reset_piece(&mut self, index: u32) {
         if index < self.num_pieces {
-            self.progress[index as usize] = None;
+            self.progress.remove(&index);
             self.have.clear(index);
         }
         self.debug_check();
@@ -394,7 +405,7 @@ impl Picker {
     /// Release an in-flight block that will not arrive (timeout, reject, or
     /// the peer disconnected), so it can be handed out again.
     pub fn block_failed(&mut self, index: u32, block: u32) {
-        if let Some(Some(prog)) = self.progress.get_mut(index as usize)
+        if let Some(prog) = self.progress.get_mut(&index)
             && let Some(inflight) = prog.in_flight.get_mut(block as usize)
         {
             *inflight = inflight.saturating_sub(1);
@@ -453,7 +464,7 @@ impl Picker {
             if self.have.has(index) || !self.wants(index) {
                 continue;
             }
-            let received = match &self.progress[index as usize] {
+            let received = match self.progress.get(&index) {
                 Some(p) => p.received_count(),
                 None => 0,
             };
@@ -478,7 +489,7 @@ impl Picker {
             .filter(|&i| peer_has.has(i) && !self.have.has(i) && self.wants(i))
             .collect();
         candidates.sort_by_key(|&i| {
-            let started = self.progress[i as usize].is_some();
+            let started = self.progress.contains_key(&i);
             let group = u8::from(!started); // started (0) before unstarted (1)
             // Descending: 2 (high) sorts before 1 (normal).
             let urgency = u8::MAX - self.priority[i as usize];
@@ -497,12 +508,18 @@ impl Picker {
     /// giving a completed piece fresh accounting would resurrect it, break
     /// the invariant that `have` and block progress are disjoint, and — for a
     /// one-block piece — report the piece complete a second time.
+    ///
+    /// The range check is explicit because the store is a map: it used to fall
+    /// out of indexing, and a map would take a key past the end of the torrent.
     fn progress_mut(&mut self, index: u32, blocks: u32) -> Option<&mut Progress> {
-        if self.have.has(index) {
+        if index >= self.num_pieces || self.have.has(index) {
             return None;
         }
-        let slot = self.progress.get_mut(index as usize)?;
-        Some(slot.get_or_insert_with(|| Progress::new(blocks)))
+        Some(
+            self.progress
+                .entry(index)
+                .or_insert_with(|| Progress::new(blocks)),
+        )
     }
 }
 
@@ -642,6 +659,42 @@ mod tests {
         assert!(p.is_complete());
         // Nothing left to pick.
         assert!(p.pick(&peer, 10).is_empty());
+    }
+
+    /// A table that quietly kept an entry per piece would pass every other
+    /// test in this file, so the size of the set gets one of its own.
+    #[test]
+    fn block_accounting_is_kept_only_for_pieces_in_progress() {
+        let mut p = one_block_pieces(4096);
+        assert_eq!(p.started_pieces(), 0, "a fresh picker has started nothing");
+
+        let peer = field(4096, &(0..4096).collect::<Vec<_>>());
+        let picks = p.pick(&peer, 3);
+        assert_eq!(picks.len(), 3);
+        assert_eq!(
+            p.started_pieces(),
+            3,
+            "three requested pieces, three entries — not one per piece of the torrent"
+        );
+
+        // Completing a piece releases its accounting.
+        assert!(p.block_received(picks[0].index, 0));
+        p.set_have(picks[0].index);
+        assert_eq!(p.started_pieces(), 2);
+
+        // So does giving up on one.
+        p.reset_piece(picks[1].index);
+        assert_eq!(p.started_pieces(), 1);
+    }
+
+    /// Piece indices come from peers, and a map takes any key.
+    #[test]
+    fn a_piece_index_past_the_end_starts_nothing() {
+        let mut p = one_block_pieces(4);
+        assert!(!p.block_received(9999, 0));
+        p.block_failed(9999, 0);
+        assert_eq!(p.started_pieces(), 0);
+        p.check_invariants();
     }
 
     #[test]

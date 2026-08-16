@@ -37,6 +37,36 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Fill `buf` with bytes from `getrandom(2)`.
+///
+/// Through `rustix`, already here for `openat` and the workspace's sanctioned
+/// way to reach a syscall std does not expose. It replaces the `getrandom`
+/// crate, which was a direct dependency for this one call.
+///
+/// The loop is what that crate was doing for us: `getrandom(2)` may return
+/// short — over 256 bytes, or on a signal — and a short read taken for success
+/// is a token with a tail of zeroes.
+fn random_bytes(buf: &mut [u8]) -> std::io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match rustix::rand::getrandom(&mut buf[filled..], rustix::rand::GetRandomFlags::empty()) {
+            // A signal arrived before any byte did; ask again.
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+            // Not documented to happen for a blocking, unflagged call, but a
+            // zero-length read would spin forever if it ever did.
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "getrandom(2) returned no bytes",
+                ));
+            }
+            Ok(n) => filled += n,
+        }
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -702,7 +732,7 @@ where
 )]
 fn random_roll() -> f64 {
     let mut bytes = [0u8; 8];
-    if getrandom::getrandom(&mut bytes).is_err() {
+    if random_bytes(&mut bytes).is_err() {
         return 0.0;
     }
     let mantissa = u64::from_le_bytes(bytes) >> 11; // 53 bits
@@ -729,7 +759,7 @@ fn distinct(mut peers: Vec<DestHash>) -> Vec<DestHash> {
 fn build_peer_id() -> std::io::Result<[u8; 20]> {
     let mut id = *b"-CV0001-............";
     let mut tail = [0u8; 12];
-    getrandom::getrandom(&mut tail)
+    random_bytes(&mut tail)
         .map_err(|e| std::io::Error::other(format!("getrandom for the peer id: {e}")))?;
     id[8..].copy_from_slice(&tail);
     Ok(id)
@@ -1181,7 +1211,7 @@ fn load_or_create_token(data_dir: &Path) -> std::io::Result<String> {
 /// the token is never briefly readable by anyone else and never half-written.
 fn write_new_token(path: &Path) -> std::io::Result<String> {
     let mut raw = [0u8; 32];
-    getrandom::getrandom(&mut raw).map_err(|e| std::io::Error::other(format!("getrandom: {e}")))?;
+    random_bytes(&mut raw).map_err(|e| std::io::Error::other(format!("getrandom: {e}")))?;
     let token = registry::hex(&raw);
     write_private_file(path, token.as_bytes())?;
     Ok(token)
@@ -1822,6 +1852,24 @@ mod tests {
         let policy = ReconnectPolicy::default();
         let base = policy.base_delay(5);
         assert!(policy.jittered(base, 1.0) < base);
+    }
+
+    /// The buffer must come back filled, whatever its size.
+    #[test]
+    fn random_bytes_fills_the_whole_buffer() {
+        // Past the 256-byte short-read point, so the loop is under test.
+        let mut a = [0u8; 1024];
+        random_bytes(&mut a).expect("randomness");
+        let mut b = [0u8; 1024];
+        random_bytes(&mut b).expect("randomness");
+        assert_ne!(a, b, "two draws were identical");
+        // A tail of zeroes is what a mishandled short read looks like.
+        assert!(
+            a[a.len() - 64..].iter().any(|&x| x != 0),
+            "the tail of the buffer was never written"
+        );
+        // An empty request is not an error and not a spin.
+        random_bytes(&mut []).expect("an empty request");
     }
 
     #[test]

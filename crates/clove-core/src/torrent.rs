@@ -291,7 +291,10 @@ struct Shared {
     max_frame: u32,
     /// Raw `info` dictionary bytes, for serving BEP 9 metadata to magnet
     /// peers. Empty if unknown (a synthetic test torrent).
-    raw_info: Vec<u8>,
+    ///
+    /// Shared with the registry's [`MetaInfo`](crate::metainfo::MetaInfo),
+    /// not copied.
+    raw_info: Arc<[u8]>,
     state: Mutex<State>,
     done: Mutex<bool>,
     done_cv: Condvar,
@@ -532,7 +535,7 @@ impl Torrent {
             storage,
             num_pieces,
             max_frame,
-            raw_info: meta.raw_info.clone(),
+            raw_info: Arc::clone(&meta.raw_info),
             state: Mutex::new(State {
                 picker,
                 choker: Choker::default(),
@@ -1001,8 +1004,23 @@ impl Torrent {
             });
         }
 
-        let writer_handle = spawn_writer(writer, rx);
-        let reader_handle = spawn_reader(Arc::clone(&self.shared), id, reader);
+        // A thread the OS will not give us ends this connection, not the
+        // torrent: drop the peer so its budget slot and table entry go back.
+        let writer_handle = match spawn_writer(writer, rx) {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.shared.remove_peer(id);
+                return Err(e);
+            }
+        };
+        let reader_handle = match spawn_reader(Arc::clone(&self.shared), id, reader) {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Removing the peer drops the sender, which ends the writer.
+                self.shared.remove_peer(id);
+                return Err(e);
+            }
+        };
         let mut threads = lock(&self.threads);
         // Reap the handles of peers that have already gone. Two per connection
         // accumulate otherwise, and a long-lived torrent sees a lot of churn.
@@ -1016,8 +1034,8 @@ impl Torrent {
 fn spawn_writer<W: std::io::Write + I2pClose + Send + 'static>(
     mut writer: W,
     rx: Receiver<Message>,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
+) -> std::io::Result<JoinHandle<()>> {
+    peer_thread().spawn(move || {
         while let Ok(msg) = rx.recv() {
             if wire::write_message(&mut writer, &msg).is_err() {
                 break;
@@ -1041,9 +1059,12 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
     shared: Arc<Shared>,
     id: u64,
     mut reader: R,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        while let Ok(body) = wire::read_frame(&mut reader, shared.max_frame) {
+) -> std::io::Result<JoinHandle<()>> {
+    peer_thread().spawn(move || {
+        // One frame buffer for the life of the connection; see
+        // `wire::read_frame_into`.
+        let mut body = Vec::new();
+        while wire::read_frame_into(&mut reader, shared.max_frame, &mut body).is_ok() {
             match Message::parse(&body) {
                 Ok(msg) => shared.on_message(id, &msg),
                 Err(_) => break, // protocol violation: drop the peer
@@ -1051,6 +1072,20 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
         }
         shared.remove_peer(id);
     })
+}
+
+/// Stack size for a peer's reader and writer threads.
+///
+/// Two per connection and up to `peer_limit` connections is several hundred
+/// threads, and the default 2 MiB each is most of a gigabyte of address space.
+/// Neither thread recurses over anything a peer controls — the deepest call is
+/// `bencode`'s decoder, capped at [`MAX_DEPTH`](crate::bencode::MAX_DEPTH) —
+/// so this is far more than either needs and eight times less than the default.
+const PEER_STACK_BYTES: usize = 256 * 1024;
+
+/// A builder for the threads that serve one peer connection.
+fn peer_thread() -> std::thread::Builder {
+    std::thread::Builder::new().stack_size(PEER_STACK_BYTES)
 }
 
 impl Shared {
@@ -1907,13 +1942,13 @@ mod tests {
             info_hash: InfoHash([0x33; 20]),
             name: "demo".into(),
             piece_length,
-            pieces,
+            pieces: pieces.into(),
             files,
             total_length: total,
             private: true,
             trackers: vec![],
             skipped_trackers: 0,
-            raw_info: Vec::new(),
+            raw_info: Arc::from([].as_slice()),
         }
     }
 

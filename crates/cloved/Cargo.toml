@@ -10,8 +10,12 @@ publish.workspace = true
 [dependencies]
 clove-core = { path = "../clove-core" }
 i2pnet = { path = "../i2pnet" }
-getrandom = "0.2"
-rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
+rustix = { version = "1", default-features = false, features = [
+    "fs",
+    "process",
+    "rand",
+    "std",
+] }
 
 # Layer-2 self-restriction (SCOPE §5). Linux-only, applied after
 # initialisation; see crates/cloved/src/sandbox.rs. `libc` is here for the

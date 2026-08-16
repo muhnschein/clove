@@ -6,6 +6,7 @@
 //! has to reason about `..`, separators, or NUL bytes.
 
 use std::fmt;
+use std::sync::Arc;
 
 use sha1::{Digest, Sha1};
 
@@ -52,7 +53,11 @@ pub struct MetaInfo {
     /// Bytes per piece (except possibly the last).
     pub piece_length: u32,
     /// SHA-1 expectation for every piece, in order.
-    pub pieces: Vec<[u8; 20]>,
+    ///
+    /// Shared, not owned: [`Storage`](crate::storage::Storage) wants the same
+    /// list, nothing mutates it after parsing, and 20 bytes per piece per copy
+    /// adds up across a catalogue of torrents.
+    pub pieces: Arc<[[u8; 20]]>,
     /// The torrent's files, in on-wire order.
     pub files: Vec<FileEntry>,
     /// Sum of all file lengths.
@@ -68,7 +73,10 @@ pub struct MetaInfo {
     /// The raw bencoded `info` dictionary these fields came from — the exact
     /// bytes the info-hash covers. Kept so we can serve BEP 9 metadata to
     /// magnet peers and re-emit the torrent without re-encoding.
-    pub raw_info: Vec<u8>,
+    ///
+    /// Shared for the same reason as [`pieces`](MetaInfo::pieces), and the
+    /// larger of the two: this dictionary is mostly the piece hashes again.
+    pub raw_info: Arc<[u8]>,
 }
 
 /// Why a .torrent was rejected.
@@ -192,7 +200,7 @@ impl MetaInfo {
         // change the identity i2psnark peers agreed on.
         let info_range =
             bencode::raw_entry(input, b"info")?.ok_or(Error::Invalid("missing info dictionary"))?;
-        let raw_info = input[info_range].to_vec();
+        let raw_info: Arc<[u8]> = Arc::from(&input[info_range]);
         let info_hash = InfoHash(Sha1::digest(&raw_info).into());
 
         let name = info
@@ -217,7 +225,7 @@ impl MetaInfo {
         if pieces_raw.is_empty() || pieces_raw.len() % 20 != 0 {
             return Err(Error::Invalid("pieces is not a multiple of 20 bytes"));
         }
-        let pieces: Vec<[u8; 20]> = pieces_raw
+        let pieces: Arc<[[u8; 20]]> = pieces_raw
             .chunks_exact(20)
             .map(|chunk| {
                 let mut hash = [0u8; 20];

@@ -222,7 +222,7 @@ mod torrent_bytes_tests {
         let trackers = vec!["http://tracker.i2p/announce".to_owned()];
         let bytes = torrent_bytes(&raw_info, &trackers);
         let meta = MetaInfo::parse(&bytes).unwrap();
-        assert_eq!(meta.raw_info, raw_info);
+        assert_eq!(&meta.raw_info[..], &raw_info[..]);
         assert_eq!(meta.trackers, vec![trackers.clone()]);
 
         // Trackerless magnets synthesize too.
