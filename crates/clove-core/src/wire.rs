@@ -385,6 +385,34 @@ impl std::error::Error for HandshakeError {}
 /// I/O errors from the reader, or [`io::ErrorKind::InvalidData`] if the
 /// declared length exceeds `max_len`.
 pub fn read_frame<R: Read>(reader: &mut R, max_len: u32) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    read_frame_into(reader, max_len, &mut body)?;
+    Ok(body)
+}
+
+/// [`read_frame`] into a caller-owned buffer, which is resized to the frame's
+/// length and filled.
+///
+/// What a peer connection uses. A reader loop calling [`read_frame`] allocates
+/// a buffer per message and frees it a moment later — 16 KiB per block, per
+/// peer, for the life of a download — and a heap doing that on hundreds of
+/// threads at once keeps the pages rather than returning them, so the daemon's
+/// resident size drifts upward and stays there. One buffer per connection,
+/// grown to the largest frame that connection has carried and reused after
+/// that, has the same peak and no churn.
+///
+/// The buffer is still bounded by `max_len`: it is sized to a length the peer
+/// declared, and the ceiling is checked before the resize, exactly as
+/// [`read_frame`] does.
+///
+/// # Errors
+///
+/// As [`read_frame`].
+pub fn read_frame_into<R: Read>(
+    reader: &mut R,
+    max_len: u32,
+    body: &mut Vec<u8>,
+) -> io::Result<()> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf);
@@ -394,9 +422,9 @@ pub fn read_frame<R: Read>(reader: &mut R, max_len: u32) -> io::Result<Vec<u8>> 
             "wire: peer declared an oversized message",
         ));
     }
-    let mut body = vec![0u8; len as usize];
-    reader.read_exact(&mut body)?;
-    Ok(body)
+    body.clear();
+    body.resize(len as usize, 0);
+    reader.read_exact(body)
 }
 
 /// Encode and write one message frame (blocking).
@@ -549,6 +577,46 @@ mod tests {
                 block: vec![1, 2, 3]
             }
         );
+    }
+
+    /// A peer's reader keeps one buffer for the life of the connection, so a
+    /// long frame followed by a short one must leave nothing of the long one
+    /// behind — the failure mode is a message that parses as something the peer
+    /// never sent.
+    #[test]
+    fn a_reused_frame_buffer_carries_nothing_between_messages() {
+        let mut buf = Vec::new();
+        write_message(
+            &mut buf,
+            &Message::Piece {
+                index: 7,
+                begin: 0,
+                block: vec![0xAB; 4096],
+            },
+        )
+        .unwrap();
+        write_message(&mut buf, &Message::Have(5)).unwrap();
+        write_message(&mut buf, &Message::KeepAlive).unwrap();
+        write_message(&mut buf, &Message::Interested).unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let mut body = Vec::new();
+        let expected = [
+            Message::Piece {
+                index: 7,
+                begin: 0,
+                block: vec![0xAB; 4096],
+            },
+            Message::Have(5),
+            Message::KeepAlive,
+            Message::Interested,
+        ];
+        for want in expected {
+            read_frame_into(&mut cursor, MAX_MESSAGE_LEN, &mut body).unwrap();
+            assert_eq!(Message::parse(&body).unwrap(), want);
+        }
+        // And the stream is exhausted, not merely re-reading the last buffer.
+        assert!(read_frame_into(&mut cursor, MAX_MESSAGE_LEN, &mut body).is_err());
     }
 
     #[test]

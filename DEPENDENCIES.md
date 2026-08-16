@@ -46,8 +46,9 @@ commit. Closure sizes are recorded when the dependency is actually added.
   the tree under `getrandom`, `landlock` and `seccompiler`, so this is a direct
   edge to an existing node, not a new crate. Not socket-capable in our use: we
   reference constants, and `unsafe_code = "forbid"` means we cannot call it.
-- **`rustix` 1.1** (features = `["fs", "std"]`, `default-features = false`,
-  `clove-core`). Torrent file names are attacker-supplied, and validating them
+- **`rustix` 1.1** (`default-features = false`; `["fs", "std"]` in
+  `clove-core`, plus `process` and `rand` in `cloved`).
+  Torrent file names are attacker-supplied, and validating them
   lexically — no separators, no `..` — says nothing about what the filesystem
   does with them: a symlink already sitting under the download directory turns
   an ordinary join-and-open into a write outside it. The fix is to walk the
@@ -68,10 +69,20 @@ commit. Closure sizes are recorded when the dependency is actually added.
   in a `Cargo.toml` away, `rustix` is listed in *both* the deny and allow sets
   of `ci/check-net-deps.sh`, and that script now also fails if any manifest
   turns the `net` feature on — the allowlist alone would have said nothing.
-  That check is per-manifest, so it covers the second consumer below as well.
+  That check is per-manifest, so it covers `cloved`'s use as well.
 
-- **`getrandom` 0.2** (`cloved`). The API token and the
-  peer-ID suffix are bytes straight from the OS RNG; `getrandom` is the
-  maintained thin wrapper over `getrandom(2)`/`/dev/urandom`, exactly the
-  syscall access we do not want to hand-roll. Tiny closure (`cfg-if`, `libc`,
-  both already in the tree); not socket-capable.
+  The `rand` feature is `cloved`'s, and it is what the `getrandom` crate used
+  to be here for: the API token and the peer-ID suffix are bytes straight from
+  the OS RNG, and `rustix::rand::getrandom` is the same `getrandom(2)` wrapper
+  by another maintainer we already depend on. Keeping the crate would have
+  meant one direct dependency, plus `wasi` in the lockfile, for one syscall
+  this one already wraps — so it went, and `cloved::random_bytes` carries the
+  short-read and `EINTR` loop the crate was doing for us. `rand` adds no new
+  lockfile entry and nothing socket-capable; it is a module gate, not a
+  transitive edge.
+
+## Removed
+
+- **`getrandom` 0.2** — replaced by `rustix`'s `rand` feature (above), which
+  wraps the same syscall in a crate that was already a direct dependency of the
+  same binary. Went with `wasi`, its only lockfile entry not otherwise needed.

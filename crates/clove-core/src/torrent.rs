@@ -291,7 +291,10 @@ struct Shared {
     max_frame: u32,
     /// Raw `info` dictionary bytes, for serving BEP 9 metadata to magnet
     /// peers. Empty if unknown (a synthetic test torrent).
-    raw_info: Vec<u8>,
+    ///
+    /// Shared with the [`MetaInfo`] the registry is holding, not copied:
+    /// see [`MetaInfo::raw_info`](crate::metainfo::MetaInfo::raw_info).
+    raw_info: Arc<[u8]>,
     state: Mutex<State>,
     done: Mutex<bool>,
     done_cv: Condvar,
@@ -532,7 +535,7 @@ impl Torrent {
             storage,
             num_pieces,
             max_frame,
-            raw_info: meta.raw_info.clone(),
+            raw_info: Arc::clone(&meta.raw_info),
             state: Mutex::new(State {
                 picker,
                 choker: Choker::default(),
@@ -1001,8 +1004,25 @@ impl Torrent {
             });
         }
 
-        let writer_handle = spawn_writer(writer, rx);
-        let reader_handle = spawn_reader(Arc::clone(&self.shared), id, reader);
+        // A thread the OS will not give us is the end of this connection, not of
+        // the torrent: drop the peer again so its budget slot, its table entry
+        // and the connection itself go back rather than leaking on a daemon that
+        // is already at its limits.
+        let writer_handle = match spawn_writer(writer, rx) {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.shared.remove_peer(id);
+                return Err(e);
+            }
+        };
+        let reader_handle = match spawn_reader(Arc::clone(&self.shared), id, reader) {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Removing the peer drops the sender, which ends the writer.
+                self.shared.remove_peer(id);
+                return Err(e);
+            }
+        };
         let mut threads = lock(&self.threads);
         // Reap the handles of peers that have already gone. Two per connection
         // accumulate otherwise, and a long-lived torrent sees a lot of churn.
@@ -1016,8 +1036,8 @@ impl Torrent {
 fn spawn_writer<W: std::io::Write + I2pClose + Send + 'static>(
     mut writer: W,
     rx: Receiver<Message>,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
+) -> std::io::Result<JoinHandle<()>> {
+    peer_thread().spawn(move || {
         while let Ok(msg) = rx.recv() {
             if wire::write_message(&mut writer, &msg).is_err() {
                 break;
@@ -1041,9 +1061,14 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
     shared: Arc<Shared>,
     id: u64,
     mut reader: R,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        while let Ok(body) = wire::read_frame(&mut reader, shared.max_frame) {
+) -> std::io::Result<JoinHandle<()>> {
+    peer_thread().spawn(move || {
+        // One frame buffer for the life of the connection (see
+        // [`wire::read_frame_into`]). It settles at this torrent's largest
+        // frame — a block, or the bitfield — and stops asking the allocator for
+        // 16 KiB per message after that.
+        let mut body = Vec::new();
+        while wire::read_frame_into(&mut reader, shared.max_frame, &mut body).is_ok() {
             match Message::parse(&body) {
                 Ok(msg) => shared.on_message(id, &msg),
                 Err(_) => break, // protocol violation: drop the peer
@@ -1051,6 +1076,26 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
         }
         shared.remove_peer(id);
     })
+}
+
+/// Stack size for a peer's reader and writer threads.
+///
+/// Two threads per connection and up to `peer_limit` connections is several
+/// hundred threads on a busy daemon, each of which gets 2 MiB by default —
+/// nearly a gigabyte of address space, and the pages any of them dirties are
+/// resident for as long as the connection lives. Neither thread recurses over
+/// anything a peer controls: the deepest call either makes is `bencode`'s
+/// decoder on an extension payload, and that is capped at
+/// [`MAX_DEPTH`](crate::bencode::MAX_DEPTH) — 32 frames — with everything else
+/// a flat loop over a buffer that lives on the heap.
+///
+/// 256 KiB is therefore two orders of magnitude more than the measured need,
+/// and still eight times smaller than the default.
+const PEER_STACK_BYTES: usize = 256 * 1024;
+
+/// A builder for the threads that serve one peer connection.
+fn peer_thread() -> std::thread::Builder {
+    std::thread::Builder::new().stack_size(PEER_STACK_BYTES)
 }
 
 impl Shared {
@@ -1907,13 +1952,13 @@ mod tests {
             info_hash: InfoHash([0x33; 20]),
             name: "demo".into(),
             piece_length,
-            pieces,
+            pieces: pieces.into(),
             files,
             total_length: total,
             private: true,
             trackers: vec![],
             skipped_trackers: 0,
-            raw_info: Vec::new(),
+            raw_info: Arc::from([].as_slice()),
         }
     }
 

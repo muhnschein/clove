@@ -888,7 +888,8 @@ mod tests {
 
         // Randomness (the API token and the peer id) and a clock read.
         let mut seed = [0u8; 16];
-        getrandom::getrandom(&mut seed).expect("getrandom");
+        rustix::rand::getrandom(&mut seed[..], rustix::rand::GetRandomFlags::empty())
+            .expect("getrandom");
         assert!(seed.iter().any(|&b| b != 0), "getrandom returned nothing");
         let _ = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

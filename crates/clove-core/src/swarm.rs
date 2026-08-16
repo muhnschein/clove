@@ -937,7 +937,7 @@ mod tests {
             info_hash: InfoHash([tag; 20]),
             name: format!("swarm-demo-{tag}"),
             piece_length: BLOCK_LEN,
-            pieces,
+            pieces: pieces.into(),
             files: vec![FileEntry {
                 path: vec!["swarm-demo".into()],
                 length: content.len() as u64,
@@ -946,7 +946,7 @@ mod tests {
             private: true,
             trackers: vec![],
             skipped_trackers: 0,
-            raw_info: Vec::new(),
+            raw_info: Arc::from([].as_slice()),
         };
 
         let seed_dir = TempDir::new("seed");
@@ -995,7 +995,7 @@ mod tests {
             info_hash: InfoHash([tag; 20]),
             name: format!("budget-demo-{tag}"),
             piece_length: BLOCK_LEN,
-            pieces,
+            pieces: pieces.into(),
             files: vec![FileEntry {
                 path: vec!["budget-demo".into()],
                 length: content.len() as u64,
@@ -1004,7 +1004,7 @@ mod tests {
             private: true,
             trackers: vec![],
             skipped_trackers: 0,
-            raw_info: Vec::new(),
+            raw_info: Arc::from([].as_slice()),
         };
         (meta, content)
     }
