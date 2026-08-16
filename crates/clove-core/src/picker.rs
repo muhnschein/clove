@@ -69,18 +69,11 @@ pub struct Picker {
     have: Bitfield,
     /// Block state for started-but-incomplete pieces, keyed by piece index.
     ///
-    /// A map rather than one slot per piece, because the set is *sparse and
-    /// small* — a piece is in here only between its first requested block and
-    /// its verification, so the size is bounded by what the peer table can have
-    /// outstanding (`max_peers` × `PIPELINE_DEPTH` blocks, fewer pieces than
-    /// that), never by the length of the torrent.
-    ///
-    /// It was a `Vec<Option<Progress>>`, and `Option<Progress>` is 48 bytes
-    /// whether or not the piece was ever touched: 48 bytes × every piece × every
-    /// hosted torrent, resident for as long as the daemon runs. Measured over 40
-    /// torrents of 8192 pieces that is 16 MiB of tables describing pieces nobody
-    /// had asked for — the single largest allocation in a seeding daemon, and
-    /// one that grows with the *catalogue* rather than with the work in flight.
+    /// A map, not a slot per piece: a piece is in here only between its first
+    /// requested block and its verification, so the set is bounded by what the
+    /// peer table can have outstanding, not by the length of the torrent. As a
+    /// `Vec<Option<Progress>>` it cost 48 bytes per piece of every hosted
+    /// torrent, touched or not.
     progress: BTreeMap<u32, Progress>,
     /// What each piece is worth to us: `0` skip, `1` normal, `2` high.
     ///
@@ -162,11 +155,8 @@ impl Picker {
     }
 
     /// How many pieces currently carry block accounting — started, not yet
-    /// verified or abandoned.
-    ///
-    /// Bounded by what the peer table can have outstanding, never by the length
-    /// of the torrent. That is the property the block-progress store exists to
-    /// have, and this is how a test holds it to it.
+    /// verified or abandoned. Exposed so a test can hold that set to its
+    /// bound.
     #[must_use]
     pub fn started_pieces(&self) -> usize {
         self.progress.len()
@@ -519,9 +509,8 @@ impl Picker {
     /// the invariant that `have` and block progress are disjoint, and — for a
     /// one-block piece — report the piece complete a second time.
     ///
-    /// The range check is explicit now that the store is a map. It used to fall
-    /// out of indexing a table that spanned the torrent, and a map would happily
-    /// accept a key past the end — which is a piece index straight off the wire.
+    /// The range check is explicit because the store is a map: it used to fall
+    /// out of indexing, and a map would take a key past the end of the torrent.
     fn progress_mut(&mut self, index: u32, blocks: u32) -> Option<&mut Progress> {
         if index >= self.num_pieces || self.have.has(index) {
             return None;
@@ -672,11 +661,8 @@ mod tests {
         assert!(p.pick(&peer, 10).is_empty());
     }
 
-    /// Block accounting exists only for pieces actually being worked on, and
-    /// goes away again when they finish. The size of that set is what a hosted
-    /// torrent costs in memory for as long as the daemon runs, so it is worth a
-    /// test rather than an assumption: a table that quietly kept an entry per
-    /// piece would pass every behavioural test in this file.
+    /// A table that quietly kept an entry per piece would pass every other
+    /// test in this file, so the size of the set gets one of its own.
     #[test]
     fn block_accounting_is_kept_only_for_pieces_in_progress() {
         let mut p = one_block_pieces(4096);
@@ -701,8 +687,7 @@ mod tests {
         assert_eq!(p.started_pieces(), 1);
     }
 
-    /// A piece index arrives from a peer, and the store is now a map, which
-    /// will happily take a key past the end of the torrent.
+    /// Piece indices come from peers, and a map takes any key.
     #[test]
     fn a_piece_index_past_the_end_starts_nothing() {
         let mut p = one_block_pieces(4);

@@ -54,14 +54,9 @@ pub struct MetaInfo {
     pub piece_length: u32,
     /// SHA-1 expectation for every piece, in order.
     ///
-    /// Shared rather than owned, because three long-lived structures want the
-    /// same list for the life of a hosted torrent — this one, the
-    /// [`Storage`](crate::storage::Storage) that verifies against it, and any
-    /// [`MetaInfo`] clone a caller is holding — and 20 bytes per piece per copy
-    /// is the kind of duplication that only shows up in aggregate: 40 torrents
-    /// of 8192 pieces paid 6.4 MiB for the storage copy alone. Nothing mutates
-    /// a piece list after parsing, so there is nothing to gain from separate
-    /// copies and nothing to lose by sharing one.
+    /// Shared, not owned: [`Storage`](crate::storage::Storage) wants the same
+    /// list, nothing mutates it after parsing, and 20 bytes per piece per copy
+    /// adds up across a catalogue of torrents.
     pub pieces: Arc<[[u8; 20]]>,
     /// The torrent's files, in on-wire order.
     pub files: Vec<FileEntry>,
@@ -79,10 +74,8 @@ pub struct MetaInfo {
     /// bytes the info-hash covers. Kept so we can serve BEP 9 metadata to
     /// magnet peers and re-emit the torrent without re-encoding.
     ///
-    /// Shared for the same reason as [`pieces`](MetaInfo::pieces), and it is the
-    /// larger of the two: the info dictionary is mostly the piece-hash string,
-    /// so a running torrent that copied it held a second piece list in bencoded
-    /// form beside the parsed one.
+    /// Shared for the same reason as [`pieces`](MetaInfo::pieces), and the
+    /// larger of the two: this dictionary is mostly the piece hashes again.
     pub raw_info: Arc<[u8]>,
 }
 

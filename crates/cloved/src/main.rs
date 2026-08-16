@@ -39,18 +39,13 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Fill `buf` with bytes from `getrandom(2)`.
 ///
-/// Through `rustix`, which is already here for `openat` and is the workspace's
-/// sanctioned way to reach a syscall std does not expose (`unsafe_code` is
-/// forbidden, so calling it ourselves is not on the table). It replaces the
-/// `getrandom` crate, which was one direct dependency for one syscall this one
-/// already wraps.
+/// Through `rustix`, already here for `openat` and the workspace's sanctioned
+/// way to reach a syscall std does not expose. It replaces the `getrandom`
+/// crate, which was a direct dependency for this one call.
 ///
-/// The loop is the whole difference between the two. `getrandom(2)` may return
-/// short — it is documented to for requests over 256 bytes, and for any request
-/// interrupted by a signal — and treating a short read as success would hand out
-/// a token whose tail is zeroes. Every caller here asks for 32 bytes or fewer,
-/// so in practice this goes round once; the loop is what makes that a fact about
-/// the code rather than about the request sizes it happens to see today.
+/// The loop is what that crate was doing for us: `getrandom(2)` may return
+/// short — over 256 bytes, or on a signal — and a short read taken for success
+/// is a token with a tail of zeroes.
 fn random_bytes(buf: &mut [u8]) -> std::io::Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -1859,19 +1854,16 @@ mod tests {
         assert!(policy.jittered(base, 1.0) < base);
     }
 
-    /// The buffer must come back filled, whatever its size — a short
-    /// `getrandom(2)` treated as success is a token with a predictable tail.
+    /// The buffer must come back filled, whatever its size.
     #[test]
     fn random_bytes_fills_the_whole_buffer() {
-        // Past the 256-byte point where the syscall is documented to be
-        // allowed to return short, so the loop is what is under test.
+        // Past the 256-byte short-read point, so the loop is under test.
         let mut a = [0u8; 1024];
         random_bytes(&mut a).expect("randomness");
         let mut b = [0u8; 1024];
         random_bytes(&mut b).expect("randomness");
         assert_ne!(a, b, "two draws were identical");
-        // Nothing left at the default. A tail of zeroes is exactly what a
-        // mishandled short read looks like.
+        // A tail of zeroes is what a mishandled short read looks like.
         assert!(
             a[a.len() - 64..].iter().any(|&x| x != 0),
             "the tail of the buffer was never written"

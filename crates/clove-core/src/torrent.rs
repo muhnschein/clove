@@ -292,8 +292,8 @@ struct Shared {
     /// Raw `info` dictionary bytes, for serving BEP 9 metadata to magnet
     /// peers. Empty if unknown (a synthetic test torrent).
     ///
-    /// Shared with the [`MetaInfo`] the registry is holding, not copied:
-    /// see [`MetaInfo::raw_info`](crate::metainfo::MetaInfo::raw_info).
+    /// Shared with the registry's [`MetaInfo`](crate::metainfo::MetaInfo),
+    /// not copied.
     raw_info: Arc<[u8]>,
     state: Mutex<State>,
     done: Mutex<bool>,
@@ -1004,10 +1004,8 @@ impl Torrent {
             });
         }
 
-        // A thread the OS will not give us is the end of this connection, not of
-        // the torrent: drop the peer again so its budget slot, its table entry
-        // and the connection itself go back rather than leaking on a daemon that
-        // is already at its limits.
+        // A thread the OS will not give us ends this connection, not the
+        // torrent: drop the peer so its budget slot and table entry go back.
         let writer_handle = match spawn_writer(writer, rx) {
             Ok(handle) => handle,
             Err(e) => {
@@ -1063,10 +1061,8 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
     mut reader: R,
 ) -> std::io::Result<JoinHandle<()>> {
     peer_thread().spawn(move || {
-        // One frame buffer for the life of the connection (see
-        // [`wire::read_frame_into`]). It settles at this torrent's largest
-        // frame — a block, or the bitfield — and stops asking the allocator for
-        // 16 KiB per message after that.
+        // One frame buffer for the life of the connection; see
+        // `wire::read_frame_into`.
         let mut body = Vec::new();
         while wire::read_frame_into(&mut reader, shared.max_frame, &mut body).is_ok() {
             match Message::parse(&body) {
@@ -1080,17 +1076,11 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
 
 /// Stack size for a peer's reader and writer threads.
 ///
-/// Two threads per connection and up to `peer_limit` connections is several
-/// hundred threads on a busy daemon, each of which gets 2 MiB by default —
-/// nearly a gigabyte of address space, and the pages any of them dirties are
-/// resident for as long as the connection lives. Neither thread recurses over
-/// anything a peer controls: the deepest call either makes is `bencode`'s
-/// decoder on an extension payload, and that is capped at
-/// [`MAX_DEPTH`](crate::bencode::MAX_DEPTH) — 32 frames — with everything else
-/// a flat loop over a buffer that lives on the heap.
-///
-/// 256 KiB is therefore two orders of magnitude more than the measured need,
-/// and still eight times smaller than the default.
+/// Two per connection and up to `peer_limit` connections is several hundred
+/// threads, and the default 2 MiB each is most of a gigabyte of address space.
+/// Neither thread recurses over anything a peer controls — the deepest call is
+/// `bencode`'s decoder, capped at [`MAX_DEPTH`](crate::bencode::MAX_DEPTH) —
+/// so this is far more than either needs and eight times less than the default.
 const PEER_STACK_BYTES: usize = 256 * 1024;
 
 /// A builder for the threads that serve one peer connection.

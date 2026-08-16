@@ -9,8 +9,8 @@
 //!
 //! mmap is deliberately not used (predictable memory over speed, SCOPE §4),
 //! and for the same reason nothing here reads a whole piece at once:
-//! verification streams the piece through a block-sized buffer into SHA-1 and
-//! compares the result to the metainfo expectation. A download is only trusted
+//! verification streams it through a block-sized buffer into SHA-1 and
+//! compares that to the metainfo expectation. A download is only trusted
 //! after it verifies.
 
 use std::fs::File;
@@ -23,11 +23,8 @@ use sha1::{Digest, Sha1};
 
 use crate::metainfo::MetaInfo;
 
-/// How much of a piece is read at a time when verifying it.
-///
-/// The block size, so the read pattern is the one the rest of the engine
-/// already makes, and small enough that the buffer is a rounding error next to
-/// a peer connection's own state.
+/// How much of a piece is read at a time when verifying it. The block size, so
+/// the read pattern is the one the rest of the engine already makes.
 const VERIFY_CHUNK: u32 = crate::wire::BLOCK_LEN;
 
 /// One file's placement in the torrent's global byte space.
@@ -135,9 +132,8 @@ impl Storage {
     /// [`read_block`](Storage::read_block) into a caller-owned buffer, which is
     /// resized to exactly `len` bytes and filled.
     ///
-    /// For callers that read block after block — verification, and anything
-    /// serving a peer's request pipeline — so the buffer is allocated once
-    /// rather than once per block.
+    /// For callers that read block after block, so the buffer is allocated
+    /// once rather than once per block.
     ///
     /// # Errors
     ///
@@ -179,16 +175,11 @@ impl Storage {
     /// [`verify_piece`](Storage::verify_piece), reusing `scratch` as the read
     /// buffer.
     ///
-    /// The buffer is the whole reason this exists. Verification used to read the
-    /// entire piece into a fresh allocation and hash it in one go, which is a
-    /// buffer the *torrent* sizes:
-    /// [`MAX_PIECE_LENGTH`](crate::metainfo::MAX_PIECE_LENGTH) is 128 MiB, so a torrent
-    /// could name a figure and have the daemon allocate it, once per piece, on
-    /// every recheck. SHA-1 is a streaming hash and has never needed the piece
-    /// in one contiguous run, so this feeds it a block at a time out of
-    /// one buffer that the caller keeps: the peak is a constant instead of a
-    /// number an attacker picks, and a full recheck stops asking the allocator
-    /// for a fresh megabyte per piece.
+    /// The buffer is the point. This used to read the whole piece into a fresh
+    /// allocation — a size the *torrent* names, up to
+    /// [`MAX_PIECE_LENGTH`](crate::metainfo::MAX_PIECE_LENGTH)'s 128 MiB, once
+    /// per piece on every recheck. SHA-1 streams, so the peak is a constant
+    /// instead of a number an attacker picks.
     ///
     /// # Errors
     ///
@@ -226,9 +217,7 @@ impl Storage {
     /// Any read error other than short/absent regions.
     pub fn verify_all(&self) -> io::Result<crate::bitfield::Bitfield> {
         let mut have = crate::bitfield::Bitfield::empty(self.num_pieces());
-        // One buffer for the whole pass, not one per piece: a recheck walks
-        // every piece of every file a torrent has, and this is the difference
-        // between one allocation and hundreds of thousands of them.
+        // One buffer for the whole pass, not one per piece.
         let mut scratch = Vec::new();
         for index in 0..self.num_pieces() {
             if self.verify_piece_into(index, &mut scratch)? {
@@ -649,19 +638,14 @@ mod tests {
         assert!(!st.verify_piece(0).unwrap());
     }
 
-    /// Verification hashes a piece in block-sized chunks, so a piece several
-    /// chunks long is the case that would break if the streaming loop dropped,
-    /// repeated, or reordered one.
-    ///
-    /// Every piece here is three chunks and a bit, so the loop runs four times
-    /// with a short final read — and the last piece of the torrent is short
-    /// again, which is the other end of the same arithmetic.
+    /// Pieces of three chunks and a bit, so the streaming loop runs four times
+    /// with a short final read — where a dropped, repeated or reordered chunk
+    /// would show.
     #[test]
     fn a_piece_longer_than_one_chunk_verifies_chunk_by_chunk() {
         let dir = TempDir::new();
         let piece_length = VERIFY_CHUNK * 3 + 1024;
-        // Two full pieces and a short one, with content that would hash the
-        // same under a dropped or duplicated chunk only by collision.
+        // Two full pieces and a short one.
         let total = piece_length as usize * 2 + 777;
         let content: Vec<u8> = (0..total).map(|i| u8::try_from(i % 251).unwrap()).collect();
         let meta = meta_for(
@@ -675,8 +659,7 @@ mod tests {
         let st = Storage::create(&meta, &dir.0, false).unwrap();
         assert_eq!(st.num_pieces(), 3);
 
-        // A piece that is only partly written reads short: not held, not an
-        // error, and not a panic on the chunk that runs off the end.
+        // A partly written piece reads short: not held, and not an error.
         st.write_block(0, 0, &content[..VERIFY_CHUNK as usize])
             .unwrap();
         assert!(!st.verify_piece(0).unwrap(), "a partial piece is not held");
@@ -688,8 +671,8 @@ mod tests {
         }
         assert!(st.verify_all().unwrap().is_full());
 
-        // A flipped byte in the *last* chunk of a piece must still be caught:
-        // a loop that stopped early would call this piece good.
+        // A flipped byte in the last chunk: a loop that stopped early would
+        // call this piece good.
         let last_chunk_start = piece_length - 1;
         st.write_block(0, last_chunk_start, &[0xFF]).unwrap();
         assert!(
@@ -698,9 +681,8 @@ mod tests {
         );
     }
 
-    /// The scratch buffer is reused across pieces, so a longer piece followed
-    /// by a shorter one must hash the shorter one's bytes and nothing left over
-    /// from before.
+    /// A shorter piece after a longer one must hash its own bytes and nothing
+    /// left in the reused buffer.
     #[test]
     fn a_reused_verify_buffer_does_not_leak_the_previous_piece() {
         let dir = TempDir::new();
@@ -719,8 +701,8 @@ mod tests {
             let len = st.piece_len(p) as usize;
             st.write_block(p, 0, &content[start..start + len]).unwrap();
         }
-        // Pieces 0..2 are 16 bytes, piece 3 is 2. Walk them in that order
-        // through one buffer, which is what `verify_all` does.
+        // Pieces 0..2 are 16 bytes, piece 3 is 2. Forwards is what
+        // `verify_all` does; backwards leaves the buffer oversized.
         let mut scratch = Vec::new();
         for p in 0..st.num_pieces() {
             assert!(
@@ -728,7 +710,6 @@ mod tests {
                 "piece {p} through a reused buffer"
             );
         }
-        // And backwards, so the buffer is oversized rather than undersized.
         for p in (0..st.num_pieces()).rev() {
             assert!(
                 st.verify_piece_into(p, &mut scratch).unwrap(),
