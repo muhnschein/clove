@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="clove — a modern I2P-only BitTorrent client">
+  <title>clove — a modern I2P-only BitTorrent client</title>
+  <desc>Repository social preview: a garlic bulb beside the clove wordmark.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b0d10"/>
+      <stop offset="1" stop-color="#181c23"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#7c5cff" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#7c5cff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="bulb" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fbf6ea"/>
+      <stop offset="1" stop-color="#dbd0b7"/>
+    </linearGradient>
+    <linearGradient id="skin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7c5cff" stop-opacity="0.22"/>
+      <stop offset="0.55" stop-color="#7c5cff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <circle cx="300" cy="316" r="270" fill="url(#glow)"/>
+
+  <!-- The mark is drawn rather than set as an emoji: a social preview is
+       unfurled by whatever renderer the reader's client happens to have. -->
+  <g transform="translate(190 186)">
+    <path d="M101 40 C105 18 107 9 110 0 C113 9 115 18 119 40 Z" fill="#8d9c66"/>
+    <path d="M110 34 C92 74 34 112 34 172 C34 218 68 252 110 252 C152 252 186 218 186 172 C186 112 128 74 110 34 Z" fill="url(#bulb)"/>
+    <path d="M110 34 C92 74 34 112 34 172 C34 218 68 252 110 252 C152 252 186 218 186 172 C186 112 128 74 110 34 Z" fill="url(#skin)"/>
+    <g fill="none" stroke="#c4b694" stroke-width="2.5" stroke-linecap="round" opacity="0.9">
+      <path d="M110 44 C84 92 58 130 60 176 C62 212 82 240 110 250"/>
+      <path d="M110 44 C96 96 84 134 86 178 C88 214 98 240 110 250"/>
+      <path d="M110 44 C124 96 136 134 134 178 C132 214 122 240 110 250"/>
+      <path d="M110 44 C136 92 162 130 160 176 C158 212 138 240 110 250"/>
+    </g>
+  </g>
+
+  <g font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+    <text x="470" y="296" font-size="146" font-weight="700" fill="#f7f3ec" letter-spacing="-2">clove</text>
+    <text x="472" y="362" font-size="40" fill="#ded7ca">A modern I2P-only BitTorrent client</text>
+    <rect x="474" y="394" width="120" height="4" rx="2" fill="#7c5cff"/>
+    <text x="472" y="444" font-size="25" fill="#a294e8" letter-spacing="1.5">SAMv3 · Rust · Linux · seccomp + Landlock</text>
+    <text x="1190" y="586" font-size="22" fill="#5f6472" text-anchor="end">github.com/muhnschein/clove</text>
+  </g>
+</svg>
