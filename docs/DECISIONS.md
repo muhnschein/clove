@@ -58,4 +58,10 @@ streams): one shared minimal HTTP/1.1 implementation in `clove-core`.
 
 Azureus-style prefix `CV`, which does not collide with anything in the
 informal BEP 20 registry (CT/CD/CB etc. are taken; CV is free as of this
-writing). Version digits track releases.
+writing).
+
+The four version digits are fixed at `0001` and carry no release: `YYYY.0M`
+does not fit them, and a peer id that changed monthly would sort clove's users
+into cohorts by release for anyone watching a swarm. Trackers get the release
+in the client string, where the audience is one party rather than every peer.
+Revisit if a swarm-side compatibility problem needs the release peer to peer.

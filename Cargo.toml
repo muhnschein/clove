@@ -12,7 +12,9 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.0.1"
+# Semver's spelling of release 2026.08 (calver.org); `clove_core::VERSION` is
+# the padded name, and a test there fails if only one of the two is bumped.
+version = "2026.8.0"
 edition = "2024"
 rust-version = "1.94"
 license = "ISC"

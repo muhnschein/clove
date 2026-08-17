@@ -1,4 +1,4 @@
-.Dd July 25, 2026
+.Dd August 17, 2026
 .Dt CLOVED 8
 .Os
 .Sh NAME
@@ -78,8 +78,10 @@ crate may open a socket; the engine cannot, and this is enforced by lint and
 by a dependency gate in CI rather than by convention.
 .It
 The only outbound IP socket is the connection to the SAM bridge, which must be
-a loopback address unless the explicit, documented-as-dangerous override is
-set.
+a loopback address.
+A remote
+.Ic sam_address
+is refused when the configuration is parsed; there is no override.
 .It
 There is no name resolution outside I2P: hostnames are resolved by SAM naming
 only, never by DNS.
@@ -236,7 +238,7 @@ The daemon waits rather than exiting:
 $ cloved
 cloved: waiting for router (SAM at 127.0.0.1:7656): Connection refused
 $ clove status
-version      0.1.0
+version      2026.08
 router       waiting-for-router
 .Ed
 .Sh SEE ALSO

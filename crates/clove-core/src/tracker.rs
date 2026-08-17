@@ -27,9 +27,9 @@ use i2pnet::DestHash;
 use crate::bencode::{self, Value};
 use crate::http;
 
-/// What clove calls itself to trackers. Kept in step with the wire peer id
-/// prefix (`-CV0001-`, Q7) so a tracker operator sees one name, not two.
-pub const USER_AGENT: &str = concat!("clove/", env!("CARGO_PKG_VERSION"));
+/// What clove calls itself to trackers (Q7): `clove/` and
+/// [`crate::VERSION`], written out because `concat!` takes literals only.
+pub const USER_AGENT: &str = "clove/2026.08";
 
 /// Minimum interval clove will wait between announces regardless of what a
 /// tracker asks for, to avoid hammering (a floor, not the tracker's own
@@ -725,6 +725,13 @@ mod tests {
     use super::*;
     use crate::bencode::encode;
     use std::collections::BTreeMap;
+
+    /// One name in a tracker's logs and another in a bug report is a question
+    /// nobody should have to answer.
+    #[test]
+    fn user_agent_carries_the_release_name() {
+        assert_eq!(USER_AGENT, format!("clove/{}", crate::VERSION));
+    }
 
     fn params() -> AnnounceParams<'static> {
         AnnounceParams {

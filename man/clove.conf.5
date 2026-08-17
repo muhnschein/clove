@@ -1,4 +1,4 @@
-.Dd July 30, 2026
+.Dd August 17, 2026
 .Dt CLOVE.CONF 5
 .Os
 .Sh NAME
@@ -45,6 +45,7 @@ Default:
 .Pp
 The address must be loopback
 .Pq Pa 127.0.0.1 , Pa localhost , Pa [::1] .
+A non-loopback address is refused, and no override accepts one.
 .Pp
 A unix-socket path is refused: clove speaks SAM over TCP only, and accepting
 a path it could not dial meant

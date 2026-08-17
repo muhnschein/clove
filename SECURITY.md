@@ -57,8 +57,9 @@ These are enforced in the codebase and checked in CI, not merely intended:
   build if a socket-capable dependency appears without being allowlisted.
 - The engine has no IP or port vocabulary at all. Peers are 32-byte I2P
   destination hashes end to end.
-- The only outbound IP socket is to the SAM bridge, which must be loopback
-  unless the documented override is set.
+- The only outbound IP socket is to the SAM bridge, which must be loopback.
+  A remote `sam_address` is refused when the configuration is parsed, and
+  there is no override — see `clove.conf(5)`.
 - Announce URLs that are not I2P URLs are dropped when the torrent is parsed —
   never contacted, never logged beyond a count.
 - State files are written temp-then-rename, so a crash cannot corrupt them.

@@ -37,7 +37,7 @@ You need an I2P router exposing SAMv3 on loopback (by default
 
 ```console
 # Build and install clove for the current user.
-$ git clone https://github.com/vittuusaatanaperkele/clove.git
+$ git clone https://github.com/muhnschein/clove.git
 $ cd clove
 $ make install PREFIX="$HOME/.local"
 $ export PATH="$HOME/.local/bin:$PATH"
@@ -172,6 +172,17 @@ CI also checks the dependency allowlist and fails if a socket-capable crate
 crosses the network boundary without review. Live interoperability findings are
 recorded in [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt).
 
+
+## Versioning
+
+Releases are named for the month they were cut in — full year, zero-padded
+month, [CalVer](https://calver.org/) `YYYY.0M` — with a counter appended if a
+month needs a second one: `2026.08`, then `2026.08.1`. A release name says
+*when* and promises nothing about compatibility; that promise belongs to the
+state format's own version, in
+[`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md).
+
+`clove status` reports the release the daemon is running.
 
 ## License
 

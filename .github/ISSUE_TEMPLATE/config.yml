@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Suspected vulnerability (private)
+    url: https://github.com/muhnschein/clove/security/advisories/new
+    about: Anything that could put traffic or an identity outside I2P. Never a public issue.
+  - name: The manuals
+    url: https://github.com/muhnschein/clove/tree/main/man
+    about: clove(1), cloved(8), clove.conf(5) and clove-api(7) answer most usage questions.
