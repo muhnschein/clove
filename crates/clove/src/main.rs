@@ -1379,7 +1379,7 @@ mod tests {
         // and the SAM address, neither of which is ours either.
         let hostile_status = obj(&[
             ("router", Value::from("lost\u{1b}[2J")),
-            ("version", Value::from("0.0.1\u{1b}[H")),
+            ("version", Value::from("2026.08\u{1b}[H")),
             ("sam_address", Value::from("127.0.0.1:7656\u{7}")),
         ]);
         let status = render_status(&hostile_status, &Value::Array(Vec::new()));
@@ -1598,7 +1598,7 @@ mod tests {
         // The merge: what `status` used to say about the daemon, and what
         // `stats` used to say about the torrents, in one report.
         let status = obj(&[
-            ("version", Value::from("0.0.1".to_owned())),
+            ("version", Value::from("2026.08".to_owned())),
             ("router", Value::from("connected".to_owned())),
             ("sam_address", Value::from("127.0.0.1:7656".to_owned())),
             ("uptime_secs", Value::UInt(11_520)),

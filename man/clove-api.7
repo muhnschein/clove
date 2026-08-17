@@ -1,4 +1,4 @@
-.Dd July 30, 2026
+.Dd August 17, 2026
 .Dt CLOVE-API 7
 .Os
 .Sh NAME
@@ -83,7 +83,8 @@ The daemon failed the operation; the message says how.
 .Bl -tag -width Ds
 .It Sy GET Pa /v1/status
 Daemon and router state:
-.Sy version ,
+.Sy version
+.Pq the release name, year and zero-padded month, e.g. 2026.08 ,
 .Sy uptime_secs ,
 .Sy sam_address ,
 .Sy torrents ,
@@ -257,7 +258,7 @@ Query status with
 $ tok=$(cat ~/.local/share/clove/token)
 $ curl -s --unix-socket $XDG_RUNTIME_DIR/clove.sock \e
     -H "X-Clove-Token: $tok" http://clove/v1/status
-{"version":"0.1.0","uptime_secs":842,"sam_address":"127.0.0.1:7656",
+{"version":"2026.08","uptime_secs":842,"sam_address":"127.0.0.1:7656",
  "torrents":3,"router":"connected",
  "sandbox":"landlock enforced; seccomp filter installed"}
 .Ed

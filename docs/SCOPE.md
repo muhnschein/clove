@@ -214,7 +214,8 @@ Reference class: OpenBSD base, OpenSSH (non-portable), doas, opentracker, SQLite
 - **Regress runnable by anyone:** `make test` from a clean checkout runs the whole suite with zero infrastructure. If contributors can't run the tests, the tests decay into ours alone, then nobody's.
 
 ### Releases & project hygiene
-- **Date-based versioning:** No major/minor/patch-releases. Just simple iterations, e.g. *2026.08*.
+- **Calendar versioning** ([calver.org](https://calver.org/)): a release is named for the month it was cut in — full year, zero-padded month, `YYYY.0M`, e.g. *2026.08*. A second release inside one month appends a counter (*2026.08.1*). No major/minor/patch numbers: a release name says when, not what it promises to be compatible with. The compatibility promise belongs to the state format, which carries its own integer version (`docs/STATE-FORMAT.md`), and to the `/v1/` API path.
+- **One release, two spellings, one test.** `clove_core::VERSION` is the name everything prints; `Cargo.toml` carries the same release as `2026.8.0`, because semver forbids the leading zero in `08`. A test in `clove-core` fails when a bump touches only one of them. Cutting a release is: bump both, refresh the version in the man-page examples, tag `v2026.08`.
 - **Boring is good:** Few, boring, well-tested releases over frequent ones.
 - **Culture of deletion:** every feature must justify its continued existence at each release; removals are announced proudly in release notes, not buried. The LOC metric above is allowed — encouraged — to go down.
 

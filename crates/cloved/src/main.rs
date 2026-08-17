@@ -1110,7 +1110,7 @@ fn status_json(daemon: &Daemon) -> Vec<u8> {
         (count, registry.totals())
     };
     Value::Object(vec![
-        ("version".to_owned(), Value::from(env!("CARGO_PKG_VERSION"))),
+        ("version".to_owned(), Value::from(clove_core::VERSION)),
         (
             "uptime_secs".to_owned(),
             Value::UInt(daemon.start.elapsed().as_secs()),

@@ -173,6 +173,20 @@ crosses the network boundary without review. Live interoperability findings are
 recorded in [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt).
 
 
+## Versioning
+
+Releases are named for the month they were cut in — the full year and a
+zero-padded month, [CalVer](https://calver.org/) `YYYY.0M` — with a counter
+appended if a month needs a second one: `2026.08`, then `2026.08.1`. There are
+no major, minor or patch numbers, so a release name says *when* and promises
+nothing about compatibility. What does promise something is the state format,
+which carries its own integer version and is documented in
+[`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md): a newer clove always reads
+older state, and an older clove refuses newer state cleanly.
+
+`clove status` reports the release the daemon is running, and it is the first
+thing worth putting in a bug report.
+
 ## License
 
 clove is available under the [ISC License](LICENSE).
