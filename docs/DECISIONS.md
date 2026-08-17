@@ -60,12 +60,8 @@ Azureus-style prefix `CV`, which does not collide with anything in the
 informal BEP 20 registry (CT/CD/CB etc. are taken; CV is free as of this
 writing).
 
-The four version digits stay `0001` and do *not* follow the calendar release.
-BEP 20 gives four digits and `YYYY.0M` does not fit them, but the reason to
-pin them is the other one: a peer id that changed every month would sort
-clove's users into cohorts by release for anyone watching a swarm, and the
-peer id is what every peer sees. Trackers get the release name in the client
-string instead (`clove_core::tracker::USER_AGENT`, which is `clove/` plus
-`clove_core::VERSION`), where an operator can use it and the audience is one
-party rather than every peer. Revisit if a swarm-side compatibility problem
-ever needs the release visible peer to peer.
+The four version digits are fixed at `0001` and carry no release: `YYYY.0M`
+does not fit them, and a peer id that changed monthly would sort clove's users
+into cohorts by release for anyone watching a swarm. Trackers get the release
+in the client string, where the audience is one party rather than every peer.
+Revisit if a swarm-side compatibility problem needs the release peer to peer.

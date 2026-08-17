@@ -12,11 +12,8 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-# Calendar versioning (calver.org): the release is named for the month it was
-# cut in, `YYYY.0M`. Cargo insists on semver, which forbids the leading zero,
-# so the manifest spells the same release `2026.8.0` and `clove_core::VERSION`
-# carries the padded name everything user-facing prints. A test there keeps
-# the two from drifting; bump both, or neither.
+# Semver's spelling of release 2026.08 (calver.org); `clove_core::VERSION` is
+# the padded name, and a test there fails if only one of the two is bumped.
 version = "2026.8.0"
 edition = "2024"
 rust-version = "1.94"

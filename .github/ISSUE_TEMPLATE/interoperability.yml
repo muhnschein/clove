@@ -6,40 +6,36 @@ body:
   - type: markdown
     attributes:
       value: |
-        For when clove and something else disagree: a router build it will not
-        talk to, a tracker that refuses its announces, a peer client it cannot
-        finish a handshake with, or a swarm where it connects and then moves
-        nothing.
+        For a router build clove will not talk to, a tracker that refuses its
+        announces, a peer client it cannot finish a handshake with, or a swarm
+        where it connects and then moves nothing.
 
         **Not for suspected vulnerabilities.** Anything that could put traffic
         or an identity outside I2P goes through
         [private vulnerability reporting](https://github.com/muhnschein/clove/security/advisories/new),
-        never a public issue. See
+        never a public issue — see
         [SECURITY.md](https://github.com/muhnschein/clove/blob/main/SECURITY.md).
 
-        **Nothing here should contain a secret.** Your destination *key* (the
-        `DESTINATION=` blob, `<data_dir>/dest.key`) and the API token in
-        `<data_dir>/token` are secrets; the public destination and its
-        `.b32.i2p` address are not. clove does not log the key — if you find it
-        in a log, that is a vulnerability report, not this form.
+        **Nothing here should contain a secret.** The destination key
+        (`<data_dir>/dest.key`, and the `DESTINATION=` blob behind it) and the
+        API token in `<data_dir>/token` are secrets; the public destination and
+        its `.b32.i2p` address are not.
   - type: textarea
     id: summary
     attributes:
       label: What happened
-      description: What you expected clove to do, and what it did instead.
+      description: What you expected, and what clove did instead.
       placeholder: |
-        Announces to tracker2.postman.i2p are answered with a bencoded
-        failure reason and no peers, while i2psnark on the same router gets a
-        peer list for the same torrent.
+        Announces to tracker2.postman.i2p come back as a bencoded failure with
+        no peers, while i2psnark on the same router gets a peer list for the
+        same torrent.
     validations:
       required: true
   - type: input
     id: clove-version
     attributes:
       label: clove version
-      description: >-
-        The `version` line from `clove status` — the release name, e.g.
-        `2026.08`. If you built from a branch, give the commit instead.
+      description: The `version` line from `clove status`, or the commit if you built from a branch.
       placeholder: "2026.08"
     validations:
       required: true
@@ -57,8 +53,7 @@ body:
     id: router-version
     attributes:
       label: Router version
-      description: >-
-        `i2pd --version`, or the version at the top of the Java I2P console.
+      description: "`i2pd --version`, or the top of the Java I2P console."
       placeholder: "i2pd 2.58.0"
     validations:
       required: true
@@ -66,7 +61,7 @@ body:
     id: kernel
     attributes:
       label: Kernel
-      description: Output of `uname -r`. clove needs Linux 6.12 or newer.
+      description: "`uname -r`. clove needs Linux 6.12 or newer."
       placeholder: "6.12.4-arch1-1"
     validations:
       required: true
@@ -74,7 +69,7 @@ body:
     id: architecture
     attributes:
       label: Architecture
-      description: Output of `uname -m`.
+      description: "`uname -m`."
       options:
         - x86_64
         - aarch64
@@ -87,11 +82,9 @@ body:
     attributes:
       label: SAM configuration
       description: >-
-        The `sam_address` clove is configured with, as `IP:PORT` — the `sam`
-        line of `clove status`. It must be loopback (`127.0.0.1`, `localhost`
-        or `[::1]`); a non-loopback address is refused at startup, and there is
-        no override. Say here if the router's SAM bridge is not on its default
-        port, or if the router is reached through a forwarder.
+        The configured `sam_address` as `IP:PORT` — the `sam` line of `clove
+        status`. Say here if the bridge is not on its default port, or is
+        reached through a forwarder.
       placeholder: "127.0.0.1:7656"
     validations:
       required: true
@@ -99,21 +92,15 @@ body:
     id: other-end
     attributes:
       label: The other end
-      description: >-
-        Which tracker, or which peer client and version, clove disagreed with,
-        where you know it.
+      description: Which tracker, or which peer client and version, where you know it.
       placeholder: "tracker2.postman.i2p, or i2psnark 2.9.0 / BiglyBT / XD"
-    validations:
-      required: false
   - type: textarea
     id: steps
     attributes:
       label: Steps to reproduce
       description: >-
-        What you ran, in order, starting from a state someone else can reach.
-        A magnet or `.torrent` that shows it is worth more than any
-        description — an I2P swarm that anyone can join, if the content allows
-        it.
+        What you ran, in order, from a state someone else can reach. A magnet
+        or `.torrent` that shows it is worth more than any description.
       placeholder: |
         1. cloved (default config, i2pd already running)
         2. clove add 'magnet:?xt=urn:btih:...&tr=http://tracker2.postman.i2p/announce.php'
@@ -130,19 +117,14 @@ body:
       label: Logs
       description: >-
         `cloved` logs to standard error; under systemd, `journalctl --user -u
-        clove`. Include the startup lines (they name the sandbox that applied
-        and the router state) and everything around the failure. Pasted here it
-        is formatted as code, so no backticks are needed.
+        clove`. Include the startup lines — they name the sandbox that applied
+        and the router state — and everything around the failure.
       render: text
-    validations:
-      required: false
   - type: textarea
     id: extra
     attributes:
       label: Anything else
       description: >-
         A non-default `clove.conf`, a container or unusual sandbox, another
-        BitTorrent client sharing the router, or anything you tried that
-        changed the outcome.
-    validations:
-      required: false
+        BitTorrent client sharing the router, or anything that changed the
+        outcome.

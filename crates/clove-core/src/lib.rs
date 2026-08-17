@@ -2,15 +2,11 @@
 //! daemon/API above. This crate never touches a socket — peer addressing is
 //! [`i2pnet::DestHash`] only, enforced by the workspace `clippy.toml`.
 
-/// The release name: the full year and the zero-padded month it was cut in
-/// (SCOPE §9, calver.org), with a trailing counter only when a month needed a
-/// second release — `2026.08`, then `2026.08.1`.
+/// The release name everything user-facing prints: `YYYY.0M`, a counter
+/// appended for a second release in one month (SCOPE §9).
 ///
-/// Everything user-facing prints this: `clove status`, the listing header,
-/// `GET /v1/status`, and the tracker client string. It is written out rather
-/// than derived from `CARGO_PKG_VERSION` because semver has no way to spell
-/// the leading zero in `08`; the manifest carries the same release as
-/// `2026.8.0`, and the test below fails if a bump touches only one of them.
+/// Written out because semver cannot spell the leading zero in `08`; the
+/// manifest carries the same release as `2026.8.0`.
 pub const VERSION: &str = "2026.08";
 
 pub mod bencode;
@@ -38,11 +34,8 @@ pub mod wire;
 mod tests {
     use super::VERSION;
 
-    /// The release name and the manifest version are two spellings of one
-    /// thing, and nothing but this test connects them: a release that bumps
-    /// `Cargo.toml` and forgets `VERSION` would ship a daemon reporting last
-    /// month's name, which is exactly the field an interoperability report is
-    /// asked for.
+    /// Nothing but this connects the two spellings: a bump that touches only
+    /// `Cargo.toml` would ship a daemon reporting last month's release.
     #[test]
     fn version_matches_the_manifest() {
         let major = env!("CARGO_PKG_VERSION_MAJOR");
@@ -56,9 +49,8 @@ mod tests {
         assert_eq!(VERSION, expected);
     }
 
-    /// The scheme itself, not this release: a year that is four digits and a
-    /// month that is two and lands in the calendar. A typo like `2026.8` or
-    /// `2026.13` is a release name that sorts wrong or means nothing.
+    /// The scheme, not this release: `2026.8` sorts wrong, `2026.13` is not a
+    /// month.
     #[test]
     fn version_is_a_calendar_date() {
         let (year, rest) = VERSION.split_once('.').unwrap();

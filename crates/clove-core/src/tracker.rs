@@ -27,10 +27,8 @@ use i2pnet::DestHash;
 use crate::bencode::{self, Value};
 use crate::http;
 
-/// What clove calls itself to trackers: the client string of Q7, carrying the
-/// release name rather than the manifest's semver spelling of it. Written out
-/// because `concat!` takes literals and [`crate::VERSION`] is a constant; the
-/// test at the bottom of this file is what keeps the two the same string.
+/// What clove calls itself to trackers (Q7): `clove/` and
+/// [`crate::VERSION`], written out because `concat!` takes literals only.
 pub const USER_AGENT: &str = "clove/2026.08";
 
 /// Minimum interval clove will wait between announces regardless of what a
@@ -728,8 +726,8 @@ mod tests {
     use crate::bencode::encode;
     use std::collections::BTreeMap;
 
-    /// A tracker operator seeing `clove/2026.08` in the logs and a bug report
-    /// naming `2026.09` is a question nobody should have to answer.
+    /// One name in a tracker's logs and another in a bug report is a question
+    /// nobody should have to answer.
     #[test]
     fn user_agent_carries_the_release_name() {
         assert_eq!(USER_AGENT, format!("clove/{}", crate::VERSION));

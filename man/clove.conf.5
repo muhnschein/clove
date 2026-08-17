@@ -45,11 +45,7 @@ Default:
 .Pp
 The address must be loopback
 .Pq Pa 127.0.0.1 , Pa localhost , Pa [::1] .
-A non-loopback address is a fatal configuration error, not a warning, and
-there is no override that accepts one: the daemon dials
-.Pa 127.0.0.1
-by construction, so a remote address it appeared to accept would be a remote
-router it then did not talk to.
+A non-loopback address is refused, and no override accepts one.
 .Pp
 A unix-socket path is refused: clove speaks SAM over TCP only, and accepting
 a path it could not dial meant
