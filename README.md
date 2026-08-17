@@ -37,7 +37,7 @@ You need an I2P router exposing SAMv3 on loopback (by default
 
 ```console
 # Build and install clove for the current user.
-$ git clone https://github.com/vittuusaatanaperkele/clove.git
+$ git clone https://github.com/muhnschein/clove.git
 $ cd clove
 $ make install PREFIX="$HOME/.local"
 $ export PATH="$HOME/.local/bin:$PATH"
