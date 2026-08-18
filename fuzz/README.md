@@ -85,7 +85,7 @@ beyond "did not panic":
 | `resume` | on-disk state, possibly tampered with | bitfield lengths match the piece count; priorities in range; round trip agrees |
 | `json` | daemon replies read by the CLI | round trip agrees |
 | `http` | tracker responses and API requests | — |
-| `wire` | a peer's whole byte stream: framing, messages, handshake | a message survives its own encoder unchanged |
+| `wire` | a peer's whole byte stream: framing, messages, handshake | a message survives its own encoder unchanged; a reused frame buffer reads what a fresh one does |
 | `tracker` | announce responses | a hostile `interval` cannot make us announce inside the local floor |
 | `extensions` | `i2p_pex`, `ut_metadata`, BEP 10 handshake | the PEX peer cap holds |
 | `magnet` | magnet URIs | non-I2P trackers are filtered out |
@@ -106,7 +106,8 @@ public parse entry points across all four crates are:
 `json::parse`, `magnet::parse`, `metadata::MetadataMessage::parse`,
 `metainfo::MetaInfo::{parse, from_info_dict}`, `pex::PexMessage::parse`,
 `resume::Resume::decode`, `tracker::parse_response`,
-`wire::{Message::parse, Handshake::parse, read_frame}`, and in `i2pnet`,
+`wire::{Message::parse, Handshake::parse, read_frame, read_frame_into}`,
+and in `i2pnet`,
 `addr::{destination_bytes, destination_len, base32_decode, base32_encode,
 i2p_base64_decode, i2p_base64_encode}` with `DestHash::{from_b32,
 from_b64_destination}`.
@@ -450,7 +451,29 @@ executions at eight times that budget. So 120s is now a measured floor, on the
 same footing as the other five — and carrying the same caveat, which this
 target is the reason for.
 
-What it does not yet cover is a *session*: `Message::parse` feeding
+Since then the framing has grown a second entry point, and the target
+followed it. `wire::read_frame_into` fills a caller-owned buffer instead of
+allocating one per frame, which is what a peer connection uses — `read_frame`
+allocates 16 KiB per block, per peer, for a whole download, and a heap doing
+that across hundreds of threads keeps the pages rather than returning them.
+`Torrent`'s peer read loop switched to it; the target did not, and for a while
+this file was reporting 337 saturated edges over a function the daemon no
+longer runs on its hot path.
+
+A reused buffer is also the one that can carry the tail of a longer previous
+frame into a shorter one, and what that produces is a message the peer never
+sent — nothing panics, nothing is out of bounds, the transfer is just wrong. So
+the target now reads the same bytes through both entry points in lockstep, one
+cursor each, and requires them to agree frame for frame. The property is the
+one thing a reused buffer has to promise.
+
+That is a coverage regression this fuzzer could not have caught on its own,
+because nothing in a report says which functions a target *stopped* being about.
+The `cargo check --manifest-path fuzz/Cargo.toml` gate catches a changed
+signature; it cannot catch production moving to a new function and leaving the
+old one, still compiling, still fuzzed.
+
+What the target still does not cover is a *session*: `Message::parse` feeding
 `on_message` against a real `Torrent`, where the state machine's bugs live.
 This target reaches the codec, not the protocol.
 
