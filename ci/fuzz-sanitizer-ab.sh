@@ -21,11 +21,22 @@
 # per arm, several RNG seeds, and a pristine copy of the committed seed corpus
 # for every single run so no arm inherits another's findings.
 #
-# READ THE OUTPUT CAREFULLY. The two arms do not have identical instrumentation
-# — ASan inlines its own shadow checks, which sancov can count as edges — so
-# absolute coverage is not comparable across arms. What *is* comparable is each
-# arm's gain over its own seed baseline, and its execution count. Those are the
-# columns this prints.
+# Runs start from an EMPTY corpus, which is the correction the first version of
+# this script needed. Starting from the committed seed, both arms gained 0 edges
+# in every run — the seed already sits at each target's ceiling, so there was no
+# ground left for either arm to find and the coverage question got no signal at
+# all. From cold there is a whole corpus to rediscover, and how much of it an
+# arm rediscovers per second is exactly the question. `--warm` keeps the old
+# behaviour for the different question of whether more budget from the current
+# seed finds anything.
+#
+# The two arms do not have identical instrumentation — ASan inlines shadow
+# checks that sancov counts too, and the gap is large: on `json` the same corpus
+# reads 735 edges under address and 474 under none. So raw edge counts are not
+# comparable across arms, and this reports each arm's cold result as a fraction
+# of *its own* ceiling, measured by replaying the committed seed under that same
+# build. A ratio of like-for-like figures is comparable where the figures
+# themselves are not.
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -33,6 +44,7 @@ cd "$(dirname "$0")/.."
 TARGETS_ALL='bencode metainfo resume json http wire tracker extensions magnet dest'
 SECS=120
 SEEDS=3
+WARM=no
 TARGETS=''
 
 usage() {
@@ -41,6 +53,9 @@ usage: ci/fuzz-sanitizer-ab.sh [options] [target...]
 
   --secs N     wall clock per arm per seed (default 120)
   --seeds N    how many RNG seeds per arm (default 3)
+  --warm       start each run from the committed seed instead of from empty.
+               Answers "does more budget find anything from where we are",
+               which on a saturated corpus is reliably zero for both arms.
   --out PATH   where to write the report (default fuzz/sanitizer-ab-<stamp>.txt,
                `-` for stdout)
   -h, --help   this
@@ -55,6 +70,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --secs) SECS="${2:?--secs needs a number}"; shift 2 ;;
         --seeds) SEEDS="${2:?--seeds needs a number}"; shift 2 ;;
+        --warm) WARM=yes; shift ;;
         --out) OUT="${2:?--out needs a path}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         -*) echo "ab: unknown option $1" >&2; usage >&2; exit 2 ;;
@@ -87,10 +103,13 @@ emit "commit    $(git rev-parse HEAD 2>/dev/null || echo unknown)"
 emit "dirty     $(if [ -n "$(git status --porcelain 2>/dev/null)" ]; then echo yes; else echo no; fi)"
 emit "rustc     $(rustc +nightly --version 2>/dev/null || echo unknown)"
 emit "arms      address, none — ${SECS}s x ${SEEDS} seed(s) each"
+emit "start     $(if [ "$WARM" = yes ]; then echo 'committed seed (--warm)'; else echo 'empty corpus'; fi)"
 emit ""
-emit "Gain is over each arm's own seed baseline, not across arms: ASan's"
-emit "inlined shadow checks are instrumented too, so the absolute figures are"
-emit "not measuring the same thing. Execs are directly comparable."
+emit "Each arm is scored against its own ceiling — the edges that arm's build"
+emit "counts for the whole committed seed — because ASan's inlined shadow checks"
+emit "are instrumented too, so the raw figures are not measuring the same thing."
+emit "The ratio is comparable where the counts are not. Execs are directly"
+emit "comparable."
 emit ""
 
 work=$(mktemp -d)
@@ -122,18 +141,32 @@ for t in $TARGETS; do
 
     emit "$t"
     for arm in address none; do
-        gains=''
+        # This arm's ceiling: what its own instrumentation counts for the whole
+        # committed seed, replayed without mutating anything. Only ever used as
+        # the denominator for this same arm.
+        ceiling=''
+        ref="$work/$t-$arm-ceiling"
+        rm -rf "$ref"; mkdir -p "$ref"
+        [ -d "$work/seed/corpus/$t" ] &&
+            cp "$work/seed/corpus/$t"/* "$ref/" 2>/dev/null || true
+        # shellcheck disable=SC2086  # $dict is one flag or nothing
+        cargo +nightly fuzz run --sanitizer "$arm" "$t" "$ref" -- $dict \
+            -max_len="$maxlen" -runs=0 >"$work/$t.$arm.ceiling" 2>&1 || true
+        ceiling=$(grep -oE 'INITED cov: [0-9]+' "$work/$t.$arm.ceiling" \
+            2>/dev/null | head -1 | grep -oE '[0-9]+$' || true)
+
+        reached=''
         execs=''
-        base=''
+        total=0
+        runs=0
         s=1
         while [ "$s" -le "$SEEDS" ]; do
-            # A pristine corpus per run. Without this the second arm starts
-            # from everything the first one found, which is not a comparison —
-            # it is the second arm being handed the answer.
             corpus="$work/$t-$arm-$s"
             rm -rf "$corpus"
             mkdir -p "$corpus"
-            if [ -d "$work/seed/corpus/$t" ]; then
+            # Cold unless --warm: an arm handed the committed seed starts at
+            # the ceiling and can only report zero.
+            if [ "$WARM" = yes ] && [ -d "$work/seed/corpus/$t" ]; then
                 cp "$work/seed/corpus/$t"/* "$corpus/" 2>/dev/null || true
             fi
 
@@ -144,35 +177,44 @@ for t in $TARGETS; do
                 -max_total_time="$SECS" -max_len="$maxlen" -seed="$s" \
                 -print_final_stats=1 >"$log" 2>&1 || true
 
-            inited=$(grep -oE 'INITED cov: [0-9]+' "$log" 2>/dev/null |
-                head -1 | grep -oE '[0-9]+$' || true)
             final=$(grep -oE 'cov: [0-9]+' "$log" 2>/dev/null |
                 tail -1 | grep -oE '[0-9]+$' || true)
             n=$(grep -oE 'stat::number_of_executed_units: *[0-9]+' "$log" \
                 2>/dev/null | tail -1 | grep -oE '[0-9]+$' || true)
 
-            if [ -n "${inited:-}" ] && [ -n "${final:-}" ]; then
-                gains="$gains $((final - inited))"
-                [ -n "$base" ] || base="$inited"
-            else
-                gains="$gains ?"
-            fi
+            reached="$reached ${final:-?}"
             execs="$execs ${n:-?}"
+            if [ -n "${final:-}" ]; then
+                total=$((total + final))
+                runs=$((runs + 1))
+            fi
             s=$((s + 1))
         done
-        emit "$(printf '  %-9s seed cov %-6s gained%-18s execs%s' \
-            "$arm" "${base:-?}" "$gains" "$execs")"
+
+        pct='?'
+        if [ "$runs" -gt 0 ] && [ -n "${ceiling:-}" ] && [ "${ceiling:-0}" -gt 0 ]
+        then
+            pct="$(( (total / runs) * 100 / ceiling ))%"
+        fi
+        emit "$(printf '  %-9s ceiling %-6s reached%-16s = %-5s of ceiling   execs%s' \
+            "$arm" "${ceiling:-?}" "$reached" "$pct" "$execs")"
     done
     emit ""
 done
 
 emit "--- reading this ---"
 emit ""
-emit "ASan is worth its throughput here if the address arm finds edges the"
-emit "none arm does not, or finds them at a comparable rate. If the none arm"
-emit "gains at least as much per run while executing several times as often,"
-emit "the sanitizer is being paid for in coverage and returning memory-error"
-emit "detection that a forbid(unsafe_code) workspace cannot produce."
+emit "ASan earns its throughput here if the address arm rediscovers a larger"
+emit "share of its own ceiling per run. If the none arm reaches a comparable"
+emit "share while executing several times as often, the sanitizer is being paid"
+emit "for in coverage, and what it returns is memory-error detection that a"
+emit "forbid(unsafe_code) workspace cannot produce on its own."
+emit ""
+emit "One caveat on the ratio: a ceiling includes any edge only reachable from a"
+emit "seed the mutator cannot rebuild from cold. `extensions` is the case here —"
+emit "its two hand-made 16 KiB inputs are not something a 120s cold run will"
+emit "arrive at — so its percentage is deflated. Equally for both arms, so the"
+emit "comparison holds, but do not read it as an absolute."
 emit ""
 emit "Two things this cannot price, and neither belongs in the table:"
 emit ""
