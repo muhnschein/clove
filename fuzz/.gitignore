@@ -4,6 +4,9 @@ target/
 corpus/
 artifacts/
 coverage/
-# Reports from `make fuzz-all` — a run's own output, not a repo artifact.
+# Reports from `make fuzz-all`, `make fuzz-coverage` and
+# `make fuzz-sanitizer-ab` — a run's own output, not a repo artifact.
 report-*.txt
+coverage-*.txt
+sanitizer-ab-*.txt
 Cargo.lock

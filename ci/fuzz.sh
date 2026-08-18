@@ -22,6 +22,7 @@ cd "$(dirname "$0")/.."
 TARGETS_ALL='bencode metainfo resume json http wire tracker extensions magnet dest'
 SCALE=1
 QUICK=no
+SANITIZER=address
 SEED=no
 TARGETS=''
 
@@ -31,6 +32,10 @@ usage: ci/fuzz.sh [options] [target...]
 
   --scale N     multiply every budget by N (default 1)
   --quick       30s per target, for a smoke check rather than a hunt
+  --sanitizer S address (default), none, leak, memory, thread. `none` is
+                several times faster and, in a workspace that forbids unsafe
+                code, gives up little; measure before switching the default
+                with ci/fuzz-sanitizer-ab.sh
   --seed        after the run, minimise the corpus and repack the committed
                 seed so the next run starts from what this one found
   --budget T    print target T's budget in seconds and exit; this is how CI
@@ -51,6 +56,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --scale) SCALE="${2:?--scale needs a number}"; shift 2 ;;
         --quick) QUICK=yes; shift ;;
+        --sanitizer) SANITIZER="${2:?--sanitizer needs a name}"; shift 2 ;;
         --seed) SEED=yes; shift ;;
         --budget) BUDGET_OF="${2:?--budget needs a target}"; shift 2 ;;
         --max-len) MAXLEN_OF="${2:?--max-len needs a target}"; shift 2 ;;
@@ -224,6 +230,7 @@ note "dicts     $(ls fuzz/dicts/*.dict 2>/dev/null | wc -l | tr -d ' ') file(s) 
 note "scale     $SCALE${QUICK:+ (quick=$QUICK)}"
 note "rss limit $RSS_LIMIT MiB per target"
 note "max input $MAX_LEN_DEFAULT B, except extensions at $(max_len_for extensions) B"
+note "sanitizer $SANITIZER"
 note ""
 
 seed_corpus
@@ -304,7 +311,7 @@ for t in $sched; do
         # failure was the one the failure skipped.
         rc=0
         # shellcheck disable=SC2086  # $dict is one flag or nothing
-        cargo +nightly fuzz run "$t" -- $dict \
+        cargo +nightly fuzz run --sanitizer "$SANITIZER" "$t" -- $dict \
             -max_total_time="$secs" -max_len="$maxlen" \
             -rss_limit_mb="$RSS_LIMIT" -print_final_stats=1 \
             >"$logs/$t.log" 2>&1 || rc=$?

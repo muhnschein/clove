@@ -31,6 +31,9 @@ make fuzz-all QUICK=1               # ~2 min, "does it still build and run"
 make fuzz-all SCALE=8               # a long hunt
 make fuzz-all SEED=1                # and keep what it finds (see Corpus)
 make fuzz TARGET=metainfo SECS=600  # one target, straight through
+
+make fuzz-coverage                  # which functions the seed actually reaches
+make fuzz-sanitizer-ab              # what ASan costs and buys, per target
 ```
 
 Budgets total 3360s, about twenty minutes of wall clock on four cores:
@@ -252,6 +255,56 @@ Three rules for reading that note, each of which this table once got wrong:
   that run's `--seed` pass then banks them. `dest` plateaued at ~1506s against
   a 120s budget, which reads as twelve times too small; it is not, because the
   next run starts at 436 edges rather than the 366 that one did.
+
+## Coverage
+
+`make fuzz-coverage` replays the committed seed under instrumentation and
+reports, per target, how much of its subject the corpus reaches — and which
+functions it has **never entered**.
+
+That last list is the point of the exercise. A sweep reports edge counts, which
+say how much a run learned; they say nothing about how much of the parser the
+target can reach *at all*. Both of this fuzzer's real failures were of the
+second kind — `wire` plateaued for three sweeps with `read_frame` unfuzzed, and
+the `extensions` PEX cap could not be tripped at any budget — and both were
+caught by somebody happening to look. A function listed as never entered is the
+same problem, found on purpose.
+
+A low percentage is not by itself wrong: error paths, `Display` impls and
+encode-side helpers are regions too, and some are unreachable from a target by
+design. Read the never-entered list, not the total.
+
+Needs `llvm-tools-preview` on the nightly toolchain. `rustfilt` is optional and
+only makes the symbol names legible.
+
+## Sanitizer
+
+Runs default to AddressSanitizer, which is cargo-fuzz's default. `ci/fuzz.sh
+--sanitizer none` switches it, and the report header records which was used.
+
+Whether `address` is the right default *here* is an open question with numbers
+on both sides, and `make fuzz-sanitizer-ab` is what settles it. Every crate in
+this workspace sets `unsafe_code = "forbid"`, so the bug class ASan exists to
+find cannot occur in the code under test. Against keeping it:
+
+- it costs roughly 4x throughput — the `extensions` measurement puts that
+  target at 9x slower than `json` without a sanitizer against 30-36x with;
+- it is the cause of the only false crash this fuzzer has produced. The RSS
+  growth behind that `oom-` artifact is ASan's allocator, so dropping it
+  *retires* the problem that `-rss_limit_mb` only defers.
+
+For keeping it:
+
+- it intercepts `memcmp`, which is where libFuzzer's *auto*-dictionary comes
+  from. The ten hand-written dictionaries cover some of that ground; how much
+  is exactly what the A/B measures;
+- dependencies do contain unsafe code, even if the parsers barely reach it.
+
+The A/B gives each arm equal wall clock, several RNG seeds, and a pristine copy
+of the committed seed for every run. Compare each arm's gain over *its own*
+baseline rather than the absolute coverage: ASan's inlined shadow checks are
+instrumented too, so the two arms are not counting the same edges. Neither
+column prices crash search, which is the thing more executions actually buy.
 
 ## Corpus
 
