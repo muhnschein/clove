@@ -68,14 +68,7 @@ describing anything clove does.
     This happens to enforce Layer 1's loopback-only rule for free.
     Consequence: a remote SAM bridge is NOT reachable — it would need the
     backend to dial elsewhere. Refused at parse time rather than worked
-    around, and there is no escape hatch for it.
-
-    Since 2026-07-29 the configuration says so rather than implying
-    otherwise. A remote address and a unix-socket path are both refused at
-    parse time, because accepting them meant `cloved -C` approving a
-    configuration the runtime then did not honour — a path left the daemon
-    with no router, and a remote host was redirected to the same port on
-    127.0.0.1, which is a different machine than the one asked for.
+    around.
 
 2.2 [decided] yosemite's synchronous Stream exposes `split(self) ->
     (ReadHalf, WriteHalf)`, not a duplicating `try_clone`. clove's

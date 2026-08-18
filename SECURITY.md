@@ -6,10 +6,11 @@ project has. This file says how to report one.
 
 ## Reporting a vulnerability
 
-**Use GitHub's private vulnerability reporting on this repository**. That is the only reporting channel. Do not open a public issue for a suspected vulnerability.
+**Use GitHub's private vulnerability reporting on this repository**. That is the
+only reporting channel. Do not open a public issue for a suspected vulnerability.
 
-Please include the clove version or commit, the I2P router and version, what you observed, and a reproduction if you have one. A vague report of a real problem is still worth sending; we would rather
-chase a hunch than miss a leak.
+Please include the clove version or commit, the I2P router and version, what you
+observed, and a reproduction if you have one.
 
 ## What counts as a vulnerability
 

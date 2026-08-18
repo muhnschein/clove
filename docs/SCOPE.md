@@ -14,15 +14,14 @@
 
 **Modern Linux, and nothing else.** clove targets a kernel of **6.12 or newer**,
 `seccomp`, Landlock, and systemd, and is built and tested only there.
-"Targets", not "requires": Layer 2 is best-effort at runtime, and `sandbox
-require` (`clove.conf(5)`) is how an operator makes it a real requirement. The three
-architectures the syscall filter is emitted for are `x86_64`, `aarch64` and
-`riscv64`.
+"Targets", not "requires": Layer 2 is best-effort at runtime, unless `sandbox
+require` is set (`clove.conf(5)`). The three architectures the syscall filter
+is emitted for are `x86_64`, `aarch64` and `riscv64`.
 
-The choice follows OpenSSH's: support one platform properly rather than support
-every platform partially. No portability shims, no feature detection beyond what
-the kernel baseline already guarantees, no accommodation for other operating
-systems in the code, the documentation, or the packaging.
+We'd rather support one platform properly than support every platform partially.
+No portability shims, no feature detection beyond what the kernel baseline already
+guarantees, no accommodation for other operating systems in the code, the
+documentation, or the packaging.
 
 ---
 
@@ -31,7 +30,7 @@ systems in the code, the documentation, or the packaging.
 Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 
 1. **Leak-proof by construction.** The client must be architecturally incapable of clearnet communication, independent of any OS-level sandboxing.
-2. **Robust.** Correct handling of session loss, tunnel churn, router restarts, and misbehaving peers. This is the primary quality bar — the reason this project exists is that XD is flakey.
+2. **Robust.** Correct handling of session loss, tunnel churn, router restarts, and misbehaving peers. This is the primary quality bar.
 3. **Interoperable.** A first-class citizen on existing I2P swarms (i2psnark-dominated) and with both major router implementations.
 4. **Operable.** A CLI pleasant enough for daily use, plus a local HTTP API for future frontends.
 
@@ -44,7 +43,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 - BitTorrent v2 (BEP 52), uTP, Local Peer Discovery, IP-based anything.
 - Embedded router. We require an external router exposing SAMv3 (i2pd or Java I2P).
 - Any platform that is not modern Linux (§0).
-- A daemon-less one-shot download mode (think `clove fetch`). It would need a second lifecycle (session setup, download, teardown, all in one process) whose failure modes are not the daemon's, and every hour spent on it is an hour not spent on improving the daemon.
+- A daemon-less one-shot download mode.
 
 ## 3. Initial Feature Cut
 
@@ -136,7 +135,7 @@ Build a standalone, SAMv3-based BitTorrent client for the I2P network that is:
 
 **Layer 3 — OS sandbox (shipped, documented, default in packaging):**
 - systemd unit with `IPAddressDeny=any` + `IPAddressAllow=localhost`, `RestrictAddressFamilies=AF_UNIX AF_INET`, `PrivateDevices`, `ProtectSystem=strict` + `ReadWritePaths` for data dir, `NoNewPrivileges`, syscall filter, `LimitCORE=0` and `UMask=0077` (the destination key and the API token are in that address space).
-- **Two units, because a user manager is not a system manager.** `IPAddressDeny=` is "only available for system services, not for per-user services" (systemd.resource-control(5)), and the filesystem-namespacing settings are unavailable to user services without `PrivateUsers=`. Neither is *refused* there, which is the trap: the firewall warns once per boot and passes every packet, and the namespacing logs at debug level and runs the service unconfined. A single file asking for both would therefore start, look healthy, and enforce neither. So `contrib/systemd/system/` carries the full unit and `contrib/systemd/user/` carries the seccomp-and-limits subset that a user manager applies in full. `make install` picks by prefix and says which it installed; the two cannot be merged anyway, since `DynamicUser=`, `StateDirectory=` and the `/etc` config path have no conditional form inside a unit.
+- Two units, because `IPAddressDeny=` is "only available for system services, not for per-user services" (systemd.resource-control(5)), and the filesystem-namespacing settings are unavailable to user services without `PrivateUsers=`. Neither is *refused* there, which is the trap: the firewall warns once per boot and passes every packet, and the namespacing logs at debug level and runs the service unconfined. A single file asking for both would therefore start, look healthy, and enforce neither. So `contrib/systemd/system/` carries the full unit and `contrib/systemd/user/` carries the seccomp-and-limits subset that a user manager applies in full. `make install` picks by prefix and says which it installed; the two cannot be merged anyway, since `DynamicUser=`, `StateDirectory=` and the `/etc` config path have no conditional form inside a unit.
 - The client must behave correctly *inside* this sandbox (e.g., never attempt anything the sandbox would kill it for), and correctly *without* it (Layers 1–2 unaffected).
 
 No layer assumes another is present.

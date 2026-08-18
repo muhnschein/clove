@@ -1,7 +1,7 @@
 # clove state format
 
-clove's on-disk state is an **API**, not an implementation detail (the SQLite
-doctrine, `SCOPE.md` §3). This file specifies it. The rules:
+clove's on-disk state is an **API**, not an implementation detail 
+(`SCOPE.md` §3). This file specifies it. The rules:
 
 - Every resume file carries an integer `version` (currently **6**).
 - **Newer clove reads older state.** Older clove **refuses newer state

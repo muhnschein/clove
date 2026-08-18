@@ -34,17 +34,16 @@ BEP 10 which we need regardless. Wire-codec work, no architectural cost.
 
 One persisted destination keypair per client (stable identity across
 restarts), plus one global `ephemeral` config flag that skips persistence.
-Per-torrent transient identities are v2+: they multiply session topology
-(one PRIMARY session each) and supervision state for a niche benefit.
+Per-torrent transient identities are left for a future version: they
+multiply session topology (one PRIMARY session each) and supervision state 
+for a niche benefit.
 
 ## Q5 — Concurrency: synchronous thread-per-peer
 
 Blocking I/O, one thread per peer connection, dedicated worker threads for
 disk and hashing, bounded channels between them. Most auditable option and
 entirely viable at I2P scale (50–200 peers; tunnel latency dwarfs thread
-cost). **De-risked externally:** yosemite 0.7.0 ships a first-class `sync`
-cargo feature (alongside `tokio`/`smol`), so no async runtime enters the
-dependency tree at all.
+cost).
 
 ## Q6 — HTTP API server: hand-rolled HTTP/1.1
 

@@ -20,13 +20,11 @@ commit. Closure sizes are recorded when the dependency is actually added.
   `digest` tree instead of pulling a second copy; when one moves, both move.
   No new socket-capable crates.
 - **`landlock` 0.4** (`cloved`, Linux only). Layer-2
-  filesystem (and, on ABI 4+, outbound-TCP) self-restriction; see
+  filesystem and outbound-TCP self-restriction; see
   `crates/cloved/src/sandbox.rs`. The raw `landlock_*` syscalls are unsafe and
-  the ABI negotiation is fiddly enough to get subtly wrong, which is the whole
-  failure mode this layer exists to avoid — and the workspace forbids
-  `unsafe_code`, so a hand-rolled binding is not on the table. Maintained by
-  the Landlock authors. Not socket-capable: it takes rights away. Closure:
-  `enumflags2` (+ its derive), `thiserror` 2, `libc`.
+  the ABI negotiation is fiddly enough to get subtly wrong, so we use what's 
+  maintained by the Landlock authors. Not socket-capable: it takes rights away.
+  Closure: `enumflags2` (+ its derive), `thiserror` 2, `libc`.
   Held at `0.4.7` or newer, for two things `0.4.5` did not have: `ABI::V9`, and
   with it `AccessFs::ResolveUnix` (Linux 7.1), which is how the daemon is stopped
   from connecting to any pathname unix socket; and `CompatLevel`, which is what
@@ -58,8 +56,6 @@ commit. Closure sizes are recorded when the dependency is actually added.
   "forbid"` rules out calling it through `libc` ourselves — the same reasoning
   that brought in `landlock`.
 
-  Chosen over `cap-std`, which offers the same guarantee through a much larger
-  surface (it replaces `std::fs` wholesale and pulls `rustix` in anyway).
   Closure: `bitflags`, `linux-raw-sys` on Linux; `errno` and `windows-sys` are
   target-gated and never compiled here. Six lockfile entries, three of them
   built.
@@ -70,19 +66,3 @@ commit. Closure sizes are recorded when the dependency is actually added.
   of `ci/check-net-deps.sh`, and that script now also fails if any manifest
   turns the `net` feature on — the allowlist alone would have said nothing.
   That check is per-manifest, so it covers `cloved`'s use as well.
-
-  The `rand` feature is `cloved`'s, and it is what the `getrandom` crate used
-  to be here for: the API token and the peer-ID suffix are bytes straight from
-  the OS RNG, and `rustix::rand::getrandom` is the same `getrandom(2)` wrapper
-  by another maintainer we already depend on. Keeping the crate would have
-  meant one direct dependency, plus `wasi` in the lockfile, for one syscall
-  this one already wraps — so it went, and `cloved::random_bytes` carries the
-  short-read and `EINTR` loop the crate was doing for us. `rand` adds no new
-  lockfile entry and nothing socket-capable; it is a module gate, not a
-  transitive edge.
-
-## Removed
-
-- **`getrandom` 0.2** — replaced by `rustix`'s `rand` feature (above), which
-  wraps the same syscall in a crate that was already a direct dependency of the
-  same binary. Went with `wasi`, its only lockfile entry not otherwise needed.
