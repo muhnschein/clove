@@ -97,18 +97,48 @@ done
 # 11:37Z sweep proved round-trips exactly; a budget only has to keep finding
 # *some* of the ground each run for the corpus to accumulate it. Total is
 # unchanged at 3360s, now across ten targets: a reallocation, not a bigger bill.
+#
+# The 2026-08-16T20:23Z sweep ran at `--scale 100` — 4.57 billion executions
+# across the ten targets, no crashes — and revises none of the numbers below.
+# Why it does not is the part worth keeping:
+#
+#   dest    +70 edges, all by ~1506s    tracker     +28, still gaining ~50783s
+#   resume  +12, still gaining ~59872s  extensions   +7, all by ~36540s
+#
+# A plateau time is not a budget. It is what *discovering* those edges cost
+# against the corpus that run began from, and the same run's `--seed` pass then
+# banks them: `dest` started at 366 edges and the seed it packed replays at 436.
+# So ~1506s says a 120s budget could not have found all seventy in one run. It
+# does not say the next run needs 1506s, because the next run does not start
+# where this one did. The figure expires with the corpus that produced it.
+#
+# The two that never plateaued are the same point from the other side. `resume`
+# was still gaining at 83x its budget and `tracker` at 56x, which is not a table
+# revision — it is a different activity. What compounds for them is the corpus,
+# run after run, which is the arrangement this file already runs on.
+#
+# `tracker`'s line below used to read "+1 for 80x", meaning finished. As a
+# verdict on the target that was wrong: it has gone 689 -> 883 -> 898 -> 926
+# across four sweeps and has never once stopped. The 900s it produced is still
+# the right number, for a different reason than the one that was written down —
+# not "there is nothing left" but "what is left arrives slower than any budget
+# anybody would schedule".
 budget_for() {
     case "$1" in
-        # +0 at 8x and again at 80x, from a corpus that starts them at their
-        # ceiling. Floor.
+        # +0 at 8x, at 80x and again at 100x, from a corpus that starts them
+        # at their ceiling. Floor.
         wire|magnet|bencode|json|metainfo|http) echo 120 ;;
-        # New surface, provisional until a report speaks for it — the same
-        # footing `wire` was on when it was rewritten.
+        # No longer provisional: +70 edges at 100x, all of them by ~1506s, and
+        # the seed that run packed starts the next one at all seventy. Floor on
+        # evidence now, like the six above, rather than for want of any.
         dest) echo 120 ;;
-        resume) echo 720 ;;                     # +11, still gaining at ~42717s
-        tracker) echo 900 ;;                    # +1 for 80x; was +193 for 8x
-        extensions) echo 900 ;;                 # +8, all by ~4214s — the 240s
-                                                # cut was below the evidence
+        resume) echo 720 ;;                     # +12 at 100x, still gaining
+                                                # there at 83x this
+        tracker) echo 900 ;;                    # +28 at 100x, still gaining
+                                                # there at 56x this
+        extensions) echo 900 ;;                 # +7 at 100x, all by ~36540s;
+                                                # the old 240s cut was below
+                                                # the evidence
         *) echo 300 ;;
     esac
 }

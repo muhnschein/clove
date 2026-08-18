@@ -148,9 +148,12 @@ trips in the direction we control — whatever bytes we hold, the text we emit
 must decode back to exactly them, because a codec that loses a byte corrupts a
 peer identity rather than failing.
 
-It reaches 366 edges from a 494-file seed. The 120s budget is provisional, on
-the same footing `wire` was given when it was rewritten: a floor to re-derive
-from the first report that has something to say about it.
+It reached 366 edges from a 494-file seed, on a 120s budget that was
+provisional — the same footing `wire` was given when it was rewritten, a floor
+to re-derive from the first report with something to say about it. That report
+is the 2026-08-16 sweep: +70 edges, all of them by ~1506s, and a seed that now
+starts the next run at all seventy. The budget stays at 120s, on evidence
+rather than for want of any; see Budgets.
 
 There was one more, `keys`, over the terminal escape-sequence decoder behind
 `clove top` — the one target whose input was a keyboard rather than an
@@ -249,6 +252,65 @@ to accumulate the rest.
 The total is unchanged at 3360s, now across ten targets: a reallocation, not a
 bigger bill.
 
+### The 2026-08-16 sweep, and why a plateau time is not a budget
+
+`--scale 100`: 4.57 billion executions across the ten targets, about 93
+target-hours, **no crashes**. It revises none of the numbers above, and why it
+does not is the part worth keeping.
+
+| Target | Budget | Seed cov | Final cov | Gained | Last new edge |
+|---|---:|---:|---:|---:|---:|
+| `dest` | 120s | 366 | 436 | +70 | ~1506s of 12000s |
+| `tracker` | 900s | 898 | 926 | +28 | still gaining at ~50783s |
+| `resume` | 720s | 357 | 369 | +12 | still gaining at ~59872s |
+| `extensions` | 900s | 425 | 432 | +7 | ~36540s of 90000s |
+| `http` | 120s | 566 | 566 | 0 | — |
+| `bencode` | 120s | 389 | 389 | 0 | — |
+| `metainfo` | 120s | 456 | 456 | 0 | — |
+| `json` | 120s | 735 | 735 | 0 | — |
+| `wire` | 120s | 337 | 337 | 0 | — |
+| `magnet` | 120s | 498 | 498 | 0 | — |
+
+Read straight off the table, `dest` is a budget twelve times too small: it
+plateaued at ~1506s against the 120s it is given. That reading is wrong, and it
+is worth naming because the "1x budget" convention below is what invites it.
+
+**A plateau time is the cost of *discovering* those edges against the corpus
+that run began from — and the same run's `--seed` pass then banks them.** `dest`
+started at 366 edges; the seed that run packed replays at 436. So ~1506s says a
+120s budget could not have found all seventy in one sitting. It does not say
+the next run needs 1506s, because the next run does not start where that one
+did. **The figure expires with the corpus that produced it.**
+
+The two that never plateaued make the same point from the other side. `resume`
+was still gaining at 83x its budget and `tracker` at 56x. Those are not table
+revisions, they are a different activity — nobody schedules fourteen hours per
+target per night. What compounds for them is the corpus, which is exactly the
+arrangement this file already runs on: a budget only has to keep finding *some*
+of the ground each run.
+
+So the table stands, and six targets flat at 100x is the strongest confirmation
+the floor rows have had. What the sweep actually bought is the corpus it packed
+— and two things nobody was looking for, which are written up under Input
+length above and `wire` below rather than here, because neither is about time.
+
+#### The `tracker` verdict was wrong
+
+The previous revision recorded `tracker` returning **+1 edge for 2.2 billion
+executions**, and drew a lesson from it: a target that is genuinely still
+climbing can be finished by the next sweep. The first half of that stands. The
+second half was a verdict on the target, and this sweep refutes it — `tracker`
+gained +28 and was still gaining at the end of 90 000 seconds. Across four
+sweeps it has gone 689 → 883 → 898 → 926 and has never once stopped.
+
+The 900s it was given is still the right number, for a reason this file did not
+say. Not "there is nothing left" but "what is left arrives slower than any
+budget anybody would schedule". A plateau always meant saturated *given this
+corpus and these mutators*, and the corpus changes every run by design — so
+"finished" was never a claim the evidence could support, about this target or
+any other. `wire` is the standing warning for the same sentence read the other
+way.
+
 ### The first crash, and what it was not
 
 The 08:38Z sweep produced this fuzzer's first failure: `resume`, an
@@ -283,6 +345,15 @@ replaces every progress line with a format carrying no `INITED` line and no
 `stat::` block — which is the entire input to the report's results section — so
 adopting it means rewriting that parsing. Worth doing; not worth doing
 silently.
+
+Worth doing *sooner* than that phrasing suggests, because the mitigation has a
+ceiling and the ceiling has now been seen. `RSS_LIMIT` is `2048 * SCALE` capped
+at 16 GiB, so it stops scaling at `--scale 8`; past there a longer campaign
+gets no more headroom. `resume` peaked at **7087 MiB** in the 2026-08-16 sweep
+at scale 100 — 43% of a cap that cannot rise. Extrapolating the growth figures
+above through that run's 431M executions puts the crossing somewhere near a
+billion, which is roughly `--scale 250`. The false OOM is not fixed, it is
+deferred, and `-fork=1` is the thing that retires it.
 
 The same run exposed a second thing, which is that the report had never
 actually been read on a failure. It printed `FAIL resume (exit ?)`: the target
@@ -401,11 +472,41 @@ so its seconds buy a fortieth of the crash search — which is the *only* thing
 they buy once its coverage has plateaued, as it now has. It parses the same
 input three ways (`pex::PexMessage::parse`, `metadata::MetadataMessage::parse`,
 `extension::Handshake::parse`), and none of the three reads like ~500µs of work
-on 322 bytes, so the cause is not yet known and is not guessed at here. It
-wants measuring — `cargo +nightly fuzz run extensions -- -runs=200000` timed,
-then per-parser — and until it is, the budget is cut rather than floored, on
-the grounds that seconds spent there are worth less than seconds spent
-anywhere else.
+on 322 bytes.
+
+That was left as "wants measuring". It has now been measured, over both the
+committed seed and the corpus the 2026-08-16 sweep packed, release build,
+per-parser, no sanitizer:
+
+| | Execs/s | Per exec |
+|---|---:|---:|
+| `extensions`, all three parsers | 39 045 | 25.6 µs |
+| `pex::PexMessage::parse` alone | 105 826 | 9.4 µs |
+| `metadata::MetadataMessage::parse` alone | 104 914 | 9.5 µs |
+| `extension::Handshake::parse` alone | 101 984 | 9.8 µs |
+| **`bencode::decode` alone, same corpus** | **105 168** | **9.5 µs** |
+| `bencode` target, its own corpus | 88 816 | 11.3 µs |
+| `json` target, its own corpus | 358 134 | 2.8 µs |
+
+The answer is dull, which is why guessing would not have found it. **Each of
+the three parsers costs exactly one `bencode::decode` of the input, and the
+extension-specific work on top does not register** — under 5% of the total, at
+the edge of the measurement. There is no hot spot. Per byte the decode costs
+what `bencode`'s own corpus costs; what differs is that this target decodes the
+same input three times, on a corpus whose mean input is around three times the
+size of `bencode`'s or `json`'s.
+
+That accounts for a factor of nine. The sweeps show thirty to thirty-six, so
+the rest is ASan amplifying allocation volume — three `Value` trees of
+`BTreeMap`s and `Vec`s per execution, on an allocator that does not give pages
+back.
+
+The useful conclusion is not about the budget. It is that **`extensions` spends
+over 95% of its time inside a parser that already has its own target, saturated
+at 389 edges since three sweeps ago.** Its seconds are mostly re-fuzzing
+`bencode`. Making them buy extension-specific coverage is a question about how
+often a valid bencode dict reaches the three parsers at all — the `magnet`
+dictionary lesson, one target over — and not one more second of budget.
 
 ## Corpus
 
@@ -457,10 +558,12 @@ it actually reaches what the run that produced it reached, so the coverage of
 the packed tarball is measured — replay each target over it with `-runs=0` and
 read the `INITED` line:
 
-| | `bencode` | `metainfo` | `resume` | `json` | `http` | `wire` | `tracker` | `extensions` | `magnet` |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Sweep reached | 389 | 456 | 353 | 735 | 560 | — | 689 | 425 | 498 |
-| Committed seed reaches | 389 | 456 | 353 | 735 | 560 | 337 | 689 | 425 | 498 |
+| | `bencode` | `metainfo` | `resume` | `json` | `http` | `wire` | `tracker` | `extensions` | `magnet` | `dest` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Sweep reached | 389 | 456 | 369 | 735 | 566 | 337 | 926 | 432 | 498 | 436 |
+| Committed seed reaches | 389 | 456 | 369 | 735 | 566 | 337 | 926 | 432 | 498 | 436 |
+
+(The 2026-08-16 sweep. Ten targets now, and the two rows agree in all ten.)
 
 That check is worth running because the alternative is silent. The two sweeps
 of 2026-07-30 began from *identical* coverage in all nine targets — the second
@@ -477,6 +580,10 @@ sweep's own corpus is what is committed — plus a fresh `wire` corpus, since
 that target now reads its input as a frame stream and the old 40 files reach 35
 edges of the 337 available. One more `cmin` pass over the result took 5426
 files to 5375, which is what the tarball holds.
+
+What the tarball holds now is the 2026-08-16 sweep's own minimised corpus —
+6451 files, 451 KiB — which carries that sweep's gains in `resume`, `tracker`,
+`extensions` and `dest`, and is what the row above was measured on.
 
 So fold runs back in, rather than letting `fuzz/corpus/` accumulate until it
 dies with the working tree:
