@@ -62,118 +62,59 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$TARGETS" ] || TARGETS="$TARGETS_ALL"
 
-# Per-target budget in seconds. Deliberately not flat, and set from what the
-# reports measured rather than from taste.
+# Per-target budget in seconds. Not flat, and set from what the reports
+# measured rather than from taste. fuzz/README.md carries the reasoning; the
+# three rules it comes down to, each of which this table once got wrong:
 #
-# The 2026-07-31T08:38Z sweep is where these come from, and it ran at
-# `--scale 80` — a budget nobody would schedule, which is the point. It is the
-# far end of the curve, and what a target does with eighty times its budget
-# settles whether the budget is short. Against the corpus the previous sweep
-# left, at plateaus this report measures in seconds:
+#   - A plateau means saturated given this corpus and these mutators, never
+#     "finished". `tracker` returned +1 edge for 2.2 billion executions in one
+#     sweep and +28 in the next, and has never actually stopped.
+#   - Budget from the margin, not the gain. What matters is whether a target
+#     was still gaining at the *end* of the run, not how much it gained.
+#   - A plateau time expires with the corpus that produced it, because the same
+#     run's `--seed` pass banks the edges it found. `dest` plateauing at ~1506s
+#     is not an argument for a 1506s budget.
 #
-#   resume  +11 edges, still gaining at ~42717s    extensions  +8, all by ~4214s
-#   tracker  +1, all by ~14242s                    everything else  0
+# The evidence below is the latest sweep — `--scale 100`, 4.57 billion
+# executions across the ten targets, no crashes. Total 3360s.
 #
-# Two of these overturn the previous table, and one of them was this file's
-# mistake. `extensions` had just been cut to 240s on the strength of a flat
-# scale-8 run; its gains here land at ~4214s, seventeen times that, so the cut
-# was made where the evidence ran out rather than where the target stopped.
-# It goes up. `tracker`, which took most of the last reallocation on +193
-# edges, returned exactly +1 for 2.2 *billion* executions — the `magnet`
-# lesson again, one revision later and from the other direction.
-#
-# So the three that still convert seconds into edges — `resume`, `extensions`,
-# `tracker` — take the budget, and everything flat at 8x *and* 80x sits at the
-# floor. `http` joins them: flat at both scales now, from a corpus that starts
-# it at its ceiling.
-#
-# The floor is a choice, and worth being honest about: it is not a measured
-# plateau. With the seed already at a target's ceiling, no budget buys another
-# edge, so no report can say how few seconds are enough — what the seconds
-# still buy there is crash search, which the coverage figures cannot price.
-# 120s is small enough to be cheap and long enough to be a real hunt, and it is
-# where a target sits until either a crash or a target rewrite changes the
-# question. `wire` is the standing warning: it sat at a plateau for three
-# sweeps because the target was too narrow, not because the codec was clean.
-#
-# None of the three raised budgets reaches its plateau, and they are not meant
-# to. What carries a gain forward between runs is the seed corpus, which the
-# 11:37Z sweep proved round-trips exactly; a budget only has to keep finding
-# *some* of the ground each run for the corpus to accumulate it. Total is
-# unchanged at 3360s, now across ten targets: a reallocation, not a bigger bill.
-#
-# The 2026-08-16T20:23Z sweep ran at `--scale 100` — 4.57 billion executions
-# across the ten targets, no crashes — and revises none of the numbers below.
-# Why it does not is the part worth keeping:
-#
-#   dest    +70 edges, all by ~1506s    tracker     +28, still gaining ~50783s
-#   resume  +12, still gaining ~59872s  extensions   +7, all by ~36540s
-#
-# A plateau time is not a budget. It is what *discovering* those edges cost
-# against the corpus that run began from, and the same run's `--seed` pass then
-# banks them: `dest` started at 366 edges and the seed it packed replays at 436.
-# So ~1506s says a 120s budget could not have found all seventy in one run. It
-# does not say the next run needs 1506s, because the next run does not start
-# where this one did. The figure expires with the corpus that produced it.
-#
-# The two that never plateaued are the same point from the other side. `resume`
-# was still gaining at 83x its budget and `tracker` at 56x, which is not a table
-# revision — it is a different activity. What compounds for them is the corpus,
-# run after run, which is the arrangement this file already runs on.
-#
-# `tracker`'s line below used to read "+1 for 80x", meaning finished. As a
-# verdict on the target that was wrong: it has gone 689 -> 883 -> 898 -> 926
-# across four sweeps and has never once stopped. The 900s it produced is still
-# the right number, for a different reason than the one that was written down —
-# not "there is nothing left" but "what is left arrives slower than any budget
-# anybody would schedule".
+# The floor is a choice and not a measured plateau: with the seed already at a
+# target's ceiling no budget buys another edge, so no report can say how few
+# seconds are enough, and what the seconds still buy there is crash search,
+# which coverage cannot price. `wire` is the standing warning against reading a
+# floor as a finished target.
 budget_for() {
     case "$1" in
-        # +0 at 8x, at 80x and again at 100x, from a corpus that starts them
-        # at their ceiling. Floor.
+        # +0 at 8x, at 80x and again at 100x, from a corpus that starts
+        # them at their ceiling. Floor.
         wire|magnet|bencode|json|metainfo|http) echo 120 ;;
-        # No longer provisional: +70 edges at 100x, all of them by ~1506s, and
-        # the seed that run packed starts the next one at all seventy. Floor on
-        # evidence now, like the six above, rather than for want of any.
+        # +70 at 100x, all by ~1506s — and the seed that run packed starts
+        # the next one at all seventy, so the floor holds on evidence.
         dest) echo 120 ;;
         resume) echo 720 ;;                     # +12 at 100x, still gaining
-                                                # there at 83x this
+                                                # there at 83x this budget
         tracker) echo 900 ;;                    # +28 at 100x, still gaining
-                                                # there at 56x this
-        extensions) echo 900 ;;                 # +7 at 100x, all by ~36540s;
-                                                # the old 240s cut was below
-                                                # the evidence
+                                                # there at 56x this budget
+        extensions) echo 900 ;;                 # +7 at 100x, all by ~36540s
         *) echo 300 ;;
     esac
 }
 
 # Longest input libFuzzer may generate, per target.
 #
-# This was never passed, and the default is not "no ceiling": with `-max_len`
-# unset libFuzzer uses the larger of 4096 and the biggest file in the seed. Every
-# corpus here has sat just under 4096 for its whole history — `extensions` 4058
-# bytes, `wire` 4018, `magnet` 4003, `json` 3757 — which is not a fact about the
-# inputs, it is the ceiling printing its own shape. Four KiB has therefore been
-# the real limit on every run this fuzzer has ever done, and nothing said so.
+# Passed explicitly because the default is not "no ceiling": with `-max_len`
+# unset libFuzzer uses the larger of 4096 and the biggest file in the seed, and
+# every corpus here had sat just under 4096 for its whole history — the ceiling
+# printing its own shape rather than a fact about the inputs. Pinning it also
+# stops one large file arriving in a corpus from raising the limit for
+# everything else.
 #
-# For nine targets that is the right ceiling, and pinning it here means a single
-# large file arriving in a corpus cannot quietly raise it for everything else.
-# `extensions` is the one it was wrong for. Two of its rejection branches are
-# gated on sizes above 4 KiB, so no generated input could reach either:
-#
-#   pex::MAX_PEX_PEERS         512 peers x 32 bytes — 16 384 before the cap trips
-#   metadata::METADATA_PIECE_LEN               16 384 before a piece is oversized
-#
-# Which makes that target's own `assert!(added + dropped <= MAX_PEX_PEERS)` —
-# a property fuzz/README.md credits it with checking — unable to fail at any
-# budget, and `Error::PieceTooLarge` unreachable. Both bounds have unit tests,
-# so what was wrong is the coverage the fuzzer was *reported* as having, not the
-# parser; the fix is to let it reach them. 20 KiB clears both with room for the
-# bencode framing around the payload.
-#
-# Raising the ceiling does not on its own reach them — mutation will not arrive
-# at a 16 KiB length-prefixed bencode string by chance — so the committed seed
-# carries one input per branch. See fuzz/README.md.
+# `extensions` is the exception. `pex::MAX_PEX_PEERS` (512 x 32 bytes) and
+# `metadata::METADATA_PIECE_LEN` (a 16 KiB piece) both need ~16.4 KiB, so at
+# 4096 neither rejection branch could be reached and that target's own PEX-cap
+# assertion could not fail at any budget. 20 KiB clears both, and the committed
+# seed carries one input per branch because mutation will not arrive at a 16 KiB
+# length-prefixed bencode string by chance. See fuzz/README.md.
 MAX_LEN_DEFAULT=4096
 max_len_for() {
     case "$1" in
