@@ -19,6 +19,10 @@
 # Needs nightly, cargo-fuzz and llvm-tools-preview:
 #   rustup component add llvm-tools-preview --toolchain nightly
 # `cargo install rustfilt` is optional and only makes the symbol names legible.
+#
+# It does *not* need cargo-binutils. An earlier version of this script probed
+# for `cargo cov`, which is that crate's shim rather than anything rustup
+# installs, and then told the operator to add a component they already had.
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -84,14 +88,34 @@ if ! command -v cargo-fuzz >/dev/null 2>&1; then
     echo "coverage: needs cargo-fuzz: cargo install cargo-fuzz --locked" >&2
     exit 1
 fi
-# `cargo cov` is llvm-cov behind a shim that knows where the toolchain keeps
-# it. Without llvm-tools-preview the shim exists and the binary does not, which
-# would fail several minutes into the first build rather than here.
-if ! cargo +nightly cov -- --version >/dev/null 2>&1; then
-    echo "coverage: needs llvm-tools-preview:" >&2
+# The llvm-tools component installs its binaries beside the toolchain rather
+# than on PATH, so look there. `cargo cov` would find them too, but that shim
+# belongs to cargo-binutils — a separate `cargo install` — so probing for it
+# reports a missing rustup component when the real gap is a cargo one.
+llvm_tool() {
+    d="$(rustc +nightly --print target-libdir 2>/dev/null)/../bin"
+    if [ -x "$d/$1" ]; then
+        echo "$d/$1"
+    elif command -v "$1" >/dev/null 2>&1; then
+        command -v "$1"
+    else
+        return 1
+    fi
+}
+LLVM_COV=$(llvm_tool llvm-cov) || {
+    echo "coverage: cannot find llvm-cov." >&2
     echo "  rustup component add llvm-tools-preview --toolchain nightly" >&2
+    echo "  (looked in $(rustc +nightly --print target-libdir 2>/dev/null)/../bin and on PATH)" >&2
     exit 1
-fi
+}
+# A system llvm-cov is a different version from the rustc that wrote the
+# profile, and the profile format is versioned: mismatches fail late, with a
+# message about an unsupported profile rather than about the tool.
+case "$LLVM_COV" in
+    *rustlib*) ;;
+    *) echo "coverage: warning: using $LLVM_COV, which is not the toolchain's." >&2
+       echo "  If it reports an unsupported profile format, install the component." >&2 ;;
+esac
 
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 [ -n "$OUT" ] || OUT="fuzz/coverage-$stamp.txt"
@@ -159,7 +183,7 @@ for t in $TARGETS; do
     fi
 
     for src in $subjects; do
-        if ! cargo +nightly cov -- report "$bin" \
+        if ! "$LLVM_COV" report "$bin" \
             "-instr-profile=$prof" \
             -ignore-filename-regex='/rustc/|\.cargo/registry|/fuzz_targets/' \
             -show-functions "$src" > "$work/rep" 2>/dev/null

@@ -194,6 +194,12 @@ string by chance — so the seed carries one input per branch, generated against
 the parsers and asserted to land on the error it exists for. They are the two
 largest files in the corpus by a factor of four.
 
+Confirmed by measurement since: replaying the committed seed puts `extensions`
+at **437 edges against the 432 the sweep recorded**, while `json` reads 735
+both times. The two crafted inputs are the only difference between those
+corpora, so the five edges are the two branches that nothing could reach
+before.
+
 ## Budgets
 
 Not flat, and set from what the reports measured rather than from taste. The
@@ -274,8 +280,12 @@ A low percentage is not by itself wrong: error paths, `Display` impls and
 encode-side helpers are regions too, and some are unreachable from a target by
 design. Read the never-entered list, not the total.
 
-Needs `llvm-tools-preview` on the nightly toolchain. `rustfilt` is optional and
-only makes the symbol names legible.
+Needs `llvm-tools-preview` on the nightly toolchain, and nothing else —
+`llvm-cov` is found beside the toolchain rather than on `PATH`. It does *not*
+need cargo-binutils; the first version of this script probed for `cargo cov`,
+which is that crate's shim, and so reported a missing rustup component to an
+operator who already had it. `rustfilt` is optional and only makes the symbol
+names legible.
 
 ## Sanitizer
 
@@ -300,11 +310,29 @@ For keeping it:
   is exactly what the A/B measures;
 - dependencies do contain unsafe code, even if the parsers barely reach it.
 
-The A/B gives each arm equal wall clock, several RNG seeds, and a pristine copy
-of the committed seed for every run. Compare each arm's gain over *its own*
-baseline rather than the absolute coverage: ASan's inlined shadow checks are
-instrumented too, so the two arms are not counting the same edges. Neither
-column prices crash search, which is the thing more executions actually buy.
+The A/B gives each arm equal wall clock, several RNG seeds, and a pristine
+corpus for every run. Two things the first run of it settled:
+
+**Throughput, measured.** Dropping the sanitizer is worth **3.0x on
+`extensions` and 2.3x on `json`** — 7.8M executions against 2.6M, and 79M
+against 35M, over 3 x 120s per arm.
+
+**Start cold, or there is nothing to measure.** Run from the committed seed,
+both arms gained 0 edges in every single run: the seed already sits at each
+target's ceiling, so neither arm had ground left to find and the coverage half
+of the question got no signal at all. Runs now start from an empty corpus,
+where how much of the corpus an arm rediscovers per second is exactly the
+question. `--warm` keeps the old behaviour for the different question of
+whether more budget helps from where we already are.
+
+Scores are a fraction of each arm's *own* ceiling, never a raw edge count.
+The instrumentation gap is far too large to compare directly: the same `json`
+corpus reads **735 edges under `address` and 474 under `none`**, because ASan's
+inlined shadow checks are instrumented too. A ratio of like-for-like figures is
+comparable where the figures themselves are not.
+
+Neither column prices crash search, which is what more executions actually buy,
+nor memory errors in dependencies, which is what the sanitizer actually returns.
 
 ## Corpus
 
