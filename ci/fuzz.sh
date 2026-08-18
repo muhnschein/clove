@@ -35,6 +35,8 @@ usage: ci/fuzz.sh [options] [target...]
                 seed so the next run starts from what this one found
   --budget T    print target T's budget in seconds and exit; this is how CI
                 gets it, so the table below is the only copy of it
+  --max-len T   print target T's maximum input length in bytes and exit, for
+                the same reason
   --out PATH    where to write the report (default fuzz/report-<stamp>.txt)
   -h, --help    this
 
@@ -44,12 +46,14 @@ USAGE
 
 OUT=''
 BUDGET_OF=''
+MAXLEN_OF=''
 while [ $# -gt 0 ]; do
     case "$1" in
         --scale) SCALE="${2:?--scale needs a number}"; shift 2 ;;
         --quick) QUICK=yes; shift ;;
         --seed) SEED=yes; shift ;;
         --budget) BUDGET_OF="${2:?--budget needs a target}"; shift 2 ;;
+        --max-len) MAXLEN_OF="${2:?--max-len needs a target}"; shift 2 ;;
         --out) OUT="${2:?--out needs a path}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         -*) echo "fuzz: unknown option $1" >&2; usage >&2; exit 2 ;;
@@ -143,6 +147,41 @@ budget_for() {
     esac
 }
 
+# Longest input libFuzzer may generate, per target.
+#
+# This was never passed, and the default is not "no ceiling": with `-max_len`
+# unset libFuzzer uses the larger of 4096 and the biggest file in the seed. Every
+# corpus here has sat just under 4096 for its whole history — `extensions` 4058
+# bytes, `wire` 4018, `magnet` 4003, `json` 3757 — which is not a fact about the
+# inputs, it is the ceiling printing its own shape. Four KiB has therefore been
+# the real limit on every run this fuzzer has ever done, and nothing said so.
+#
+# For nine targets that is the right ceiling, and pinning it here means a single
+# large file arriving in a corpus cannot quietly raise it for everything else.
+# `extensions` is the one it was wrong for. Two of its rejection branches are
+# gated on sizes above 4 KiB, so no generated input could reach either:
+#
+#   pex::MAX_PEX_PEERS         512 peers x 32 bytes — 16 384 before the cap trips
+#   metadata::METADATA_PIECE_LEN               16 384 before a piece is oversized
+#
+# Which makes that target's own `assert!(added + dropped <= MAX_PEX_PEERS)` —
+# a property fuzz/README.md credits it with checking — unable to fail at any
+# budget, and `Error::PieceTooLarge` unreachable. Both bounds have unit tests,
+# so what was wrong is the coverage the fuzzer was *reported* as having, not the
+# parser; the fix is to let it reach them. 20 KiB clears both with room for the
+# bencode framing around the payload.
+#
+# Raising the ceiling does not on its own reach them — mutation will not arrive
+# at a 16 KiB length-prefixed bencode string by chance — so the committed seed
+# carries one input per branch. See fuzz/README.md.
+MAX_LEN_DEFAULT=4096
+max_len_for() {
+    case "$1" in
+        extensions) echo 20480 ;;
+        *) echo "$MAX_LEN_DEFAULT" ;;
+    esac
+}
+
 # libFuzzer's own default, scaled with the run. The visibility was the point
 # when this was pinned; the scaling is what the 2026-07-31T08:38Z sweep bought.
 #
@@ -185,6 +224,12 @@ if [ -n "$BUDGET_OF" ]; then
     case " $TARGETS_ALL " in
         *" $BUDGET_OF "*) budget_for "$BUDGET_OF"; exit 0 ;;
         *) echo "fuzz: no such target: $BUDGET_OF" >&2; exit 2 ;;
+    esac
+fi
+if [ -n "$MAXLEN_OF" ]; then
+    case " $TARGETS_ALL " in
+        *" $MAXLEN_OF "*) max_len_for "$MAXLEN_OF"; exit 0 ;;
+        *) echo "fuzz: no such target: $MAXLEN_OF" >&2; exit 2 ;;
     esac
 fi
 
@@ -237,6 +282,7 @@ note "host      $(uname -srm)"
 note "dicts     $(ls fuzz/dicts/*.dict 2>/dev/null | wc -l | tr -d ' ') file(s) in fuzz/dicts"
 note "scale     $SCALE${QUICK:+ (quick=$QUICK)}"
 note "rss limit $RSS_LIMIT MiB per target"
+note "max input $MAX_LEN_DEFAULT B, except extensions at $(max_len_for extensions) B"
 note ""
 
 seed_corpus
@@ -305,6 +351,8 @@ for t in $sched; do
     dict=''
     [ -f "fuzz/dicts/$t.dict" ] && dict="-dict=$PWD/fuzz/dicts/$t.dict"
 
+    maxlen=$(max_len_for "$t")
+
     corpus_count "$t" > "$logs/$t.before"
     say "fuzz: $t (${secs}s)"
     (
@@ -316,7 +364,8 @@ for t in $sched; do
         rc=0
         # shellcheck disable=SC2086  # $dict is one flag or nothing
         cargo +nightly fuzz run "$t" -- $dict \
-            -max_total_time="$secs" -rss_limit_mb="$RSS_LIMIT" -print_final_stats=1 \
+            -max_total_time="$secs" -max_len="$maxlen" \
+            -rss_limit_mb="$RSS_LIMIT" -print_final_stats=1 \
             >"$logs/$t.log" 2>&1 || rc=$?
         echo "$rc" > "$logs/$t.status"
     ) &

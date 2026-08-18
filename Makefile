@@ -75,7 +75,8 @@ router-trace:
 TARGET ?= bencode
 SECS ?= 60
 fuzz:
-	cargo +nightly fuzz run $(TARGET) -- -max_total_time=$(SECS)
+	cargo +nightly fuzz run $(TARGET) -- -max_total_time=$(SECS) \
+		-max_len=$$(./ci/fuzz.sh --max-len $(TARGET))
 
 ## Every target, per-target budgets, one report file you can send to someone.
 ## A crash lands in the report with its input and a reproducer, so it can be

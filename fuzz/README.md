@@ -200,6 +200,63 @@ straight to `Message::parse` read that as a *body*, where a five-byte request
 header is nothing but a wrong-length message. The vocabulary was written for a
 reader that did not exist yet. It does now; see Budgets.
 
+## Input length
+
+Passed explicitly as of this revision, and the reason to write a section about
+it is that it never had been.
+
+`-max_len` was not on the command line, and libFuzzer's default is not "no
+ceiling": with the flag unset it uses the larger of 4096 and the biggest file
+in the seed. Every corpus here has sat just under 4096 for its whole history —
+
+| `extensions` | `wire` | `magnet` | `json` | `http` | `resume` | `tracker` | `bencode` | `metainfo` | `dest` |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4058 | 4018 | 4003 | 3757 | 3752 | 3741 | 3305 | 3072 | 2573 | 1025 |
+
+— and that is not a fact about the inputs. It is the ceiling printing its own
+shape: the mutator cannot cross 4096, so a corpus climbs toward it and stops.
+Four KiB has been the real limit on every run this fuzzer has ever done, in
+every report so far, none of which mentions it.
+
+For nine targets it is the right ceiling, and `max_len_for` in `ci/fuzz.sh` now
+pins it so that one large file arriving in a corpus cannot quietly raise it for
+everything else. `extensions` is the one it was wrong for.
+
+### Two branches nothing could reach
+
+`extensions` has two rejection branches gated on sizes above 4 KiB:
+
+| Bound | Smallest input that trips it |
+|---|---:|
+| `pex::MAX_PEX_PEERS` — 512 peers x 32 bytes | ~16.4 KiB |
+| `metadata::METADATA_PIECE_LEN` — a 16 KiB piece | ~16.4 KiB |
+
+Four times the ceiling, both of them. So `Error::PieceTooLarge` was
+unreachable, and so was the target's own
+
+```rust
+assert!(message.added.len() + message.dropped.len() <= pex::MAX_PEX_PEERS);
+```
+
+— the PEX cap that the Targets table above credits this target with asserting.
+It could not have failed at any budget, on any corpus, in any run so far.
+
+Both bounds do have unit tests (`pex`'s `rejects_pex_spam`, and `metadata`'s
+oversized-piece case), so what was wrong is the coverage this file *claimed*,
+not the parser underneath it. That distinction is the reason to write it down
+rather than quietly fix it: a property nobody can trip is indistinguishable
+from a property that holds, and the report prints `ok` either way. It is the
+`wire` lesson in a different place — a number that looks like evidence of
+safety and is actually evidence of a target that cannot reach the question.
+
+`extensions` now runs at 20480, which clears both bounds with room for the
+bencode framing around the payload. Raising the ceiling is not enough on its
+own — mutation will not arrive at a 16 KiB length-prefixed bencode string by
+chance — so the committed seed carries one input per branch, generated against
+the parser and asserted to land on the error it exists for. They are the two
+largest files in the corpus by a factor of four. If a later `cmin` drops them,
+the branches went with them.
+
 ## Budgets
 
 Not flat, and set from what the reports measured rather than from taste.
@@ -607,6 +664,15 @@ files to 5375, which is what the tarball holds.
 What the tarball holds now is the 2026-08-16 sweep's own minimised corpus —
 6451 files, 451 KiB — which carries that sweep's gains in `resume`, `tracker`,
 `extensions` and `dest`, and is what the row above was measured on.
+
+Two files were added to it by hand afterwards, both in `extensions`, both about
+16 KiB, and they are the only inputs in this corpus that a run did not find.
+They exist because no run *could* find them: see Input length. They are
+generated against the parsers and asserted to reach `Error::TooManyPeers` and
+`Error::PieceTooLarge` respectively, so if a future replay shows `extensions`
+starting below 432 the first thing to check is whether a `cmin` dropped them.
+Being additions after the replay, they are not in the figures above; the next
+report's `--- corpus ---` section is where they first show up.
 
 So fold runs back in, rather than letting `fuzz/corpus/` accumulate until it
 dies with the working tree:
