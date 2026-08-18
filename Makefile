@@ -5,7 +5,7 @@
 # `make chaos` for crash resilience, `make fuzz` for the parsers.
 
 .PHONY: test smoke chaos router router-trace fmt lint man-lint doc-lint fuzz \
-        fuzz-all fuzz-seed install uninstall
+        fuzz-all fuzz-seed fuzz-coverage fuzz-sanitizer-ab install uninstall
 
 # Install layout. Override on the command line, e.g.
 #   make install PREFIX=/usr DESTDIR=$(CURDIR)/pkg
@@ -75,7 +75,8 @@ router-trace:
 TARGET ?= bencode
 SECS ?= 60
 fuzz:
-	cargo +nightly fuzz run $(TARGET) -- -max_total_time=$(SECS)
+	cargo +nightly fuzz run $(TARGET) -- -max_total_time=$(SECS) \
+		-max_len=$$(./ci/fuzz.sh --max-len $(TARGET))
 
 ## Every target, per-target budgets, one report file you can send to someone.
 ## A crash lands in the report with its input and a reproducer, so it can be
@@ -95,6 +96,23 @@ fuzz-all:
 ## corpus makes the next run both slower and shallower. See ci/fuzz-seed.sh.
 fuzz-seed:
 	@./ci/fuzz-seed.sh
+
+## Which functions of each parser the committed seed actually reaches. The
+## sweep counts edges, which says how much a run learned but not how much of
+## the parser it ever entered — and a target too narrow to reach its own
+## subject looks saturated either way. Needs llvm-tools-preview.
+##   make fuzz-coverage
+##   make fuzz-coverage ARGS="magnet wire"
+fuzz-coverage:
+	@./ci/fuzz-coverage.sh $(ARGS)
+
+## What AddressSanitizer costs and what it buys, per target: equal wall clock
+## per arm, several RNG seeds, a pristine corpus for every run. This workspace
+## forbids unsafe code, so the question is live rather than rhetorical.
+##   make fuzz-sanitizer-ab
+##   make fuzz-sanitizer-ab ARGS="--secs 300 extensions"
+fuzz-sanitizer-ab:
+	@./ci/fuzz-sanitizer-ab.sh $(ARGS)
 
 ## Check the manuals parse and follow mdoc conventions. Unresolved cross-page
 ## references are expected until the pages are installed, so they are filtered.

@@ -116,10 +116,11 @@ jobs:
       - run: tar xzf fuzz/seed-corpus.tar.gz -C fuzz -k || true
       - run: |
           secs=$(./ci/fuzz.sh --budget ${{ matrix.target }})
-          echo "budget: ${{ matrix.target }} ${secs}s"
+          maxlen=$(./ci/fuzz.sh --max-len ${{ matrix.target }})
+          echo "budget: ${{ matrix.target }} ${secs}s, max input ${maxlen} B"
           cargo +nightly fuzz run ${{ matrix.target }} -- \
             -dict=fuzz/dicts/${{ matrix.target }}.dict \
-            -max_total_time="$secs"
+            -max_total_time="$secs" -max_len="$maxlen"
       # Minimise before the cache is written, not after it is read. libFuzzer
       # keeps an input for reaching a new execution-count bucket, not a new
       # edge, so a cache that is only ever added to grows without the coverage
