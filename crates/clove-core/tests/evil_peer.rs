@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use clove_core::bencode::{self, Value as Ben};
 use clove_core::bitfield::Bitfield;
+use clove_core::extension;
 use clove_core::metainfo::MetaInfo;
 use clove_core::picker::Mode;
 use clove_core::storage::Storage;
@@ -77,6 +78,11 @@ fn content() -> Vec<u8> {
 }
 
 fn meta_for(content: &[u8]) -> MetaInfo {
+    meta_with_private(content, false)
+}
+
+/// [`meta_for`], with BEP 27's `info.private` set as asked.
+fn meta_with_private(content: &[u8], private: bool) -> MetaInfo {
     let pieces: Vec<u8> = content
         .chunks(BLOCK_LEN as usize)
         .flat_map(|c| <[u8; 20]>::from(Sha1::digest(c)))
@@ -89,6 +95,9 @@ fn meta_for(content: &[u8]) -> MetaInfo {
         b"length".to_vec(),
         Ben::Int(i64::try_from(content.len()).expect("fixture fits in i64")),
     );
+    if private {
+        info.insert(b"private".to_vec(), Ben::Int(1));
+    }
     let mut root = BTreeMap::new();
     root.insert(b"info".to_vec(), Ben::Dict(info));
     MetaInfo::parse(&bencode::encode(&Ben::Dict(root))).expect("fixture parses")
@@ -1024,6 +1033,132 @@ fn peer_exchange_stays_within_the_limit_it_enforces() {
             );
             break;
         }
+    }
+}
+
+/// BEP 27: a private torrent's peers come from its tracker and nowhere else.
+///
+/// `info.private` was parsed, stored, and reported by `GET /v1/torrents/<hash>`
+/// — and read by nothing. Peer exchange ran on a private torrent exactly as on
+/// a public one, which hands a swarm member's destination to whoever completes
+/// a handshake with us. On I2P a destination is not an IP a tracker would
+/// rather not publish; it is the whole of how to reach that peer, and the
+/// tracker deciding who may have it is what "private" means.
+///
+/// Both directions, because they fail differently: we must not *send* our
+/// address book, and we must not *learn* from a peer that sends us one anyway.
+#[test]
+fn a_private_torrent_speaks_no_peer_exchange() {
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_with_private(&content, true);
+    assert!(meta.private, "fixture must be a private torrent");
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("pex-private");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+
+    // An address book worth leaking, so an empty PEX message is not what makes
+    // this pass.
+    let known: Vec<DestHash> = (0..64u32)
+        .map(|i| {
+            let mut hash = [0u8; 32];
+            hash[..4].copy_from_slice(&i.to_be_bytes());
+            hash[4] = 0xC3;
+            DestHash(hash)
+        })
+        .collect();
+    seeder.add_peers(&known);
+    assert!(
+        !seeder.known_peers().is_empty(),
+        "fixture has nothing to leak"
+    );
+
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    let mut peer = raw_peer(&net, dest, info_hash);
+    // Offer peer exchange, which on a public torrent is what prompts the engine
+    // to send its set, and send one unprompted as well.
+    let mut m = BTreeMap::new();
+    m.insert(b"i2p_pex".to_vec(), Ben::Int(1));
+    let mut hs = BTreeMap::new();
+    hs.insert(b"m".to_vec(), Ben::Dict(m));
+    wire::write_message(
+        &mut peer,
+        &Message::Extended {
+            id: 0,
+            payload: bencode::encode(&Ben::Dict(hs)),
+        },
+    )
+    .expect("ext handshake");
+
+    // Eight destinations of one repeated byte each, so they are recognisable
+    // in the address book afterwards and cannot be confused with the fixture's
+    // or with the connecting peer's own.
+    let offered: Vec<DestHash> = (0..8u8).map(|i| DestHash([0xE0 | i; 32])).collect();
+    let mut added = Vec::new();
+    for dest in &offered {
+        added.extend_from_slice(&dest.0);
+    }
+    let mut pex = BTreeMap::new();
+    pex.insert(b"added".to_vec(), Ben::Bytes(added));
+    wire::write_message(
+        &mut peer,
+        &Message::Extended {
+            id: 1,
+            payload: bencode::encode(&Ben::Dict(pex)),
+        },
+    )
+    .expect("pex offer");
+
+    // Read everything the engine has to say for a while. Its own extension
+    // handshake must not advertise `i2p_pex`, and no PEX message may follow.
+    let deadline = Instant::now() + DEADLINE;
+    let mut saw_handshake = false;
+    while Instant::now() < deadline {
+        match next_message(&mut peer) {
+            Some(Message::Extended { id: 0, payload }) => {
+                let ours = extension::Handshake::parse(&payload).expect("our own handshake parses");
+                assert_eq!(
+                    ours.id_for("i2p_pex"),
+                    None,
+                    "a private torrent advertised i2p_pex"
+                );
+                // Metadata exchange is not restricted by BEP 27: it serves the
+                // torrent we both already hold, not a way to reach anyone.
+                assert!(
+                    ours.id_for("ut_metadata").is_some(),
+                    "ut_metadata should still be offered"
+                );
+                saw_handshake = true;
+            }
+            Some(Message::Extended { id: 1, .. }) => {
+                panic!("a private torrent sent a PEX message");
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_handshake,
+        "the engine never sent its extension handshake"
+    );
+
+    assert_eq!(
+        seeder.pex_learned(),
+        0,
+        "a private torrent learned peers over PEX"
+    );
+    // The book may have gained the destination that dialled us — a peer we are
+    // talking to is not a peer we were told about. What it must not contain is
+    // anything the PEX message offered.
+    let book = seeder.known_peers();
+    for dest in &offered {
+        assert!(
+            !book.contains(dest),
+            "a destination offered over PEX reached a private torrent's address book"
+        );
     }
 }
 

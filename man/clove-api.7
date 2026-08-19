@@ -188,6 +188,18 @@ count what has happened since this torrent's engine started, not what is true
 now: a peer that connected and left still proves peer exchange worked and that
 the inbound path carried a stream.
 Both reset when the engine is restarted, and neither is persisted.
+.Pp
+.Sy pex_peers
+is always
+.Sy 0
+when
+.Sy private
+is
+.Sy true :
+clove speaks no peer exchange on a BEP 27 private torrent, in either
+direction.
+See
+.Xr cloved 8 .
 .It Sy DELETE Pa /v1/torrents/ Ns Ar info-hash Ns Op ?data=1
 Remove a torrent.
 With

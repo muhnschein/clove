@@ -502,8 +502,8 @@ impl Parser<'_> {
 
 /// Write a JSON string literal, escaping per RFC 8259: `"` and `\` are
 /// backslash-escaped, the shortcuts `\b \t \n \f \r` are used where they
-/// apply, and any other control character below `0x20` becomes `\u00XX`.
-/// Non-ASCII UTF-8 passes through unescaped (valid JSON).
+/// apply, and everything [`needs_escaping`] names becomes `\uXXXX`. Other
+/// non-ASCII UTF-8 passes through unescaped (valid JSON).
 fn write_string(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
@@ -515,13 +515,37 @@ fn write_string(s: &str, out: &mut String) {
             '\n' => out.push_str("\\n"),
             '\u{0C}' => out.push_str("\\f"),
             '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => {
+            c if needs_escaping(c) => {
                 let _ = write!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
         }
     }
     out.push('"');
+}
+
+/// Whether a character is written as a `\uXXXX` escape rather than as itself.
+///
+/// RFC 8259 requires this of `0x00..0x20` and permits it of anything else, and
+/// what the permission is spent on is the point. `clove list --json` and
+/// `clove show --json` print this text straight to a terminal, and a terminal
+/// is an interpreter: the characters [`crate::text::scrub`] refuses to put in
+/// front of a person are exactly the ones that must not survive the encoder
+/// either. Escaping them here rather than scrubbing them there is what lets
+/// both hold at once — a JSON consumer unescapes and gets the torrent's real
+/// name back, and a terminal is shown six inert ASCII characters.
+///
+/// The set is [`crate::text::scrub`]'s, character for character:
+///
+/// - the `Cc` category — C0, `DEL` and C1 — where the escape sequences, the
+///   carriage returns and the newlines live (`0x00..0x20` is the RFC's
+///   requirement and the rest of `Cc` is this function's addition); and
+/// - the bidirectional overrides and isolates, which draw nothing themselves
+///   and reorder the text around them, so `…rat.exe` can be made to render as
+///   `…exe.tar` in the very listing an operator is reading.
+fn needs_escaping(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 #[cfg(test)]
@@ -589,6 +613,44 @@ mod tests {
         );
         // Non-ASCII passes through as UTF-8.
         assert_eq!(Value::from("café").encode(), "\"café\"");
+    }
+
+    /// The encoder's half of the promise `crate::text` makes: text a stranger
+    /// wrote reaches a terminal through `clove list --json` without passing
+    /// through `scrub`, so nothing a terminal acts on may survive encoding.
+    #[test]
+    fn terminal_hazards_do_not_survive_encoding() {
+        // DEL and C1 are controls that `0x20` alone does not cover; the C1 run
+        // is where a terminal in 8-bit mode finds CSI.
+        assert_eq!(Value::from("a\u{7f}b").encode(), "\"a\\u007fb\"");
+        assert_eq!(Value::from("a\u{9b}b").encode(), "\"a\\u009bb\"");
+        // The classic filename spoof: RLO renders "safe.exe.gnp" as
+        // "safe.gnp.exe" — inside a JSON string exactly as outside one.
+        assert_eq!(
+            Value::from("safe\u{202e}gnp.exe").encode(),
+            "\"safe\\u202egnp.exe\""
+        );
+        for c in [
+            '\u{0}', '\u{1b}', '\u{7f}', '\u{80}', '\u{9b}', '\u{200e}', '\u{200f}', '\u{202a}',
+            '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}',
+            '\u{2069}',
+        ] {
+            let encoded = Value::from(c.to_string().as_str()).encode();
+            assert!(
+                !encoded.chars().any(|e| e == c),
+                "{c:?} survived encoding as {encoded:?}"
+            );
+            // Escaped, not dropped: a consumer that unescapes gets the real
+            // name back, which is what the API promises.
+            assert_eq!(
+                parse(&encoded).unwrap(),
+                Value::from(c.to_string().as_str())
+            );
+        }
+        // Text an operator can actually read is untouched, non-ASCII included.
+        for ok in ["plain-name_1.0.iso", "café", "日本語のファイル", "Ünïcödé"] {
+            assert_eq!(Value::from(ok).encode(), format!("\"{ok}\""));
+        }
     }
 
     #[test]

@@ -21,19 +21,55 @@ impl ApiListener {
     /// Bind a unix-socket listener at `path`, replacing any stale socket file
     /// from a previous run and restricting it to the owner (`0600`).
     ///
+    /// **Bound under a temporary name, restricted, then renamed into place.**
+    /// `bind(2)` creates the socket with `0777 & ~umask`, which is `0755` under
+    /// the umask a shell hands out, and the mode we want is only applied
+    /// afterwards. Binding at `path` directly therefore publishes a
+    /// connectable socket at the name clients look for, and *then* takes the
+    /// permission away — a window in which any local user may connect. Token
+    /// auth means they would be answered with `401` and nothing else, so this
+    /// is the second lock rather than the first; it is also the lock the
+    /// project's own file-writing already uses (`write_private_file` in
+    /// `cloved`), and there is no reason for the socket to be the exception.
+    ///
+    /// Renaming a bound socket keeps the listener: the socket lives in its
+    /// inode, and the path is only the name a client resolves to reach it.
+    /// The rename is atomic, so it also replaces a stale socket without the
+    /// moment of "no socket at all" an unlink-then-bind leaves behind.
+    ///
     /// # Errors
     ///
-    /// The stale socket cannot be removed, the bind fails, or the mode cannot
-    /// be set.
+    /// The bind fails, the mode cannot be set, or the socket cannot be moved
+    /// into place.
     pub fn bind_unix(path: &Path) -> io::Result<ApiListener> {
-        // A leftover socket file makes bind fail with EADDRINUSE; clear it.
-        match std::fs::remove_file(path) {
+        let name = path.file_name().map_or_else(
+            || std::ffi::OsString::from("clove.sock"),
+            std::ffi::OsStr::to_os_string,
+        );
+        let tmp = path.with_file_name(format!(
+            "{}.{}.tmp",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        // A temp left by an earlier crash of this pid would fail the bind below
+        // with EADDRINUSE.
+        match std::fs::remove_file(&tmp) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let listener = UnixListener::bind(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let listener = UnixListener::bind(&tmp)?;
+        // From here the temp is ours to clean up on any failure: leaving a
+        // connectable socket behind under a name nothing will ever remove is
+        // worse than the error being reported.
+        let settle = || -> io::Result<()> {
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            std::fs::rename(&tmp, path)
+        };
+        if let Err(e) = settle() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         Ok(ApiListener(listener))
     }
 
@@ -110,6 +146,51 @@ mod tests {
         assert_eq!(&back, b"ping");
 
         server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The socket must be owner-only at every moment it is reachable, which
+    /// means before it has the name a client connects to — not a moment after.
+    /// Binding at the final path and chmod-ing afterwards passes the check
+    /// below and still leaves the window; what proves the order is that no
+    /// permissive mode was ever visible at that path, and that a socket left
+    /// over from a previous run is replaced rather than briefly missing.
+    #[test]
+    fn the_socket_is_owner_only_before_it_is_reachable() {
+        let dir = std::env::temp_dir().join(format!("clove-api-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("api.sock");
+
+        // A stale socket at the target, as an unclean stop leaves.
+        let stale = ApiListener::bind_unix(&path).unwrap();
+        let listener = ApiListener::bind_unix(&path).unwrap();
+        drop(stale);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the replacing socket is not owner-only");
+        // The new listener is the one at that path: it answers, and nothing
+        // was left behind under the temporary name.
+        let mut client = connect_unix(&path).unwrap();
+        let server = thread::spawn(move || {
+            let mut conn = listener.accept().unwrap();
+            conn.write_all(b"pong").unwrap();
+        });
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).unwrap();
+        assert_eq!(&back, b"pong");
+        server.join().unwrap();
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary sockets left behind: {leftovers:?}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -295,6 +295,17 @@ struct Shared {
     /// Shared with the registry's [`MetaInfo`](crate::metainfo::MetaInfo),
     /// not copied.
     raw_info: Arc<[u8]>,
+    /// BEP 27 `info.private`: this torrent's peers come from its tracker and
+    /// from nowhere else.
+    ///
+    /// What it costs is peer exchange, in both directions — see
+    /// [`Torrent::our_extension_handshake`]. A private torrent is one whose
+    /// tracker decides who is in the swarm, and `i2p_pex` hands a peer's
+    /// destination to whoever asks for it, which is the tracker's decision made
+    /// by somebody else. On I2P that destination *is* the peer's address, so
+    /// the leak is not "an IP a private tracker would rather not publish" but
+    /// the whole of how to reach them.
+    private: bool,
     state: Mutex<State>,
     done: Mutex<bool>,
     done_cv: Condvar,
@@ -536,6 +547,7 @@ impl Torrent {
             num_pieces,
             max_frame,
             raw_info: Arc::clone(&meta.raw_info),
+            private: meta.private,
             state: Mutex::new(State {
                 picker,
                 choker: Choker::default(),
@@ -1137,11 +1149,22 @@ impl Shared {
         Some(id)
     }
 
-    /// Our BEP 10 handshake payload: advertise `i2p_pex` and `ut_metadata`, and
-    /// the metadata size if we hold the info dictionary.
+    /// Our BEP 10 handshake payload: advertise `ut_metadata`, `i2p_pex` unless
+    /// the torrent is private, and the metadata size if we hold the info
+    /// dictionary.
+    ///
+    /// **`i2p_pex` is withheld from a private torrent** (BEP 27
+    /// `info.private`), which is the visible half of not speaking peer exchange
+    /// there: a peer that is never told an id for it cannot send us one, so the
+    /// refusal is a fact about the connection rather than a rule we apply to
+    /// messages afterwards. `ut_metadata` stays — BEP 27 restricts where
+    /// *peers* may come from, and the metadata a peer serves is the torrent we
+    /// both already hold.
     fn our_extension_handshake(&self) -> Vec<u8> {
         let mut ids = std::collections::BTreeMap::new();
-        ids.insert(I2P_PEX.to_owned(), OUR_PEX_ID);
+        if !self.private {
+            ids.insert(I2P_PEX.to_owned(), OUR_PEX_ID);
+        }
         ids.insert(UT_METADATA.to_owned(), OUR_METADATA_ID);
         let metadata_size = (!self.raw_info.is_empty()).then_some(self.raw_info.len());
         extension::Handshake {
@@ -1369,12 +1392,20 @@ impl Shared {
                 let Ok(hs) = extension::Handshake::parse(payload) else {
                     return;
                 };
-                st.peers[idx].pex_id = hs.id_for(I2P_PEX);
+                // Their id for peer exchange is remembered only if we speak
+                // it at all: on a private torrent this stays `None`, and the
+                // send below — the one place it is read — has nothing to send
+                // to. A peer offering `i2p_pex` is not an invitation to use it.
+                st.peers[idx].pex_id = (!self.private).then(|| hs.id_for(I2P_PEX)).flatten();
                 st.peers[idx].metadata_id = hs.id_for(UT_METADATA);
                 // Now that we know their pex id, send them the peers we know.
                 Self::send_pex(st, idx, out);
             }
-            OUR_PEX_ID => {
+            // Never advertised for a private torrent, so a peer sending it
+            // anyway is not following the handshake it was given. Checked
+            // rather than assumed: the id is a number a peer can pick, and
+            // "we did not offer it" is not the same as "it cannot arrive".
+            OUR_PEX_ID if !self.private => {
                 if let Ok(pex) = PexMessage::parse(payload) {
                     for dest in pex.added {
                         if st.remember_peer_from(dest, Source::Pex) {
@@ -1394,6 +1425,9 @@ impl Shared {
 
     /// Send `idx`'s peer the destinations we know (minus its own), if it
     /// supports peer exchange. State-only, so an associated function.
+    ///
+    /// A private torrent never gets here: its peers carry no `pex_id`, because
+    /// the handshake above declines to record one.
     fn send_pex(st: &mut State, idx: usize, out: &mut Vec<Outgoing>) {
         let Some(pex_id) = st.peers[idx].pex_id else {
             return;

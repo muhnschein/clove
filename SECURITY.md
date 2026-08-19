@@ -88,7 +88,14 @@ These are enforced in the codebase and checked in CI, not merely intended:
   daemon's log lines and in `clove`'s output alike: control characters and
   bidirectional overrides out of a torrent, a tracker or a SAM bridge cannot
   forge a log line or rewrite what the rest of the screen says. The stored value
-  and the API's JSON keep the real name.
+  keeps the real name, and so does the API's JSON — where those characters are
+  written as `\uXXXX` escapes rather than as themselves, so that `--json`
+  output is inert in a terminal and unchanged for a consumer that unescapes it.
+- **A private torrent speaks no peer exchange.** With BEP 27's `info.private`
+  set, clove neither advertises `i2p_pex` to a peer nor acts on an `i2p_pex`
+  message from one, so that torrent's peers come from its trackers and nowhere
+  else. A destination is how a peer is reached on I2P, and which parties may
+  hold one is the tracker's decision to make.
 
 If you find a way to violate one of these, that is a vulnerability by
 definition, even without a demonstrated exploit.

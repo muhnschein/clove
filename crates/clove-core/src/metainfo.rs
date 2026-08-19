@@ -31,6 +31,27 @@ pub const MIN_PIECE_LENGTH: u32 = 16 * 1024;
 /// Largest piece length clove accepts (128 MiB).
 pub const MAX_PIECE_LENGTH: u32 = 128 * 1024 * 1024;
 
+/// Most announce tiers clove keeps from one torrent, and most URLs it keeps
+/// from one tier. A torrent past either loses the excess, counted like any
+/// other dropped announce URL.
+///
+/// The announcer tracks every URL it is given, independently and in series
+/// (`swarm::Announcer`), so the URL count is a number the *torrent* picks and
+/// the daemon then spends time on: each pass resolves a name and dials it,
+/// with timeouts measured in the minute. A `.torrent` is a stranger's file and
+/// bencode is compact — a two-megabyte one has room for something like a
+/// hundred thousand `http://a.i2p` announce URLs, which is a first pass long
+/// enough that the tracker the torrent is actually on gets announced to once
+/// and then not again for days, and a hundred thousand parties told our
+/// destination on the way.
+///
+/// The numbers are generous against reality rather than against the format:
+/// torrents on I2P carry one or two trackers, and the largest multi-tracker
+/// files in the wild are an order of magnitude below this.
+pub const MAX_TRACKER_TIERS: usize = 16;
+/// See [`MAX_TRACKER_TIERS`].
+pub const MAX_TRACKERS_PER_TIER: usize = 16;
+
 /// One file within a torrent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
@@ -67,8 +88,9 @@ pub struct MetaInfo {
     /// Announce URL tiers (BEP 12) after the I2P-only filter. May be empty:
     /// a torrent can still be joined via PEX or magnet paths.
     pub trackers: Vec<Vec<String>>,
-    /// How many non-I2P announce URLs were dropped. The only trace they
-    /// leave: callers may log "skipped N non-I2P trackers", nothing more.
+    /// How many announce URLs were dropped — for not being I2P URLs, or for
+    /// being past [`MAX_TRACKER_TIERS`]/[`MAX_TRACKERS_PER_TIER`]. The only
+    /// trace they leave: callers may log "skipped N trackers", nothing more.
     pub skipped_trackers: usize,
     /// The raw bencoded `info` dictionary these fields came from — the exact
     /// bytes the info-hash covers. Kept so we can serve BEP 9 metadata to
@@ -471,12 +493,20 @@ fn parse_trackers(root: &Value) -> Result<(Vec<Vec<String>>, usize), Error> {
             let tier = tier
                 .as_list()
                 .ok_or(Error::Invalid("announce-list tier is not a list"))?;
+            // Still type-checked past the cap rather than skipped wholesale: a
+            // malformed announce-list is a malformed torrent whether or not the
+            // malformed part is one clove was going to keep, and a parser that
+            // stops looking at a size limit accepts files it rejects a byte
+            // shorter.
             let mut kept = Vec::new();
             for url in tier {
                 let url = url
                     .as_str()
                     .ok_or(Error::Invalid("announce URL is not a UTF-8 string"))?;
-                if is_i2p_tracker(url) {
+                if is_i2p_tracker(url)
+                    && tiers.len() < MAX_TRACKER_TIERS
+                    && kept.len() < MAX_TRACKERS_PER_TIER
+                {
                     kept.push(url.to_owned());
                 } else {
                     skipped += 1;
@@ -672,6 +702,58 @@ mod tests {
             vec![vec!["http://good.i2p/announce".to_owned()]]
         );
         assert_eq!(t.skipped_trackers, 2);
+    }
+
+    /// A torrent does not get to decide how much of the daemon's time its
+    /// announce list is worth. The announcer walks every URL it is handed, in
+    /// series, with minute-long timeouts — so an unbounded list is a first pass
+    /// that never finishes, and every URL on it is one more party told our
+    /// destination.
+    #[test]
+    fn an_enormous_announce_list_is_cut_to_the_cap() {
+        let tiers = Value::List(
+            (0..MAX_TRACKER_TIERS + 10)
+                .map(|t| {
+                    Value::List(
+                        (0..MAX_TRACKERS_PER_TIER + 10)
+                            .map(|u| bval(&format!("http://t{t}-{u}.i2p/announce")))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+        let offered = (MAX_TRACKER_TIERS + 10) * (MAX_TRACKERS_PER_TIER + 10);
+        let input = single_file(vec![("announce-list", tiers)]);
+        let t = MetaInfo::parse(&input).unwrap();
+
+        assert_eq!(t.trackers.len(), MAX_TRACKER_TIERS);
+        for tier in &t.trackers {
+            assert_eq!(tier.len(), MAX_TRACKERS_PER_TIER);
+        }
+        let kept: usize = t.trackers.iter().map(Vec::len).sum();
+        assert_eq!(kept, MAX_TRACKER_TIERS * MAX_TRACKERS_PER_TIER);
+        // Every URL is accounted for: kept, or counted as dropped.
+        assert_eq!(kept + t.skipped_trackers, offered);
+        // The ones kept are the first of each, not an arbitrary selection.
+        assert_eq!(t.trackers[0][0], "http://t0-0.i2p/announce");
+    }
+
+    /// A list that fits keeps every URL, so the cap is a ceiling and not a
+    /// silent trim of the one or two trackers a real torrent carries.
+    #[test]
+    fn an_ordinary_announce_list_is_untouched() {
+        let tiers = Value::List(vec![
+            Value::List(vec![bval("http://a.i2p/announce")]),
+            Value::List(vec![
+                bval("http://b.i2p/announce"),
+                bval("http://c.i2p/announce"),
+            ]),
+        ]);
+        let input = single_file(vec![("announce-list", tiers)]);
+        let t = MetaInfo::parse(&input).unwrap();
+        assert_eq!(t.trackers.len(), 2);
+        assert_eq!(t.trackers[1].len(), 2);
+        assert_eq!(t.skipped_trackers, 0);
     }
 
     #[test]

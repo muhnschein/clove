@@ -257,3 +257,15 @@ file shipped with the source.
 .Sh CAVEATS
 i2p_dht, UDP tracker announces, and BitTorrent v2 are not implemented.
 Peer discovery is by tracker announce and peer exchange.
+A torrent whose
+.Sy info
+dictionary sets
+.Sy private
+.Pq BEP 27
+speaks no peer exchange in either direction: clove neither advertises
+.Sy i2p_pex
+to its peers nor accepts a
+.Sy i2p_pex
+message from one, so such a torrent's peers come from its trackers alone.
+On I2P a destination is the whole of how to reach a peer, so handing one to a
+party the tracker did not admit is the leak that flag exists to prevent.
