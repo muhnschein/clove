@@ -65,4 +65,10 @@ commit. Closure sizes are recorded when the dependency is actually added.
   in a `Cargo.toml` away, `rustix` is listed in *both* the deny and allow sets
   of `ci/check-net-deps.sh`, and that script now also fails if any manifest
   turns the `net` feature on — the allowlist alone would have said nothing.
-  That check is per-manifest, so it covers `cloved`'s use as well.
+  That check is per-manifest, so it covers `cloved`'s use as well — and reads
+  the whole dependency declaration, in each of TOML's three spellings, rather
+  than the one line the crate name sits on. It did not always: `cloved`
+  declares rustix's features across several lines, which is exactly the
+  manifest the old single-line `grep` could not see into
+  (`docs/AUDIT-2026-08.md` F2). `ci/check-net-deps.sh --self-test` checks the
+  scanner against manifests written to trip it, and CI runs it before the gate.

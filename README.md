@@ -94,7 +94,9 @@ Design and protocol documents live in the repository:
 - [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt) — I2P BitTorrent dialect and
   interoperability findings;
 - [`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md) — persistent state format;
-- [`DEPENDENCIES.md`](DEPENDENCIES.md) — reviewed dependency allowlist; and
+- [`DEPENDENCIES.md`](DEPENDENCIES.md) — reviewed dependency allowlist;
+- [`docs/AUDIT-2026-08.md`](docs/AUDIT-2026-08.md) — a full audit against the
+  threat model, what it found and what it did not; and
 - [`SECURITY.md`](SECURITY.md) — vulnerability policy.
 
 ## Security model

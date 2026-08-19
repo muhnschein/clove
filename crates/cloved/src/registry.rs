@@ -1007,6 +1007,19 @@ where
         if self.torrents.contains_key(&info_hash) {
             return Err(AddError::Duplicate);
         }
+        // Announce URLs the parser dropped: not I2P, or past the cap on how
+        // many one torrent may carry. Counted there and, until now, read
+        // nowhere — so a torrent quietly lost trackers and the operator found
+        // out by noticing it had no peers. The count and nothing else: the URLs
+        // themselves are what SCOPE §3 says must never be logged.
+        if meta.skipped_trackers > 0 {
+            eprintln!(
+                "cloved: {}: skipped {} announce URL(s) that are not I2P or are past the \
+                 per-torrent cap",
+                hex(&info_hash),
+                meta.skipped_trackers
+            );
+        }
         let num_pieces = u32::try_from(meta.pieces.len()).unwrap_or(u32::MAX);
         let priorities = vec![1u8; meta.files.len()];
 

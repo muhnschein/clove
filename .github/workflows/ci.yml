@@ -40,6 +40,10 @@ jobs:
       # takes seconds and needs no nightly toolchain — only running the fuzzer
       # does.
       - run: cargo check --manifest-path fuzz/Cargo.toml
+      # The scanner first, against manifests written to trip it: the gate
+      # reads TOML with awk, and a scanner that quietly stopped matching
+      # would report "ok" for every run after the one that broke it.
+      - run: ./ci/check-net-deps.sh --self-test
       - run: ./ci/check-net-deps.sh
       # End-to-end: drive the real binaries as an operator does. Unit tests
       # cannot see whole-process faults (the Phase-F registry deadlocks
