@@ -89,12 +89,12 @@ The man pages are the primary user documentation:
 
 Design and protocol documents live in the repository:
 
-- [`docs/SCOPE.md`](docs/SCOPE.md) — goals, non-goals, and engineering scope;
-- [`docs/DECISIONS.md`](docs/DECISIONS.md) — resolved design decisions;
+- [`docs/SCOPE.md`](docs/SCOPE.md) — goals, non-goals, and engineering standards;
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — design decisions;
 - [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt) — I2P BitTorrent dialect and
   interoperability findings;
 - [`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md) — persistent state format;
-- [`DEPENDENCIES.md`](DEPENDENCIES.md) — reviewed dependency allowlist; and
+- [`DEPENDENCIES.md`](DEPENDENCIES.md) — dependency allowlist; and
 - [`SECURITY.md`](SECURITY.md) — vulnerability policy.
 
 ## Security model

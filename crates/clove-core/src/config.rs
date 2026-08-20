@@ -486,18 +486,6 @@ fn looks_like_sam_address(value: &str) -> bool {
     }
 }
 
-/// Why this build cannot dial `value`, or `None` if it can.
-///
-/// The SAM backend builds its own loopback TCP connection and takes the port
-/// from here and nothing else (`crates/i2pnet/src/sam.rs`), so these two shapes
-/// parse and validate and then are not what happens. Both were accepted:
-///
-/// - a unix-socket path became `"unsupported-sam-address"` at startup and the
-///   daemon ran with no router, having been told its configuration was fine;
-/// - a remote `host:port` had its host discarded and the port dialed on
-///   `127.0.0.1`, which is a different router than the one asked for — and the
-///   one case where quietly doing something else is worse than failing, because
-///   the operator set a deliberately ugly flag to say they meant it.
 fn unsupported_sam_transport(value: &str) -> Option<&'static str> {
     if value.starts_with('/') {
         return Some("a unix-socket SAM address is not supported; use host:port");

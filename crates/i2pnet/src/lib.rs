@@ -101,16 +101,6 @@ pub trait I2pStream: Read + Write + Send + Sized {
 
 /// Ending a connection from a thread that is not the one blocked on it.
 ///
-/// The reader-thread/writer-thread model (Q5) has one thread parked in a
-/// blocking read for as long as the connection lives, and dropping the *other*
-/// half does not wake it: both halves reference one connection, and a
-/// duplicated descriptor keeps it open. So a peer dropped from the engine's
-/// table — paused, idle-timed-out, disconnected on session teardown — left its
-/// reader parked forever, holding a thread, a descriptor and a router-side
-/// stream for the life of the process. Measured as a socket count against the
-/// bridge that climbed all afternoon, and half-fixed twice under
-/// `PROTOCOL.i2p-bt` §2.7a before the cause was named.
-///
 /// Implementations close the connection in **both** directions: the point is
 /// to unblock the reader, and shutting down only the write side does not.
 pub trait I2pClose {

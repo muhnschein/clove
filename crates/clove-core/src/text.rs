@@ -1,20 +1,9 @@
 //! Making somebody else's text safe to put in front of a person.
 //!
-//! Almost every string clove displays came from a stranger: a `.torrent`'s
-//! `info.name` and file paths, a tracker's `failure reason`, an announce URL, a
-//! SAM bridge's account of why a session died. None of it is trusted, and all of
-//! it ends up somewhere a person reads — the daemon's stderr, which is to say a
-//! journal, a log shipper and eventually a bug report; or `clove list`, which is
-//! to say a terminal.
-//!
-//! A terminal is an interpreter. `"\x1b[2J"` clears the reader's screen,
-//! `"\x1b]0;…\x07"` retitles their window, and a bare newline forges a log line —
-//! an operator reading `cloved: …` has no way to tell which of those lines clove
-//! wrote. None of that is a parser bug: `metainfo::check_component` refuses
-//! separators, `.`, `..` and NUL because those are what a *path* must not
-//! contain, and it has no opinion about `ESC` because `ESC` is not a path
-//! problem. It is a display problem, and this is where display problems are
-//! fixed.
+//! Almost every string clove displays came from a stranger. None of it is 
+//! trusted, and all of
+//! it ends up somewhere a person reads, including a terminal. A terminal is an
+//! interpreter. Solution:
 //!
 //! **Scrub at the boundary, not at the source.** The stored name is the
 //! torrent's actual name and the API's JSON has to keep it — `json::write_string`

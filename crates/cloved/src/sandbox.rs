@@ -3,12 +3,8 @@
 //!
 //! Once the daemon has finished initialising — config read, data directory
 //! created, token loaded, registry opened, control socket bound — it no longer
-//! needs most of the process it started as. It does not exec, it does not
-//! ptrace, it does not load modules, it does not touch the filesystem outside
-//! its own data directory, and the only address it dials is the SAM bridge.
-//! [`enter_post_init`] takes those capabilities away from itself. That call is
-//! the single phase hook: an OpenBSD port drops `pledge(2)`/`unveil(2)` in at
-//! exactly this point and deletes nothing else.
+//! needs most of the process it started as.
+//! [`enter_post_init`] takes those capabilities away from itself.
 //!
 //! Two mechanisms:
 //!
@@ -125,13 +121,6 @@ fn landlock_restrict(_limits: &Limits) -> (bool, String) {
 /// baseline and should say so rather than run half-confined and report success.
 /// `AccessFs::ResolveUnix` is ABI 9 (Linux 7.1) and is asked for `BestEffort`,
 /// because it is a bonus rather than a promise.
-///
-/// That split is what makes the returned status mean something. The old code
-/// targeted ABI 5 best-effort throughout, so `PartiallyEnforced` covered
-/// everything from "one nicety missing" to "barely any of this applied" and the
-/// message could only shrug at "kernel supports an older ABI". Here the required
-/// tier cannot be partial — it either applies or errors — so a partial result has
-/// exactly one possible cause, and the message can name it.
 ///
 /// The rights themselves come from [`Role`], per path. Note that
 /// `handle_access` still covers *every* filesystem right: what is handled is
@@ -331,7 +320,7 @@ mod seccomp {
     /// when this list has to change. Every entry was either observed in the
     /// measured trace or is justified in place.
     const ALLOWED: &[libc::c_long] = &[
-        // --- Threads. Thread-per-peer (Q5), so this is the busiest group.
+        // --- Threads. Thread-per-peer, so this is the busiest group.
         // `clone` as well as `clone3`: musl uses it, and glibc falls back to it
         // when `clone3` is unavailable — which, under a filter that denied it,
         // would be a daemon that cannot start a peer.
@@ -750,17 +739,6 @@ mod tests {
                 std::process::Command::new("/bin/true").status().is_err(),
                 "exec succeeded under the filter"
             );
-            // The property that made this worth changing: a syscall nobody
-            // enumerated is refused. `linkat` and `symlinkat` stand in for the
-            // whole class — ordinary calls, reachable from safe `std`, that the
-            // daemon has no business making — and `io_uring_setup` is denied by
-            // exactly the same mechanism and no other. That is the difference
-            // from a deny list, where each of the three had to be thought of
-            // first, and `io_uring` was not.
-            //
-            // `unsafe` is forbidden workspace-wide, so `io_uring_setup` cannot
-            // be called from here to be asserted on directly. It does not need
-            // to be: under an allowlist there is nothing special about it.
             let target = dir.join("blocks.bin");
             std::fs::write(&target, b"x").expect("a file to link to");
             assert!(

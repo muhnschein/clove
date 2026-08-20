@@ -122,10 +122,7 @@ struct PendingMagnet {
     magnet: Magnet,
     /// Set once a fetch thread owns this entry, so it is spawned once.
     claimed: bool,
-    /// What the fetch loop has managed so far. A magnet that never resolves
-    /// used to be indistinguishable from one that resolved a second ago —
-    /// both were the bare word `fetching-metadata` — which is no state at all
-    /// to debug from. Written by [`note_fetch_round`](Registry::note_fetch_round).
+    /// What the fetch loop has managed so far.
     progress: FetchProgress,
 }
 
@@ -410,9 +407,7 @@ impl Hosted {
             // SHA-1 in memory, which says nothing about whether the write
             // reached the platter; `verified` is the weaker, truer claim that
             // we fsynced the files and the piece was good as of then
-            // (`docs/STATE-FORMAT.md`). Copying `have` here is what let a
-            // crash — or a bad sector afterwards — come back as a torrent
-            // serving pieces nobody had checked.
+            // (`docs/STATE-FORMAT.md`).
             verified: self.verified.as_bytes().to_vec(),
             priorities: self.priorities.clone(),
             uploaded: self.uploaded,
@@ -827,7 +822,7 @@ where
     /// Take a torrent offline: unregister from the demux, snapshot its
     /// progress, and signal its swarm to stop (without blocking on in-flight
     /// dials). Peers already attached drain on their own; full disconnect
-    /// arrives with the peer-timeout work (R5).
+    /// arrives with the peer-timeout work.
     fn stop_live(&mut self, info_hash: &[u8; 20]) {
         let Some(hosted) = self.torrents.get_mut(info_hash) else {
             return;
@@ -856,16 +851,6 @@ where
         live.torrent.disconnect_all();
         // Graceful goodbye to the trackers, best-effort and detached — but
         // only when there is a working session to send it over.
-        //
-        // Without that condition this fires on every session teardown,
-        // including the ones caused by a wedged session (PROTOCOL.i2p-bt
-        // §2.12): each one spawns a detached thread holding a clone of the
-        // dead session and opening a fresh naming-lookup socket to the SAM
-        // bridge, for a goodbye that cannot be delivered. Measured live as a
-        // socket count against the bridge that climbed steadily for the life
-        // of a run — and a bridge at its connection ceiling refuses new
-        // streams, which is what wedges the session in the first place. The
-        // loop fed itself.
         if let Some(network) = &self.network
             && network.usable()
         {
@@ -1181,16 +1166,6 @@ where
     /// the normal path (persist, go live), and only then drop the pending entry
     /// and its URI file.
     ///
-    /// That order is the whole of it. Dropping the magnet first — which this
-    /// did — means a promotion that then fails to persist has destroyed the
-    /// recoverable state and registered nothing in its place: the magnet is
-    /// gone from memory and from disk, the torrent does not exist, and a
-    /// restart finds neither. A full disk or a refused rename at the wrong
-    /// moment was enough. Now the magnet survives a failed promotion and the
-    /// fetch can be retried; the worst case is a `.magnet` file for a torrent
-    /// that is already registered, which the next start resolves in favour of
-    /// the torrent.
-    ///
     /// # Errors
     ///
     /// [`AddError`] from the underlying [`add_torrent`](Registry::add_torrent),
@@ -1340,10 +1315,6 @@ where
 
     /// Publish the result of a [`ScanJob`]: adopt the have-set, persist it, and
     /// bring the torrent live if it should be. Returns the verified piece count.
-    ///
-    /// Re-validates on the way in, because the lock was released for the
-    /// duration: the torrent may have been removed, and a `scanned` error may be
-    /// exactly why (its files went with it).
     ///
     /// # Errors
     ///

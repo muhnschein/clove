@@ -21,7 +21,7 @@ use crate::wire::{BLOCK_LEN, BlockRequest};
 
 /// Default endgame trigger: once this few blocks remain unreceived across
 /// the whole torrent, allow duplicate in-flight requests. Config-tunable
-/// later (R5); a constant for now.
+/// later; a constant for now.
 pub const DEFAULT_ENDGAME_BLOCKS: u32 = 32;
 
 /// Piece-selection strategy.

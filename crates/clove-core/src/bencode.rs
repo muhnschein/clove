@@ -1,4 +1,4 @@
-//! Hand-rolled bencode codec (Q2, `docs/DECISIONS.md`).
+//! Hand-rolled bencode codec (`docs/DECISIONS.md`).
 //!
 //! Decodes .torrent metainfo and clove's own resume files, so it is written
 //! for hostile input: hard depth limit, strict integer and length syntax,

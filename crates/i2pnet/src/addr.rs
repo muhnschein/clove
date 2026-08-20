@@ -74,20 +74,7 @@ const CERT_HEADER: usize = 3;
 /// This exists because `SAMv3`'s `SESSION STATUS` reply does not carry the
 /// destination. It carries the session's **private key blob**, of which the
 /// public destination is merely the first 387-or-so bytes; the rest is the
-/// private crypto and signing keys. The distinction is invisible if you never
-/// look — both are one long base64 run — and clove did not look.
-///
-/// The cost of not looking, measured against a live tracker on 2026-07-27:
-///
-/// - Every announce sent our **private keys** to the tracker in the `ip`
-///   parameter. postman's tracker refused each one as "in violation of the
-///   site's policy", which was the correct and generous response.
-/// - Every `DestHash` we derived for ourselves — the identity printed at
-///   startup, published to peers over PEX, and dialled by the loopback tests
-///   — was the SHA-256 of the private blob rather than of the destination. It
-///   named nothing. A router asked to resolve it could only fail, which is
-///   what "leaseSet not found" had been telling us since the first live run,
-///   while we read it as a router's fault (`PROTOCOL.i2p-bt` §5.1c).
+/// private crypto and signing keys.
 ///
 /// The length is not fixed: the certificate's own header says how long its
 /// payload is, so a destination is `387 + payload` bytes. Anything shorter
@@ -376,11 +363,9 @@ mod tests {
     ///
     /// A `SAMv3` `SESSION STATUS DESTINATION=` field is the session's private
     /// key blob: the public destination, then the private crypto and signing
-    /// keys. Captured from i2pd on 2026-07-27 it was 679 bytes — 391 of
-    /// destination (a KEY certificate with a 4-byte payload) and 288 of key
-    /// material that must never leave the process.
+    /// keys.
     ///
-    /// Two things must hold, and neither did:
+    /// Two things must hold:
     ///   - our identity is the hash of the destination, not of the blob;
     ///   - what we publish is the destination, not the blob.
     #[test]
@@ -457,12 +442,10 @@ mod tests {
 mod hostile_tests {
     //! Adversarial coverage for the address parsers.
     //!
-    //! These are attacker-reachable and were outside every existing sweep:
-    //! `clove-core/tests/hostile.rs` only reaches parsers in `clove-core`,
-    //! and these live here. A b32 label arrives from a magnet link, a PEX
-    //! message or a manually supplied peer; a full base64 destination arrives
-    //! from a non-compact tracker response and from the router on every
-    //! inbound stream. All of it is bytes someone else chose.
+    //! These are attacker-reachable: A b32 label arrives from a magnet link, 
+    //! a PEX message or a manually supplied peer; a full base64 destination 
+    //! arrives from a non-compact tracker response and from the router on 
+    //! every inbound stream. All of it is bytes someone else chose.
     //!
     //! The contract is the same one the rest of the project holds parsers
     //! to: parse or return `None` — never panic, never loop, never accept

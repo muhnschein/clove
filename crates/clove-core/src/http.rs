@@ -1,4 +1,4 @@
-//! Minimal hand-rolled HTTP/1.1 (Q6, `docs/DECISIONS.md`).
+//! Minimal hand-rolled HTTP/1.1 (`docs/DECISIONS.md`).
 //!
 //! Just the subset clove needs, hostile-input hardened, both ends:
 //!
@@ -13,14 +13,7 @@
 //! Anything fancier is a parse error, not a silent guess.
 //!
 //! Response bodies arrive `Content-Length`-delimited, `chunked`, or
-//! close-delimited. Chunked was not supported until a live announce to
-//! a tracker failed on it: the reader fell through to
-//! read-until-close and handed the *chunk framing* to the bencode parser,
-//! which reported "not bencode" — an accurate description of `1a4\r\n…` and a
-//! useless one. Every announce failed identically, so the client acquired no
-//! peers at all. A tracker written in PHP behind an ordinary webserver
-//! chunks its output as a matter of course; declining to implement it was
-//! declining to talk to trackers.
+//! close-delimited.
 
 use std::io::{self, Read};
 

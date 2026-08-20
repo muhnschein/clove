@@ -2,7 +2,7 @@
 //!
 //! Loads config, opens the data dir, hosts the engine (a [`registry::Registry`]
 //! of live torrents over the SAM backend), and serves the local `/v1/` HTTP
-//! API (hand-rolled HTTP/1.1 + JSON, Q6) over a unix socket with token auth.
+//! API over a unix socket with token auth.
 //! The SAM session comes up in the background on the supervisor's backoff;
 //! until then torrents wait in "waiting-for-router". Once initialisation is
 //! done the daemon restricts itself (Landlock/seccomp, [`sandbox`]).
@@ -38,14 +38,6 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Fill `buf` with bytes from `getrandom(2)`.
-///
-/// Through `rustix`, already here for `openat` and the workspace's sanctioned
-/// way to reach a syscall std does not expose. It replaces the `getrandom`
-/// crate, which was a direct dependency for this one call.
-///
-/// The loop is what that crate was doing for us: `getrandom(2)` may return
-/// short — over 256 bytes, or on a signal — and a short read taken for success
-/// is a token with a tail of zeroes.
 fn random_bytes(buf: &mut [u8]) -> std::io::Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -124,25 +116,6 @@ fn confine(config: &Config) -> Result<sandbox::Verdict, String> {
     // thread and its descendants, not siblings that already exist.
     let paths: Vec<(&Path, sandbox::Role)> =
         vec![(config.data_dir.as_path(), sandbox::Role::State)];
-    // The control socket's directory is deliberately *not* here, and used to be.
-    //
-    // It was granted so the socket "could be unlinked at exit" — but nothing
-    // unlinks it: `ApiListener` has no `Drop`, and the stale socket is cleared by
-    // the *next* start's `bind_unix`, which runs long before this line. So the
-    // grant bought nothing, and it was not cheap: with `XDG_RUNTIME_DIR` set the
-    // directory is `/run/user/<uid>`, shared with every other application's
-    // runtime state, and the daemon held read, write, create and delete over all
-    // of it.
-    //
-    // If unlink-at-exit is ever added, this is what has to come back — as
-    // narrow rights on that one directory, not as everything.
-    //
-    // Nothing read-only either. `/dev/urandom` used to be listed, and it was pure
-    // self-reference: randomness comes from `getrandom(2)`, which needs no file,
-    // and the device is only a fallback for kernels before 3.17 — far below the
-    // 6.12 floor (SCOPE §0). A traced run puts it bluntly: the one and only
-    // `/dev/urandom` open in it is Landlock's own `O_PATH` open, made while adding
-    // the rule granting access to `/dev/urandom`.
     let verdict = sandbox::enter_post_init(&sandbox::Limits {
         paths: &paths,
         connect_tcp: sam_tcp_port(&config.sam_address),
@@ -204,11 +177,6 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    // `0700`, not the umask's opinion. The token and the destination key live
-    // here and are `0600` themselves, but a traversable directory is one
-    // `chmod` accident away from mattering, and nothing else needs to look
-    // inside it. Applied on an existing directory too: an install that was
-    // created before this, or by a permissive umask, is the case worth fixing.
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|e| format!("creating data dir {}: {e}", config.data_dir.display()))?;
     // Fatal, unlike the rest of this layer: the local filesystem refusing the
@@ -318,14 +286,6 @@ fn sam_tcp_port(sam_address: &str) -> Option<u16> {
 /// blob in `<data_dir>/destination.key` at `0600`. `ephemeral yes` in
 /// `clove.conf` turns this off and every start gets a fresh transient
 /// destination instead.
-///
-/// Why it matters beyond "nice to have a stable name": a destination that
-/// changes is a peer nobody can reach. Trackers hand our destination to other
-/// clients, PEX propagates it, and peers that dialled us hold it — all of which
-/// point at an identity that no longer exists the moment the session is
-/// rebuilt. With the session tree rebuilding on router loss, clove was
-/// announcing a *new* identity every time, seeding the swarm with dead
-/// destinations and guaranteeing the inbound half could never work.
 struct Identity {
     /// `None` under `ephemeral yes` — nothing is read and nothing is written.
     path: Option<PathBuf>,
@@ -408,13 +368,6 @@ const MIN_PRIVATE_KEY_BYTES: usize = 256 + 20;
 
 /// Whether `text` is a SAM private key blob: I2P base64 that decodes to a
 /// complete destination *plus* the private key material behind it.
-///
-/// A destination alone is a perfectly well-formed thing to find in this file and
-/// completely useless as a `DESTINATION=` — it is the public half, and a router
-/// cannot sign with it. So was "a destination and one byte", which is what this
-/// used to accept: any trailing byte at all passed, and the resulting blob was
-/// handed to `SESSION CREATE` on every attempt, refused every time, and retried
-/// for the life of the process.
 fn is_private_key_blob(text: &str) -> bool {
     let Some(bytes) = i2pnet::addr::i2p_base64_decode(text) else {
         return false;
@@ -486,14 +439,6 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str, identity: Ident
             *lock(&daemon.router) = "connected";
 
             // Phase 2: wait for the session to end.
-            //
-            // This used to be a 30-second `PING` probe, which was wrong twice
-            // over: it could not see a dead session for up to 90 seconds
-            // (end-of-file on the control connection read as success), and
-            // when it finally did, it had thrown away everything the router
-            // had said about why. The session now watches its own control
-            // connection, so this returns the moment the router hangs up and
-            // returns its account of it (`PROTOCOL.i2p-bt` §2.13).
             let reason = session.wait_until_lost();
 
             // Phase 3: teardown, then rebuild from phase 1.
@@ -509,7 +454,7 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str, identity: Ident
 
 /// One session bring-up: connect and establish the forwarded listener.
 ///
-/// `key` is the persisted identity when there is one (Q4); `None` asks the
+/// `key` is the persisted identity when there is one; `None` asks the
 /// router for a fresh transient destination, whose key the caller then stores.
 fn connect_session(
     port: u16,
@@ -1551,10 +1496,7 @@ mod tests {
         ] {
             assert_eq!(status_of(&speak(&d, &get(bad, Some(TOKEN)))), 400, "{bad}");
         }
-        // Absent is 404 whether it was named in full or by a prefix. The
-        // 38-character case used to be here as a malformed hash and is now a
-        // well-formed prefix that happens to match nothing — the same answer a
-        // full hash gets, which is the point of accepting prefixes at all.
+        // Absent is 404 whether it was named in full or by a prefix.
         for absent in [
             "/v1/torrents/0123456789abcdef0123456789abcdef01234567", // full, unknown
             "/v1/torrents/0123456789abcdef0123456789abcdef012345",   // 38-char prefix
@@ -1881,8 +1823,6 @@ mod tests {
             a, b,
             "two peer ids were identical: the random tail is not random"
         );
-        // The old fallback shipped this when getrandom failed; every instance
-        // that hit it would announce under one identity.
         assert_ne!(a, *b"-CV0001-............");
     }
 
