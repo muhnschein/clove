@@ -1,39 +1,21 @@
 //! Making somebody else's text safe to put in front of a person.
 //!
-//! Almost every string clove displays came from a stranger. None of it is 
-//! trusted, and all of
-//! it ends up somewhere a person reads, including a terminal. A terminal is an
-//! interpreter. Solution:
-//!
-//! **Scrub at the boundary, not at the source.** The stored name is the
-//! torrent's actual name and the API's JSON has to keep it — `json::write_string`
-//! escapes everything below `0x20`, so a `--json` consumer is inert and correct.
-//! Sanitising in the daemon's model would misreport what the torrent is called.
-//! So the substitution happens at each point where bytes become some
-//! interpreter's input, and this module exists so that all of those points do it
-//! the same way. Three separate implementations of this had already drifted:
-//! two replacement characters between them, one of them missing the
-//! bidirectional overrides entirely, and two output paths in the CLI that
-//! reached the terminal without passing through any of them.
+//! Almost every string clove displays came from a stranger, and a terminal is
+//! an interpreter. Scrubbing happens where bytes become some interpreter's
+//! input, not at the source: the stored name is the torrent's actual name, and
+//! `json::write_string` already escapes it for `--json` consumers. This module
+//! exists so every one of those points scrubs the same way.
 
 /// Replace every character that a terminal would act on rather than draw.
 ///
-/// Two families go, both to `.`:
+/// Two families go, both to `.`: the `Cc` category (C0, `DEL`, C1 — escape
+/// sequences, carriage returns, newlines), and the bidi overrides and
+/// isolates, which draw nothing and reorder the text *around* them, so
+/// `…rat.exe` can render as `…exe.tar`. Everything else passes through;
+/// deciding what alphabets a torrent may be named in is not our business.
 ///
-/// - the `Cc` category — C0, `DEL` and C1 — which is where the escape sequences,
-///   the carriage returns and the newlines live; and
-/// - the bidirectional overrides and isolates, which draw nothing themselves and
-///   reorder the text *around* them, so `…rat.exe` can be made to render as
-///   `…exe.tar` in the very listing an operator is reading to decide what to
-///   trust.
-///
-/// Everything else passes through, including the non-ASCII that makes column
-/// alignment approximate: the alternative is deciding what alphabets a torrent
-/// may be named in, which is not this function's business.
-///
-/// Replaced rather than removed, so the text still reads as having had something
-/// there. A name that silently loses characters is a name an operator cannot
-/// match against what they were expecting.
+/// Replaced rather than removed: a name that silently loses characters is one
+/// an operator cannot match against what they expected.
 #[must_use]
 pub fn scrub(text: &str) -> String {
     text.chars().map(scrub_char).collect()
@@ -42,9 +24,8 @@ pub fn scrub(text: &str) -> String {
 /// [`scrub`], and no more than `max_chars` characters of it — with a `…` when
 /// something was cut.
 ///
-/// The bound is the half that matters for anything a *remote* party sizes. A
-/// tracker does not get to decide how much of an operator's log it occupies, and
-/// a 10 000-character `failure reason` is not a diagnosis.
+/// The bound matters for anything a *remote* party sizes: a tracker does not
+/// get to decide how much of an operator's log it occupies.
 #[must_use]
 pub fn scrub_bounded(text: &str, max_chars: usize) -> String {
     let mut out: String = text.chars().take(max_chars).map(scrub_char).collect();
@@ -108,12 +89,10 @@ mod tests {
     #[test]
     fn bounded_truncates_and_says_so() {
         assert_eq!(scrub_bounded("short", 10), "short");
-        // Exactly at the bound is not truncated, so no ellipsis is added.
+        // Exactly at the bound is not truncated, so no ellipsis.
         assert_eq!(scrub_bounded("abcde", 5), "abcde");
         assert_eq!(scrub_bounded("abcdef", 5), "abcde…");
-        // The bound counts characters, not bytes: a multi-byte string must not
-        // be cut mid-character (which would panic on a byte slice) nor counted
-        // as longer than it reads.
+        // Characters, not bytes: cutting mid-character would panic on a slice.
         let wide = "é".repeat(10);
         assert_eq!(scrub_bounded(&wide, 10), wide);
         assert_eq!(scrub_bounded(&wide, 4), "ééét…".replace('t', "é"));

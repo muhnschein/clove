@@ -442,9 +442,9 @@ mod tests {
 mod hostile_tests {
     //! Adversarial coverage for the address parsers.
     //!
-    //! These are attacker-reachable: A b32 label arrives from a magnet link, 
-    //! a PEX message or a manually supplied peer; a full base64 destination 
-    //! arrives from a non-compact tracker response and from the router on 
+    //! These are attacker-reachable: A b32 label arrives from a magnet link,
+    //! a PEX message or a manually supplied peer; a full base64 destination
+    //! arrives from a non-compact tracker response and from the router on
     //! every inbound stream. All of it is bytes someone else chose.
     //!
     //! The contract is the same one the rest of the project holds parsers
