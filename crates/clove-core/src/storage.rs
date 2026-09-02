@@ -63,6 +63,8 @@ impl Storage {
             // symlinked component is refused by the kernel rather than by a
             // check that could be stale by the time we act on it.
             let file = open_beneath(root, &entry.path)?;
+            // (A lexically unsafe component is refused inside the walk as
+            // well, so this layer does not depend on `metainfo` having run.)
             if preallocate && entry.length > 0 {
                 claim_blocks(&file, entry.length, &entry.path)?;
             }
@@ -286,7 +288,8 @@ impl Storage {
 }
 
 /// Walk `components` beneath `root` as directory descriptors, refusing to
-/// traverse a symbolic link at any level, and creating missing directories.
+/// traverse a symbolic link at any level, and — with `create` — making the
+/// directories that are missing.
 ///
 /// Returns the descriptor of the directory holding the last component, and the
 /// last component itself.
@@ -308,16 +311,26 @@ impl Storage {
 /// leaves a window between the two in which the component can become a link, and
 /// closing that window is the whole reason `openat` exists.
 ///
-/// Landlock stops the escape too where it is available, but `docs/SCOPE.md` §9 is
-/// explicit that no layer may assume another is present.
+/// The lexical rules are checked here as well, not only in `metainfo`. A `..`
+/// handed to `openat` walks up like any other name, so this module's safety was
+/// entirely another module's promise — and `docs/SCOPE.md` §9 is explicit that
+/// no layer may assume another is present, which is also why Landlock stopping
+/// the same escape where it is available changes nothing here.
+///
+/// Without `create`, a layout that is not there is reported as [`NotFound`]
+/// rather than built: deletion must not leave behind the directory tree of a
+/// torrent that never wrote a byte.
+///
+/// [`NotFound`]: io::ErrorKind::NotFound
 ///
 /// # Errors
 ///
-/// A component that is a symbolic link or is not a directory, and any
-/// filesystem error opening or creating one.
+/// A component that is lexically unsafe, a symbolic link, or not a directory,
+/// and any filesystem error opening or creating one.
 fn walk_beneath<'a>(
     root: &Path,
     components: &'a [String],
+    create: bool,
 ) -> io::Result<(rustix::fd::OwnedFd, &'a str)> {
     use rustix::fs::{CWD, Mode, OFlags, mkdirat, openat};
 
@@ -327,11 +340,16 @@ fn walk_beneath<'a>(
             "a file entry with no path components",
         ));
     };
+    for component in components {
+        check_component(component)?;
+    }
 
     // The root is the configured download directory, not anything a torrent
     // named, so it is created the ordinary way. Everything below it is
     // attacker-influenced and gets the careful treatment.
-    std::fs::create_dir_all(root)?;
+    if create {
+        std::fs::create_dir_all(root)?;
+    }
     let mut dir = openat(
         CWD,
         root,
@@ -340,11 +358,13 @@ fn walk_beneath<'a>(
     )?;
 
     for component in parents {
-        match mkdirat(&dir, component.as_str(), Mode::from_bits_truncate(0o755)) {
-            // Already there is the ordinary case; whether it is usable is the
-            // next line's question, and it asks the kernel.
-            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-            Err(e) => return Err(refused(component, e)),
+        if create {
+            match mkdirat(&dir, component.as_str(), Mode::from_bits_truncate(0o755)) {
+                // Already there is the ordinary case; whether it is usable
+                // is the next line's question, and it asks the kernel.
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(e) => return Err(refused(component, e)),
+            }
         }
         dir = openat(
             &dir,
@@ -355,6 +375,25 @@ fn walk_beneath<'a>(
         .map_err(|e| refused(component, e))?;
     }
     Ok((dir, last.as_str()))
+}
+
+/// A path component usable under the download root: nonempty, no separators,
+/// not `.`/`..`, no NUL — the same rule `metainfo` applies, stated again here
+/// because this is the layer that hands the name to the kernel.
+fn check_component(component: &str) -> io::Result<()> {
+    let bad = component.is_empty()
+        || component == "."
+        || component == ".."
+        || component.contains('/')
+        || component.contains('\\')
+        || component.contains('\0');
+    if bad {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: unsafe path component", crate::text::scrub(component)),
+        ));
+    }
+    Ok(())
 }
 
 /// Turn the errno a refused component produces into something an operator can
@@ -388,7 +427,7 @@ fn refused(component: &str, e: rustix::io::Errno) -> io::Error {
 fn open_beneath(root: &Path, components: &[String]) -> io::Result<File> {
     use rustix::fs::{Mode, OFlags, openat};
 
-    let (dir, last) = walk_beneath(root, components)?;
+    let (dir, last) = walk_beneath(root, components, true)?;
     // `O_NOFOLLOW` here is what stops the *file* itself being a link to
     // somewhere else — the last component is the one that gets the bytes.
     let fd = openat(
@@ -433,7 +472,8 @@ fn claim_blocks(file: &File, length: u64, components: &[String]) -> io::Result<(
 ///
 /// Deleting through a symbolic link is the same escape pointed the other way,
 /// and takes somebody else's file with it. Absent is success: there is nothing
-/// to delete.
+/// to delete — and nothing is created on the way to finding that out, so
+/// removing a torrent that never started leaves no directory tree behind.
 ///
 /// # Errors
 ///
@@ -443,7 +483,7 @@ fn claim_blocks(file: &File, length: u64, components: &[String]) -> io::Result<(
 pub fn remove_beneath(root: &Path, components: &[String]) -> io::Result<()> {
     use rustix::fs::{AtFlags, unlinkat};
 
-    let (dir, last) = match walk_beneath(root, components) {
+    let (dir, last) = match walk_beneath(root, components, false) {
         Ok(pair) => pair,
         // Nothing laid out beneath the root at all: nothing to remove.
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -897,6 +937,73 @@ mod tests {
         // the new-file branch.
         let again = Storage::create(&meta, &dir.0, false).expect("reopen");
         assert!(again.verify_all().unwrap().has(0));
+    }
+
+    /// `metainfo` refuses these before a torrent is ever hosted, and for a
+    /// long time that was the only thing between a `..` and `openat`, which
+    /// walks up on it like any other name. Storage refuses them itself now,
+    /// so a caller that skipped `metainfo` — or a future one that reads
+    /// paths from somewhere else — cannot write or delete outside the root.
+    #[test]
+    fn lexically_unsafe_components_are_refused_without_metainfo() {
+        let dir = TempDir::new();
+        let root = dir.0.join("downloads");
+        std::fs::create_dir_all(&root).unwrap();
+        // What `..` would reach.
+        let victim = dir.0.join("victim.bin");
+        std::fs::write(&victim, b"keep").unwrap();
+
+        let bad: [Vec<String>; 6] = [
+            vec!["..".into(), "victim.bin".into()],
+            vec!["demo".into(), "..".into(), "..".into(), "victim.bin".into()],
+            vec![".".into(), "x.bin".into()],
+            vec!["a/b".into(), "x.bin".into()],
+            vec![String::new(), "x.bin".into()],
+            vec!["demo".into(), "x\0y".into()],
+        ];
+        for path in &bad {
+            let meta = meta_for(
+                vec![FileEntry {
+                    path: path.clone(),
+                    length: 4,
+                }],
+                16,
+                b"keep",
+            );
+            let Err(err) = Storage::create(&meta, &root, false) else {
+                panic!("{path:?} was opened");
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{path:?}: {err}");
+            let err = remove_beneath(&root, path).expect_err("deleting through it");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{path:?}: {err}");
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert!(
+            !dir.0.join("x.bin").exists() && !root.join("x.bin").exists(),
+            "a file was created through a refused component"
+        );
+    }
+
+    /// Removing a torrent that never wrote a byte must not build its
+    /// directory tree on the way to finding there is nothing to remove.
+    #[test]
+    fn remove_beneath_creates_nothing() {
+        let dir = TempDir::new();
+        let root = dir.0.join("downloads");
+        let path: Vec<String> = vec!["demo".into(), "deep".into(), "a.bin".into()];
+
+        // No root at all: still not an error, and still no root afterwards.
+        remove_beneath(&root, &path).expect("absent is success");
+        assert!(!root.exists(), "the download root was created by a removal");
+
+        // A root with nothing of this torrent in it.
+        std::fs::create_dir_all(&root).unwrap();
+        remove_beneath(&root, &path).expect("absent is success");
+        assert!(
+            !root.join("demo").exists(),
+            "a removal created the directory it was asked to delete from"
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
 
     /// Deletion refuses the same links, and treats absence as success.
