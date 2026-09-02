@@ -8,14 +8,21 @@
 
 /// Replace every character that a terminal would act on rather than draw.
 ///
-/// Two families go, both to `.`: the `Cc` category (C0, `DEL`, C1 — escape
-/// sequences, carriage returns, newlines), and the bidi overrides and
-/// isolates, which draw nothing and reorder the text *around* them, so
-/// `…rat.exe` can render as `…exe.tar`. Everything else passes through;
-/// deciding what alphabets a torrent may be named in is not our business.
+/// Three families go, all to `.`: the `Cc` category (C0, `DEL`, C1 — escape
+/// sequences, carriage returns, newlines); the bidi overrides and isolates,
+/// which draw nothing and reorder the text *around* them, so `…rat.exe` can
+/// render as `…exe.tar`; and the rest of the format characters (`Cf`) with the
+/// line and paragraph separators — zero-width spaces and joiners, the soft
+/// hyphen, the byte-order mark, tag characters, variation selectors — which
+/// draw nothing at all, so `safe\u{200b}.exe` looks like `safe.exe` and cannot
+/// be matched by typing it. Everything else passes through; deciding what
+/// alphabets a torrent may be named in is not our business.
 ///
 /// Replaced rather than removed: a name that silently loses characters is one
 /// an operator cannot match against what they expected.
+///
+/// `i2pnet` has a twin of this for router text, and a test there pins the two
+/// to the same table.
 #[must_use]
 pub fn scrub(text: &str) -> String {
     text.chars().map(scrub_char).collect()
@@ -39,8 +46,27 @@ pub fn scrub_bounded(text: &str, max_chars: usize) -> String {
 fn scrub_char(c: char) -> char {
     match c {
         c if c.is_control() => '.',
-        // LRM/RLM, the LRE/RLE/PDF/LRO/RLO run, and the isolates.
-        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '.',
+        // The format characters that matter in a name, spelled out rather
+        // than asked of a Unicode table clove does not carry: soft hyphen,
+        // Arabic letter mark, Mongolian vowel separator, the zero-width
+        // spaces and joiners with LRM/RLM, the line and paragraph
+        // separators, the LRE/RLE/PDF/LRO/RLO run, word joiner and the
+        // invisible operators, the isolates and the deprecated formatting
+        // controls, the variation selectors, the byte-order mark, the
+        // interlinear annotation marks, and the tag characters.
+        '\u{ad}'
+        | '\u{61c}'
+        | '\u{180e}'
+        | '\u{200b}'..='\u{200f}'
+        | '\u{2028}'
+        | '\u{2029}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206f}'
+        | '\u{fe00}'..='\u{fe0f}'
+        | '\u{feff}'
+        | '\u{fff9}'..='\u{fffb}'
+        | '\u{e0000}'..='\u{e007f}' => '.',
         c => c,
     }
 }
@@ -69,6 +95,62 @@ mod tests {
             '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
         ] {
             assert_eq!(scrub(&c.to_string()), ".", "{c:?} survived");
+        }
+    }
+
+    /// The invisible characters: each draws nothing, so a name carrying one
+    /// looks like a name that does not and cannot be matched by typing it.
+    #[test]
+    fn format_characters_go() {
+        assert_eq!(scrub("safe\u{200b}.exe"), "safe..exe");
+        assert_eq!(scrub("\u{feff}name"), ".name");
+        let ranges: [(u32, u32); 13] = [
+            (0xad, 0xad),
+            (0x61c, 0x61c),
+            (0x180e, 0x180e),
+            (0x200b, 0x200f),
+            (0x2028, 0x2029),
+            (0x202a, 0x202e),
+            (0x2060, 0x2064),
+            (0x2066, 0x206f),
+            (0xfe00, 0xfe0f),
+            (0xfeff, 0xfeff),
+            (0xfff9, 0xfffb),
+            (0xe0000, 0xe007f),
+            // Kept from the bidi test above, so the table here is complete.
+            (0x200e, 0x200f),
+        ];
+        for (lo, hi) in ranges {
+            for code in lo..=hi {
+                let c = char::from_u32(code).unwrap();
+                assert_eq!(scrub(&c.to_string()), ".", "U+{code:04X} survived");
+            }
+        }
+        // The neighbours on either side of each range are drawn characters
+        // and stay: the table has to be exactly the invisible ones.
+        for c in [
+            '\u{ac}',
+            '\u{ae}',
+            '\u{61b}',
+            '\u{61d}',
+            '\u{180d}',
+            '\u{180f}',
+            '\u{200a}',
+            '\u{2010}',
+            '\u{2027}',
+            '\u{202f}',
+            '\u{205f}',
+            '\u{2065}',
+            '\u{2070}',
+            '\u{fdff}',
+            '\u{fe10}',
+            '\u{fefe}',
+            '\u{ff00}',
+            '\u{fff8}',
+            '\u{fffc}',
+            '\u{e0080}',
+        ] {
+            assert_eq!(scrub(&c.to_string()), c.to_string(), "{c:?} was scrubbed");
         }
     }
 
