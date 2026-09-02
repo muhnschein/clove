@@ -6,6 +6,7 @@
 .Nd control an I2P-only BitTorrent daemon
 .Sh SYNOPSIS
 .Nm
+.Op Fl c Ar file
 .Op Fl -socket Ar path
 .Ar command
 .Op Ar arguments
@@ -77,6 +78,27 @@ rather than removing them.
 .Pp
 The options are as follows:
 .Bl -tag -width Ds
+.It Fl c , Fl -config Ar file
+Read configuration from
+.Ar file
+instead of the default path, the same rule
+.Xr cloved 8
+follows: a file named here must exist, and the socket path and the token
+directory come from it.
+.Pp
+A daemon run from the system unit in
+.Pa contrib/systemd
+reads
+.Pa /etc/clove/clove.conf ,
+which is not where
+.Nm
+looks by default, and keeps its token in
+.Pa /var/lib/clove
+where only root can read it.
+Every command against that daemon therefore names the file, as root:
+.Bd -literal -offset indent
+# clove -c /etc/clove/clove.conf status
+.Ed
 .It Fl -socket Ar path
 Talk to the daemon listening on
 .Ar path
