@@ -139,6 +139,17 @@ pub const MAX_CONNECTIONS_PER_DEST: usize = 2;
 /// (`docs/PROTOCOL.i2p-bt` §4.8).
 pub const SUSPICION_LIMIT: u32 = 3;
 
+/// Metadata pieces one peer may ask for per maintenance tick before the
+/// rest are rejected.
+///
+/// Serving a piece is 16 KiB out for a 30-byte frame in, and nothing else
+/// bounds how often a peer may ask: memory is safe (the outgoing queue is
+/// bounded) but the amplification is not. A real fetch asks for each piece
+/// once, so a whole 1 MiB info dictionary fits in one tick's allowance.
+/// A minimal counter for now; the `metadata` module is growing a proper
+/// request budget that this should hand over to.
+pub const MAX_METADATA_REQUESTS_PER_TICK: u32 = 64;
+
 /// Outgoing message queue depth per peer before the writer applies
 /// backpressure. Bounded — no unbounded channels in the engine (SCOPE §4).
 /// Deep enough that no honest peer reaches it, so a queue this full means the
@@ -472,6 +483,9 @@ struct Peer {
     pex_id: Option<u8>,
     /// The message id the peer listens on for `ut_metadata`.
     metadata_id: Option<u8>,
+    /// Metadata pieces asked for since the last maintenance tick, against
+    /// [`MAX_METADATA_REQUESTS_PER_TICK`].
+    metadata_requests: u32,
 }
 
 /// A running maintenance tick (see [`Torrent::spawn_maintenance`]). Dropping
@@ -1348,6 +1362,7 @@ impl Shared {
             downloaded_at_round: 0,
             pex_id: None,
             metadata_id: None,
+            metadata_requests: 0,
         });
         Ok(id)
     }
@@ -1365,7 +1380,7 @@ impl Shared {
         extension::Handshake {
             ids,
             metadata_size,
-            client: Some("clove/0.1".to_owned()),
+            client: Some(crate::tracker::USER_AGENT.to_owned()),
         }
         .encode()
     }
@@ -1437,6 +1452,10 @@ impl Shared {
             let mut st = lock(&self.state);
             let now = Instant::now();
             let (keepalive, timeout) = (st.keepalive_interval, st.idle_timeout);
+            for peer in &mut st.peers {
+                // A fresh metadata allowance per tick.
+                peer.metadata_requests = 0;
+            }
             for peer in &st.peers {
                 if now.duration_since(peer.last_seen) >= timeout {
                     idle.push(peer.id);
@@ -1686,17 +1705,26 @@ impl Shared {
         let Some(metadata_id) = st.peers[idx].metadata_id else {
             return;
         };
+        let peer = &mut st.peers[idx];
+        let allowed = peer.metadata_requests < MAX_METADATA_REQUESTS_PER_TICK;
+        peer.metadata_requests = peer.metadata_requests.saturating_add(1);
         let total = self.raw_info.len();
-        let start = piece as usize * METADATA_PIECE_LEN;
-        let reply = if self.raw_info.is_empty() || start >= total {
-            MetadataMessage::Reject { piece }
-        } else {
-            let end = (start + METADATA_PIECE_LEN).min(total);
-            MetadataMessage::Data {
-                piece,
-                total_size: u32::try_from(total).unwrap_or(u32::MAX),
-                data: self.raw_info[start..end].to_vec(),
+        // `checked_mul`: the index is the peer's, and on a 32-bit target the
+        // product wraps into a range that reads as valid.
+        let start = usize::try_from(piece)
+            .ok()
+            .and_then(|p| p.checked_mul(METADATA_PIECE_LEN))
+            .filter(|&start| allowed && start < total);
+        let reply = match start {
+            Some(start) => {
+                let end = start.saturating_add(METADATA_PIECE_LEN).min(total);
+                MetadataMessage::Data {
+                    piece,
+                    total_size: u32::try_from(total).unwrap_or(u32::MAX),
+                    data: self.raw_info[start..end].to_vec(),
+                }
             }
+            None => MetadataMessage::Reject { piece },
         };
         out.push((
             st.peers[idx].id,
@@ -2143,7 +2171,7 @@ pub fn fetch_metadata<S: I2pStream>(
     let our_ext = extension::Handshake {
         ids,
         metadata_size: None,
-        client: Some("clove/0.1".to_owned()),
+        client: Some(crate::tracker::USER_AGENT.to_owned()),
     };
     wire::write_message(
         &mut stream,
@@ -2209,7 +2237,7 @@ pub fn fetch_metadata<S: I2pStream>(
 mod tests {
     use super::*;
     use crate::metainfo::{FileEntry, InfoHash};
-    use i2pnet::mock::MockNet;
+    use i2pnet::mock::{MockNet, MockStream};
     use i2pnet::{I2pDialer, I2pListener};
     use sha1::{Digest, Sha1};
     use std::io::{Read as _, Write as _};
@@ -2688,6 +2716,180 @@ mod tests {
             0,
             "A learned nothing over PEX; its peers came from add_peers and \
              from the connection"
+        );
+    }
+
+    /// A raw peer speaking BEP 10 to `server`: dialled, handshaken, and with
+    /// `ut_metadata` advertised on id 3. Returns the stream, bounded reads
+    /// set, and the extension handshake clove sent back.
+    fn metadata_peer(net: &MockNet, server: &Arc<Torrent>) -> (MockStream, extension::Handshake) {
+        let ep = net.endpoint();
+        let dest = ep.dest();
+        let accepting = Arc::clone(server);
+        std::thread::spawn(move || {
+            if let Ok((stream, from)) = ep.accept() {
+                let _ = accepting.attach(stream, from);
+            }
+        });
+        let mut peer = net
+            .endpoint()
+            .dialer()
+            .dial(dest, Duration::from_secs(5))
+            .unwrap();
+        let ours = Handshake {
+            info_hash: server.info_hash(),
+            peer_id: *b"-XX0000-metametameta",
+            extensions: Extensions {
+                extended: true,
+                fast: false,
+            },
+        };
+        peer.write_all(&ours.encode()).unwrap();
+        let mut buf = [0u8; wire::HANDSHAKE_LEN];
+        peer.read_exact(&mut buf).unwrap();
+        let mut ids = std::collections::BTreeMap::new();
+        ids.insert(UT_METADATA.to_owned(), 3u8);
+        let hs = extension::Handshake {
+            ids,
+            metadata_size: None,
+            client: None,
+        };
+        wire::write_message(
+            &mut peer,
+            &Message::Extended {
+                id: 0,
+                payload: hs.encode(),
+            },
+        )
+        .unwrap();
+        peer.set_timeouts(Some(Duration::from_secs(2)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let theirs = loop {
+            assert!(Instant::now() < deadline, "no extension handshake arrived");
+            let Ok(body) = wire::read_frame(&mut peer, 1 << 20) else {
+                continue;
+            };
+            if let Ok(Message::Extended { id: 0, payload }) = Message::parse(&body) {
+                break extension::Handshake::parse(&payload).unwrap();
+            }
+        };
+        (peer, theirs)
+    }
+
+    /// The `ut_metadata` replies to `want` requests, in order.
+    fn metadata_replies(peer: &mut MockStream, want: usize) -> Vec<MetadataMessage> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut replies = Vec::new();
+        while replies.len() < want {
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {want} metadata replies arrived",
+                replies.len()
+            );
+            let Ok(body) = wire::read_frame(peer, 1 << 20) else {
+                continue;
+            };
+            if let Ok(Message::Extended { id: 3, payload }) = Message::parse(&body) {
+                replies.push(MetadataMessage::parse(&payload).unwrap());
+            }
+        }
+        replies
+    }
+
+    /// A metadata request costs the peer thirty bytes and us sixteen
+    /// kilobytes, and nothing bounded how often one peer could ask. Past the
+    /// per-tick allowance the rest are rejected until the next tick.
+    #[test]
+    fn metadata_requests_past_the_allowance_are_rejected() {
+        let net = MockNet::new();
+        let meta = real_meta(&[7u8; 100]);
+        let dir = TempDir::new("meta-budget");
+        let server = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(1),
+            Mode::RarestFirst,
+            *b"-CV0001-budgetbudget",
+        );
+        let (mut peer, _hs) = metadata_peer(&net, &server);
+        let asks = MAX_METADATA_REQUESTS_PER_TICK as usize + 20;
+        for _ in 0..asks {
+            wire::write_message(
+                &mut peer,
+                &Message::Extended {
+                    id: OUR_METADATA_ID,
+                    payload: MetadataMessage::Request { piece: 0 }.encode(),
+                },
+            )
+            .unwrap();
+        }
+        let replies = metadata_replies(&mut peer, asks);
+        let pieces_served = replies
+            .iter()
+            .filter(|r| matches!(r, MetadataMessage::Data { .. }))
+            .count();
+        assert_eq!(
+            pieces_served, MAX_METADATA_REQUESTS_PER_TICK as usize,
+            "served {pieces_served} pieces to one peer in one tick"
+        );
+        assert!(
+            replies[pieces_served..]
+                .iter()
+                .all(|r| matches!(r, MetadataMessage::Reject { .. })),
+            "requests past the allowance were not rejected"
+        );
+    }
+
+    /// A piece index that overflows `index * METADATA_PIECE_LEN` on a 32-bit
+    /// target is rejected rather than multiplied. Panic-free on every target,
+    /// which is what this asserts; the wrap it prevents needs a 32-bit
+    /// `usize` to show.
+    #[test]
+    fn an_absurd_metadata_piece_index_is_rejected() {
+        let net = MockNet::new();
+        let meta = real_meta(&[7u8; 100]);
+        let dir = TempDir::new("meta-absurd");
+        let server = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(1),
+            Mode::RarestFirst,
+            *b"-CV0001-absurdabsurd",
+        );
+        let (mut peer, _hs) = metadata_peer(&net, &server);
+        wire::write_message(
+            &mut peer,
+            &Message::Extended {
+                id: OUR_METADATA_ID,
+                payload: MetadataMessage::Request { piece: u32::MAX }.encode(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata_replies(&mut peer, 1),
+            vec![MetadataMessage::Reject { piece: u32::MAX }]
+        );
+    }
+
+    /// The client name in the extension handshake is the release, the same
+    /// string the tracker sees — not a version nothing else knows about.
+    #[test]
+    fn the_extension_handshake_names_the_release() {
+        let net = MockNet::new();
+        let meta = real_meta(&[7u8; 100]);
+        let dir = TempDir::new("meta-client");
+        let server = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(1),
+            Mode::RarestFirst,
+            *b"-CV0001-clientclient",
+        );
+        let (_peer, hs) = metadata_peer(&net, &server);
+        assert_eq!(hs.client.as_deref(), Some(crate::tracker::USER_AGENT));
+        assert_eq!(
+            hs.client.as_deref(),
+            Some(format!("clove/{}", crate::VERSION).as_str())
         );
     }
 
