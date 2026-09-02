@@ -173,10 +173,19 @@ fn sam_hello(port: u16, timeout: Duration, what: &str) -> io::Result<(TcpStream,
     // inside it could hold this open indefinitely. Bound the exchange too.
     let deadline = Instant::now() + timeout;
     let reply = read_sam_line(&mut stream, port, MAX_HELLO_LINE, Some(deadline), what)?;
-    if !reply.starts_with("HELLO REPLY") || !reply.contains("RESULT=OK") {
+    // The result is a field, not a substring: a refusal whose MESSAGE quotes
+    // `RESULT=OK` is still a refusal. And the line reaches a terminal.
+    let result = reply
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("RESULT="))
+        .unwrap_or("MISSING");
+    if !reply.starts_with("HELLO REPLY") || result != "OK" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("SAM bridge on 127.0.0.1:{port} refused HELLO: {reply}"),
+            format!(
+                "SAM bridge on 127.0.0.1:{port} refused HELLO: {}",
+                scrub_control_line(&reply)
+            ),
         ));
     }
     Ok((stream, reply))
@@ -295,7 +304,10 @@ fn expect_stream_ok(status: &str, what: &str) -> Result<(), DialFailed> {
     if !status.starts_with("STREAM STATUS") {
         return Err(DialFailed::Peer(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("SAM bridge answered with {status:?} where a STREAM STATUS belongs"),
+            format!(
+                "SAM bridge answered with {:?} where a STREAM STATUS belongs",
+                scrub_control_line(status)
+            ),
         )));
     }
     let result = status
@@ -303,13 +315,17 @@ fn expect_stream_ok(status: &str, what: &str) -> Result<(), DialFailed> {
         .find_map(|f| f.strip_prefix("RESULT="))
         .unwrap_or("MISSING");
     if result != "OK" {
+        // The router's words reach a terminal, so they are scrubbed like every
+        // other control line. `MESSAGE=` runs to the end of the line and is
+        // scrubbed as one, rather than trusted to be only a message.
         let error = io::Error::new(
             io::ErrorKind::ConnectionRefused,
             format!(
-                "router refused {what}: {result}{}",
+                "router refused {what}: {}{}",
+                result.chars().map(scrub_char).collect::<String>(),
                 status
                     .split_once("MESSAGE=")
-                    .map(|(_, m)| format!(" ({})", m.trim_matches('"')))
+                    .map(|(_, m)| format!(" ({})", scrub_control_line(m.trim_matches('"'))))
                     .unwrap_or_default()
             ),
         );
@@ -1323,9 +1339,13 @@ fn parse_naming_reply<'a>(reply: &'a str, name: &str) -> io::Result<&'a str> {
         .find_map(|f| f.strip_prefix("RESULT="))
         .unwrap_or("MISSING");
     if result != "OK" {
+        // The result word is the router's text too, and reaches a terminal.
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("router could not resolve {asked}: {result}"),
+            format!(
+                "router could not resolve {asked}: {}",
+                result.chars().map(scrub_char).collect::<String>()
+            ),
         ));
     }
     reply
@@ -1622,6 +1642,10 @@ mod hostile_bridge_tests {
         Flood,
         /// A well-formed refusal.
         RefuseHello,
+        /// A refusal whose `MESSAGE` quotes `RESULT=OK`, with a terminal
+        /// escape for company: a substring match reads it as acceptance, and
+        /// an unscrubbed error repeats the escape.
+        ForgeOk,
         /// A single byte every so often: inside any per-read timeout, but
         /// never finishing. Only a whole-exchange deadline stops this.
         Dribble,
@@ -1654,6 +1678,11 @@ mod hostile_bridge_tests {
                         }
                         Misbehaviour::RefuseHello => {
                             let _ = sock.write_all(b"HELLO REPLY RESULT=NOVERSION\n");
+                        }
+                        Misbehaviour::ForgeOk => {
+                            let _ = sock.write_all(
+                                b"HELLO REPLY RESULT=NOVERSION MESSAGE=\"RESULT=OK\x1b[2J\"\n",
+                            );
                         }
                         Misbehaviour::Dribble => loop {
                             if sock.write_all(b"X").is_err() {
@@ -1719,6 +1748,7 @@ mod hostile_bridge_tests {
             Misbehaviour::Flood,
             Misbehaviour::RefuseHello,
             Misbehaviour::Dribble,
+            Misbehaviour::ForgeOk,
         ] {
             let port = fake_bridge(how);
             let Some((result, elapsed)) = within(LIMIT, move || hello_version(port, PROBE)) else {
@@ -1745,6 +1775,7 @@ mod hostile_bridge_tests {
             Misbehaviour::Flood,
             Misbehaviour::RefuseHello,
             Misbehaviour::Dribble,
+            Misbehaviour::ForgeOk,
         ] {
             let port = fake_bridge(how);
             let config = SamConfig {
@@ -1820,6 +1851,46 @@ mod hostile_bridge_tests {
     fn a_healthy_hello_is_accepted_and_its_version_reported() {
         let port = fake_bridge(Misbehaviour::HelloThenStall);
         assert_eq!(hello_version(port, PROBE).expect("hello accepted"), "3.3");
+    }
+
+    /// `RESULT=` is a field. A refusal whose `MESSAGE` quoted `RESULT=OK`
+    /// passed the old substring check, and the raw line then reached the
+    /// error — escape sequence and all.
+    #[test]
+    fn a_forged_ok_inside_a_refusal_is_still_a_refusal_and_is_scrubbed() {
+        let port = fake_bridge(Misbehaviour::ForgeOk);
+        let e = hello_version(port, PROBE)
+            .expect_err("a refusal quoting RESULT=OK in its MESSAGE was accepted");
+        assert!(e.to_string().contains("NOVERSION"), "{e}");
+        assert!(!e.to_string().contains('\u{1b}'), "escape survived: {e}");
+    }
+
+    /// A `STREAM STATUS` is the router's text and reaches a terminal, in the
+    /// result word, the message, and the line that is not a status at all.
+    #[test]
+    fn a_stream_status_cannot_forge_a_log_line() {
+        for status in [
+            "STREAM STATUS RESULT=I2P_ERROR\u{1b}[2J MESSAGE=\"x\r\ncloved: all is well\"",
+            "\u{1b}[2Jnot a status\r\n",
+        ] {
+            let e: io::Error = expect_stream_ok(status, "the stream to a peer")
+                .expect_err("refused")
+                .into();
+            let text = e.to_string();
+            assert!(
+                !text.contains('\u{1b}') && !text.contains('\r') && !text.contains('\n'),
+                "{text:?}"
+            );
+        }
+        // What the words are for still gets through.
+        let e: io::Error = expect_stream_ok(
+            "STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"no tunnels\"",
+            "the stream to a peer",
+        )
+        .expect_err("refused")
+        .into();
+        assert!(e.to_string().contains("I2P_ERROR"), "{e}");
+        assert!(e.to_string().contains("no tunnels"), "{e}");
     }
 
     /// A bridge that speaks the outbound-dial half of SAM: `HELLO REPLY`,
@@ -1936,6 +2007,7 @@ mod hostile_bridge_tests {
             Misbehaviour::RefuseHello,
             Misbehaviour::Dribble,
             Misbehaviour::HelloThenStall,
+            Misbehaviour::ForgeOk,
         ] {
             let port = fake_bridge(how);
             let (result, took) =
@@ -2167,6 +2239,22 @@ mod naming_tests {
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
 
+    /// The result word is the router's text as much as the rest of the line.
+    #[test]
+    fn a_refusal_word_cannot_forge_a_log_line() {
+        let e = parse_naming_reply(
+            "NAMING REPLY RESULT=KEY_NOT_FOUND\u{1b}[2J\r\ncloved: ok NAME=t.i2p",
+            "t.i2p",
+        )
+        .expect_err("refused");
+        let text = e.to_string();
+        assert!(text.contains("KEY_NOT_FOUND"), "{text}");
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\r') && !text.contains('\n'),
+            "{text:?}"
+        );
+    }
+
     #[test]
     fn a_reply_cannot_forge_a_log_line_or_leak_a_blob() {
         // The reply is the bridge's text and reaches an operator's terminal.
@@ -2240,6 +2328,7 @@ mod naming_tests {
             Misbehaviour::RefuseHello,
             Misbehaviour::Dribble,
             Misbehaviour::HelloThenStall,
+            Misbehaviour::ForgeOk,
         ] {
             let port = fake_bridge(how);
             let Some(result) = within(LIMIT, move || naming_lookup(port, "tracker.i2p", PROBE))
