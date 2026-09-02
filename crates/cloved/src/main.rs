@@ -144,6 +144,34 @@ fn honour_sandbox_policy(policy: SandboxPolicy, verdict: &sandbox::Verdict) -> R
     Ok(())
 }
 
+/// Create the data directory private, and make sure it is.
+///
+/// Created `0700` from the first `mkdir` — every level of it — rather than
+/// with the umask and then chmod'd: the old order left the directory `0755`
+/// between the two calls on a first run, briefly, on the directory about to
+/// hold the destination key and the API token. The chmod stays for a
+/// directory that already existed with some other mode.
+///
+/// The chmod is fatal, unlike the rest of this layer: the local filesystem
+/// refusing the owner permission to make this directory private is a broken
+/// install, and the secrets are what it is about to hold.
+fn prepare_data_dir(data_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(data_dir)
+        .map_err(|e| format!("creating data dir {}: {e}", data_dir.display()))?;
+    std::fs::set_permissions(data_dir, PermissionsExt::from_mode(0o700)).map_err(|e| {
+        format!(
+            "could not restrict {} to 0700: {e}; refusing to keep the destination key and API \
+             token in a directory this daemon cannot make private",
+            data_dir.display()
+        )
+    })
+}
+
 /// Claim `<data_dir>/lock` for this process, refusing to start if another
 /// daemon holds it.
 ///
@@ -212,22 +240,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    std::fs::create_dir_all(&config.data_dir)
-        .map_err(|e| format!("creating data dir {}: {e}", config.data_dir.display()))?;
-    // Fatal, unlike the rest of this layer: the local filesystem refusing the
-    // owner permission to make this directory private is a broken install, and
-    // it is about to hold the destination key and the API token.
-    std::fs::set_permissions(
-        &config.data_dir,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .map_err(|e| {
-        format!(
-            "could not restrict {} to 0700: {e}; refusing to keep the destination key and API \
-             token in a directory this daemon cannot make private",
-            config.data_dir.display()
-        )
-    })?;
+    prepare_data_dir(&config.data_dir)?;
     // Held for the life of the process: the lock is on the descriptor, and
     // this binding is the one that keeps it open. Before the registry and the
     // socket, so a second daemon never gets as far as touching either.
@@ -2726,6 +2739,36 @@ mod tests {
         assert!(!accept_error_is_transient(&std::io::Error::other(
             "not from the kernel"
         )));
+    }
+
+    // ---------------------------------------------------- data directory
+
+    /// Every directory created on the way to the data directory is private
+    /// from its first moment, not chmod'd private a call later — the parent
+    /// levels are what make the difference observable, since only the leaf
+    /// was ever chmod'd.
+    #[test]
+    fn the_data_directory_is_private_from_creation_at_every_level() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("data-dir-mode");
+        let data = dir.0.join("a").join("b").join("clove");
+        prepare_data_dir(&data).expect("create");
+        for level in [&data, &dir.0.join("a").join("b"), &dir.0.join("a")] {
+            let mode = std::fs::metadata(level).expect("stat").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} was created {mode:04o}", level.display());
+        }
+
+        // An existing directory with a wider mode is still tightened.
+        let loose = dir.0.join("loose");
+        std::fs::create_dir(&loose).expect("mkdir");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        prepare_data_dir(&loose).expect("prepare an existing directory");
+        let mode = std::fs::metadata(&loose)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     // ------------------------------------------------- instance lock
