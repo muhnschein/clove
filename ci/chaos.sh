@@ -123,6 +123,10 @@ while [ "$cycle" -le "$CYCLES" ]; do
     sleep "0.$((cycle % 5 + 1))"
     kill -9 "$daemon_pid" 2>/dev/null
     wait "$daemon_pid" 2>/dev/null || true
+    # The storm has to land: a pid that is still alive here means the kill hit
+    # something else (a wrapper, once), and every assertion after this point
+    # would then be about a daemon that never died.
+    kill -0 "$daemon_pid" 2>/dev/null && fail "the SIGKILL missed the daemon (pid $daemon_pid is still alive)"
     daemon_pid=""
     kill "$churn_pid" 2>/dev/null
     wait "$churn_pid" 2>/dev/null || true
