@@ -108,7 +108,13 @@ and
 .Pq attached across every torrent, and the ceiling they come from ,
 and
 .Sy router
-.Pq Sy connecting , Sy waiting-for-router , Sy connected , Sy unsupported-sam-address ,
+.Po
+.Sy connecting , Sy waiting-for-router , Sy connected , Sy unsupported-sam-address ,
+or
+.Sy supervisor-failed ,
+the daemon could not start the thread that talks to the router and is
+running without one
+.Pc ,
 and
 .Sy sandbox ,
 the Layer-2 confinement this daemon actually achieved at start-up

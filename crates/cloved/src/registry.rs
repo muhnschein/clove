@@ -187,6 +187,11 @@ pub(crate) struct ScanJob {
 }
 
 impl ScanJob {
+    /// The torrent this pass is for.
+    pub(crate) fn info_hash(&self) -> &[u8; 20] {
+        &self.info_hash
+    }
+
     /// Lay the files out if they are not there yet, then hash what is.
     ///
     /// Takes as long as it takes; the caller must not be holding the registry.

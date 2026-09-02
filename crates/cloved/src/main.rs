@@ -263,6 +263,12 @@ fn run() -> Result<(), String> {
         router: Mutex::new("connecting"),
     });
 
+    // First, and fatal: with no signal handler this loop *is* persistence, so
+    // a daemon that cannot start it would run for hours and keep nothing.
+    // Before the per-torrent threads below, so that a large rescan cannot be
+    // what exhausts the thread limit this one needs.
+    spawn_persist_loop(&daemon)?;
+
     // Resume metadata fetches for magnets loaded from disk. Collect first:
     // a `for .. in lock(..)` holds the guard for the whole loop body, and
     // spawn_metadata_fetch re-locks it (deadlock).
@@ -278,17 +284,48 @@ fn run() -> Result<(), String> {
     // with the registry unlocked, and `run_scan` re-locks it to report.
     let scans = lock(&daemon.registry).pending_scans();
     for job in scans {
-        let daemon = Arc::clone(&daemon);
-        std::thread::spawn(move || {
-            if let Err(e) = run_scan(&daemon, &job) {
+        // Shared with the thread rather than moved into it: a spawn that
+        // fails drops its closure, and the job has to outlive that to be
+        // reported on below.
+        let job = Arc::new(job);
+        let shared = Arc::clone(&daemon);
+        let work = Arc::clone(&job);
+        let spawned = spawn_named("scan", move || {
+            if let Err(e) = run_scan(&shared, &work) {
                 eprintln!("cloved: re-verifying after an unclean stop: {e}");
             }
         });
+        // No thread means no scan, and a torrent left marked as scanning
+        // never starts. Publish the failure so the mark comes off; the torrent
+        // then runs on the have-set the resume file could vouch for, and
+        // `clove verify` can retry the rest.
+        if let Err(e) = spawned {
+            eprintln!(
+                "cloved: could not start a verification thread for {}: {e}",
+                registry::hex(job.info_hash())
+            );
+            let _ = lock(&daemon.registry).finish_scan(&job, Err(e));
+        }
     }
 
     spawn_sam_supervisor(&daemon, &config.sam_address, identity);
-    spawn_persist_loop(&daemon);
     serve(&listener, &daemon)
+}
+
+/// Start a thread with a name, and hand back the failure if there is one.
+///
+/// Every thread the daemon starts comes through here. The name is what
+/// `ps -T` and a core dump show. The `Result` is the point: `thread::spawn`
+/// panics when the process is out of threads or memory, and which thread
+/// that panic lands on decides whether the daemon exits, the supervisor dies
+/// silently with `router` stuck at "connected", or a registry lock is
+/// poisoned — none of them the answer to a limit being reached.
+fn spawn_named<F, T>(name: &str, f: F) -> std::io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new().name(name.to_owned()).spawn(f)
 }
 
 /// Daemon state shared across connection threads.
@@ -469,8 +506,9 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str, identity: Ident
         *lock(&daemon.router) = "unsupported-sam-address";
         return;
     };
-    let daemon = Arc::clone(daemon);
-    std::thread::spawn(move || {
+    let shared = Arc::clone(daemon);
+    let spawned = spawn_named("sam-supervisor", move || {
+        let daemon = shared;
         let policy = ReconnectPolicy::default();
         loop {
             let mut failures = 0u32;
@@ -529,6 +567,15 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str, identity: Ident
             lock(&daemon.registry).detach_network();
         }
     });
+    // Without this thread there is no router, ever. The daemon still serves
+    // its API — the torrents are on disk and listable — so say so where an
+    // operator will look, rather than leave `router` at "connecting" for good.
+    if let Err(e) = spawned {
+        eprintln!(
+            "cloved: could not start the router supervisor thread: {e}; running without a router"
+        );
+        *lock(&daemon.router) = "supervisor-failed";
+    }
 }
 
 /// One session bring-up: connect and establish the forwarded listener.
@@ -555,14 +602,16 @@ fn connect_session(
 }
 
 /// Periodically snapshot live progress into resume files.
-fn spawn_persist_loop(daemon: &Arc<Daemon>) {
+fn spawn_persist_loop(daemon: &Arc<Daemon>) -> Result<(), String> {
     let daemon = Arc::clone(daemon);
-    std::thread::spawn(move || {
+    spawn_named("persist", move || {
         loop {
             std::thread::sleep(PERSIST_INTERVAL);
             lock(&daemon.registry).persist_progress();
         }
-    });
+    })
+    .map(|_| ())
+    .map_err(|e| format!("could not start the persistence thread: {e}"))
 }
 
 /// Pause between metadata-fetch rounds (announce + peer attempts).
@@ -576,8 +625,9 @@ fn spawn_metadata_fetch(daemon: &Arc<Daemon>, info_hash: [u8; 20]) {
     if !lock(&daemon.registry).claim_fetch(&info_hash) {
         return;
     }
-    let daemon = Arc::clone(daemon);
-    std::thread::spawn(move || {
+    let shared = Arc::clone(daemon);
+    let spawned = spawn_named("metadata-fetch", move || {
+        let daemon = shared;
         let mut first_round = true;
         let mut rounds = 0u32;
         loop {
@@ -620,6 +670,20 @@ fn spawn_metadata_fetch(daemon: &Arc<Daemon>, info_hash: [u8; 20]) {
             std::thread::sleep(FETCH_ROUND_WAIT);
         }
     });
+    // The entry stays claimed — nothing re-spawns a fetch, so unclaiming it
+    // would only pretend otherwise — but the reason has to reach `clove
+    // list`, where a magnet that never tries would otherwise just look slow.
+    if let Err(e) = spawned {
+        eprintln!(
+            "cloved: could not start the metadata-fetch thread for {}: {e}",
+            registry::hex(&info_hash)
+        );
+        let round = FetchRound {
+            last_error: Some(format!("could not start the fetch thread: {e}")),
+            ..FetchRound::default()
+        };
+        lock(&daemon.registry).note_fetch_round(&info_hash, 0, &round);
+    }
 }
 
 /// How long a magnet's announce may spend reaching a tracker. The same budget
@@ -889,14 +953,12 @@ fn dispatch(
         return;
     };
     let daemon = Arc::clone(daemon);
-    let spawned = std::thread::Builder::new()
-        .name("api-handler".to_owned())
-        .spawn(move || {
-            let _slot = slot;
-            if let Err(e) = handle(stream, &daemon) {
-                eprintln!("cloved: connection error: {e}");
-            }
-        });
+    let spawned = spawn_named("api-handler", move || {
+        let _slot = slot;
+        if let Err(e) = handle(stream, &daemon) {
+            eprintln!("cloved: connection error: {e}");
+        }
+    });
     if let Err(e) = spawned {
         // The closure went down with the failure, and the stream and the
         // slot with it, so there is nothing to give back by hand.
@@ -2593,6 +2655,26 @@ mod tests {
         drop(held);
         assert_eq!(active.load(Ordering::Acquire), 0);
         assert!(HandlerSlot::claim(&active, MAX_API_HANDLERS).is_some());
+    }
+
+    // ---------------------------------------------------------- threads
+
+    /// Every daemon thread carries its name, and a spawn reports its failure
+    /// as a value rather than a panic on the thread that asked.
+    #[test]
+    fn daemon_threads_are_named_and_spawn_failures_are_values() {
+        let seen = spawn_named("named-test", || {
+            std::thread::current().name().map(str::to_owned)
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+        assert_eq!(seen.as_deref(), Some("named-test"));
+
+        // The shape the callers rely on: an `io::Result`, so the failure
+        // path is a `match` and not an unwind through a registry lock.
+        let handle: std::io::Result<std::thread::JoinHandle<()>> = spawn_named("shape", || ());
+        handle.expect("spawn").join().expect("join");
     }
 
     // ----------------------------------------------------- accept loop
