@@ -1084,7 +1084,10 @@ fn accept_forwarded(listener: &TcpListener) -> io::Result<Option<(ForwardedStrea
     if stream.set_read_timeout(Some(DEST_LINE_TIMEOUT)).is_err() {
         return Ok(None);
     }
-    let Ok(dest) = read_dest_line(&mut stream, MAX_DEST_LINE) else {
+    // The same budget again as a whole-line deadline: the read timeout is per
+    // byte, and a header dribbled a byte at a time is otherwise unbounded.
+    let deadline = Instant::now() + DEST_LINE_TIMEOUT;
+    let Ok(dest) = read_dest_line(&mut stream, MAX_DEST_LINE, Some(deadline)) else {
         return Ok(None);
     };
     if stream.set_read_timeout(None).is_err() {
@@ -1098,10 +1101,28 @@ fn accept_forwarded(listener: &TcpListener) -> io::Result<Option<(ForwardedStrea
 /// by space-separated `FROM_PORT`/`TO_PORT` params — up to the `\n`, and
 /// derive the peer's [`DestHash`]. Reads one byte at a time so the stream
 /// payload after the newline is left untouched for the peer's reader.
-fn read_dest_line<R: Read>(reader: &mut R, max_len: usize) -> io::Result<DestHash> {
+///
+/// `deadline` bounds the whole line, as [`read_sam_line`]'s does, and for
+/// the same reason: the socket's read timeout is per byte, so without it one
+/// byte every 29 seconds held this open for `max_len` reads — on the one
+/// acceptor thread, before any per-connection thread exists, from anything
+/// that can reach the loopback forward port. A read already in progress when
+/// the deadline passes still gets its own timeout, so the true bound is the
+/// deadline plus one read.
+fn read_dest_line<R: Read>(
+    reader: &mut R,
+    max_len: usize,
+    deadline: Option<Instant>,
+) -> io::Result<DestHash> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "forwarded stream did not finish its destination line in time",
+            ));
+        }
         if reader.read(&mut byte)? == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1431,7 +1452,7 @@ mod tests {
         input.extend_from_slice(b"the-bittorrent-handshake");
         let mut cursor = Cursor::new(input);
 
-        let got = read_dest_line(&mut cursor, MAX_DEST_LINE).unwrap();
+        let got = read_dest_line(&mut cursor, MAX_DEST_LINE, Some(generous())).unwrap();
         assert_eq!(got, expected);
 
         // The payload after the newline must be intact for the peer reader.
@@ -1443,15 +1464,53 @@ mod tests {
     #[test]
     fn read_dest_line_rejects_overlong_line() {
         let mut cursor = Cursor::new(vec![b'A'; 128]); // no newline, no dest
-        let err = read_dest_line(&mut cursor, 32).unwrap_err();
+        let err = read_dest_line(&mut cursor, 32, Some(generous())).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn read_dest_line_eof_before_newline() {
         let mut cursor = Cursor::new(b"partial-no-newline".to_vec());
-        let err = read_dest_line(&mut cursor, MAX_DEST_LINE).unwrap_err();
+        let err = read_dest_line(&mut cursor, MAX_DEST_LINE, Some(generous())).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A deadline no test here will reach, for the cases about something else.
+    fn generous() -> Instant {
+        Instant::now() + DEST_LINE_TIMEOUT
+    }
+
+    /// The header must arrive whole within the deadline. The per-byte socket
+    /// timeout alone let a byte every 29 s hold `accept` for `MAX_DEST_LINE`
+    /// reads — some 34 hours — on the one acceptor thread, and any local
+    /// process can reach the forward port.
+    #[test]
+    fn a_dribbled_destination_line_is_cut_off_at_the_deadline() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut dribbler = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        std::thread::spawn(move || {
+            // One byte every so often, never a newline; ends when the test
+            // drops its end of the socket.
+            while dribbler.write_all(b"A").is_ok() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        // A per-read timeout far past the deadline, so only the deadline can
+        // end this.
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let budget = Duration::from_millis(200);
+        let started = Instant::now();
+        let err = read_dest_line(&mut server, MAX_DEST_LINE, Some(started + budget)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        let took = started.elapsed();
+        assert!(took >= budget, "gave up before the deadline: {took:?}");
+        assert!(
+            took < Duration::from_secs(2),
+            "the deadline did not end the read: {took:?}"
+        );
     }
 
     /// The `SILENT=false` header of a forwarded connection, and the hash the
