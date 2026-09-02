@@ -236,6 +236,10 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("creating socket dir {}: {e}", parent.display()))?;
     }
     let token = load_or_create_token(&config.data_dir).map_err(|e| e.to_string())?;
+    // The key gets the token's treatment: a file that is not safe to be a
+    // secret stops the start, and stays where it is.
+    let identity = Identity::new(&config.data_dir, config.ephemeral);
+    identity.check()?;
 
     let registry = Registry::open(&config.data_dir, registry::Limits::from(&config))
         .map_err(|e| format!("opening registry in {}: {e}", config.data_dir.display()))?;
@@ -281,11 +285,7 @@ fn run() -> Result<(), String> {
         });
     }
 
-    spawn_sam_supervisor(
-        &daemon,
-        &config.sam_address,
-        Identity::new(&config.data_dir, config.ephemeral),
-    );
+    spawn_sam_supervisor(&daemon, &config.sam_address, identity);
     spawn_persist_loop(&daemon);
     serve(&listener, &daemon)
 }
@@ -336,6 +336,34 @@ impl Identity {
         }
     }
 
+    /// Refuse to start over a key file that is not safe to treat as a secret.
+    ///
+    /// The same rule as the token, for the same reason: a key that has been
+    /// world-readable, or is owned by somebody else, or is a symlink to
+    /// wherever, is not something to quietly step around. It used to be
+    /// stepped around *and then overwritten* — `load` declined it, the router
+    /// handed out a fresh destination, and `remember` renamed that over the
+    /// old file. An operator who restored a backup that dropped modes lost
+    /// their stable identity for good after one log line. Fatal at startup
+    /// instead, with the file left in place to be inspected.
+    ///
+    /// Run once, here, rather than being the supervisor's job: that thread
+    /// reconnects for the life of the process, and a fatal error from a
+    /// background thread is a daemon that dies at some random later moment.
+    fn check(&self) -> Result<(), String> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        match read_private_file(path) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!(
+                "{}: {e}. The file has been left as it is; restore its mode to 0600 to keep \
+                 this identity, or delete it to start with a new one",
+                path.display()
+            )),
+        }
+    }
+
     /// The stored key, or `None` for a transient destination this run.
     ///
     /// A file that is present but not a key is refused rather than sent to the
@@ -377,8 +405,20 @@ impl Identity {
         let Some(path) = self.path.as_ref() else {
             return;
         };
-        if std::fs::read_to_string(path).is_ok_and(|stored| stored.trim() == key) {
-            return;
+        match read_private_file(path) {
+            Ok(Some(stored)) if stored.trim() == key => return,
+            Ok(_) => {}
+            // Refused for its mode, owner or being a symlink. `check` makes
+            // this fatal at startup, so reaching it means the file changed
+            // under a running daemon; either way it is not ours to replace.
+            Err(e) => {
+                eprintln!(
+                    "cloved: not overwriting the destination key in {}: {e}; this run's \
+                     identity will not survive a restart",
+                    path.display()
+                );
+                return;
+            }
         }
         match write_private_file(path, key.as_bytes()) {
             Ok(()) => eprintln!("cloved: identity saved to {}", path.display()),
@@ -2202,9 +2242,10 @@ mod tests {
                 "the exposed token was replaced instead of reported"
             );
 
-            // The identity is the same check, and declines to the transient
-            // path rather than being fatal: a daemon with no stored key still
-            // runs, it just comes back as somebody else.
+            // The identity is the same check. `load` declines to the transient
+            // path rather than being fatal — it runs on the supervisor thread,
+            // for the life of the process — and `Identity::check` is what
+            // makes the same file fatal at startup.
             let dir = TempDir::new(&format!("loose-key-{mode:o}"));
             let key = dir.0.join("destination.key");
             std::fs::write(&key, key_blob_b64()).expect("write");
@@ -2226,6 +2267,58 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, dir.0.join("token")).expect("symlink");
         let err = load_or_create_token(&dir.0).expect_err("a symlinked token was followed");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// A refused key file is preserved, not replaced.
+    ///
+    /// The sequence the supervisor runs: `load` declines the file, the router
+    /// hands out a fresh destination, `remember` is called with it. That used
+    /// to rename the new key over the old file, which destroyed the one copy
+    /// of an identity that a `chmod` would have restored. And the startup
+    /// check makes it fatal before any of that can happen, the token's rule.
+    #[test]
+    fn a_refused_destination_key_survives_load_and_remember() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("identity-refused");
+        let path = dir.0.join("destination.key");
+        let original = key_blob_b64();
+        std::fs::write(&path, &original).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let identity = Identity::new(&dir.0, false);
+        let err = identity
+            .check()
+            .expect_err("a world-readable key passed the startup check");
+        assert!(
+            err.contains("destination.key") && err.contains("0600"),
+            "the refusal does not say which file or what to do: {err}"
+        );
+
+        // And even past the check — the file changing under a running daemon —
+        // the supervisor's sequence must leave it alone.
+        assert_eq!(identity.load(), None, "a 0644 key was used");
+        let mut other = i2pnet::addr::i2p_base64_decode(&original).expect("decode");
+        other[0] ^= 0xFF;
+        identity.remember(&i2pnet::addr::i2p_base64_encode(&other));
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("re-read"),
+            original,
+            "the refused key was overwritten"
+        );
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "the refused key's mode was changed");
+        assert_eq!(
+            std::fs::read_dir(&dir.0).expect("read dir").count(),
+            1,
+            "something else was written beside the refused key"
+        );
+
+        // Under `ephemeral yes` there is no key file to check, however bad the
+        // one on disk is.
+        Identity::new(&dir.0, true)
+            .check()
+            .expect("ephemeral looked at a key it will never use");
     }
 
     /// A destination plus a stray byte is not a key, however well-formed the
