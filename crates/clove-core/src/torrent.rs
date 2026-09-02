@@ -1077,12 +1077,34 @@ fn spawn_writer<W: std::io::Write + I2pClose + Send + 'static>(
     })
 }
 
+/// Removes the reader's peer when the thread ends, however it ends.
+///
+/// The removal used to be the last statement of the loop, which a panic —
+/// an accounting assertion in a debug build, say — skipped: the entry, its
+/// budget slot and its writer all outlived the thread until the idle timeout
+/// noticed, five minutes later. Same shape as the demux's `PendingGuard`.
+struct ReaderGuard {
+    shared: Arc<Shared>,
+    id: u64,
+}
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        self.shared.remove_peer(self.id);
+    }
+}
+
 fn spawn_reader<R: std::io::Read + Send + 'static>(
     shared: Arc<Shared>,
     id: u64,
     mut reader: R,
 ) -> std::io::Result<JoinHandle<()>> {
+    let guard = ReaderGuard {
+        shared: Arc::clone(&shared),
+        id,
+    };
     peer_thread().spawn(move || {
+        let _guard = guard;
         // One frame buffer for the life of the connection.
         let mut body = Vec::new();
         while wire::read_frame_into(&mut reader, shared.max_frame, &mut body).is_ok() {
@@ -1091,7 +1113,6 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
                 Err(_) => break, // protocol violation: drop the peer
             }
         }
-        shared.remove_peer(id);
     })
 }
 
@@ -2415,6 +2436,49 @@ mod tests {
         assert!(
             st.peers.iter().any(|p| p.id == served && !p.we_choke),
             "seeding, the peer we are serving fastest should hold the slot"
+        );
+    }
+
+    /// A reader thread that dies by panic — an accounting assertion tripping
+    /// in a debug build — must still take its peer with it: the entry, the
+    /// budget slot it holds, and the writer waiting on its queue. The removal
+    /// used to be the loop's last statement, which a panic skipped.
+    #[test]
+    fn a_panicking_reader_still_frees_its_peer_and_budget_slot() {
+        struct Explodes;
+        impl std::io::Read for Explodes {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("reader thread blew up");
+            }
+        }
+
+        let content: Vec<u8> = (0..(3 * BLOCK_LEN))
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let meta = three_file_meta(&content);
+        let dir = TempDir::new("reader-panic");
+        let budget = PeerBudget::new(1);
+        let torrent = Torrent::with_budget(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(3),
+            Mode::RarestFirst,
+            *b"-CV0001-panicpanicpa",
+            Arc::clone(&budget),
+        );
+        let (id, _rx) = seat_peer(&torrent, DestHash([9; 32]));
+        assert_eq!(budget.in_use(), 1);
+
+        let handle = spawn_reader(Arc::clone(&torrent.shared), id, Explodes).unwrap();
+        assert!(handle.join().is_err(), "the reader was meant to panic");
+        assert!(
+            torrent.connected_peers().is_empty(),
+            "a panicking reader left its peer in the table"
+        );
+        assert_eq!(
+            budget.in_use(),
+            0,
+            "a panicking reader kept its budget slot"
         );
     }
 
