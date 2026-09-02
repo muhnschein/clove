@@ -41,6 +41,17 @@ pub const MAX_PIECE_LENGTH: u32 = 128 * 1024 * 1024;
 /// still a number an operator can reason about against their limits.
 pub const MAX_FILES: usize = 100_000;
 
+/// Longest path component a torrent may name, in bytes — `NAME_MAX` on
+/// Linux and every filesystem clove is likely to meet. Refused here so the
+/// `ENAMETOOLONG` surfaces at the torrent rather than at the first block
+/// written, far from its cause.
+pub const MAX_COMPONENT_BYTES: usize = 255;
+
+/// Longest file path a torrent may name below the download root, in bytes
+/// with separators — `PATH_MAX`, less whatever the root itself takes, which
+/// is the operator's to keep short.
+pub const MAX_PATH_BYTES: usize = 4096;
+
 /// Most announce URLs a torrent keeps, counted across every tier.
 ///
 /// Each kept URL is a naming lookup for the router and an announce per cycle
@@ -489,6 +500,11 @@ fn parse_files(info: &Value, name: &str) -> Result<(Vec<FileEntry>, u64), Error>
                     check_component(part)?;
                     path.push(part.to_owned());
                 }
+                // Each component fits a name; the whole has to fit a path.
+                let bytes: usize = path.iter().map(|part| part.len() + 1).sum();
+                if bytes > MAX_PATH_BYTES {
+                    return Err(Error::Invalid("file path longer than a path can be"));
+                }
                 total = total
                     .checked_add(length)
                     .ok_or(Error::Invalid("total length overflows"))?;
@@ -562,14 +578,27 @@ fn as_size(v: &Value) -> Option<u64> {
 /// Sorting makes this a scan of neighbours: if one path is a prefix of another,
 /// everything sorting between them shares that prefix too, so a collision
 /// always shows up in an adjacent pair.
+///
+/// Compared case-folded, because the filesystem may: `A.txt` and `a.txt` are
+/// one file on a case-insensitive volume, which is the aliasing this exists
+/// to refuse, and a torrent that only works on a case-sensitive disk is not
+/// worth accepting on one. Unicode normalisation (NFC against NFD) is the
+/// same problem again on some filesystems and is *not* folded here — clove
+/// carries no normalisation tables, and a lower-casing is what `str` can do
+/// without one.
 fn check_distinct_paths(entries: &[FileEntry]) -> Result<(), Error> {
-    let mut paths: Vec<&[String]> = entries.iter().map(|e| e.path.as_slice()).collect();
+    let mut paths: Vec<Vec<String>> = entries
+        .iter()
+        .map(|e| e.path.iter().map(|part| part.to_lowercase()).collect())
+        .collect();
     paths.sort_unstable();
     for pair in paths.windows(2) {
         if pair[0] == pair[1] {
-            return Err(Error::Invalid("two files share the same path"));
+            return Err(Error::Invalid(
+                "two files share the same path, up to letter case",
+            ));
         }
-        if pair[1].starts_with(pair[0]) {
+        if pair[1].starts_with(&pair[0]) {
             return Err(Error::Invalid("a file path is also a directory path"));
         }
     }
@@ -577,7 +606,7 @@ fn check_distinct_paths(entries: &[FileEntry]) -> Result<(), Error> {
 }
 
 /// A path component usable under the data directory: nonempty, no
-/// separators, not `.`/`..`, no NUL.
+/// separators, not `.`/`..`, no NUL, and no longer than a filename can be.
 fn check_component(s: &str) -> Result<(), Error> {
     let bad = s.is_empty()
         || s == "."
@@ -586,10 +615,14 @@ fn check_component(s: &str) -> Result<(), Error> {
         || s.contains('\\')
         || s.contains('\0');
     if bad {
-        Err(Error::Invalid("unsafe path component"))
-    } else {
-        Ok(())
+        return Err(Error::Invalid("unsafe path component"));
     }
+    if s.len() > MAX_COMPONENT_BYTES {
+        return Err(Error::Invalid(
+            "path component longer than a filename can be",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -916,6 +949,109 @@ mod tests {
         );
         // The cap is what the wire can carry: an id byte and a bit per piece.
         assert_eq!(1 + MAX_PIECES.div_ceil(8), crate::wire::MAX_MESSAGE_LEN);
+    }
+
+    /// `A.txt` and `a.txt` are one file on a case-insensitive volume, which
+    /// is exactly the aliasing the distinct-path check exists to refuse.
+    #[test]
+    fn rejects_paths_that_collide_up_to_case() {
+        let piece_len = i64::from(MIN_PIECE_LENGTH);
+        let file = |len: i64, parts: Vec<&str>| {
+            dict(vec![
+                ("length", Value::Int(len)),
+                (
+                    "path",
+                    Value::List(parts.into_iter().map(bval).collect::<Vec<_>>()),
+                ),
+            ])
+        };
+        let torrent = |files: Vec<Value>| {
+            encode(&dict(vec![(
+                "info",
+                dict(vec![
+                    ("name", bval("album")),
+                    ("piece length", Value::Int(piece_len)),
+                    ("pieces", Value::Bytes(vec![0u8; 20])),
+                    ("files", Value::List(files)),
+                ]),
+            )]))
+        };
+        for (a, b) in [
+            (vec!["A.txt"], vec!["a.txt"]),
+            (vec!["Dir", "x"], vec!["dir", "x"]),
+            (vec!["Ärger.txt"], vec!["ärger.txt"]),
+            // A file where another entry wants a directory, up to case.
+            (vec!["A"], vec!["a", "b"]),
+        ] {
+            let input = torrent(vec![file(piece_len - 10, a.clone()), file(10, b.clone())]);
+            assert!(
+                matches!(MetaInfo::parse(&input), Err(Error::Invalid(_))),
+                "{a:?} and {b:?} were both accepted"
+            );
+        }
+        // Different names that merely share letters are still distinct.
+        let ok = torrent(vec![file(piece_len - 10, vec!["ab"]), file(10, vec!["ba"])]);
+        MetaInfo::parse(&ok).expect("distinct names");
+    }
+
+    /// A component longer than a filename, or a path longer than a path,
+    /// is refused at the torrent rather than as ENAMETOOLONG at the first
+    /// block written.
+    #[test]
+    fn rejects_over_long_components_and_paths() {
+        let piece_len = i64::from(MIN_PIECE_LENGTH);
+        let file = |parts: Vec<String>| {
+            dict(vec![
+                ("length", Value::Int(piece_len)),
+                (
+                    "path",
+                    Value::List(parts.iter().map(|p| bval(p)).collect::<Vec<_>>()),
+                ),
+            ])
+        };
+        let torrent = |name: &str, files: Vec<Value>| {
+            encode(&dict(vec![(
+                "info",
+                dict(vec![
+                    ("name", bval(name)),
+                    ("piece length", Value::Int(piece_len)),
+                    ("pieces", Value::Bytes(vec![0u8; 20])),
+                    ("files", Value::List(files)),
+                ]),
+            )]))
+        };
+
+        let long = "x".repeat(MAX_COMPONENT_BYTES + 1);
+        let fits = "x".repeat(MAX_COMPONENT_BYTES);
+        assert_eq!(
+            MetaInfo::parse(&torrent("album", vec![file(vec![long.clone()])])).err(),
+            Some(Error::Invalid(
+                "path component longer than a filename can be"
+            ))
+        );
+        // The name is a component too.
+        assert_eq!(
+            MetaInfo::parse(&torrent(&long, vec![file(vec!["a".into()])])).err(),
+            Some(Error::Invalid(
+                "path component longer than a filename can be"
+            ))
+        );
+        MetaInfo::parse(&torrent("album", vec![file(vec![fits.clone()])]))
+            .expect("a component at the limit");
+        // Bytes, not characters: a multibyte name is measured as the
+        // filesystem measures it.
+        let wide = "é".repeat(MAX_COMPONENT_BYTES / 2 + 1);
+        assert!(wide.len() > MAX_COMPONENT_BYTES);
+        assert!(MetaInfo::parse(&torrent("album", vec![file(vec![wide])])).is_err());
+
+        // Every component fits, the path does not.
+        let deep: Vec<String> = (0..=MAX_PATH_BYTES / MAX_COMPONENT_BYTES)
+            .map(|_| fits.clone())
+            .collect();
+        assert_eq!(
+            MetaInfo::parse(&torrent("album", vec![file(deep)])).err(),
+            Some(Error::Invalid("file path longer than a path can be"))
+        );
     }
 
     #[test]
