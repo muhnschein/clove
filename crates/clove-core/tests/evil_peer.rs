@@ -1561,6 +1561,70 @@ fn choke_rounds_run_without_any_traffic_at_all() {
     drop(held);
 }
 
+/// A block the disk will not take. The write error used to be discarded with
+/// the block still counted as owed in the picker — never re-offered, the
+/// download stalled for good in release and tripped the accounting check in
+/// debug — and nothing anywhere recorded that storage had failed.
+///
+/// The seam is a FIFO where the torrent's file should be: storage opens it
+/// like any file, and every positioned write on it fails with `ESPIPE`. Pure
+/// filesystem, so it works whoever the test runs as.
+#[test]
+fn a_block_the_disk_refuses_is_re_offered_and_the_error_is_reported() {
+    use rustix::fs::{CWD, FileType, Mode, mknodat};
+
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let num_pieces = u32::try_from(meta.pieces.len()).expect("piece count");
+
+    let seed_dir = TempDir::new("espipe-seed");
+    let seeder = seeding_torrent(&meta, &content, &seed_dir);
+    let seed_ep = net.endpoint();
+    let seed_dest = seed_ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, seed_ep);
+
+    let dir = TempDir::new("espipe-leech");
+    mknodat(
+        CWD,
+        dir.0.join("evil"),
+        FileType::Fifo,
+        Mode::from_bits_truncate(0o644),
+        0,
+    )
+    .expect("mkfifo");
+    let leecher = leeching_torrent(&meta, &dir);
+    assert!(leecher.storage_error().is_none(), "nothing has failed yet");
+    let stream = net
+        .endpoint()
+        .dialer()
+        .dial(seed_dest, Duration::from_secs(5))
+        .expect("dial seeder");
+    leecher.attach(stream, seed_dest).expect("attach");
+
+    let deadline = Instant::now() + DEADLINE;
+    while leecher.storage_error().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "blocks arrived, could not be written, and nobody was told"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Nothing verified, nothing leaked: the failed blocks went back to the
+    // picker and are being asked for again, and the peer was not dropped for
+    // our disk's failing. The engine's own accounting assertions are live
+    // throughout this, so a leaked in-flight count would have panicked the
+    // reader thread and emptied the table.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(leecher.have().count(), 0, "a piece verified on a FIFO");
+    assert_eq!(
+        leecher.connected_peers().len(),
+        1,
+        "the seeder was dropped over a local storage failure"
+    );
+    let _ = num_pieces;
+}
+
 /// Interest is a five-byte message and used to run a whole choke round, so a
 /// peer flipping it drove the optimistic rotation: every third flip choked an
 /// honest peer holding a slot (discarding its outstanding requests) to make

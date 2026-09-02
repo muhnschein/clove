@@ -280,6 +280,12 @@ struct State {
     /// Failed pieces each destination shared the blame for, less the pieces
     /// it has since helped verify.
     suspicion: HashMap<DestHash, u32>,
+    /// The last storage failure, if any: a block that could not be written or
+    /// a piece that could not be read back to verify. The download cannot
+    /// finish past one of these, so the registry surfaces it and may pause
+    /// the torrent; it is never cleared by the engine, since nothing here can
+    /// tell a transient `ENOSPC` from a dying disk.
+    storage_error: Option<String>,
     /// Peers to remove once the lock is released. A handler runs under the
     /// state lock and `remove_peer` takes it, so a handler that decides a
     /// peer must go queues it here and the caller finishes the job.
@@ -546,6 +552,7 @@ impl Torrent {
                 suppliers: HashMap::new(),
                 banned: HashSet::new(),
                 suspicion: HashMap::new(),
+                storage_error: None,
                 to_drop: Vec::new(),
             }),
             done: Mutex::new(false),
@@ -706,6 +713,15 @@ impl Torrent {
     #[must_use]
     pub fn is_banned(&self, dest: DestHash) -> bool {
         lock(&self.shared.state).banned.contains(&dest)
+    }
+
+    /// The last storage failure this torrent hit, for status. A block that
+    /// could not be written goes back to the picker and is asked for again,
+    /// so a full disk shows up here rather than as a download that quietly
+    /// stops; a piece that could not be *read* to verify stays unverified.
+    #[must_use]
+    pub fn storage_error(&self) -> Option<String> {
+        lock(&self.shared.state).storage_error.clone()
     }
 
     /// How many destinations this run has banned, for status: a torrent that
@@ -1615,7 +1631,13 @@ impl Shared {
         if !was_requested || st.picker.has(index) {
             // Unsolicited, already satisfied, or late; ignore the payload but
             // still keep the pipeline full below.
-        } else if self.storage.write_block(index, begin, block).is_ok() {
+        } else if let Err(e) = self.storage.write_block(index, begin, block) {
+            // The picker still counts this block as owed. Give it back, or
+            // it is never re-offered and the download stalls with nothing
+            // anywhere saying why; the error is the something.
+            st.picker.block_failed(index, block_no);
+            st.storage_error = Some(e.to_string());
+        } else {
             self.downloaded
                 .fetch_add(block.len() as u64, std::sync::atomic::Ordering::Relaxed);
             st.peers[idx].downloaded += block.len() as u64;
@@ -1627,19 +1649,27 @@ impl Shared {
                 return;
             }
             // Piece complete: verify from disk before trusting it.
-            if let Ok(true) = self.storage.verify_piece(index) {
-                st.picker.set_have(index);
-                st.credit_suppliers(index);
-                for peer in &st.peers {
-                    out.push((peer.id, peer.out.clone(), Message::Have(index)));
+            match self.storage.verify_piece(index) {
+                Ok(true) => {
+                    st.picker.set_have(index);
+                    st.credit_suppliers(index);
+                    for peer in &st.peers {
+                        out.push((peer.id, peer.out.clone(), Message::Have(index)));
+                    }
                 }
-            } else {
-                st.picker.reset_piece(index);
-                // Whoever is banned here is queued for removal by the caller,
-                // and its blocks go back to the picker then; the refill below
-                // may still ask it for more, which is one wasted request
-                // rather than a leaked one.
-                st.blame_suppliers(index);
+                Ok(false) => {
+                    st.picker.reset_piece(index);
+                    // Whoever is banned here is queued for removal by the
+                    // caller, and its blocks go back to the picker then; the
+                    // refill below may still ask it for more, which is one
+                    // wasted request rather than a leaked one.
+                    st.blame_suppliers(index);
+                }
+                // Not a hash failure: the bytes were never read. Blaming the
+                // suppliers would ban honest peers for a bad sector, and
+                // resetting would re-download the piece for ever. It stays
+                // received and unverified, and the error is reported.
+                Err(e) => st.storage_error = Some(e.to_string()),
             }
         }
         fill_requests(st, idx, out);
