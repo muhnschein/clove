@@ -635,6 +635,35 @@ impl SamSession {
     /// The router is unreachable, did not answer in time, refused the session,
     /// or returned a destination we cannot parse.
     pub fn connect(config: &SamConfig) -> io::Result<SamSession> {
+        // Both go into the `SESSION CREATE` line, and SAM is a line protocol
+        // of space-separated fields: a space or a newline in either is a
+        // second field, or a second command, of the sender's choosing. The
+        // nickname generator emits `[a-z0-9-]` and the daemon refuses a key
+        // file that is not base64, but the config is `pub`, and this crate
+        // trusts its callers no more than `check_lookup_name` does. Checked
+        // before any socket is opened.
+        if has_unsendable_byte(&config.nickname) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "not a nickname clove will put in a SAM command (contains a space or a \
+                     control character): {:?}",
+                    config.nickname.chars().map(scrub_char).collect::<String>()
+                ),
+            ));
+        }
+        // Not repeated in the error: it is the key.
+        if config
+            .persistent_key
+            .as_deref()
+            .is_some_and(has_unsendable_byte)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the persistent key contains a space or a control character, which cannot go \
+                 into a SAM command; is destination.key intact?",
+            ));
+        }
         let port = config.samv3_tcp_port;
         let (mut control, hello) = sam_hello(port, config.probe_timeout, "HELLO")?;
         debug_assert!(hello.contains("RESULT=OK"));
@@ -1289,6 +1318,13 @@ const MAX_NAMING_LINE: usize = 8192;
 /// registered hostname comes near this.
 const MAX_LOOKUP_NAME: usize = 255;
 
+/// Whether `field` holds a byte that cannot travel inside one SAM field: a
+/// space or anything below it, or DEL. SAM is a line protocol of
+/// space-separated fields, so such a byte ends the field — or the command.
+fn has_unsendable_byte(field: &str) -> bool {
+    field.bytes().any(|b| b <= 0x20 || b == 0x7f)
+}
+
 /// Refuse a name that cannot go into a `NAMING LOOKUP` as a single field.
 ///
 /// SAM is a line protocol of space-separated fields, so a name carrying a space
@@ -1312,7 +1348,7 @@ fn check_lookup_name(name: &str) -> io::Result<()> {
     if name.len() > MAX_LOOKUP_NAME {
         return Err(bad("longer than a hostname"));
     }
-    if name.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+    if has_unsendable_byte(name) {
         return Err(bad("contains a space or a control character"));
     }
     Ok(())
@@ -2688,6 +2724,52 @@ mod session_tests {
             .map(drop)
             .expect_err("no DESTINATION means no identity");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// The nickname and the key both go into `SESSION CREATE`, and the config
+    /// is `pub`: this crate checks them itself, before it dials anything.
+    #[test]
+    fn a_nickname_or_key_that_would_forge_a_command_is_refused_before_dialling() {
+        // Nothing is listening here, so a connection error would prove the
+        // check ran too late.
+        let port = {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        for nickname in [
+            "clove\nDEST GENERATE",
+            "clove SILENT=true",
+            "clove\x7f",
+            "clove\0",
+        ] {
+            let e = SamSession::connect(&SamConfig {
+                nickname: nickname.to_owned(),
+                ..config(port)
+            })
+            .map(drop)
+            .expect_err("a nickname with a control character went into a command");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+            assert!(
+                !e.to_string().contains('\n'),
+                "the newline was repeated: {e}"
+            );
+        }
+
+        let key = format!("{}\nDEST GENERATE", "A".repeat(64));
+        let e = SamSession::connect(&SamConfig {
+            persistent_key: Some(key),
+            ..config(port)
+        })
+        .map(drop)
+        .expect_err("a key with a newline went into a command");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        assert!(!e.to_string().contains("AAAA"), "the key was repeated: {e}");
+
+        // An ordinary config still reaches the socket, and finds nobody.
+        let e = SamSession::connect(&config(port))
+            .map(drop)
+            .expect_err("nothing is listening");
+        assert_ne!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
     }
 
     #[test]
