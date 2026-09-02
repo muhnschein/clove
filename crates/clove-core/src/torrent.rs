@@ -234,6 +234,9 @@ struct Shared {
     /// Shared with the registry's [`MetaInfo`](crate::metainfo::MetaInfo),
     /// not copied.
     raw_info: Arc<[u8]>,
+    /// BEP 27: a private torrent's peers come from its tracker and nowhere
+    /// else. Peer exchange is neither advertised, sent nor listened to.
+    private: bool,
     state: Mutex<State>,
     done: Mutex<bool>,
     done_cv: Condvar,
@@ -516,6 +519,7 @@ impl Torrent {
             num_pieces,
             max_frame,
             raw_info: Arc::clone(&meta.raw_info),
+            private: meta.private,
             state: Mutex::new(State {
                 picker,
                 choker: Choker::default(),
@@ -1238,11 +1242,14 @@ impl Shared {
         Ok(id)
     }
 
-    /// Our BEP 10 handshake payload: advertise `i2p_pex` and `ut_metadata`, and
-    /// the metadata size if we hold the info dictionary.
+    /// Our BEP 10 handshake payload: advertise `i2p_pex` (unless the torrent
+    /// is private) and `ut_metadata`, and the metadata size if we hold the
+    /// info dictionary.
     fn our_extension_handshake(&self) -> Vec<u8> {
         let mut ids = std::collections::BTreeMap::new();
-        ids.insert(I2P_PEX.to_owned(), OUR_PEX_ID);
+        if !self.private {
+            ids.insert(I2P_PEX.to_owned(), OUR_PEX_ID);
+        }
         ids.insert(UT_METADATA.to_owned(), OUR_METADATA_ID);
         let metadata_size = (!self.raw_info.is_empty()).then_some(self.raw_info.len());
         extension::Handshake {
@@ -1464,9 +1471,17 @@ impl Shared {
                 };
                 st.peers[idx].pex_id = hs.id_for(I2P_PEX);
                 st.peers[idx].metadata_id = hs.id_for(UT_METADATA);
-                // Now their pex id is known, send them the peers we know.
-                Self::send_pex(st, idx, out);
+                // Now their pex id is known, send them the peers we know —
+                // unless the torrent is private, in which case nobody is told
+                // anything whatever the peer advertised.
+                if !self.private {
+                    Self::send_pex(st, idx, out);
+                }
             }
+            // Never advertised on a private torrent, so a message on it is a
+            // peer guessing; ignored rather than a violation, since clove's
+            // own id is public knowledge.
+            OUR_PEX_ID if self.private => {}
             OUR_PEX_ID => {
                 if let Ok(pex) = PexMessage::parse(payload) {
                     for dest in pex.added {

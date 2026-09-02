@@ -748,6 +748,20 @@ describing anything clove does.
     byte of BitTorrent arrives — so filling the cap takes a swarm's worth of
     identities rather than one.
 
+4.10 [decided] **BEP 27 `private` is honoured, not just displayed.** Found
+    by the 2026-09 audit (M-8): the flag was parsed into the metainfo and
+    printed by `clove show`, and that was its only consumer — every handshake
+    advertised `i2p_pex`, every peer was sent the known-peer set, and inbound
+    PEX was believed. Private trackers treat that as a ban-worthy violation,
+    and it lets a non-member reach the swarm through a member.
+
+    On a private torrent clove now advertises no `i2p_pex` id in its BEP 10
+    handshake, never sends a PEX message whatever the peer advertised, and
+    ignores a message arriving on the id it uses for PEX in public — ignored
+    rather than treated as a violation, since that id is the same for every
+    clove and a peer may simply be guessing. `ut_metadata` is unaffected: it
+    serves the info dictionary, not peers.
+
 4.5 [decided] Magnet links (clove-core::magnet): `magnet:?xt=urn:btih:<hex
     40 | base32 32>`; `dn` and `tr` are percent-decoded, `tr` filtered to
     I2P-only like .torrent announce URLs.

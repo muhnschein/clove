@@ -77,6 +77,15 @@ fn content() -> Vec<u8> {
 }
 
 fn meta_for(content: &[u8]) -> MetaInfo {
+    meta_with(content, false)
+}
+
+/// [`meta_for`] with the BEP 27 `private` flag set.
+fn private_meta_for(content: &[u8]) -> MetaInfo {
+    meta_with(content, true)
+}
+
+fn meta_with(content: &[u8], private: bool) -> MetaInfo {
     let pieces: Vec<u8> = content
         .chunks(BLOCK_LEN as usize)
         .flat_map(|c| <[u8; 20]>::from(Sha1::digest(c)))
@@ -89,6 +98,9 @@ fn meta_for(content: &[u8]) -> MetaInfo {
         b"length".to_vec(),
         Ben::Int(i64::try_from(content.len()).expect("fixture fits in i64")),
     );
+    if private {
+        info.insert(b"private".to_vec(), Ben::Int(1));
+    }
     let mut root = BTreeMap::new();
     root.insert(b"info".to_vec(), Ben::Dict(info));
     MetaInfo::parse(&bencode::encode(&Ben::Dict(root))).expect("fixture parses")
@@ -1135,6 +1147,91 @@ fn peer_exchange_stays_within_the_limit_it_enforces() {
             break;
         }
     }
+}
+
+/// BEP 27: a private torrent's peers come from its tracker alone. The flag
+/// used to be parsed and shown and nothing more — `i2p_pex` was advertised,
+/// the known-peer set was handed to every peer, and inbound PEX was believed
+/// — which private trackers treat as ban-worthy and which lets a non-member
+/// find the swarm. None of the three may happen now.
+#[test]
+fn a_private_torrent_neither_offers_nor_accepts_peer_exchange() {
+    use clove_core::extension::{Handshake as ExtHandshake, I2P_PEX};
+    use clove_core::pex::PexMessage;
+
+    let net = MockNet::new();
+    let content = content();
+    let meta = private_meta_for(&content);
+    assert!(meta.private, "the fixture must be a private torrent");
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("private");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    // Something to leak, if it were going to.
+    seeder.add_peers(&[DestHash([0xAB; 32]), DestHash([0xAC; 32])]);
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    let mut peer = raw_peer(&net, dest, info_hash);
+    // Advertise i2p_pex ourselves, which is what prompts a PEX send.
+    let mut m = BTreeMap::new();
+    m.insert(b"i2p_pex".to_vec(), Ben::Int(1));
+    let mut hs = BTreeMap::new();
+    hs.insert(b"m".to_vec(), Ben::Dict(m));
+    wire::write_message(
+        &mut peer,
+        &Message::Extended {
+            id: 0,
+            payload: bencode::encode(&Ben::Dict(hs)),
+        },
+    )
+    .expect("ext handshake");
+    // And send a PEX message on the id clove uses for it in public.
+    wire::write_message(
+        &mut peer,
+        &Message::Extended {
+            id: 1,
+            payload: PexMessage {
+                added: vec![DestHash([0xEE; 32])],
+                dropped: Vec::new(),
+            }
+            .encode(),
+        },
+    )
+    .expect("pex");
+
+    // Its extension handshake must not offer i2p_pex, and nothing on id 1
+    // may follow it. Read until the connection goes quiet.
+    let mut saw_handshake = false;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        match next_message(&mut peer) {
+            Some(Message::Extended { id: 0, payload }) => {
+                let hs = ExtHandshake::parse(&payload).expect("clove's own handshake parses");
+                assert_eq!(
+                    hs.id_for(I2P_PEX),
+                    None,
+                    "a private torrent advertised peer exchange"
+                );
+                saw_handshake = true;
+            }
+            Some(Message::Extended { id: 1, .. }) => {
+                panic!("a private torrent sent a peer-exchange message");
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_handshake, "no extension handshake arrived at all");
+    assert_eq!(
+        seeder.pex_learned(),
+        0,
+        "a private torrent believed an inbound PEX message"
+    );
+    assert!(
+        !seeder.known_peers().contains(&DestHash([0xEE; 32])),
+        "a PEX-supplied destination reached a private torrent's peer set"
+    );
 }
 
 /// One destination may not take the whole peer table.
