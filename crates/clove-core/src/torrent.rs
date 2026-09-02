@@ -435,8 +435,16 @@ struct Peer {
     last_sent: Instant,
     /// When we last heard anything from them, for the idle timeout.
     last_seen: Instant,
-    /// Bytes served to them, the choker's ranking signal.
+    /// Bytes served to them.
     uploaded: u64,
+    /// Payload bytes they served us (solicited blocks, counted when written,
+    /// before verification).
+    downloaded: u64,
+    /// The two counters as they stood at the last choke round, so a round
+    /// ranks peers by what moved *since* — a lifetime total never decays, and
+    /// whoever was unchoked first would keep the slot for good.
+    uploaded_at_round: u64,
+    downloaded_at_round: u64,
     /// The message id the peer listens on for `i2p_pex`, once it handshakes.
     pex_id: Option<u8>,
     /// The message id the peer listens on for `ut_metadata`.
@@ -1236,6 +1244,9 @@ impl Shared {
             last_sent: Instant::now(),
             last_seen: Instant::now(),
             uploaded: 0,
+            downloaded: 0,
+            uploaded_at_round: 0,
+            downloaded_at_round: 0,
             pex_id: None,
             metadata_id: None,
         });
@@ -1592,6 +1603,7 @@ impl Shared {
         } else if self.storage.write_block(index, begin, block).is_ok() {
             self.downloaded
                 .fetch_add(block.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            st.peers[idx].downloaded += block.len() as u64;
             // Remembered by destination, not connection: the verdict may come
             // after this connection is gone, and a ban is on the identity.
             let dest = st.peers[idx].dest;
@@ -1776,17 +1788,31 @@ fn fill_requests(st: &mut State, idx: usize, out: &mut Vec<Outgoing>) {
 }
 
 /// Run a choke round and enqueue the resulting choke/unchoke messages.
+///
+/// The rate a peer is ranked by is what the choker's doc promises: bytes it
+/// sent *us* since the last round while we are leeching (tit-for-tat), bytes
+/// we sent *it* while seeding. Per round rather than lifetime, so a peer that
+/// was generous once does not hold a slot for ever on the strength of it.
 fn run_choker(st: &mut State, out: &mut Vec<Outgoing>) {
+    let seeding = st.picker.is_complete();
     let snapshots: Vec<PeerSnapshot> = st
         .peers
         .iter()
         .map(|p| PeerSnapshot {
             id: p.id,
             interested: p.they_interested,
-            rate: p.uploaded,
+            rate: if seeding {
+                p.uploaded.saturating_sub(p.uploaded_at_round)
+            } else {
+                p.downloaded.saturating_sub(p.downloaded_at_round)
+            },
             unchoked: !p.we_choke,
         })
         .collect();
+    for p in &mut st.peers {
+        p.uploaded_at_round = p.uploaded;
+        p.downloaded_at_round = p.downloaded;
+    }
     let decision = st.choker.plan(&snapshots);
     for id in decision.unchoke {
         if let Some(peer) = st.peers.iter_mut().find(|p| p.id == id) {
@@ -2045,6 +2071,27 @@ mod tests {
         MetaInfo::parse(&encode(&Value::Dict(root))).unwrap()
     }
 
+    /// A closer that closes nothing, for peers registered straight into the
+    /// table with no connection behind them.
+    struct Quiet;
+
+    impl I2pClose for Quiet {
+        fn close(&self) {}
+    }
+
+    /// Seat a peer in `torrent`'s table without a connection, returning its
+    /// id and the receiving end of its queue.
+    fn seat_peer(torrent: &Torrent, dest: DestHash) -> (u64, Receiver<Message>) {
+        let (tx, rx) = sync_channel::<Message>(OUTGOING_QUEUE);
+        let slot = torrent.shared.budget.claim().unwrap();
+        let id = torrent
+            .shared
+            .register_peer(tx, Arc::new(Quiet), dest, slot)
+            .ok()
+            .unwrap();
+        (id, rx)
+    }
+
     /// One piece per file, so "which file was skipped" is readable off the wire.
     fn three_file_meta(content: &[u8]) -> MetaInfo {
         let each = u64::from(BLOCK_LEN);
@@ -2193,6 +2240,92 @@ mod tests {
         torrent.set_piece_priorities(&meta.piece_priorities(&[0, 0, 0]));
         assert_eq!(torrent.bytes_left(), 0);
         assert!(torrent.is_complete());
+    }
+
+    /// The choker ranks by what a peer is worth to us in the role we are in:
+    /// bytes received from it while leeching, bytes sent to it while seeding —
+    /// and by the last round's traffic, not the lifetime total. The snapshot
+    /// used to hand it lifetime `uploaded` in both roles, so a leecher rewarded
+    /// the peers it had *given* the most to, for ever.
+    #[test]
+    fn choke_rounds_rank_by_role_and_by_recent_traffic() {
+        let content: Vec<u8> = (0..(3 * BLOCK_LEN))
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let meta = three_file_meta(&content);
+
+        // Leeching: one slot, two interested peers. The one we uploaded to a
+        // lot gave us nothing; the other gave us a block.
+        let dir = TempDir::new("rank-leech");
+        let leecher = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(3),
+            Mode::RarestFirst,
+            *b"-CV0001-rankrankrank",
+        );
+        let (taker, _taker_rx) = seat_peer(&leecher, DestHash([1; 32]));
+        let (giver, _giver_rx) = seat_peer(&leecher, DestHash([2; 32]));
+        let mut out = Vec::new();
+        {
+            let mut st = lock(&leecher.shared.state);
+            st.choker = Choker::new(1);
+            for p in &mut st.peers {
+                p.they_interested = true;
+                if p.id == taker {
+                    p.uploaded = 1 << 20;
+                } else {
+                    p.downloaded = u64::from(BLOCK_LEN);
+                }
+            }
+            run_choker(&mut st, &mut out);
+            assert!(
+                st.peers.iter().any(|p| p.id == giver && !p.we_choke),
+                "leeching, the peer that sent us bytes should hold the slot"
+            );
+            assert!(
+                st.peers.iter().any(|p| p.id == taker && p.we_choke),
+                "leeching, the peer we merely uploaded to should not"
+            );
+
+            // The window resets: with nothing new from anyone the two tie,
+            // and the tie breaks by id, which is the taker. A lifetime count
+            // would have kept the giver in the slot on last round's block.
+            out.clear();
+            run_choker(&mut st, &mut out);
+            assert!(
+                st.peers.iter().any(|p| p.id == taker && !p.we_choke),
+                "a round must rank by traffic since the last one, not lifetime"
+            );
+        }
+
+        // Seeding: the same two peers, and now what we send them is the
+        // signal.
+        let seed_dir = TempDir::new("rank-seed");
+        let seeder = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &seed_dir.0, false).unwrap()),
+            &Bitfield::full(3),
+            Mode::RarestFirst,
+            *b"-CV0001-rankrankrank",
+        );
+        let (served, _served_rx) = seat_peer(&seeder, DestHash([1; 32]));
+        let (_other, _other_rx) = seat_peer(&seeder, DestHash([2; 32]));
+        let mut st = lock(&seeder.shared.state);
+        st.choker = Choker::new(1);
+        for p in &mut st.peers {
+            p.they_interested = true;
+            if p.id == served {
+                p.uploaded = u64::from(BLOCK_LEN);
+            } else {
+                p.downloaded = 1 << 20;
+            }
+        }
+        run_choker(&mut st, &mut out);
+        assert!(
+            st.peers.iter().any(|p| p.id == served && !p.we_choke),
+            "seeding, the peer we are serving fastest should hold the slot"
+        );
     }
 
     /// Two instances negotiate BEP 10 and one learns a third peer via `i2p_pex`.
