@@ -32,9 +32,20 @@ use crate::http;
 pub const USER_AGENT: &str = "clove/2026.08";
 
 /// Minimum interval clove will wait between announces regardless of what a
-/// tracker asks for, to avoid hammering (a floor, not the tracker's own
-/// `min interval`).
+/// tracker asks for, to avoid hammering. Clove's own floor; a tracker's
+/// `min interval` is honoured on top of it (see
+/// [`AnnounceState::on_success_with_min`]).
 pub const MIN_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Longest clove will wait between announces whatever a tracker asks for.
+///
+/// A tracker's `interval` is an instruction and the scheduler obeys it — but
+/// `interval: 4000000000` is "never announce again until restart", which is
+/// a tracker deciding a torrent has no peers for the life of the daemon.
+/// Four hours is longer than any real tracker asks for and short enough that
+/// a mistake, or a hostile value, costs one missed cycle rather than all of
+/// them.
+pub const MAX_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// The event an announce carries (BEP 3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -401,19 +412,42 @@ impl AnnounceState {
     }
 
     /// Record a successful announce of `sent`: schedule the next at
-    /// `now + interval` (floored at [`MIN_ANNOUNCE_INTERVAL`]) and clear the
-    /// backoff.
+    /// `now + interval`, clamped to [`MIN_ANNOUNCE_INTERVAL`] and
+    /// [`MAX_ANNOUNCE_INTERVAL`], and clear the backoff.
     ///
     /// The event is a parameter because the state machine has to know what
     /// actually went out — that is how `completed` stops being sent again.
     pub fn on_success(&mut self, now: u64, interval: u32, sent: Event) {
+        self.on_success_with_min(now, interval, None, sent);
+    }
+
+    /// [`on_success`](Self::on_success), also honouring the tracker's
+    /// `min interval` when it sent one.
+    ///
+    /// The tracker's floor sits above clove's own: a tracker that says
+    /// "every half hour, and never inside ten minutes" gets the larger of
+    /// its two numbers, and both stay under [`MAX_ANNOUNCE_INTERVAL`] — a
+    /// `min interval` of a year is the same "never again" as an `interval`
+    /// of one, and is clamped the same way.
+    pub fn on_success_with_min(
+        &mut self,
+        now: u64,
+        interval: u32,
+        min_interval: Option<u32>,
+        sent: Event,
+    ) {
         self.started = true;
         if sent == Event::Completed {
             self.completed = true;
         }
         self.failures = 0;
         let floor = MIN_ANNOUNCE_INTERVAL.as_secs();
-        self.next_due = now.saturating_add(u64::from(interval).max(floor));
+        let ceiling = MAX_ANNOUNCE_INTERVAL.as_secs();
+        let wait = u64::from(interval)
+            .max(u64::from(min_interval.unwrap_or(0)))
+            .max(floor)
+            .min(ceiling);
+        self.next_due = now.saturating_add(wait);
     }
 
     /// Record a failed announce: exponential backoff from 30s, capped.
@@ -849,6 +883,52 @@ mod tests {
         st.on_success(2000, 5, Event::Periodic);
         assert!(!st.due(2000 + 59));
         assert!(st.due(2000 + 60));
+    }
+
+    /// `interval: 4000000000` used to mean "never announce again until
+    /// restart": a tracker deciding a torrent has no peers for the life of
+    /// the daemon. The ceiling turns that into one long cycle.
+    #[test]
+    fn an_absurd_interval_is_clamped_to_the_ceiling() {
+        let ceiling = MAX_ANNOUNCE_INTERVAL.as_secs();
+        let mut st = AnnounceState::new();
+        st.on_success(1_000, u32::MAX, Event::Started);
+        assert!(!st.due(1_000 + ceiling - 1), "the ceiling was not applied");
+        assert!(st.due(1_000 + ceiling), "the ceiling is too high");
+        // And a saturating `now` cannot overflow into "due immediately".
+        st.on_success(u64::MAX, u32::MAX, Event::Periodic);
+        assert!(!st.due(u64::MAX - 1));
+    }
+
+    /// The tracker's `min interval` is a floor above clove's own, and is
+    /// capped by the same ceiling — otherwise it is the same "never again"
+    /// spelled in the other field.
+    #[test]
+    fn min_interval_is_honoured_as_a_floor_under_the_ceiling() {
+        let mut st = AnnounceState::new();
+        // Larger than the interval: it wins.
+        st.on_success_with_min(0, 60, Some(900), Event::Started);
+        assert!(!st.due(899), "min interval was ignored");
+        assert!(st.due(900));
+        // Smaller than the interval: the interval stands.
+        st.on_success_with_min(1_000, 1_800, Some(300), Event::Periodic);
+        assert!(!st.due(1_000 + 1_799));
+        assert!(st.due(1_000 + 1_800));
+        // Below clove's floor: the floor stands.
+        st.on_success_with_min(5_000, 1, Some(5), Event::Periodic);
+        assert!(!st.due(5_000 + 59));
+        assert!(st.due(5_000 + 60));
+        // Absurd: clamped like an interval would be.
+        let ceiling = MAX_ANNOUNCE_INTERVAL.as_secs();
+        st.on_success_with_min(9_000, 60, Some(u32::MAX), Event::Periodic);
+        assert!(!st.due(9_000 + ceiling - 1));
+        assert!(st.due(9_000 + ceiling));
+        // Absent: exactly `on_success`.
+        let mut plain = AnnounceState::new();
+        plain.on_success(0, 1_800, Event::Started);
+        let mut none = AnnounceState::new();
+        none.on_success_with_min(0, 1_800, None, Event::Started);
+        assert_eq!(plain.next_due, none.next_due);
     }
 
     #[test]
