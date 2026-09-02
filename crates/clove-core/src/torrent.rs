@@ -677,18 +677,26 @@ impl Torrent {
         // Weak, so a forgotten handle cannot keep the torrent (and its open
         // files) alive for the life of the process.
         let shared = Arc::downgrade(&self.shared);
-        std::thread::spawn(move || {
-            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(period);
-                if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
+        let spawned = std::thread::Builder::new()
+            .name("clove-maint".into())
+            .spawn(move || {
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(period);
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    let Some(shared) = shared.upgrade() else {
+                        return;
+                    };
+                    shared.maintain();
                 }
-                let Some(shared) = shared.upgrade() else {
-                    return;
-                };
-                shared.maintain();
-            }
-        });
+            });
+        // A thread the OS will not give us is a torrent without keep-alives
+        // or timeouts, which is degraded rather than fatal; say so and carry
+        // on, as every other spawn site does.
+        if let Err(e) = spawned {
+            eprintln!("clove: cannot start the maintenance thread: {e}");
+        }
         Maintenance { stop }
     }
 
@@ -1078,7 +1086,7 @@ fn spawn_writer<W: std::io::Write + I2pClose + Send + 'static>(
     mut writer: W,
     rx: Receiver<Message>,
 ) -> std::io::Result<JoinHandle<()>> {
-    peer_thread().spawn(move || {
+    peer_thread("clove-peer-wr").spawn(move || {
         while let Ok(msg) = rx.recv() {
             if wire::write_message(&mut writer, &msg).is_err() {
                 break;
@@ -1118,7 +1126,7 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
         shared: Arc::clone(&shared),
         id,
     };
-    peer_thread().spawn(move || {
+    peer_thread("clove-peer-rd").spawn(move || {
         let _guard = guard;
         // One frame buffer for the life of the connection.
         let mut body = Vec::new();
@@ -1232,9 +1240,12 @@ fn write_handshake_until<S: I2pStream>(
 /// [`MAX_DEPTH`](crate::bencode::MAX_DEPTH).
 const PEER_STACK_BYTES: usize = 256 * 1024;
 
-/// A builder for the threads that serve one peer connection.
-fn peer_thread() -> std::thread::Builder {
-    std::thread::Builder::new().stack_size(PEER_STACK_BYTES)
+/// A builder for the threads that serve one peer connection. Named, so a
+/// `ps -T` or a core says which of a few hundred threads is which.
+fn peer_thread(name: &str) -> std::thread::Builder {
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(PEER_STACK_BYTES)
 }
 
 /// The error a banned destination is refused with, at every door.
