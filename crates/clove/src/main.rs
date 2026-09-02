@@ -181,12 +181,24 @@ fn parse_refs(operands: &[String]) -> Result<(Vec<String>, bool), Fail> {
 /// rather than a daemon-side `/v1/torrents/all` endpoint: expanding here keeps
 /// the bulk case made of the same single-torrent requests, so there is one
 /// code path on the daemon and nothing new to authorise.
-fn expand(socket: &Path, token: &str, refs: &[String], all: bool) -> Result<Vec<String>, Fail> {
+///
+/// `with_pending` says whether `--all` reaches magnets still fetching their
+/// metadata: `remove` can act on one, nothing else can.
+fn expand(
+    socket: &Path,
+    token: &str,
+    refs: &[String],
+    all: bool,
+    with_pending: bool,
+) -> Result<Vec<String>, Fail> {
     if !all {
         if refs.is_empty() {
             return Err(Fail::Usage(format!(
                 "this command needs a torrent ({REF_HELP}), or --all"
             )));
+        }
+        for reference in refs.iter().filter(|r| !is_index(r)) {
+            check_reference(reference)?;
         }
         // A bare number is the `#` column of the listing, resolved here
         // against the listing as it is right now. Deliberately client-side and
@@ -208,17 +220,55 @@ fn expand(socket: &Path, token: &str, refs: &[String], all: bool) -> Result<Vec<
     let items = listed
         .as_array()
         .ok_or_else(|| Fail::Failed("daemon did not return a torrent list".to_owned()))?;
-    Ok(items
+    Ok(listed_targets(items, with_pending))
+}
+
+/// The info-hashes `--all` stands for, out of a listing.
+///
+/// A magnet still fetching its metadata is an add in progress, not yet a
+/// torrent: it has no engine to pause, verify or resume, and including it
+/// would make `resume --all` fail for the whole run because one entry was
+/// never resumable. It *can* be removed, though, and `remove --all` that left
+/// every magnet behind was not removing all. `state` is the one marker that
+/// says which it is, and using it keeps this rule out of every command.
+fn listed_targets(items: &[Value], with_pending: bool) -> Vec<String> {
+    items
         .iter()
-        // A magnet still fetching its metadata is an add in progress, not yet
-        // a torrent: it has no engine to pause, verify or announce, and
-        // including it would make `resume --all` fail for the whole run
-        // because one entry was never resumable. `state` is the one marker
-        // that says so, and using it keeps this rule out of every command.
-        .filter(|item| item.get("state").and_then(Value::as_str) != Some("fetching-metadata"))
+        .filter(|item| {
+            with_pending || item.get("state").and_then(Value::as_str) != Some("fetching-metadata")
+        })
         .filter_map(|item| item.get("info_hash").and_then(Value::as_str))
         .map(str::to_owned)
-        .collect())
+        .collect()
+}
+
+/// Shortest hash prefix the daemon resolves; `registry::MIN_PREFIX` there.
+const MIN_PREFIX: usize = 4;
+
+/// Whether `reference` has the shape of something the daemon could resolve:
+/// four to forty lowercase hex characters.
+fn is_reference(reference: &str) -> bool {
+    (MIN_PREFIX..=40).contains(&reference.len())
+        && reference
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse a torrent reference the daemon would refuse, before it is built
+/// into a request target.
+///
+/// The daemon checks the same thing, but by then the text is part of the
+/// path: `clove remove 'abcd?data=1'` reached the daemon as a removal *with*
+/// `data=1`, and no `--data` had been typed. A reference that is not one is a
+/// usage error here, where it is still just an argument.
+fn check_reference(reference: &str) -> Result<(), Fail> {
+    if is_reference(reference) {
+        return Ok(());
+    }
+    Err(Fail::Usage(format!(
+        "{:?} is not a torrent reference; a torrent is named by {REF_HELP}",
+        display(reference)
+    )))
 }
 
 /// Longest listing position accepted as one: `999`, three digits.
@@ -282,6 +332,7 @@ fn resolve_indices(socket: &Path, token: &str, refs: &[String]) -> Result<Vec<St
 /// `#` position means the same thing everywhere it can be typed.
 fn one_target(socket: &Path, token: &str, reference: &str) -> Result<String, Fail> {
     if !is_index(reference) {
+        check_reference(reference)?;
         return Ok(reference.to_owned());
     }
     let refs = [reference.to_owned()];
@@ -407,7 +458,9 @@ fn cmd_add(where_: &Where, operands: &[String]) -> Result<(), Fail> {
     let reply = request(&socket, &token, "POST", &path, &body)?;
     let value = parse_body(&reply)?;
     match value.get("info_hash").and_then(Value::as_str) {
-        Some(info_hash) => println!("added {info_hash}"),
+        // Always hex from this daemon, and still the daemon's text: the one
+        // place a string from the API reached the terminal unscrubbed.
+        Some(info_hash) => println!("added {}", display(info_hash)),
         // A reply we did not recognise, shown as-is so it is not lost — but
         // scrubbed, because "as-is" here means straight from the daemon's JSON
         // to a terminal, and that is the one thing this must not be.
@@ -429,7 +482,7 @@ fn cmd_remove(where_: &Where, operands: &[String]) -> Result<(), Fail> {
         .collect();
     let (refs, all) = parse_refs(&rest)?;
     let (socket, token) = resolve(where_)?;
-    let targets = expand(&socket, &token, &refs, all)?;
+    let targets = expand(&socket, &token, &refs, all, true)?;
     for_each(&targets, |target| {
         let path = if delete_data {
             format!("/v1/torrents/{target}?data=1")
@@ -466,7 +519,7 @@ fn cmd_show(where_: &Where, json: bool, operands: &[String]) -> Result<(), Fail>
 fn cmd_action(where_: &Where, operands: &[String], action: &str, done: &str) -> Result<(), Fail> {
     let (refs, all) = parse_refs(operands)?;
     let (socket, token) = resolve(where_)?;
-    let targets = expand(&socket, &token, &refs, all)?;
+    let targets = expand(&socket, &token, &refs, all, false)?;
     for_each(&targets, |target| {
         request(
             &socket,
@@ -483,7 +536,7 @@ fn cmd_action(where_: &Where, operands: &[String], action: &str, done: &str) -> 
 fn cmd_verify(where_: &Where, operands: &[String]) -> Result<(), Fail> {
     let (refs, all) = parse_refs(operands)?;
     let (socket, token) = resolve(where_)?;
-    let targets = expand(&socket, &token, &refs, all)?;
+    let targets = expand(&socket, &token, &refs, all, false)?;
     for_each(&targets, |target| {
         let reply = request(
             &socket,
@@ -1789,19 +1842,102 @@ mod tests {
         let socket = Path::new("/nonexistent/clove.sock");
         // No torrents and no --all is a usage error, named so the operator
         // learns that a prefix would have done.
-        let err = expand(socket, "t", &[], false).expect_err("nothing to act on");
+        let err = expand(socket, "t", &[], false, false).expect_err("nothing to act on");
         assert!(
             matches!(&err, Fail::Usage(m) if m.contains("prefix")),
             "{err:?}"
         );
         // Mixing them is a usage error rather than a silent preference for one.
-        let both = expand(socket, "t", &["3f2a".to_owned()], true);
+        let both = expand(socket, "t", &["3f2a".to_owned()], true, false);
         assert!(matches!(both, Err(Fail::Usage(_))));
         // Plain references never touch the socket, which is why this passes a
         // path that does not exist.
         assert_eq!(
-            expand(socket, "t", &["3f2a".to_owned(), "9b1c".to_owned()], false).expect("refs"),
+            expand(
+                socket,
+                "t",
+                &["3f2a".to_owned(), "9b1c".to_owned()],
+                false,
+                false
+            )
+            .expect("refs"),
             vec!["3f2a".to_owned(), "9b1c".to_owned()]
+        );
+    }
+
+    /// A reference is checked before it is built into a request path. The
+    /// regression: `remove 'abcd?data=1'` reached the daemon as a removal
+    /// with `data=1`, and nobody had typed `--data`.
+    #[test]
+    fn a_reference_that_is_not_one_is_refused_before_it_becomes_a_path() {
+        for good in ["abcd", "3f2a", &"0".repeat(40), &"f".repeat(40), "1234"] {
+            assert!(is_reference(good), "{good:?} should be a reference");
+        }
+        for bad in [
+            "abcd?data=1",
+            "abcd/verify",
+            "abcd#x",
+            "ABCD",
+            "abc",
+            &"a".repeat(41),
+            "",
+            "../..",
+            "abcd ",
+        ] {
+            assert!(!is_reference(bad), "{bad:?} should not be a reference");
+        }
+
+        // Through the two doors every command uses. Neither touches the
+        // socket for a refused reference, so a path that does not exist does.
+        let socket = Path::new("/nonexistent/clove.sock");
+        let err = expand(socket, "t", &["abcd?data=1".to_owned()], false, false)
+            .expect_err("a query string passed as a torrent");
+        assert!(
+            matches!(&err, Fail::Usage(m) if m.contains("not a torrent reference")),
+            "{err:?}"
+        );
+        assert!(matches!(
+            one_target(socket, "t", "abcd/verify"),
+            Err(Fail::Usage(_))
+        ));
+        assert_eq!(
+            one_target(socket, "t", "abcd").expect("a plain prefix"),
+            "abcd"
+        );
+        // A position is still a position, resolved against the listing —
+        // which here means an unreachable daemon, not a usage error.
+        assert!(matches!(
+            one_target(socket, "t", "1"),
+            Err(Fail::Unreachable(_))
+        ));
+    }
+
+    /// `--all` reaches a pending magnet for `remove` and for nothing else.
+    #[test]
+    fn remove_all_includes_pending_magnets_and_the_other_bulk_commands_do_not() {
+        let items = vec![
+            obj(&[
+                ("info_hash", Value::from("a".repeat(40))),
+                ("state", Value::from("seeding")),
+            ]),
+            obj(&[
+                ("info_hash", Value::from("b".repeat(40))),
+                ("state", Value::from("fetching-metadata")),
+            ]),
+            obj(&[
+                ("info_hash", Value::from("c".repeat(40))),
+                ("state", Value::from("paused")),
+            ]),
+        ];
+        assert_eq!(
+            listed_targets(&items, true),
+            vec!["a".repeat(40), "b".repeat(40), "c".repeat(40)],
+            "remove --all left the magnet behind"
+        );
+        assert_eq!(
+            listed_targets(&items, false),
+            vec!["a".repeat(40), "c".repeat(40)],
+            "a bulk pause or resume would fail on the magnet"
         );
     }
 

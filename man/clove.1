@@ -233,6 +233,11 @@ With
 .Fl -data
 their downloaded files are deleted as well.
 .Pp
+.Fl -all
+here reaches magnets still fetching their metadata as well, which the other
+bulk commands skip: a magnet can be removed and nothing else can be done to
+it.
+.Pp
 .Fl -all Fl -data
 deletes the data of every hosted torrent and cannot be undone.
 Both flags are required to spell it, which is the only guard there is: a
