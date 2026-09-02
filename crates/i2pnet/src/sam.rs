@@ -152,6 +152,20 @@ fn read_sam_line(
         .to_owned())
 }
 
+/// `Instant::now() + timeout`, without the panic.
+///
+/// `Instant` addition panics on overflow. No timeout here can reach that —
+/// they are constants and config values measured in seconds — but the panic
+/// would land on a peer-serving thread, so it is ruled out by construction
+/// rather than by argument. The saturating direction is "never": a deadline
+/// too far off to represent is one that would not arrive, so it is `None`,
+/// which every line reader here takes as "no whole-exchange deadline" with
+/// the socket's own per-read timeout still in force. The other direction,
+/// "now", would turn an absurdly long timeout into an immediate one.
+fn deadline_after(timeout: Duration) -> Option<Instant> {
+    Instant::now().checked_add(timeout)
+}
+
 /// Open a socket to the SAM bridge and complete the `HELLO VERSION`
 /// handshake on it, returning the socket ready for a command.
 ///
@@ -171,8 +185,13 @@ fn sam_hello(port: u16, timeout: Duration, what: &str) -> io::Result<(TcpStream,
 
     // The read timeout is per-call, so a bridge dribbling one byte just
     // inside it could hold this open indefinitely. Bound the exchange too.
-    let deadline = Instant::now() + timeout;
-    let reply = read_sam_line(&mut stream, port, MAX_HELLO_LINE, Some(deadline), what)?;
+    let reply = read_sam_line(
+        &mut stream,
+        port,
+        MAX_HELLO_LINE,
+        deadline_after(timeout),
+        what,
+    )?;
     // The result is a field, not a substring: a refusal whose MESSAGE quotes
     // `RESULT=OK` is still a refusal. And the line reaches a terminal.
     let result = reply
@@ -234,12 +253,11 @@ fn dial_stream(
     // the status read gets the caller's full timeout rather than the short
     // handshake one.
     stream.set_read_timeout(Some(timeout))?;
-    let deadline = Instant::now() + timeout;
     let status = read_sam_line(
         &mut stream,
         port,
         MAX_STATUS_LINE,
-        Some(deadline),
+        deadline_after(timeout),
         "STREAM CONNECT",
     )?;
     expect_stream_ok(&status, &format!("the stream to {}", peer.to_b32()))?;
@@ -680,12 +698,11 @@ impl SamSession {
         control.write_all(command.as_bytes())?;
 
         control.set_read_timeout(Some(config.session_timeout))?;
-        let deadline = Instant::now() + config.session_timeout;
         let status = read_sam_line(
             &mut control,
             port,
             MAX_SESSION_LINE,
-            Some(deadline),
+            deadline_after(config.session_timeout),
             "SESSION CREATE",
         )?;
         let blob = parse_session_status(&status)?;
@@ -1002,12 +1019,11 @@ impl SamListener {
             session.nickname
         );
         forward.write_all(command.as_bytes())?;
-        let deadline = Instant::now() + timeout;
         let status = read_sam_line(
             &mut forward,
             sam_port,
             MAX_STATUS_LINE,
-            Some(deadline),
+            deadline_after(timeout),
             "STREAM FORWARD",
         )?;
         expect_stream_ok(&status, "STREAM FORWARD")?;
@@ -1151,8 +1167,8 @@ fn accept_forwarded(listener: &TcpListener) -> io::Result<Option<(ForwardedStrea
     }
     // The same budget again as a whole-line deadline: the read timeout is per
     // byte, and a header dribbled a byte at a time is otherwise unbounded.
-    let deadline = Instant::now() + DEST_LINE_TIMEOUT;
-    let Ok(dest) = read_dest_line(&mut stream, MAX_DEST_LINE, Some(deadline)) else {
+    let deadline = deadline_after(DEST_LINE_TIMEOUT);
+    let Ok(dest) = read_dest_line(&mut stream, MAX_DEST_LINE, deadline) else {
         return Ok(None);
     };
     if stream.set_read_timeout(None).is_err() {
@@ -1425,12 +1441,11 @@ fn naming_lookup(port: u16, name: &str, timeout: Duration) -> io::Result<DestHas
     let (mut stream, _) = sam_hello(port, timeout, "HELLO (for NAMING LOOKUP)")?;
     stream.write_all(format!("NAMING LOOKUP NAME={name}\n").as_bytes())?;
 
-    let deadline = Instant::now() + timeout;
     let reply = read_sam_line(
         &mut stream,
         port,
         MAX_NAMING_LINE,
-        Some(deadline),
+        deadline_after(timeout),
         "NAMING LOOKUP",
     )?;
     let value = parse_naming_reply(&reply, name)?;
@@ -1547,6 +1562,24 @@ mod tests {
         // Two spellings become one an operator can type.
         let name: String = "safe\u{200b}.exe".chars().map(scrub_char).collect();
         assert_eq!(name, "safe..exe");
+    }
+
+    /// `Instant + Duration` panics on overflow; a deadline is computed on
+    /// every dial, so it must saturate instead.
+    #[test]
+    fn an_unrepresentable_deadline_is_none_not_a_panic() {
+        let before = Instant::now();
+        let soon = deadline_after(Duration::from_secs(1)).expect("a second from now exists");
+        assert!(soon >= before + Duration::from_secs(1));
+        assert_eq!(deadline_after(Duration::MAX), None);
+        // And none is "no whole-exchange deadline", which the line reader
+        // honours by reading on.
+        let mut cursor = Cursor::new(b"hello\n".to_vec());
+        assert!(
+            read_dest_line(&mut cursor, MAX_DEST_LINE, deadline_after(Duration::MAX)).is_err(),
+            "not a destination"
+        );
+        assert_eq!(cursor.position(), 6, "the reader read the whole line");
     }
 
     #[test]
