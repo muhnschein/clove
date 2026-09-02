@@ -143,6 +143,40 @@ fn honour_sandbox_policy(policy: SandboxPolicy, verdict: &sandbox::Verdict) -> R
     Ok(())
 }
 
+/// Claim `<data_dir>/lock` for this process, refusing to start if another
+/// daemon holds it.
+///
+/// Two daemons on one data directory each persist every 30 seconds into the
+/// same resume files and each bind the same socket, and the second to bind
+/// used to win it silently. An `flock` is the right shape for the guard: it
+/// dies with the process, so a `SIGKILL` leaves nothing stale behind, and a
+/// non-blocking attempt says at once whether somebody else is there.
+///
+/// Runs before the sandbox is entered — `flock(2)` is not on the post-init
+/// allowlist and has no reason to be — and the returned handle must stay open
+/// for the life of the process, since closing it releases the lock.
+fn lock_instance(data_dir: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = data_dir.join("lock");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("opening {}: {e}", path.display()))?;
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(file),
+        Err(rustix::io::Errno::WOULDBLOCK) => Err(format!(
+            "another cloved is running on this data directory (it holds {}); refusing to \
+             start a second one — two daemons over one set of state files corrupt it",
+            path.display()
+        )),
+        Err(e) => Err(format!("locking {}: {e}", path.display())),
+    }
+}
+
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     let defaults = Defaults::from_env().map_err(|e| e.to_string())?;
@@ -193,6 +227,10 @@ fn run() -> Result<(), String> {
             config.data_dir.display()
         )
     })?;
+    // Held for the life of the process: the lock is on the descriptor, and
+    // this binding is the one that keeps it open. Before the registry and the
+    // socket, so a second daemon never gets as far as touching either.
+    let _instance = lock_instance(&config.data_dir)?;
     if let Some(parent) = config.api_socket.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating socket dir {}: {e}", parent.display()))?;
@@ -2262,5 +2300,33 @@ mod tests {
         // A second call reads the existing token rather than rotating it —
         // rotating would invalidate every running CLI on restart.
         assert_eq!(load_or_create_token(&dir.0).expect("reuse"), first);
+    }
+
+    // ------------------------------------------------- instance lock
+
+    /// One data directory, one daemon. `flock` locks belong to the open file
+    /// description, so a second `open` in this process stands in for a second
+    /// process exactly.
+    #[test]
+    fn the_data_directory_admits_one_daemon_at_a_time() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("instance-lock");
+        let first = lock_instance(&dir.0).expect("the first daemon takes the lock");
+
+        let err = lock_instance(&dir.0).expect_err("a second daemon got the same lock");
+        assert!(
+            err.contains("another cloved is running") && err.contains("lock"),
+            "the refusal does not say what is going on: {err}"
+        );
+        let mode = std::fs::metadata(dir.0.join("lock"))
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the lock file is not private to the daemon");
+
+        // Releasing it — the first daemon exiting — is what lets the next one in.
+        drop(first);
+        lock_instance(&dir.0).expect("the lock outlived the process that held it");
     }
 }

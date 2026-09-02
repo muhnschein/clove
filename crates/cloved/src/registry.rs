@@ -2045,10 +2045,22 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 /// Write `bytes` to `path` atomically: a sibling temp file, fsynced, then
 /// renamed over `path` (atomic on the same filesystem).
+///
+/// The temp name carries this process's pid and is opened `create_new`, the
+/// way `write_private_file` in `main.rs` does it. A fixed `<path>.tmp` opened
+/// with truncation let two daemons on one data directory interleave: one
+/// truncates the temp the other has just fsynced, and the other renames the
+/// half-written file into place. The instance lock makes that pairing
+/// unlikely; this makes it harmless.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+    let tmp = PathBuf::from(format!("{}.{}.tmp", path.display(), std::process::id()));
+    // A temp left by an earlier crash of this pid would fail create_new below.
+    let _ = fs::remove_file(&tmp);
     {
-        let mut file = fs::File::create(&tmp)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
@@ -2771,6 +2783,38 @@ mod tests {
         assert!(
             !magnet_path.exists(),
             "the stale magnet file was left behind"
+        );
+    }
+
+    /// The temp file is this process's own, not a fixed name any writer of
+    /// the same target would open with truncation.
+    #[test]
+    fn atomic_write_uses_a_private_temp_name() {
+        let data = TempDir::new("atomic-tmp");
+        let target = data.0.join("state.resume");
+        // What the old fixed name would have been. Left in place by "another
+        // writer"; if this write went through it, it would be truncated and
+        // renamed away.
+        let fixed = data.0.join("state.resume.tmp");
+        fs::write(&fixed, b"another writer's half-written temp").unwrap();
+        // And a leftover of *our* own pid, from a crash: it must not make the
+        // write fail, and it must not be trusted either.
+        let ours = data
+            .0
+            .join(format!("state.resume.{}.tmp", std::process::id()));
+        fs::write(&ours, b"stale").unwrap();
+
+        atomic_write(&target, b"the real state").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"the real state");
+        assert_eq!(
+            fs::read(&fixed).unwrap(),
+            b"another writer's half-written temp",
+            "the fixed-name temp was touched"
+        );
+        assert!(
+            !ours.exists(),
+            "the pid temp was left behind after the rename"
         );
     }
 

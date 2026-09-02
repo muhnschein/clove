@@ -163,6 +163,20 @@ start_daemon
 run status >/dev/null || fail "clove status failed"
 expect_router_state "waiting-for-router"
 
+# One data directory, one daemon. A second start on the same configuration
+# used to unlink the first's socket and bind its own, and both then persisted
+# into the same resume files. It now has to refuse, at once, saying why — and
+# leave the first daemon answering on the socket it already had.
+echo "smoke: a second daemon on the same data_dir refuses to start"
+set +e
+timeout 20 "$cloved" -c "$work/smoke.conf" >"$work/second.log" 2>&1
+code=$?
+set -e
+[ "$code" -ne 0 ] || fail "a second cloved on the same data_dir started"
+expect_contains "$(cat "$work/second.log")" "another cloved is running" "the second daemon's refusal"
+kill -0 "$daemon_pid" 2>/dev/null || fail "the first daemon died when a second one tried to start"
+run status >/dev/null || fail "the first daemon stopped answering after a second one tried to start"
+
 echo "smoke: add, list, show"
 added=$(run add "$work/demo.torrent") || fail "add failed"
 info_hash=$(printf '%s' "$added" | awk '{print $2}')

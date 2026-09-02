@@ -202,6 +202,16 @@ Absent when
 is set; see
 .Xr clove.conf 5 .
 Anyone holding this file can be you on the network.
+.It Pa ~/.local/share/clove/lock
+Instance lock, held with
+.Xr flock 2
+for the life of the process.
+A second
+.Nm
+started on the same data directory refuses to start rather than take over
+the socket and write into the same state files; the lock is released by the
+kernel when the holder exits, however it exits, so nothing stale is left
+behind.
 .It Pa ~/.local/share/clove/state/
 Per-torrent state: the original
 .Pa .torrent ,
