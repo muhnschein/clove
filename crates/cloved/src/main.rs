@@ -990,8 +990,18 @@ fn accept_error_is_transient(e: &std::io::Error) -> bool {
 
 /// Serve one request: parse, authenticate, route, respond.
 fn handle(mut stream: ApiStream, daemon: &Arc<Daemon>) -> std::io::Result<()> {
-    let Ok(request) = http::read_request(&mut stream, MAX_REQUEST_BODY) else {
-        return write_response(&mut stream, &error(400, "malformed request"));
+    let request = match http::read_request(&mut stream, MAX_REQUEST_BODY) {
+        Ok(request) => request,
+        // Its own message, so a client can tell "too big" from "garbage" —
+        // and so the test that walks the boundary is asserting something the
+        // code can actually say.
+        Err(http::Error::BodyTooLarge) => {
+            return write_response(
+                &mut stream,
+                &error(400, "request body exceeds the allowed size"),
+            );
+        }
+        Err(_) => return write_response(&mut stream, &error(400, "malformed request")),
     };
 
     // Token auth on every request, unix socket included (SCOPE §3).
@@ -1825,7 +1835,14 @@ mod tests {
         let raw = format!(
             "POST /v1/torrents HTTP/1.1\r\nx-clove-token: {TOKEN}\r\nContent-Length: 1073741824\r\n\r\n"
         );
-        assert_eq!(status_of(&speak(&d, raw.as_bytes())), 400);
+        let reply = speak(&d, raw.as_bytes());
+        assert_eq!(status_of(&reply), 400);
+        // And refused *for its size*: the at-limit test below asserts this
+        // message is absent, which means nothing unless it is present here.
+        assert!(
+            reply.contains("exceeds the allowed size"),
+            "an oversized body was refused for some other reason: {reply}"
+        );
     }
 
     #[test]
