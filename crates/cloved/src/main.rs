@@ -13,6 +13,7 @@ mod sandbox;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -798,19 +799,50 @@ const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// lines a second would bury the message they are trying to deliver.
 const ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long one control connection may sit in a read or a write before the
+/// daemon gives up on it. A `clove` request is a few kilobytes over a local
+/// socket; ten seconds is a client that has gone away, not a slow one.
+const API_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connection threads at once. Past this a connection is answered `503` and
+/// closed rather than given a thread: the API is one request per connection
+/// from a CLI on the same machine, so this is a ceiling on a fault, not on
+/// load — and the units' `TasksMax=1024` is shared with two threads per peer.
+const MAX_API_HANDLERS: usize = 32;
+
+/// One of the [`MAX_API_HANDLERS`] slots. Given back when it is dropped —
+/// at the end of the thread that took it, or with the closure that never
+/// became a thread.
+struct HandlerSlot(Arc<AtomicUsize>);
+
+impl HandlerSlot {
+    fn claim(active: &Arc<AtomicUsize>, cap: usize) -> Option<HandlerSlot> {
+        let mut now = active.load(Ordering::Relaxed);
+        loop {
+            if now >= cap {
+                return None;
+            }
+            match active.compare_exchange_weak(now, now + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Some(HandlerSlot(Arc::clone(active))),
+                Err(seen) => now = seen,
+            }
+        }
+    }
+}
+
+impl Drop for HandlerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Accept loop: one thread per connection. Only a fatal accept error returns.
 fn serve(listener: &ApiListener, daemon: &Arc<Daemon>) -> Result<(), String> {
     let mut last_complaint: Option<Instant> = None;
+    let active = Arc::new(AtomicUsize::new(0));
     loop {
         match listener.accept() {
-            Ok(stream) => {
-                let daemon = Arc::clone(daemon);
-                std::thread::spawn(move || {
-                    if let Err(e) = handle(stream, &daemon) {
-                        eprintln!("cloved: connection error: {e}");
-                    }
-                });
-            }
+            Ok(stream) => dispatch(stream, daemon, &active, API_IO_TIMEOUT),
             // Out of descriptors, or a connection that went away between
             // arriving and being accepted. Neither says anything about the
             // listener, and returning here — as this used to — took the
@@ -825,6 +857,50 @@ fn serve(listener: &ApiListener, daemon: &Arc<Daemon>) -> Result<(), String> {
             }
             Err(e) => return Err(format!("accept failed: {e}")),
         }
+    }
+}
+
+/// Hand an accepted connection to a thread of its own, within the limits.
+///
+/// Both timeouts go on before anything is read, so a client that connects
+/// and never sends costs one thread for `timeout` and not for ever. A
+/// connection past the handler cap is answered `503` here, briefly and
+/// inline, because dropping it unanswered looks like a crash from the
+/// client's side. A thread that cannot be started is logged and the
+/// connection dropped; the accept loop carries on either way, like M-2.
+fn dispatch(
+    mut stream: ApiStream,
+    daemon: &Arc<Daemon>,
+    active: &Arc<AtomicUsize>,
+    timeout: Duration,
+) {
+    if let Err(e) = stream.set_timeouts(Some(timeout)) {
+        eprintln!("cloved: could not set a timeout on a control connection: {e}; dropping it");
+        return;
+    }
+    let Some(slot) = HandlerSlot::claim(active, MAX_API_HANDLERS) else {
+        let _ = write_response(
+            &mut stream,
+            &error(
+                503,
+                "too many API connections open at once; try again in a moment",
+            ),
+        );
+        return;
+    };
+    let daemon = Arc::clone(daemon);
+    let spawned = std::thread::Builder::new()
+        .name("api-handler".to_owned())
+        .spawn(move || {
+            let _slot = slot;
+            if let Err(e) = handle(stream, &daemon) {
+                eprintln!("cloved: connection error: {e}");
+            }
+        });
+    if let Err(e) = spawned {
+        // The closure went down with the failure, and the stream and the
+        // slot with it, so there is nothing to give back by hand.
+        eprintln!("cloved: could not start a thread for a control connection: {e}; dropping it");
     }
 }
 
@@ -2438,6 +2514,85 @@ mod tests {
         // A second call reads the existing token rather than rotating it —
         // rotating would invalidate every running CLI on restart.
         assert_eq!(load_or_create_token(&dir.0).expect("reuse"), first);
+    }
+
+    // ------------------------------------------------ connection limits
+
+    /// A client that connects and sends nothing is let go after the timeout,
+    /// and its thread's slot comes back.
+    #[test]
+    fn a_silent_client_does_not_hold_a_handler_thread_for_ever() {
+        let dir = TempDir::new("silent-client");
+        let d = daemon(&dir);
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        let active = Arc::new(AtomicUsize::new(0));
+
+        let started = Instant::now();
+        dispatch(
+            ApiStream::from_unix(server),
+            &d,
+            &active,
+            Duration::from_millis(200),
+        );
+        // Our side never writes. The daemon's side must still finish: a 400
+        // for the request that never came, then the connection closed.
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("client timeout");
+        let mut reply = Vec::new();
+        client
+            .read_to_end(&mut reply)
+            .expect("the handler never gave up");
+        assert_eq!(status_of(&String::from_utf8_lossy(&reply)), 400);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the timeout did not bound the read"
+        );
+        // The slot follows the thread out. It is released a moment after the
+        // stream closes, so allow for that rather than asserting the instant.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while active.load(Ordering::Acquire) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the handler slot was never released"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Past the handler cap a connection is answered, not parked or dropped.
+    #[test]
+    fn a_connection_past_the_handler_cap_gets_a_503() {
+        let dir = TempDir::new("handler-cap");
+        let d = daemon(&dir);
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        // Every slot taken, as if 32 requests were in flight.
+        let active = Arc::new(AtomicUsize::new(MAX_API_HANDLERS));
+
+        dispatch(
+            ApiStream::from_unix(server),
+            &d,
+            &active,
+            Duration::from_secs(1),
+        );
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).expect("read the refusal");
+        let reply = String::from_utf8_lossy(&reply);
+        assert_eq!(status_of(&reply), 503, "{reply}");
+        assert!(reply.contains("too many"), "{reply}");
+        // Refusing must not consume or leak a slot.
+        assert_eq!(active.load(Ordering::Acquire), MAX_API_HANDLERS);
+
+        // And the slot accounting itself: claim up to the cap, no further,
+        // and dropping one gives it back.
+        let active = Arc::new(AtomicUsize::new(0));
+        let held: Vec<HandlerSlot> = (0..MAX_API_HANDLERS)
+            .map(|_| HandlerSlot::claim(&active, MAX_API_HANDLERS).expect("under the cap"))
+            .collect();
+        assert!(HandlerSlot::claim(&active, MAX_API_HANDLERS).is_none());
+        drop(held);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(HandlerSlot::claim(&active, MAX_API_HANDLERS).is_some());
     }
 
     // ----------------------------------------------------- accept loop

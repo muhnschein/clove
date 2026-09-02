@@ -12,6 +12,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::time::Duration;
 
 /// A bound control-API listener.
 #[derive(Debug)]
@@ -98,6 +99,21 @@ impl ApiStream {
     #[must_use]
     pub fn from_unix(stream: UnixStream) -> ApiStream {
         ApiStream(stream)
+    }
+
+    /// Bound how long a read or a write on this connection may block; `None`
+    /// restores blocking behaviour.
+    ///
+    /// The daemon sets this on every accepted connection. A client that
+    /// connects and then says nothing — a crashed `clove`, a half-open socket
+    /// — otherwise parks a handler thread for the life of the process.
+    ///
+    /// # Errors
+    ///
+    /// The socket refused the option.
+    pub fn set_timeouts(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.0.set_read_timeout(timeout)?;
+        self.0.set_write_timeout(timeout)
     }
 }
 
@@ -215,6 +231,32 @@ mod tests {
             "the symlink was removed"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A silent peer gives the read back within the timeout rather than
+    /// holding it for ever.
+    #[test]
+    fn a_timeout_bounds_a_read_on_a_silent_connection() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let mut stream = ApiStream::from_unix(ours);
+        stream
+            .set_timeouts(Some(Duration::from_millis(100)))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = stream
+            .read(&mut [0u8; 1])
+            .expect_err("a read on a silent connection returned");
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the timeout did not fire"
+        );
     }
 
     /// The case the unlink exists for: a daemon that died left its socket

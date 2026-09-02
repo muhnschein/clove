@@ -78,7 +78,17 @@ so a client can say which torrents were meant without asking for the listing
 again.
 .It Sy 500
 The daemon failed the operation; the message says how.
+.It Sy 503
+The daemon already has as many connections open as it will serve at once
+.Pq 32 ;
+try again in a moment.
 .El
+.Pp
+A connection is one request and one reply.
+A client that connects and then sends nothing for ten seconds, or stops
+reading its reply for that long, is closed: the daemon puts a read and a write
+timeout on every accepted connection, so a client that has gone away does not
+keep a handler thread for the life of the process.
 .Ss Endpoints
 .Bl -tag -width Ds
 .It Sy GET Pa /v1/status
