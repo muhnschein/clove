@@ -15,7 +15,10 @@
 [Unit]
 Description=clove, an I2P-only BitTorrent daemon
 Documentation=man:clove(1) man:clove.conf(5) man:clove-api(7) man:cloved(8)
-After=default.target
+# No After=default.target here: WantedBy=default.target below already makes
+# the target order itself after this unit, so an After= the other way round
+# is an ordering cycle that systemd breaks by dropping a job — possibly ours.
+# User units order after basic.target on their own, which is all this needs.
 
 [Service]
 Type=exec

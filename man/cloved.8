@@ -57,6 +57,17 @@ Torrents that were not paused are brought online as soon as a router session
 exists; paused ones stay offline until
 .Cm clove resume .
 .Pp
+Both secrets are checked before they are read.
+A token or destination key that is a symbolic link, is not a regular file,
+is not owned by the daemon's user, or is readable by its group or by anyone
+else is refused, and the refusal is fatal: the daemon does not start, says
+which file and why, and leaves the file exactly as it found it.
+A first run writes both files mode 0600, so this only happens to a file that
+arrived some other way \(em restored from a backup that dropped modes, copied
+by hand, unpacked from an archive.
+Restore the file's mode to 0600 to keep using it, or delete it to have a new
+one generated; a deleted destination key means a new identity on the network.
+.Pp
 Progress is snapshotted to each torrent's resume file every 30 seconds and
 around every lifecycle change.
 State files are written with a temporary file, an
@@ -202,6 +213,16 @@ Absent when
 is set; see
 .Xr clove.conf 5 .
 Anyone holding this file can be you on the network.
+.It Pa ~/.local/share/clove/lock
+Instance lock, held with
+.Xr flock 2
+for the life of the process.
+A second
+.Nm
+started on the same data directory refuses to start rather than take over
+the socket and write into the same state files; the lock is released by the
+kernel when the holder exits, however it exits, so nothing stale is left
+behind.
 .It Pa ~/.local/share/clove/state/
 Per-torrent state: the original
 .Pa .torrent ,

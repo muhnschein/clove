@@ -163,6 +163,20 @@ start_daemon
 run status >/dev/null || fail "clove status failed"
 expect_router_state "waiting-for-router"
 
+# One data directory, one daemon. A second start on the same configuration
+# used to unlink the first's socket and bind its own, and both then persisted
+# into the same resume files. It now has to refuse, at once, saying why — and
+# leave the first daemon answering on the socket it already had.
+echo "smoke: a second daemon on the same data_dir refuses to start"
+set +e
+timeout 20 "$cloved" -c "$work/smoke.conf" >"$work/second.log" 2>&1
+code=$?
+set -e
+[ "$code" -ne 0 ] || fail "a second cloved on the same data_dir started"
+expect_contains "$(cat "$work/second.log")" "another cloved is running" "the second daemon's refusal"
+kill -0 "$daemon_pid" 2>/dev/null || fail "the first daemon died when a second one tried to start"
+run status >/dev/null || fail "the first daemon stopped answering after a second one tried to start"
+
 echo "smoke: add, list, show"
 added=$(run add "$work/demo.torrent") || fail "add failed"
 info_hash=$(printf '%s' "$added" | awk '{print $2}')
@@ -246,14 +260,16 @@ expect_contains "$(run list)" "paused" "pause by prefix took effect"
 run resume "$prefix" >/dev/null || fail "resume by prefix failed"
 expect_contains "$(run show "$prefix")" "$info_hash" "show by prefix"
 
-# Too short to be worth guessing from is a usage-class refusal (400 -> exit 1),
-# and a well-formed prefix matching nothing is "no such torrent".
-for bad in abc zzzz; do
+# Too short, or not hex, is not a torrent reference at all, and the CLI says
+# so before it builds a request path out of it (exit 2, usage). The daemon
+# applies the same rule to whatever reaches it; a well-formed reference that
+# matches nothing is "no such torrent" from the daemon (exit 1), below.
+for bad in abc zzzz 'abcd?data=1'; do
     set +e
     run pause "$bad" >/dev/null 2>&1
     code=$?
     set -e
-    expect_status "$code" 1 "pause with an unusable reference ($bad)"
+    expect_status "$code" 2 "pause with an unusable reference ($bad)"
 done
 
 # Both torrents share no prefix by construction (one is ab-repeated), so an

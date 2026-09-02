@@ -21,6 +21,13 @@
 #   data_dir /var/lib/clove
 #   api_socket /run/clove/clove.sock
 #
+# `clove` reads its socket path and token from the same file, but looks for it
+# under $XDG_CONFIG_HOME, never under @SYSCONFDIR@ — so every invocation
+# against this daemon names the file, and only root can read the token in
+# /var/lib/clove (DynamicUser= owns it):
+#
+#   sudo clove -c @SYSCONFDIR@/clove/clove.conf status
+#
 # Layer 3 is a belt-and-braces sandbox. clove is already I2P-only by
 # construction (Layer 1) and does not rely on this unit being present — but
 # when it is, the kernel enforces the same promise independently.
@@ -63,7 +70,10 @@ PrivateTmp=yes
 PrivateDevices=yes
 ProtectProc=invisible
 ProcSubset=pid
-ReadWritePaths=/var/lib/clove
+# No ReadWritePaths= for the state directory: StateDirectory= above already
+# makes it writable under ProtectSystem=strict, and naming /var/lib/clove
+# here would name the symlink DynamicUser= plants there rather than the
+# directory behind it.
 # Config is read once at start and never written.
 ReadOnlyPaths=@SYSCONFDIR@/clove
 # NoExecPaths= on the download tree is deliberately absent: DynamicUser= makes

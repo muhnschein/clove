@@ -64,9 +64,12 @@ No such resource or torrent.
 .It Sy 405
 Method not allowed for that path.
 .It Sy 409
-The torrent is already added, or the given prefix matched more than one
-torrent.
-The second case carries a
+The torrent is already added, a different torrent with the same
+.Sy name
+is already hosted
+.Pq the two would share files on disk; the message names it ,
+or the given prefix matched more than one torrent.
+The last case carries a
 .Sy candidates
 array beside the
 .Sy error
@@ -78,7 +81,17 @@ so a client can say which torrents were meant without asking for the listing
 again.
 .It Sy 500
 The daemon failed the operation; the message says how.
+.It Sy 503
+The daemon already has as many connections open as it will serve at once
+.Pq 32 ;
+try again in a moment.
 .El
+.Pp
+A connection is one request and one reply.
+A client that connects and then sends nothing for ten seconds, or stops
+reading its reply for that long, is closed: the daemon puts a read and a write
+timeout on every accepted connection, so a client that has gone away does not
+keep a handler thread for the life of the process.
 .Ss Endpoints
 .Bl -tag -width Ds
 .It Sy GET Pa /v1/status
@@ -98,7 +111,13 @@ and
 .Pq attached across every torrent, and the ceiling they come from ,
 and
 .Sy router
-.Pq Sy connecting , Sy waiting-for-router , Sy connected , Sy unsupported-sam-address ,
+.Po
+.Sy connecting , Sy waiting-for-router , Sy connected , Sy unsupported-sam-address ,
+or
+.Sy supervisor-failed ,
+the daemon could not start the thread that talks to the router and is
+running without one
+.Pc ,
 and
 .Sy sandbox ,
 the Layer-2 confinement this daemon actually achieved at start-up
@@ -193,6 +212,11 @@ Remove a torrent.
 With
 .Sy data=1
 its downloaded files are deleted too.
+A torrent whose data is being verified answers
+.Sy 400
+until the pass finishes: the hashing runs outside the daemon's lock and
+would recreate the files a removal deleted from under it.
+A magnet still fetching its metadata can be removed at any time.
 .It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /pause
 .It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /resume
 Take the torrent offline or bring it back.

@@ -58,7 +58,15 @@ run() {
 }
 
 start_daemon() {
-    timeout 120 "$cloved" >>"$work/daemon.log" 2>&1 &
+    # Not under `timeout`: the pid this records is the one the SIGKILL storm
+    # below shoots, and SIGKILL cannot be forwarded. Wrapped, the kill took
+    # out timeout(1) and left cloved running as an orphan; the next "restart"
+    # then started a second daemon on the same data_dir, which unlinked the
+    # orphan's socket and took over — twelve daemons deep by the end, all
+    # persisting into one state directory, and the test passing. The
+    # instance lock now refuses that second daemon, which is how this came
+    # to light. The trap kills the daemon on exit; that is the safety net.
+    "$cloved" >>"$work/daemon.log" 2>&1 &
     daemon_pid=$!
     i=0
     until timeout 5 "$clove" status >/dev/null 2>&1; do

@@ -13,6 +13,7 @@ mod sandbox;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -143,6 +144,68 @@ fn honour_sandbox_policy(policy: SandboxPolicy, verdict: &sandbox::Verdict) -> R
     Ok(())
 }
 
+/// Create the data directory private, and make sure it is.
+///
+/// Created `0700` from the first `mkdir` — every level of it — rather than
+/// with the umask and then chmod'd: the old order left the directory `0755`
+/// between the two calls on a first run, briefly, on the directory about to
+/// hold the destination key and the API token. The chmod stays for a
+/// directory that already existed with some other mode.
+///
+/// The chmod is fatal, unlike the rest of this layer: the local filesystem
+/// refusing the owner permission to make this directory private is a broken
+/// install, and the secrets are what it is about to hold.
+fn prepare_data_dir(data_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(data_dir)
+        .map_err(|e| format!("creating data dir {}: {e}", data_dir.display()))?;
+    std::fs::set_permissions(data_dir, PermissionsExt::from_mode(0o700)).map_err(|e| {
+        format!(
+            "could not restrict {} to 0700: {e}; refusing to keep the destination key and API \
+             token in a directory this daemon cannot make private",
+            data_dir.display()
+        )
+    })
+}
+
+/// Claim `<data_dir>/lock` for this process, refusing to start if another
+/// daemon holds it.
+///
+/// Two daemons on one data directory each persist every 30 seconds into the
+/// same resume files and each bind the same socket, and the second to bind
+/// used to win it silently. An `flock` is the right shape for the guard: it
+/// dies with the process, so a `SIGKILL` leaves nothing stale behind, and a
+/// non-blocking attempt says at once whether somebody else is there.
+///
+/// Runs before the sandbox is entered — `flock(2)` is not on the post-init
+/// allowlist and has no reason to be — and the returned handle must stay open
+/// for the life of the process, since closing it releases the lock.
+fn lock_instance(data_dir: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = data_dir.join("lock");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("opening {}: {e}", path.display()))?;
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(file),
+        Err(rustix::io::Errno::WOULDBLOCK) => Err(format!(
+            "another cloved is running on this data directory (it holds {}); refusing to \
+             start a second one — two daemons over one set of state files corrupt it",
+            path.display()
+        )),
+        Err(e) => Err(format!("locking {}: {e}", path.display())),
+    }
+}
+
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     let defaults = Defaults::from_env().map_err(|e| e.to_string())?;
@@ -177,27 +240,20 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    std::fs::create_dir_all(&config.data_dir)
-        .map_err(|e| format!("creating data dir {}: {e}", config.data_dir.display()))?;
-    // Fatal, unlike the rest of this layer: the local filesystem refusing the
-    // owner permission to make this directory private is a broken install, and
-    // it is about to hold the destination key and the API token.
-    std::fs::set_permissions(
-        &config.data_dir,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .map_err(|e| {
-        format!(
-            "could not restrict {} to 0700: {e}; refusing to keep the destination key and API \
-             token in a directory this daemon cannot make private",
-            config.data_dir.display()
-        )
-    })?;
+    prepare_data_dir(&config.data_dir)?;
+    // Held for the life of the process: the lock is on the descriptor, and
+    // this binding is the one that keeps it open. Before the registry and the
+    // socket, so a second daemon never gets as far as touching either.
+    let _instance = lock_instance(&config.data_dir)?;
     if let Some(parent) = config.api_socket.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating socket dir {}: {e}", parent.display()))?;
     }
     let token = load_or_create_token(&config.data_dir).map_err(|e| e.to_string())?;
+    // The key gets the token's treatment: a file that is not safe to be a
+    // secret stops the start, and stays where it is.
+    let identity = Identity::new(&config.data_dir, config.ephemeral);
+    identity.check()?;
 
     let registry = Registry::open(&config.data_dir, registry::Limits::from(&config))
         .map_err(|e| format!("opening registry in {}: {e}", config.data_dir.display()))?;
@@ -220,6 +276,12 @@ fn run() -> Result<(), String> {
         router: Mutex::new("connecting"),
     });
 
+    // First, and fatal: with no signal handler this loop *is* persistence, so
+    // a daemon that cannot start it would run for hours and keep nothing.
+    // Before the per-torrent threads below, so that a large rescan cannot be
+    // what exhausts the thread limit this one needs.
+    spawn_persist_loop(&daemon)?;
+
     // Resume metadata fetches for magnets loaded from disk. Collect first:
     // a `for .. in lock(..)` holds the guard for the whole loop body, and
     // spawn_metadata_fetch re-locks it (deadlock).
@@ -235,21 +297,58 @@ fn run() -> Result<(), String> {
     // with the registry unlocked, and `run_scan` re-locks it to report.
     let scans = lock(&daemon.registry).pending_scans();
     for job in scans {
-        let daemon = Arc::clone(&daemon);
-        std::thread::spawn(move || {
-            if let Err(e) = run_scan(&daemon, &job) {
+        // Shared with the thread rather than moved into it: a spawn that
+        // fails drops its closure, and the job has to outlive that to be
+        // reported on below.
+        let job = Arc::new(job);
+        let shared = Arc::clone(&daemon);
+        let work = Arc::clone(&job);
+        let spawned = spawn_named("scan", move || {
+            if let Err(e) = run_scan(&shared, &work) {
                 eprintln!("cloved: re-verifying after an unclean stop: {e}");
             }
         });
+        // No thread means no scan, and a torrent left marked as scanning
+        // never starts. Publish the failure so the mark comes off; the torrent
+        // then runs on the have-set the resume file could vouch for, and
+        // `clove verify` can retry the rest.
+        if let Err(e) = spawned {
+            eprintln!(
+                "cloved: could not start a verification thread for {}: {e}",
+                registry::hex(job.info_hash())
+            );
+            let _ = lock(&daemon.registry).finish_scan(&job, Err(e));
+        }
     }
 
-    spawn_sam_supervisor(
-        &daemon,
-        &config.sam_address,
-        Identity::new(&config.data_dir, config.ephemeral),
-    );
-    spawn_persist_loop(&daemon);
+    spawn_sam_supervisor(&daemon, &config.sam_address, identity);
     serve(&listener, &daemon)
+}
+
+/// Start a thread, and hand back the failure if there is one.
+///
+/// Every thread the daemon starts comes through here. The `Result` is the
+/// point: `thread::spawn` panics when the process is out of threads or
+/// memory, and which thread that panic lands on decides whether the daemon
+/// exits, the supervisor dies silently with `router` stuck at "connected",
+/// or a registry lock is poisoned — none of them the answer to a limit being
+/// reached.
+///
+/// `name` is what the thread should be called in `ps -T` and a core, and is
+/// not applied yet. Setting it is a `prctl(PR_SET_NAME)` on the new thread,
+/// every one of which starts after the sandbox is entered, and the post-init
+/// seccomp allowlist in `sandbox.rs` does not admit `prctl`: std swallows the
+/// `ENOSYS`, but the traced router run rightly refuses any post-init call
+/// that comes back refused. Once the allowlist admits `prctl` restricted to
+/// `PR_SET_NAME`, this becomes `.name(name.to_owned())` and nothing else
+/// changes.
+fn spawn_named<F, T>(name: &str, f: F) -> std::io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let _ = name;
+    std::thread::Builder::new().spawn(f)
 }
 
 /// Daemon state shared across connection threads.
@@ -298,6 +397,34 @@ impl Identity {
         }
     }
 
+    /// Refuse to start over a key file that is not safe to treat as a secret.
+    ///
+    /// The same rule as the token, for the same reason: a key that has been
+    /// world-readable, or is owned by somebody else, or is a symlink to
+    /// wherever, is not something to quietly step around. It used to be
+    /// stepped around *and then overwritten* — `load` declined it, the router
+    /// handed out a fresh destination, and `remember` renamed that over the
+    /// old file. An operator who restored a backup that dropped modes lost
+    /// their stable identity for good after one log line. Fatal at startup
+    /// instead, with the file left in place to be inspected.
+    ///
+    /// Run once, here, rather than being the supervisor's job: that thread
+    /// reconnects for the life of the process, and a fatal error from a
+    /// background thread is a daemon that dies at some random later moment.
+    fn check(&self) -> Result<(), String> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        match read_private_file(path) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!(
+                "{}: {e}. The file has been left as it is; restore its mode to 0600 to keep \
+                 this identity, or delete it to start with a new one",
+                path.display()
+            )),
+        }
+    }
+
     /// The stored key, or `None` for a transient destination this run.
     ///
     /// A file that is present but not a key is refused rather than sent to the
@@ -339,8 +466,20 @@ impl Identity {
         let Some(path) = self.path.as_ref() else {
             return;
         };
-        if std::fs::read_to_string(path).is_ok_and(|stored| stored.trim() == key) {
-            return;
+        match read_private_file(path) {
+            Ok(Some(stored)) if stored.trim() == key => return,
+            Ok(_) => {}
+            // Refused for its mode, owner or being a symlink. `check` makes
+            // this fatal at startup, so reaching it means the file changed
+            // under a running daemon; either way it is not ours to replace.
+            Err(e) => {
+                eprintln!(
+                    "cloved: not overwriting the destination key in {}: {e}; this run's \
+                     identity will not survive a restart",
+                    path.display()
+                );
+                return;
+            }
         }
         match write_private_file(path, key.as_bytes()) {
             Ok(()) => eprintln!("cloved: identity saved to {}", path.display()),
@@ -390,8 +529,9 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str, identity: Ident
         *lock(&daemon.router) = "unsupported-sam-address";
         return;
     };
-    let daemon = Arc::clone(daemon);
-    std::thread::spawn(move || {
+    let shared = Arc::clone(daemon);
+    let spawned = spawn_named("sam-supervisor", move || {
+        let daemon = shared;
         let policy = ReconnectPolicy::default();
         loop {
             let mut failures = 0u32;
@@ -450,6 +590,15 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str, identity: Ident
             lock(&daemon.registry).detach_network();
         }
     });
+    // Without this thread there is no router, ever. The daemon still serves
+    // its API — the torrents are on disk and listable — so say so where an
+    // operator will look, rather than leave `router` at "connecting" for good.
+    if let Err(e) = spawned {
+        eprintln!(
+            "cloved: could not start the router supervisor thread: {e}; running without a router"
+        );
+        *lock(&daemon.router) = "supervisor-failed";
+    }
 }
 
 /// One session bring-up: connect and establish the forwarded listener.
@@ -476,14 +625,16 @@ fn connect_session(
 }
 
 /// Periodically snapshot live progress into resume files.
-fn spawn_persist_loop(daemon: &Arc<Daemon>) {
+fn spawn_persist_loop(daemon: &Arc<Daemon>) -> Result<(), String> {
     let daemon = Arc::clone(daemon);
-    std::thread::spawn(move || {
+    spawn_named("persist", move || {
         loop {
             std::thread::sleep(PERSIST_INTERVAL);
             lock(&daemon.registry).persist_progress();
         }
-    });
+    })
+    .map(|_| ())
+    .map_err(|e| format!("could not start the persistence thread: {e}"))
 }
 
 /// Pause between metadata-fetch rounds (announce + peer attempts).
@@ -497,8 +648,9 @@ fn spawn_metadata_fetch(daemon: &Arc<Daemon>, info_hash: [u8; 20]) {
     if !lock(&daemon.registry).claim_fetch(&info_hash) {
         return;
     }
-    let daemon = Arc::clone(daemon);
-    std::thread::spawn(move || {
+    let shared = Arc::clone(daemon);
+    let spawned = spawn_named("metadata-fetch", move || {
+        let daemon = shared;
         let mut first_round = true;
         let mut rounds = 0u32;
         loop {
@@ -541,6 +693,20 @@ fn spawn_metadata_fetch(daemon: &Arc<Daemon>, info_hash: [u8; 20]) {
             std::thread::sleep(FETCH_ROUND_WAIT);
         }
     });
+    // The entry stays claimed — nothing re-spawns a fetch, so unclaiming it
+    // would only pretend otherwise — but the reason has to reach `clove
+    // list`, where a magnet that never tries would otherwise just look slow.
+    if let Err(e) = spawned {
+        eprintln!(
+            "cloved: could not start the metadata-fetch thread for {}: {e}",
+            registry::hex(&info_hash)
+        );
+        let round = FetchRound {
+            last_error: Some(format!("could not start the fetch thread: {e}")),
+            ..FetchRound::default()
+        };
+        lock(&daemon.registry).note_fetch_round(&info_hash, 0, &round);
+    }
 }
 
 /// How long a magnet's announce may spend reaching a tracker. The same budget
@@ -710,27 +876,155 @@ fn build_peer_id() -> std::io::Result<[u8; 20]> {
     Ok(id)
 }
 
+/// How long the accept loop waits after a transient failure before trying
+/// again. Long enough for a descriptor to come back, short enough that a
+/// `clove` invocation does not notice.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// How often a run of transient accept failures is worth a log line. Under
+/// descriptor exhaustion the loop spins at [`ACCEPT_RETRY_DELAY`], and ten
+/// lines a second would bury the message they are trying to deliver.
+const ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long one control connection may sit in a read or a write before the
+/// daemon gives up on it. A `clove` request is a few kilobytes over a local
+/// socket; ten seconds is a client that has gone away, not a slow one.
+const API_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connection threads at once. Past this a connection is answered `503` and
+/// closed rather than given a thread: the API is one request per connection
+/// from a CLI on the same machine, so this is a ceiling on a fault, not on
+/// load — and the units' `TasksMax=1024` is shared with two threads per peer.
+const MAX_API_HANDLERS: usize = 32;
+
+/// One of the [`MAX_API_HANDLERS`] slots. Given back when it is dropped —
+/// at the end of the thread that took it, or with the closure that never
+/// became a thread.
+struct HandlerSlot(Arc<AtomicUsize>);
+
+impl HandlerSlot {
+    fn claim(active: &Arc<AtomicUsize>, cap: usize) -> Option<HandlerSlot> {
+        let mut now = active.load(Ordering::Relaxed);
+        loop {
+            if now >= cap {
+                return None;
+            }
+            match active.compare_exchange_weak(now, now + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Some(HandlerSlot(Arc::clone(active))),
+                Err(seen) => now = seen,
+            }
+        }
+    }
+}
+
+impl Drop for HandlerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Accept loop: one thread per connection. Only a fatal accept error returns.
 fn serve(listener: &ApiListener, daemon: &Arc<Daemon>) -> Result<(), String> {
+    let mut last_complaint: Option<Instant> = None;
+    let active = Arc::new(AtomicUsize::new(0));
     loop {
         match listener.accept() {
-            Ok(stream) => {
-                let daemon = Arc::clone(daemon);
-                std::thread::spawn(move || {
-                    if let Err(e) = handle(stream, &daemon) {
-                        eprintln!("cloved: connection error: {e}");
-                    }
-                });
+            Ok(stream) => dispatch(stream, daemon, &active, API_IO_TIMEOUT),
+            // Out of descriptors, or a connection that went away between
+            // arriving and being accepted. Neither says anything about the
+            // listener, and returning here — as this used to — took the
+            // whole daemon down under EMFILE: every peer dropped, and
+            // `Restart=on-failure` re-verified everything on the way back up.
+            Err(e) if accept_error_is_transient(&e) => {
+                if last_complaint.is_none_or(|at| at.elapsed() >= ACCEPT_LOG_INTERVAL) {
+                    eprintln!("cloved: accept on the control socket failed: {e}; retrying");
+                    last_complaint = Some(Instant::now());
+                }
+                std::thread::sleep(ACCEPT_RETRY_DELAY);
             }
             Err(e) => return Err(format!("accept failed: {e}")),
         }
     }
 }
 
+/// Hand an accepted connection to a thread of its own, within the limits.
+///
+/// Both timeouts go on before anything is read, so a client that connects
+/// and never sends costs one thread for `timeout` and not for ever. A
+/// connection past the handler cap is answered `503` here, briefly and
+/// inline, because dropping it unanswered looks like a crash from the
+/// client's side. A thread that cannot be started is logged and the
+/// connection dropped; the accept loop carries on either way, like M-2.
+fn dispatch(
+    mut stream: ApiStream,
+    daemon: &Arc<Daemon>,
+    active: &Arc<AtomicUsize>,
+    timeout: Duration,
+) {
+    if let Err(e) = stream.set_timeouts(Some(timeout)) {
+        eprintln!("cloved: could not set a timeout on a control connection: {e}; dropping it");
+        return;
+    }
+    let Some(slot) = HandlerSlot::claim(active, MAX_API_HANDLERS) else {
+        let _ = write_response(
+            &mut stream,
+            &error(
+                503,
+                "too many API connections open at once; try again in a moment",
+            ),
+        );
+        return;
+    };
+    let daemon = Arc::clone(daemon);
+    let spawned = spawn_named("api-handler", move || {
+        let _slot = slot;
+        if let Err(e) = handle(stream, &daemon) {
+            eprintln!("cloved: connection error: {e}");
+        }
+    });
+    if let Err(e) = spawned {
+        // The closure went down with the failure, and the stream and the
+        // slot with it, so there is nothing to give back by hand.
+        eprintln!("cloved: could not start a thread for a control connection: {e}; dropping it");
+    }
+}
+
+/// Whether an `accept(2)` failure describes the moment rather than the
+/// listener, and is therefore one to wait out.
+///
+/// Descriptor exhaustion (`EMFILE`, `ENFILE`), kernel memory pressure
+/// (`ENOBUFS`, `ENOMEM`), a connection reset before it was accepted
+/// (`ECONNABORTED`), a signal (`EINTR`) and a spurious wake-up (`EAGAIN`) all
+/// pass. Anything else — `EBADF`, `EINVAL`, `ENOTSOCK` — means the socket
+/// itself is gone, and there is nothing left to serve on.
+fn accept_error_is_transient(e: &std::io::Error) -> bool {
+    use rustix::io::Errno;
+    match e.kind() {
+        std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::WouldBlock => true,
+        _ => e.raw_os_error().is_some_and(|code| {
+            [Errno::MFILE, Errno::NFILE, Errno::NOBUFS, Errno::NOMEM]
+                .iter()
+                .any(|errno| errno.raw_os_error() == code)
+        }),
+    }
+}
+
 /// Serve one request: parse, authenticate, route, respond.
 fn handle(mut stream: ApiStream, daemon: &Arc<Daemon>) -> std::io::Result<()> {
-    let Ok(request) = http::read_request(&mut stream, MAX_REQUEST_BODY) else {
-        return write_response(&mut stream, &error(400, "malformed request"));
+    let request = match http::read_request(&mut stream, MAX_REQUEST_BODY) {
+        Ok(request) => request,
+        // Its own message, so a client can tell "too big" from "garbage" —
+        // and so the test that walks the boundary is asserting something the
+        // code can actually say.
+        Err(http::Error::BodyTooLarge) => {
+            return write_response(
+                &mut stream,
+                &error(400, "request body exceeds the allowed size"),
+            );
+        }
+        Err(_) => return write_response(&mut stream, &error(400, "malformed request")),
     };
 
     // Token auth on every request, unix socket included (SCOPE §3).
@@ -824,6 +1118,10 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response 
         }
         Err(e @ (AddError::Parse(_) | AddError::Magnet(_))) => error(400, &e.to_string()),
         Err(AddError::Duplicate) => error(409, "torrent already added"),
+        // The same status as a duplicate — it is the same answer, "this is
+        // already here" — with a message that names the clash, since the
+        // operator is looking at two different torrents.
+        Err(e @ AddError::NameClash(_)) => error(409, &e.to_string()),
         Err(AddError::Io(e)) => error(500, &format!("adding torrent: {e}")),
     }
 }
@@ -878,6 +1176,7 @@ fn torrent_action(
             match lock(&daemon.registry).remove(&info_hash, delete_data) {
                 Ok(()) => ok_json(),
                 Err(RemoveError::NotFound) => error(404, "no such torrent"),
+                Err(e @ RemoveError::Scanning) => error(400, &e.to_string()),
                 Err(RemoveError::Io(e)) => error(500, &format!("removing torrent: {e}")),
             }
         }
@@ -1559,7 +1858,14 @@ mod tests {
         let raw = format!(
             "POST /v1/torrents HTTP/1.1\r\nx-clove-token: {TOKEN}\r\nContent-Length: 1073741824\r\n\r\n"
         );
-        assert_eq!(status_of(&speak(&d, raw.as_bytes())), 400);
+        let reply = speak(&d, raw.as_bytes());
+        assert_eq!(status_of(&reply), 400);
+        // And refused *for its size*: the at-limit test below asserts this
+        // message is absent, which means nothing unless it is present here.
+        assert!(
+            reply.contains("exceeds the allowed size"),
+            "an oversized body was refused for some other reason: {reply}"
+        );
     }
 
     #[test]
@@ -2164,9 +2470,10 @@ mod tests {
                 "the exposed token was replaced instead of reported"
             );
 
-            // The identity is the same check, and declines to the transient
-            // path rather than being fatal: a daemon with no stored key still
-            // runs, it just comes back as somebody else.
+            // The identity is the same check. `load` declines to the transient
+            // path rather than being fatal — it runs on the supervisor thread,
+            // for the life of the process — and `Identity::check` is what
+            // makes the same file fatal at startup.
             let dir = TempDir::new(&format!("loose-key-{mode:o}"));
             let key = dir.0.join("destination.key");
             std::fs::write(&key, key_blob_b64()).expect("write");
@@ -2188,6 +2495,58 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, dir.0.join("token")).expect("symlink");
         let err = load_or_create_token(&dir.0).expect_err("a symlinked token was followed");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// A refused key file is preserved, not replaced.
+    ///
+    /// The sequence the supervisor runs: `load` declines the file, the router
+    /// hands out a fresh destination, `remember` is called with it. That used
+    /// to rename the new key over the old file, which destroyed the one copy
+    /// of an identity that a `chmod` would have restored. And the startup
+    /// check makes it fatal before any of that can happen, the token's rule.
+    #[test]
+    fn a_refused_destination_key_survives_load_and_remember() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("identity-refused");
+        let path = dir.0.join("destination.key");
+        let original = key_blob_b64();
+        std::fs::write(&path, &original).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let identity = Identity::new(&dir.0, false);
+        let err = identity
+            .check()
+            .expect_err("a world-readable key passed the startup check");
+        assert!(
+            err.contains("destination.key") && err.contains("0600"),
+            "the refusal does not say which file or what to do: {err}"
+        );
+
+        // And even past the check — the file changing under a running daemon —
+        // the supervisor's sequence must leave it alone.
+        assert_eq!(identity.load(), None, "a 0644 key was used");
+        let mut other = i2pnet::addr::i2p_base64_decode(&original).expect("decode");
+        other[0] ^= 0xFF;
+        identity.remember(&i2pnet::addr::i2p_base64_encode(&other));
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("re-read"),
+            original,
+            "the refused key was overwritten"
+        );
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "the refused key's mode was changed");
+        assert_eq!(
+            std::fs::read_dir(&dir.0).expect("read dir").count(),
+            1,
+            "something else was written beside the refused key"
+        );
+
+        // Under `ephemeral yes` there is no key file to check, however bad the
+        // one on disk is.
+        Identity::new(&dir.0, true)
+            .check()
+            .expect("ephemeral looked at a key it will never use");
     }
 
     /// A destination plus a stray byte is not a key, however well-formed the
@@ -2262,5 +2621,183 @@ mod tests {
         // A second call reads the existing token rather than rotating it —
         // rotating would invalidate every running CLI on restart.
         assert_eq!(load_or_create_token(&dir.0).expect("reuse"), first);
+    }
+
+    // ------------------------------------------------ connection limits
+
+    /// A client that connects and sends nothing is let go after the timeout,
+    /// and its thread's slot comes back.
+    #[test]
+    fn a_silent_client_does_not_hold_a_handler_thread_for_ever() {
+        let dir = TempDir::new("silent-client");
+        let d = daemon(&dir);
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        let active = Arc::new(AtomicUsize::new(0));
+
+        let started = Instant::now();
+        dispatch(
+            ApiStream::from_unix(server),
+            &d,
+            &active,
+            Duration::from_millis(200),
+        );
+        // Our side never writes. The daemon's side must still finish: a 400
+        // for the request that never came, then the connection closed.
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("client timeout");
+        let mut reply = Vec::new();
+        client
+            .read_to_end(&mut reply)
+            .expect("the handler never gave up");
+        assert_eq!(status_of(&String::from_utf8_lossy(&reply)), 400);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the timeout did not bound the read"
+        );
+        // The slot follows the thread out. It is released a moment after the
+        // stream closes, so allow for that rather than asserting the instant.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while active.load(Ordering::Acquire) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the handler slot was never released"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Past the handler cap a connection is answered, not parked or dropped.
+    #[test]
+    fn a_connection_past_the_handler_cap_gets_a_503() {
+        let dir = TempDir::new("handler-cap");
+        let d = daemon(&dir);
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        // Every slot taken, as if 32 requests were in flight.
+        let active = Arc::new(AtomicUsize::new(MAX_API_HANDLERS));
+
+        dispatch(
+            ApiStream::from_unix(server),
+            &d,
+            &active,
+            Duration::from_secs(1),
+        );
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).expect("read the refusal");
+        let reply = String::from_utf8_lossy(&reply);
+        assert_eq!(status_of(&reply), 503, "{reply}");
+        assert!(reply.contains("too many"), "{reply}");
+        // Refusing must not consume or leak a slot.
+        assert_eq!(active.load(Ordering::Acquire), MAX_API_HANDLERS);
+
+        // And the slot accounting itself: claim up to the cap, no further,
+        // and dropping one gives it back.
+        let active = Arc::new(AtomicUsize::new(0));
+        let held: Vec<HandlerSlot> = (0..MAX_API_HANDLERS)
+            .map(|_| HandlerSlot::claim(&active, MAX_API_HANDLERS).expect("under the cap"))
+            .collect();
+        assert!(HandlerSlot::claim(&active, MAX_API_HANDLERS).is_none());
+        drop(held);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(HandlerSlot::claim(&active, MAX_API_HANDLERS).is_some());
+    }
+
+    // ---------------------------------------------------------- threads
+
+    /// A spawn reports its failure as a value rather than a panic on the
+    /// thread that asked, and the thread it starts runs.
+    #[test]
+    fn spawn_failures_are_values_not_panics() {
+        // The shape the callers rely on: an `io::Result`, so the failure
+        // path is a `match` and not an unwind through a registry lock.
+        let handle: std::io::Result<std::thread::JoinHandle<u32>> = spawn_named("shape", || 7);
+        assert_eq!(handle.expect("spawn").join().expect("join"), 7);
+    }
+
+    // ----------------------------------------------------- accept loop
+
+    /// The accept loop's exit rule. Exhaustion and aborted handshakes are
+    /// waited out; a listener that is itself broken is the end.
+    #[test]
+    fn accept_errors_that_describe_the_moment_are_retried() {
+        use rustix::io::Errno;
+        for errno in [
+            Errno::MFILE,
+            Errno::NFILE,
+            Errno::CONNABORTED,
+            Errno::AGAIN,
+            Errno::INTR,
+            Errno::NOBUFS,
+            Errno::NOMEM,
+        ] {
+            let e = std::io::Error::from_raw_os_error(errno.raw_os_error());
+            assert!(accept_error_is_transient(&e), "{e} should be waited out");
+        }
+        for errno in [Errno::BADF, Errno::INVAL, Errno::NOTSOCK, Errno::OPNOTSUPP] {
+            let e = std::io::Error::from_raw_os_error(errno.raw_os_error());
+            assert!(!accept_error_is_transient(&e), "{e} should end the daemon");
+        }
+        // An error with no errno behind it is not something to retry into.
+        assert!(!accept_error_is_transient(&std::io::Error::other(
+            "not from the kernel"
+        )));
+    }
+
+    // ---------------------------------------------------- data directory
+
+    /// Every directory created on the way to the data directory is private
+    /// from its first moment, not chmod'd private a call later — the parent
+    /// levels are what make the difference observable, since only the leaf
+    /// was ever chmod'd.
+    #[test]
+    fn the_data_directory_is_private_from_creation_at_every_level() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("data-dir-mode");
+        let data = dir.0.join("a").join("b").join("clove");
+        prepare_data_dir(&data).expect("create");
+        for level in [&data, &dir.0.join("a").join("b"), &dir.0.join("a")] {
+            let mode = std::fs::metadata(level).expect("stat").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} was created {mode:04o}", level.display());
+        }
+
+        // An existing directory with a wider mode is still tightened.
+        let loose = dir.0.join("loose");
+        std::fs::create_dir(&loose).expect("mkdir");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        prepare_data_dir(&loose).expect("prepare an existing directory");
+        let mode = std::fs::metadata(&loose)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    // ------------------------------------------------- instance lock
+
+    /// One data directory, one daemon. `flock` locks belong to the open file
+    /// description, so a second `open` in this process stands in for a second
+    /// process exactly.
+    #[test]
+    fn the_data_directory_admits_one_daemon_at_a_time() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("instance-lock");
+        let first = lock_instance(&dir.0).expect("the first daemon takes the lock");
+
+        let err = lock_instance(&dir.0).expect_err("a second daemon got the same lock");
+        assert!(
+            err.contains("another cloved is running") && err.contains("lock"),
+            "the refusal does not say what is going on: {err}"
+        );
+        let mode = std::fs::metadata(dir.0.join("lock"))
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the lock file is not private to the daemon");
+
+        // Releasing it — the first daemon exiting — is what lets the next one in.
+        drop(first);
+        lock_instance(&dir.0).expect("the lock outlived the process that held it");
     }
 }
