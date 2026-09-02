@@ -193,6 +193,10 @@ One torrent in detail: the summary fields plus
 .Sy announces_failed ,
 .Sy last_announce_error
 .Pq present only when an announce has failed ,
+.Sy banned_peers
+.Pq destinations dropped this run for serving bytes that failed verification ,
+.Sy storage_error
+.Pq present only when the disk refused a block; the download is stalled on the operator, not the swarm ,
 a
 .Sy files
 array

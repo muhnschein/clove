@@ -564,7 +564,20 @@ fn spawn_sam_supervisor(daemon: &Arc<Daemon>, sam_address: &str, identity: Ident
                 ..SwarmConfig::default()
             };
             let demux = InboundDemux::new(swarm_config.max_peers);
-            let _accept = demux.run(listener);
+            // The accept thread is the inbound half of the network; without
+            // it the session would sit at "connected" taking no peers. A
+            // refused thread is treated like a failed bring-up: back off and
+            // try the whole tree again rather than run half a network.
+            let _accept = match demux.try_run(listener) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    eprintln!("cloved: could not start the inbound accept thread: {e}; retrying");
+                    *lock(&daemon.router) = "waiting-for-router";
+                    drop(session);
+                    std::thread::sleep(policy.jittered(policy.base_delay(1), random_roll()));
+                    continue;
+                }
+            };
             lock(&daemon.registry).attach_network(
                 Arc::clone(&session),
                 Arc::clone(&demux),

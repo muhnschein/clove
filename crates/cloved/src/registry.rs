@@ -307,6 +307,13 @@ struct Hosted {
     known_peers: usize,
     /// Of those, how many arrived over `i2p_pex`.
     pex_peers: u64,
+    /// Destinations this run has banned for serving bytes that failed
+    /// verification (`docs/PROTOCOL.i2p-bt` §4.8). Live-only, like `peers`.
+    banned_peers: usize,
+    /// The first disk error the engine hit writing or verifying a block, if
+    /// any. A download with one of these is stalled on the operator, not on
+    /// the swarm, and `clove list` has to say so.
+    storage_error: Option<String>,
     /// Peers that reached us rather than being dialed — the live proof of the
     /// inbound `STREAM FORWARD` path (`PROTOCOL.i2p-bt` §2.5).
     inbound_peers: u64,
@@ -916,6 +923,8 @@ where
                 hosted.known_peers = live.torrent.known_peers().len();
                 hosted.pex_peers = live.torrent.pex_learned();
                 hosted.inbound_peers = live.torrent.inbound_peers();
+                hosted.banned_peers = live.torrent.banned_count();
+                hosted.storage_error = live.torrent.storage_error();
                 let (ok, failed, why) = live.torrent.announce_status();
                 hosted.announces_ok = ok;
                 hosted.announces_failed = failed;
@@ -1051,6 +1060,8 @@ where
             peers: 0,
             known_peers: 0,
             pex_peers: 0,
+            banned_peers: 0,
+            storage_error: None,
             inbound_peers: 0,
             announces_ok: 0,
             announces_failed: 0,
@@ -1638,6 +1649,8 @@ where
                 peers: 0,
                 known_peers: 0,
                 pex_peers: 0,
+                banned_peers: 0,
+                storage_error: None,
                 inbound_peers: 0,
                 announces_ok: 0,
                 announces_failed: 0,
@@ -1853,6 +1866,10 @@ impl Hosted {
             ("pex_peers".to_owned(), Value::UInt(self.pex_peers)),
             ("inbound_peers".to_owned(), Value::UInt(self.inbound_peers)),
             (
+                "banned_peers".to_owned(),
+                Value::UInt(u64::try_from(self.banned_peers).unwrap_or(u64::MAX)),
+            ),
+            (
                 "announces_ok".to_owned(),
                 Value::UInt(u64::from(self.announces_ok)),
             ),
@@ -1875,6 +1892,9 @@ impl Hosted {
         }
         if let Some(why) = &self.last_announce_error {
             fields.push(("last_announce_error".to_owned(), Value::from(why.clone())));
+        }
+        if let Some(why) = &self.storage_error {
+            fields.push(("storage_error".to_owned(), Value::from(why.clone())));
         }
         Value::Object(fields)
     }

@@ -677,11 +677,13 @@ fn render_detail(value: &Value) -> String {
         "seed_ratio",
         "announces_ok",
         "announces_failed",
+        "banned_peers",
         // Last, and unwrapped: each is a sentence rather than a field, and
-        // between them they answer the two questions a stopped or peerless
-        // torrent raises.
+        // between them they answer the questions a stopped, peerless or
+        // stalled torrent raises.
         "paused_because",
         "last_announce_error",
+        "storage_error",
     ] {
         let Some(field) = value.get(key) else {
             continue;

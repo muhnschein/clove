@@ -348,8 +348,8 @@ fn announce_loop<D, N>(
                 continue;
             }
             match announce_once(torrent, url, state, target, dialer, naming, config) {
-                Ok((interval, sent)) => {
-                    state.on_success(unix_now(), interval, sent);
+                Ok((interval, min_interval, sent)) => {
+                    state.on_success_with_min(unix_now(), interval, min_interval, sent);
                     torrent.note_announce(Ok(()));
                 }
                 // Discarding this is how a torrent came to sit at
@@ -389,7 +389,7 @@ fn announce_once<D, N>(
     dialer: &D,
     naming: &N,
     config: &AnnouncerConfig,
-) -> Result<(u32, tracker::Event), tracker::Error>
+) -> Result<(u32, Option<u32>, tracker::Event), tracker::Error>
 where
     D: I2pDialer,
     N: I2pNamingLookup,
@@ -414,7 +414,7 @@ where
     };
     let response = contact_tracker(url, &params, dialer, naming, config.dial_timeout)?;
     torrent.add_peers(&response.peers);
-    Ok((response.interval, event))
+    Ok((response.interval, response.min_interval, event))
 }
 
 /// How far an announce got before it failed. Four failures that read alike in
