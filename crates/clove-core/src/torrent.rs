@@ -1694,9 +1694,13 @@ impl Shared {
             return;
         }
         let was_requested = st.peers[idx].in_flight.remove(&(index, block_no)).is_some();
-        // Any block at all is proof the peer is still working for us, which is
-        // what strikes measure. Cleared even for a late or duplicate block.
-        st.peers[idx].strikes = 0;
+        // A block we asked for is proof the peer is working for us, which is
+        // what strikes measure. One we did not ask for is not: a peer could
+        // otherwise hold a slot and a full pipeline indefinitely on one
+        // unsolicited block per maintenance tick, answering nothing.
+        if was_requested {
+            st.peers[idx].strikes = 0;
+        }
         // A block for a piece we already hold is an endgame duplicate: another
         // peer answered first and the piece verified. Writing it would put this
         // peer's bytes over verified ones with nothing to re-verify afterwards.

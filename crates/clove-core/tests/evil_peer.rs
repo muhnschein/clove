@@ -647,6 +647,71 @@ fn a_lying_peer_is_banned_and_the_download_still_completes() {
     );
 }
 
+/// A peer that takes requests, answers none of them, and keeps sending blocks
+/// nobody asked for. Any shape-valid block used to clear its strikes, so it
+/// could hold a slot and sixteen in-flight blocks for ever at the cost of one
+/// unsolicited block per maintenance tick. Only a *solicited* block counts.
+#[test]
+fn unsolicited_blocks_do_not_excuse_a_peer_that_never_answers() {
+    /// More pieces than a pipeline, so there is always a piece the peer can
+    /// send unasked.
+    const PIECES: u32 = 32;
+
+    let net = MockNet::new();
+    let content: Vec<u8> = (0..(PIECES * BLOCK_LEN))
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("unsolicited");
+    let leecher = leeching_torrent(&meta, &dir);
+    leecher.set_request_timeout(Duration::from_millis(200));
+    leecher.set_idle_timeout(Duration::from_secs(600));
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&leecher, ep);
+    let _tick = leecher.spawn_maintenance(Duration::from_millis(50));
+
+    let mut peer = raw_peer(&net, dest, info_hash);
+    claim_everything(&mut peer, PIECES).expect("claim");
+    let asked = read_requests(&mut peer, clove_core::torrent::PIPELINE_DEPTH);
+    let unasked = (0..PIECES)
+        .find(|p| !asked.iter().any(|r| r.index == *p))
+        .expect("a piece nobody asked for");
+
+    // Never an answer; a steady stream of blocks for a piece nobody wanted
+    // from us, each valid in shape.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flood_stop = Arc::clone(&stop);
+    let mut writer = peer.try_clone();
+    let flood = std::thread::spawn(move || {
+        while !flood_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let msg = Message::Piece {
+                index: unasked,
+                begin: 0,
+                block: vec![0x5A; BLOCK_LEN as usize],
+            };
+            if wire::write_message(&mut writer, &msg).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    });
+
+    let deadline = Instant::now() + DEADLINE;
+    while !leecher.connected_peers().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "a peer answering nothing kept its slot on the strength of unsolicited blocks"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = flood.join();
+    drop(peer);
+}
+
 /// The endgame hands one block to more than one peer on purpose. The peer that
 /// answers second must not be able to put its bytes over a piece that already
 /// verified — in a debug build that tripped the picker's own invariant, and in
