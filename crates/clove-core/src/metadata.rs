@@ -15,6 +15,7 @@
 //! accept a short/oversized piece.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use sha1::{Digest, Sha1};
 
@@ -151,7 +152,16 @@ impl MetadataAssembler {
     /// Expected byte length of piece `index` (the last piece is short).
     #[must_use]
     pub fn piece_len(&self, index: u32) -> usize {
-        let start = index as usize * METADATA_PIECE_LEN;
+        // The index is the peer's. On a 32-bit `usize` the multiplication
+        // wraps at index 2^18, which would name a piece inside the blob
+        // that does not exist; an offset that cannot be computed is out of
+        // range, the same as one that can and is.
+        let start = usize::try_from(index)
+            .ok()
+            .and_then(|i| i.checked_mul(METADATA_PIECE_LEN));
+        let Some(start) = start else {
+            return 0;
+        };
         if start >= self.total_size {
             return 0;
         }
@@ -209,6 +219,77 @@ impl MetadataAssembler {
         }
         let got: [u8; 20] = Sha1::digest(&bytes).into();
         (got == expected_info_hash).then_some(bytes)
+    }
+}
+
+/// How many `ut_metadata` requests one peer may have served per
+/// [`METADATA_REQUEST_WINDOW`].
+///
+/// A honest fetch asks for each piece once — [`MAX_METADATA_SIZE`] is 512
+/// pieces — and again only after a stall, so this is a rate an honest peer
+/// never notices. A peer asking in a loop is a bandwidth amplifier at no
+/// cost to itself: ~16 KiB out per ~30-byte frame in.
+pub const METADATA_REQUEST_LIMIT: u32 = 128;
+
+/// The window [`METADATA_REQUEST_LIMIT`] is counted over.
+pub const METADATA_REQUEST_WINDOW: Duration = Duration::from_secs(10);
+
+/// Per-peer budget for serving `ut_metadata` requests: `limit` requests per
+/// `window`, then `Reject` until the window turns over.
+///
+/// Time is a parameter so the budget is deterministic under test; the
+/// caller passes `Instant::now()`. Refused requests do not count — a peer
+/// past its budget is not pushed further into it by asking again — and the
+/// window is fixed rather than sliding, which is simpler and no less a
+/// bound: at most `2 × limit` in any span of `window`.
+#[derive(Clone, Debug)]
+pub struct MetadataRequestBudget {
+    limit: u32,
+    window: Duration,
+    window_start: Option<Instant>,
+    used: u32,
+}
+
+impl Default for MetadataRequestBudget {
+    fn default() -> Self {
+        Self::new(METADATA_REQUEST_LIMIT, METADATA_REQUEST_WINDOW)
+    }
+}
+
+impl MetadataRequestBudget {
+    /// A budget of `limit` requests per `window`.
+    #[must_use]
+    pub fn new(limit: u32, window: Duration) -> Self {
+        MetadataRequestBudget {
+            limit,
+            window,
+            window_start: None,
+            used: 0,
+        }
+    }
+
+    /// Whether a request arriving at `now` may be served. `true` spends one
+    /// of the window's requests; `false` means answer with `Reject`.
+    pub fn allow(&mut self, now: Instant) -> bool {
+        let expired = self
+            .window_start
+            .is_none_or(|start| now.saturating_duration_since(start) >= self.window);
+        if expired {
+            self.window_start = Some(now);
+            self.used = 0;
+        }
+        if self.used >= self.limit {
+            return false;
+        }
+        self.used += 1;
+        true
+    }
+
+    /// Requests still available in the current window, as of the last
+    /// [`allow`](Self::allow).
+    #[must_use]
+    pub fn remaining(&self) -> u32 {
+        self.limit.saturating_sub(self.used)
     }
 }
 
@@ -284,6 +365,42 @@ mod tests {
         assert_eq!(MetadataMessage::parse(b"garbage"), Err(Error::Malformed));
     }
 
+    /// A peer gets its budget, then `Reject` until the window turns over;
+    /// asking while refused does not push the window out.
+    #[test]
+    fn request_budget_limits_a_peer_per_window() {
+        let window = Duration::from_secs(10);
+        let mut budget = MetadataRequestBudget::new(3, window);
+        let t0 = Instant::now();
+        assert_eq!(budget.remaining(), 3);
+        assert!(budget.allow(t0));
+        assert!(budget.allow(t0 + Duration::from_secs(1)));
+        assert!(budget.allow(t0 + Duration::from_secs(2)));
+        assert_eq!(budget.remaining(), 0);
+        // Spent: refused for the rest of the window, however often asked.
+        for s in 3..10 {
+            assert!(!budget.allow(t0 + Duration::from_secs(s)), "at +{s}s");
+        }
+        // The window turns over from its start, not from the last refusal.
+        assert!(budget.allow(t0 + window));
+        assert_eq!(budget.remaining(), 2);
+        // A long silence starts a fresh window rather than carrying debt.
+        assert!(budget.allow(t0 + window * 5));
+        assert_eq!(budget.remaining(), 2);
+
+        // The default is what a honest fetch never notices: every piece of
+        // the largest allowed blob, once, fits in a few windows.
+        let mut default = MetadataRequestBudget::default();
+        let served = (0..=METADATA_REQUEST_LIMIT)
+            .filter(|_| default.allow(t0))
+            .count();
+        assert_eq!(served, usize::try_from(METADATA_REQUEST_LIMIT).unwrap());
+        assert!(
+            MAX_METADATA_SIZE / METADATA_PIECE_LEN
+                <= usize::try_from(METADATA_REQUEST_LIMIT).unwrap() * 4
+        );
+    }
+
     #[test]
     fn assembler_rejects_absurd_size() {
         assert_eq!(MetadataAssembler::new(0).err(), Some(Error::BadSize));
@@ -321,6 +438,15 @@ mod tests {
     fn assembler_rejects_bad_pieces() {
         let mut asm = MetadataAssembler::new(200).unwrap();
         assert_eq!(asm.add_piece(5, &[0; 200]), Err(Error::BadPiece)); // OOB index
+        // A huge index is out of range, not an offset that wrapped into
+        // range: `index * 16 KiB` overflows a 32-bit usize from 2^18 up.
+        // Unobservable on the 64-bit targets the tests run on, where the
+        // product simply exceeds the size; asserted here so the arithmetic
+        // stays checked.
+        for huge in [1 << 18, u32::MAX / 2, u32::MAX] {
+            assert_eq!(asm.piece_len(huge), 0, "index {huge}");
+            assert_eq!(asm.add_piece(huge, &[]), Err(Error::BadPiece));
+        }
         assert_eq!(asm.add_piece(0, &[0; 199]), Err(Error::BadPiece)); // wrong length
         assert!(asm.add_piece(0, &[0; 200]).is_ok());
     }

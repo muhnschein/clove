@@ -39,3 +39,6 @@
 "%FF"
 "%zz"
 "%"
+
+# Two hashes in one link is a refusal, not a last-wins.
+"&xt=urn:btih:ffffffffffffffffffffffffffffffffffffffff"

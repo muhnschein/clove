@@ -118,6 +118,14 @@ fn sweep(name: &str, seeds: &[Vec<u8>], seed_value: u64, mut parse: impl FnMut(&
     }
 }
 
+fn count_nodes(value: &Ben) -> usize {
+    match value {
+        Ben::Bytes(_) | Ben::Int(_) => 1,
+        Ben::List(items) => 1 + items.iter().map(count_nodes).sum::<usize>(),
+        Ben::Dict(map) => 1 + map.values().map(count_nodes).sum::<usize>(),
+    }
+}
+
 /// A valid, if minimal, bencoded torrent: one file, one piece.
 fn torrent_bytes() -> Vec<u8> {
     let mut info = BTreeMap::new();
@@ -168,6 +176,14 @@ fn bencode_survives_hostile_input() {
             let again =
                 bencode::decode(&bencode::encode(&value)).expect("re-encoded bencode must decode");
             assert_eq!(again, value, "bencode round trip disagreed");
+            // And it cannot be larger than its input allows: the node budget
+            // is the decoder's memory bound, and the sweep is where it would
+            // be caught lying.
+            assert!(
+                count_nodes(&value) <= bencode::node_budget(case.len()),
+                "more values than the node budget for {} bytes",
+                case.len()
+            );
         }
         let _ = bencode::decode_prefix(case);
     });
@@ -182,6 +198,14 @@ fn metainfo_survives_hostile_input() {
             // are what the rest of the engine relies on.
             assert!(!meta.pieces.is_empty(), "accepted a torrent with no pieces");
             assert!(meta.piece_length > 0, "accepted a zero piece length");
+            // The caps the daemon's descriptors, the wire's bitfield and the
+            // announcer's cycle each rely on.
+            assert!(meta.files.len() <= metainfo::MAX_FILES);
+            assert!(meta.pieces.len() <= metainfo::MAX_PIECES as usize);
+            assert!(
+                meta.trackers.iter().map(Vec::len).sum::<usize>() <= metainfo::MAX_TRACKERS,
+                "accepted more trackers than the cap"
+            );
             let sum: u64 = meta.files.iter().map(|f| f.length).sum();
             assert_eq!(sum, meta.total_length, "file lengths disagree with total");
             // No two files may land on the same path, and none may sit where
@@ -200,6 +224,10 @@ fn metainfo_survives_hostile_input() {
                 for part in &file.path {
                     assert!(part != "." && part != ".." && !part.contains('/'));
                     assert!(!part.contains('\0'), "accepted NUL in a path");
+                    assert!(
+                        part.len() <= metainfo::MAX_COMPONENT_BYTES,
+                        "accepted a component longer than a filename"
+                    );
                 }
             }
             // What the parser accepts, the display layer must be able to make
@@ -264,8 +292,16 @@ fn json_survives_hostile_input() {
         if let Ok(text) = std::str::from_utf8(case)
             && let Ok(value) = json::parse(text)
         {
-            let again = json::parse(&value.encode()).expect("re-encoded JSON parses");
+            let encoded = value.encode();
+            let again = json::parse(&encoded).expect("re-encoded JSON parses");
             assert_eq!(again, value, "JSON round trip disagreed");
+            // `clove --json` prints this verbatim, and a terminal acts on a
+            // C1 control as it would on ESC: nothing the encoder writes may
+            // be one.
+            assert!(
+                !encoded.chars().any(char::is_control),
+                "the JSON encoder emitted a control character"
+            );
         }
         let _ = json::parse(&String::from_utf8_lossy(case));
     });
@@ -310,6 +346,20 @@ fn tracker_responses_survive_hostile_input() {
                 !state.due(now + floor - 1),
                 "a hostile interval got us announcing inside the {floor}s floor"
             );
+            // And the ceiling: an interval cannot mean "never again".
+            let ceiling = tracker::MAX_ANNOUNCE_INTERVAL.as_secs();
+            assert!(
+                state.due(now + ceiling),
+                "a hostile interval pushed the next announce past the {ceiling}s ceiling"
+            );
+            let mut with_min = tracker::AnnounceState::new();
+            with_min.on_success_with_min(
+                now,
+                response.interval,
+                response.min_interval,
+                tracker::Event::Periodic,
+            );
+            assert!(!with_min.due(now + floor - 1) && with_min.due(now + ceiling));
         }
     });
 }
@@ -377,6 +427,7 @@ fn magnet_uris_survive_hostile_input() {
     sweep("magnet", &seeds, 0x5EED_000B, |case| {
         let text = String::from_utf8_lossy(case);
         if let Ok(link) = magnet::Magnet::parse(&text) {
+            assert!(link.trackers.len() <= metainfo::MAX_TRACKERS);
             // Every surviving tracker must be an I2P URL: the clearnet filter
             // is a security property, not a nicety.
             for url in &link.trackers {

@@ -40,3 +40,9 @@
 "2:ip0:"
 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 ".i2p"
+
+# An interval past the announce ceiling, and the tracker's own floor, which
+# the scheduler now honours.
+"i4000000000e"
+"12:min interval"
+"d8:intervali4000000000ee"

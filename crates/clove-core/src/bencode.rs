@@ -18,6 +18,23 @@ use std::ops::Range;
 /// Maximum nesting depth the decoder accepts.
 pub const MAX_DEPTH: u32 = 32;
 
+/// Fewest input bytes any one node costs: a list or dictionary is its `l`/`d`
+/// and its `e`, a byte string its length digit and `:`, an integer one more.
+pub const MIN_NODE_BYTES: usize = 2;
+
+/// Most [`Value`]s the decoder will build for `input_len` bytes of input.
+///
+/// This is the decoder's memory bound written down: at most this many nodes
+/// of `size_of::<Value>()` bytes each, a fixed multiple of the input rather
+/// than an argument about the grammar. The grammar cannot exceed it — every
+/// node costs [`MIN_NODE_BYTES`] — so the check that enforces it is the
+/// invariant made explicit, there to fail loudly if a future leniency ever
+/// lets a node cost less, not a case anyone expects to see.
+#[must_use]
+pub fn node_budget(input_len: usize) -> usize {
+    input_len / MIN_NODE_BYTES
+}
+
 /// A bencode value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
@@ -107,6 +124,8 @@ pub enum ErrorKind {
     TooDeep,
     /// A byte that cannot start a value.
     BadValueStart,
+    /// More nodes than [`node_budget`] allows for the input's length.
+    TooManyNodes,
 }
 
 impl fmt::Display for Error {
@@ -119,6 +138,7 @@ impl fmt::Display for Error {
             ErrorKind::BadKey => "duplicate or non-string dictionary key",
             ErrorKind::TooDeep => "nesting deeper than the decoder allows",
             ErrorKind::BadValueStart => "byte cannot start a value",
+            ErrorKind::TooManyNodes => "more values than the input could hold",
         };
         write!(f, "bencode: {what} at offset {}", self.offset)
     }
@@ -133,13 +153,7 @@ impl std::error::Error for Error {}
 /// Any syntax violation, truncation, trailing data, duplicate dictionary
 /// key, or nesting past [`MAX_DEPTH`], reported with the offending offset.
 pub fn decode(input: &[u8]) -> Result<Value, Error> {
-    let mut d = Decoder { input, pos: 0 };
-    let value = d.value(0)?;
-    if d.pos == input.len() {
-        Ok(value)
-    } else {
-        Err(d.err(ErrorKind::TrailingData))
-    }
+    decode_with_entry(input, &[]).map(|(value, _)| value)
 }
 
 /// Decode one bencode value from the start of `input`, returning it and the
@@ -152,37 +166,45 @@ pub fn decode(input: &[u8]) -> Result<Value, Error> {
 /// Any syntax violation, truncation, duplicate key, or over-deep nesting in
 /// the leading value.
 pub fn decode_prefix(input: &[u8]) -> Result<(Value, usize), Error> {
-    let mut d = Decoder { input, pos: 0 };
+    let mut d = Decoder::new(input, &[]);
     let value = d.value(0)?;
     Ok((value, d.pos))
 }
 
-/// Byte range of the raw encoded value stored under `key` in the top-level
-/// dictionary — e.g. the exact `info` bytes an info-hash is computed over.
+/// [`decode`], also reporting where the value stored under `key` in the
+/// top-level dictionary sits in `input` — e.g. the exact `info` bytes an
+/// info-hash is computed over.
 ///
-/// The whole input is validated first (as [`decode`] would), so the
-/// returned range is trustworthy. Returns `Ok(None)` if the top-level value
-/// is not a dictionary or has no such key.
+/// Found in the same pass that validates the input, so a caller that needs
+/// both the tree and the bytes pays for one decode, not for a second over
+/// input it already holds as a tree. The range is `None` if the top-level
+/// value is not a dictionary or has no such key.
+///
+/// # Errors
+///
+/// The same syntax errors as [`decode`].
+pub fn decode_with_entry(input: &[u8], key: &[u8]) -> Result<(Value, Option<Range<usize>>), Error> {
+    let mut d = Decoder::new(input, key);
+    let value = d.value(0)?;
+    if d.pos == input.len() {
+        Ok((value, d.span.take()))
+    } else {
+        Err(d.err(ErrorKind::TrailingData))
+    }
+}
+
+/// Byte range of the raw encoded value stored under `key` in the top-level
+/// dictionary — [`decode_with_entry`] for a caller that wants only the range.
+///
+/// The whole input is validated (as [`decode`] would), so the returned range
+/// is trustworthy. Returns `Ok(None)` if the top-level value is not a
+/// dictionary or has no such key.
 ///
 /// # Errors
 ///
 /// The same syntax errors as [`decode`].
 pub fn raw_entry(input: &[u8], key: &[u8]) -> Result<Option<Range<usize>>, Error> {
-    decode(input)?;
-    let mut d = Decoder { input, pos: 0 };
-    if d.peek()? != b'd' {
-        return Ok(None);
-    }
-    d.pos += 1;
-    while d.peek()? != b'e' {
-        let k = d.bytes()?;
-        let start = d.pos;
-        d.skip_value(1)?;
-        if k == key {
-            return Ok(Some(start..d.pos));
-        }
-    }
-    Ok(None)
+    decode_with_entry(input, key).map(|(_, range)| range)
 }
 
 /// Canonically encode `value` (dictionary keys sorted, strict syntax).
@@ -229,9 +251,29 @@ fn put_bytes(b: &[u8], out: &mut Vec<u8>) {
 struct Decoder<'a> {
     input: &'a [u8],
     pos: usize,
+    /// Nodes built so far, against `budget`.
+    nodes: usize,
+    /// [`node_budget`] of the input, or smaller under test.
+    budget: usize,
+    /// The top-level dictionary key whose value's byte range is wanted, if
+    /// any; an empty key can never match, since keys are never empty here.
+    want: &'a [u8],
+    /// Where the value under `want` was found.
+    span: Option<Range<usize>>,
 }
 
-impl Decoder<'_> {
+impl<'a> Decoder<'a> {
+    fn new(input: &'a [u8], want: &'a [u8]) -> Self {
+        Decoder {
+            input,
+            pos: 0,
+            nodes: 0,
+            budget: node_budget(input.len()),
+            want,
+            span: None,
+        }
+    }
+
     fn err(&self, kind: ErrorKind) -> Error {
         Error {
             offset: self.pos,
@@ -250,6 +292,20 @@ impl Decoder<'_> {
         if depth >= MAX_DEPTH {
             return Err(self.err(ErrorKind::TooDeep));
         }
+        let value = self.node(depth)?;
+        // Counted once built, not once begun: a node that is still open has
+        // cost one byte so far, and an input of nothing but `l` would run
+        // into this before it ran into the depth limit that is the right
+        // complaint about it. A built node has paid its [`MIN_NODE_BYTES`],
+        // and there are never more than [`MAX_DEPTH`] open.
+        self.nodes += 1;
+        if self.nodes > self.budget {
+            return Err(self.err(ErrorKind::TooManyNodes));
+        }
+        Ok(value)
+    }
+
+    fn node(&mut self, depth: u32) -> Result<Value, Error> {
         match self.peek()? {
             b'i' => self.int().map(Value::Int),
             b'0'..=b'9' => self.bytes().map(Value::Bytes),
@@ -274,7 +330,13 @@ impl Decoder<'_> {
                         });
                     }
                     let key = self.bytes()?;
+                    let start = self.pos;
                     let val = self.value(depth + 1)?;
+                    // Only the top-level dictionary is asked about: an `info`
+                    // key nested inside some other value is not the torrent's.
+                    if depth == 0 && key == self.want {
+                        self.span = Some(start..self.pos);
+                    }
                     if map.insert(key, val).is_some() {
                         return Err(Error {
                             offset: key_offset,
@@ -389,27 +451,6 @@ impl Decoder<'_> {
         self.pos = end;
         Ok(range)
     }
-
-    /// Skip one value without building it. Only called on input already
-    /// validated by [`decode`], so dictionaries are traversed like lists.
-    fn skip_value(&mut self, depth: u32) -> Result<(), Error> {
-        if depth >= MAX_DEPTH {
-            return Err(self.err(ErrorKind::TooDeep));
-        }
-        match self.peek()? {
-            b'i' => self.int().map(drop),
-            b'0'..=b'9' => self.bytes_span().map(drop),
-            b'l' | b'd' => {
-                self.pos += 1;
-                while self.peek()? != b'e' {
-                    self.skip_value(depth + 1)?;
-                }
-                self.pos += 1;
-                Ok(())
-            }
-            _ => Err(self.err(ErrorKind::BadValueStart)),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -515,6 +556,71 @@ mod tests {
         assert_eq!(raw_entry(input, b"missing").unwrap(), None);
         assert_eq!(raw_entry(b"i42e", b"info").unwrap(), None);
         assert!(raw_entry(b"d4:info", b"info").is_err());
+    }
+
+    /// The span comes out of the one validating pass, and it is the
+    /// top-level entry's: a key of the same name nested somewhere else is not
+    /// the one asked for, and the key's position among its siblings does not
+    /// matter.
+    #[test]
+    fn decode_with_entry_finds_the_top_level_entry_in_one_pass() {
+        let input = b"d1:ad4:infoi1ee4:infod1:xi2ee1:zi3ee";
+        let (value, range) = decode_with_entry(input, b"info").unwrap();
+        assert_eq!(value, decode(input).unwrap());
+        assert_eq!(&input[range.unwrap()], b"d1:xi2ee");
+        // Absent, or not a dictionary at all: no span, but still a value.
+        assert_eq!(decode_with_entry(input, b"nope").unwrap().1, None);
+        assert_eq!(decode_with_entry(b"li1ee", b"info").unwrap().1, None);
+        // An empty key never matches; `decode` relies on that.
+        assert_eq!(decode_with_entry(input, b"").unwrap().1, None);
+        // Trailing data is still a refusal, span or no span.
+        assert_eq!(
+            decode_with_entry(b"d4:infoi1eei2e", b"info")
+                .unwrap_err()
+                .kind,
+            ErrorKind::TrailingData
+        );
+    }
+
+    fn count_nodes(value: &Value) -> usize {
+        match value {
+            Value::Bytes(_) | Value::Int(_) => 1,
+            Value::List(items) => 1 + items.iter().map(count_nodes).sum::<usize>(),
+            Value::Dict(map) => 1 + map.values().map(count_nodes).sum::<usize>(),
+        }
+    }
+
+    /// The densest input there is — a flood of empty lists at the wire's
+    /// message ceiling — decodes to exactly the budget, so the bound is tight
+    /// and the decoder's memory is a fixed multiple of its input. Past the
+    /// budget is an error, not growth.
+    #[test]
+    fn node_budget_is_tight_and_enforced() {
+        let len = usize::try_from(crate::wire::MAX_MESSAGE_LEN).unwrap();
+        let mut flood = vec![b'l'; 1];
+        while flood.len() + 3 <= len {
+            flood.extend_from_slice(b"le");
+        }
+        flood.push(b'e');
+        let value = decode(&flood).unwrap();
+        assert_eq!(count_nodes(&value), node_budget(flood.len()));
+        assert_eq!(count_nodes(&value), flood.len() / MIN_NODE_BYTES);
+
+        // Integers cost more than the minimum, so a flood of them sits under
+        // the budget; strings and dictionaries sit on it.
+        for (dense, nodes) in [(&b"li0ei0ei0ee"[..], 4), (b"l0:0:0:e", 4), (b"ldedee", 3)] {
+            assert_eq!(count_nodes(&decode(dense).unwrap()), nodes);
+            assert!(nodes <= node_budget(dense.len()), "{dense:?}");
+        }
+
+        // The check itself, reached by shrinking the budget under a valid
+        // input — the grammar cannot exceed the real one.
+        let mut d = Decoder::new(b"llelee", &[]);
+        d.budget = 2;
+        assert_eq!(d.value(0).unwrap_err().kind, ErrorKind::TooManyNodes);
+        let mut d = Decoder::new(b"llelee", &[]);
+        d.budget = 3;
+        assert!(d.value(0).is_ok());
     }
 
     #[test]

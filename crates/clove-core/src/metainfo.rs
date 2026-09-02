@@ -31,6 +31,45 @@ pub const MIN_PIECE_LENGTH: u32 = 16 * 1024;
 /// Largest piece length clove accepts (128 MiB).
 pub const MAX_PIECE_LENGTH: u32 = 128 * 1024 * 1024;
 
+/// Most files a torrent may list.
+///
+/// The daemon opens every file of every hosted torrent at once, so a file is a
+/// descriptor for as long as the torrent is up, and the service units pin
+/// `RLIMIT_NOFILE` at 8192. A `.torrent` is a hostile surface (`SECURITY.md`),
+/// and one listing a few hundred thousand entries would take the SAM sockets
+/// down with it. A hundred thousand is more than any real torrent carries and
+/// still a number an operator can reason about against their limits.
+pub const MAX_FILES: usize = 100_000;
+
+/// Longest path component a torrent may name, in bytes — `NAME_MAX` on
+/// Linux and every filesystem clove is likely to meet. Refused here so the
+/// `ENAMETOOLONG` surfaces at the torrent rather than at the first block
+/// written, far from its cause.
+pub const MAX_COMPONENT_BYTES: usize = 255;
+
+/// Longest file path a torrent may name below the download root, in bytes
+/// with separators — `PATH_MAX`, less whatever the root itself takes, which
+/// is the operator's to keep short.
+pub const MAX_PATH_BYTES: usize = 4096;
+
+/// Most announce URLs a torrent keeps, counted across every tier.
+///
+/// Each kept URL is a naming lookup for the router and an announce per cycle
+/// for the announcer, one after another. A 2 MiB `.torrent` can carry some
+/// fifty thousand `.i2p` URLs, which is days per announce cycle and fifty
+/// thousand lookups — for a swarm reached through a handful of them at
+/// most. Sixteen covers every real announce-list; the rest are counted as
+/// skipped, the way a non-I2P URL is.
+pub const MAX_TRACKERS: usize = 16;
+
+/// Most pieces a torrent may have: as many as a `bitfield` message can carry.
+///
+/// The wire caps a message body at [`crate::wire::MAX_MESSAGE_LEN`], and a
+/// bitfield is one id byte followed by a bit per piece. A torrent with more
+/// pieces than that could be added but never exchange a bitfield with anyone,
+/// which is a torrent that silently never starts; refusing it here says why.
+pub const MAX_PIECES: u32 = (crate::wire::MAX_MESSAGE_LEN - 1) * 8;
+
 /// One file within a torrent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
@@ -64,11 +103,13 @@ pub struct MetaInfo {
     pub total_length: u64,
     /// BEP 27 private flag (`info.private == 1`); common on I2P.
     pub private: bool,
-    /// Announce URL tiers (BEP 12) after the I2P-only filter. May be empty:
-    /// a torrent can still be joined via PEX or magnet paths.
+    /// Announce URL tiers (BEP 12) after the I2P-only filter, at most
+    /// [`MAX_TRACKERS`] URLs across them. May be empty: a torrent can still
+    /// be joined via PEX or magnet paths.
     pub trackers: Vec<Vec<String>>,
-    /// How many non-I2P announce URLs were dropped. The only trace they
-    /// leave: callers may log "skipped N non-I2P trackers", nothing more.
+    /// How many announce URLs were dropped — non-I2P ones, and I2P ones past
+    /// [`MAX_TRACKERS`]. The only trace they leave: callers may log "skipped
+    /// N trackers", nothing more.
     pub skipped_trackers: usize,
     /// The raw bencoded `info` dictionary these fields came from — the exact
     /// bytes the info-hash covers. Kept so we can serve BEP 9 metadata to
@@ -188,7 +229,11 @@ impl MetaInfo {
     /// piece count disagreeing with the total length, or unsafe path
     /// components.
     pub fn parse(input: &[u8]) -> Result<Self, Error> {
-        let root = bencode::decode(input)?;
+        // One pass for both the tree and the span of the `info` entry. This
+        // used to decode twice — once for the tree and once to find the
+        // bytes — with the first tree alive throughout, which doubled the
+        // transient cost of the largest input a peer can hand us.
+        let (root, info_range) = bencode::decode_with_entry(input, b"info")?;
         let info = root
             .get(b"info")
             .ok_or(Error::Invalid("missing info dictionary"))?;
@@ -198,8 +243,7 @@ impl MetaInfo {
 
         // Hash the exact bytes: re-encoding non-canonical input would
         // change the identity i2psnark peers agreed on.
-        let info_range =
-            bencode::raw_entry(input, b"info")?.ok_or(Error::Invalid("missing info dictionary"))?;
+        let info_range = info_range.ok_or(Error::Invalid("missing info dictionary"))?;
         let raw_info: Arc<[u8]> = Arc::from(&input[info_range]);
         let info_hash = InfoHash(Sha1::digest(&raw_info).into());
 
@@ -236,6 +280,15 @@ impl MetaInfo {
 
         let (files, total_length) = parse_files(info, name)?;
         let expected_pieces = total_length.div_ceil(u64::from(piece_length));
+        // Checked on the count the lengths imply, before it is compared with
+        // the hash list: the message is then about the cap rather than about
+        // a disagreement, and the check costs nothing however long the hash
+        // list is.
+        if expected_pieces > u64::from(MAX_PIECES) {
+            return Err(Error::Invalid(
+                "more pieces than a bitfield message can carry",
+            ));
+        }
         if expected_pieces != pieces.len() as u64 {
             return Err(Error::Invalid("piece count disagrees with total length"));
         }
@@ -421,6 +474,9 @@ fn parse_files(info: &Value, name: &str) -> Result<(Vec<FileEntry>, u64), Error>
             if list.is_empty() {
                 return Err(Error::Invalid("files list is empty"));
             }
+            if list.len() > MAX_FILES {
+                return Err(Error::Invalid("too many files"));
+            }
             let mut entries = Vec::with_capacity(list.len());
             let mut total: u64 = 0;
             for file in list {
@@ -444,6 +500,11 @@ fn parse_files(info: &Value, name: &str) -> Result<(Vec<FileEntry>, u64), Error>
                     check_component(part)?;
                     path.push(part.to_owned());
                 }
+                // Each component fits a name; the whole has to fit a path.
+                let bytes: usize = path.iter().map(|part| part.len() + 1).sum();
+                if bytes > MAX_PATH_BYTES {
+                    return Err(Error::Invalid("file path longer than a path can be"));
+                }
                 total = total
                     .checked_add(length)
                     .ok_or(Error::Invalid("total length overflows"))?;
@@ -459,8 +520,9 @@ fn parse_files(info: &Value, name: &str) -> Result<(Vec<FileEntry>, u64), Error>
 }
 
 fn parse_trackers(root: &Value) -> Result<(Vec<Vec<String>>, usize), Error> {
-    let mut tiers = Vec::new();
+    let mut tiers: Vec<Vec<String>> = Vec::new();
     let mut skipped = 0usize;
+    let mut kept_total = 0usize;
     if let Some(list) = root.get(b"announce-list") {
         // BEP 12: list of tiers, each a list of URLs. Takes precedence
         // over the flat announce key.
@@ -476,8 +538,9 @@ fn parse_trackers(root: &Value) -> Result<(Vec<Vec<String>>, usize), Error> {
                 let url = url
                     .as_str()
                     .ok_or(Error::Invalid("announce URL is not a UTF-8 string"))?;
-                if is_i2p_tracker(url) {
+                if is_i2p_tracker(url) && kept_total < MAX_TRACKERS {
                     kept.push(url.to_owned());
+                    kept_total += 1;
                 } else {
                     skipped += 1;
                 }
@@ -515,14 +578,27 @@ fn as_size(v: &Value) -> Option<u64> {
 /// Sorting makes this a scan of neighbours: if one path is a prefix of another,
 /// everything sorting between them shares that prefix too, so a collision
 /// always shows up in an adjacent pair.
+///
+/// Compared case-folded, because the filesystem may: `A.txt` and `a.txt` are
+/// one file on a case-insensitive volume, which is the aliasing this exists
+/// to refuse, and a torrent that only works on a case-sensitive disk is not
+/// worth accepting on one. Unicode normalisation (NFC against NFD) is the
+/// same problem again on some filesystems and is *not* folded here — clove
+/// carries no normalisation tables, and a lower-casing is what `str` can do
+/// without one.
 fn check_distinct_paths(entries: &[FileEntry]) -> Result<(), Error> {
-    let mut paths: Vec<&[String]> = entries.iter().map(|e| e.path.as_slice()).collect();
+    let mut paths: Vec<Vec<String>> = entries
+        .iter()
+        .map(|e| e.path.iter().map(|part| part.to_lowercase()).collect())
+        .collect();
     paths.sort_unstable();
     for pair in paths.windows(2) {
         if pair[0] == pair[1] {
-            return Err(Error::Invalid("two files share the same path"));
+            return Err(Error::Invalid(
+                "two files share the same path, up to letter case",
+            ));
         }
-        if pair[1].starts_with(pair[0]) {
+        if pair[1].starts_with(&pair[0]) {
             return Err(Error::Invalid("a file path is also a directory path"));
         }
     }
@@ -530,7 +606,7 @@ fn check_distinct_paths(entries: &[FileEntry]) -> Result<(), Error> {
 }
 
 /// A path component usable under the data directory: nonempty, no
-/// separators, not `.`/`..`, no NUL.
+/// separators, not `.`/`..`, no NUL, and no longer than a filename can be.
 fn check_component(s: &str) -> Result<(), Error> {
     let bad = s.is_empty()
         || s == "."
@@ -539,10 +615,14 @@ fn check_component(s: &str) -> Result<(), Error> {
         || s.contains('\\')
         || s.contains('\0');
     if bad {
-        Err(Error::Invalid("unsafe path component"))
-    } else {
-        Ok(())
+        return Err(Error::Invalid("unsafe path component"));
     }
+    if s.len() > MAX_COMPONENT_BYTES {
+        return Err(Error::Invalid(
+            "path component longer than a filename can be",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -550,6 +630,7 @@ mod tests {
     use super::*;
     use crate::bencode::encode;
     use std::collections::BTreeMap;
+    use std::io::Write as _;
 
     fn bval(s: &str) -> Value {
         Value::Bytes(s.as_bytes().to_vec())
@@ -608,6 +689,26 @@ mod tests {
         let a = MetaInfo::parse(&single_file(vec![])).unwrap();
         let b = MetaInfo::parse(&single_file(vec![("comment", bval("x"))])).unwrap();
         assert_eq!(a.info_hash, b.info_hash);
+
+        // The hash is SHA-1 over the exact `info` bytes as they sit in the
+        // input, which for a non-canonical torrent — unsorted keys, `info`
+        // ahead of `announce`, an unsorted key order inside `info` too — are
+        // not the bytes a re-encode would produce. Written by hand so that
+        // the encoder cannot have canonicalised them first.
+        let raw_info = b"d6:pieces20:\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\
+                         \x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\
+                         12:piece lengthi16384e4:name9:hello.txt6:lengthi5ee";
+        let mut input = b"d4:info".to_vec();
+        input.extend_from_slice(raw_info);
+        input.extend_from_slice(b"8:announce21:http://t.i2p/announcee");
+        let t = MetaInfo::parse(&input).expect("a non-canonical torrent parses");
+        assert_eq!(&t.raw_info[..], &raw_info[..]);
+        assert_eq!(t.info_hash.0, <[u8; 20]>::from(Sha1::digest(raw_info)));
+        assert_ne!(
+            &bencode::encode(&bencode::decode(raw_info).unwrap())[..],
+            &raw_info[..],
+            "the input has to be non-canonical for this to prove anything"
+        );
     }
 
     #[test]
@@ -672,6 +773,40 @@ mod tests {
             vec![vec!["http://good.i2p/announce".to_owned()]]
         );
         assert_eq!(t.skipped_trackers, 2);
+    }
+
+    /// Every kept URL is a naming lookup and an announce per cycle; a
+    /// torrent does not get to make that fifty thousand of each.
+    #[test]
+    fn caps_kept_trackers_across_tiers() {
+        let tier = |from: usize, n: usize| {
+            Value::List(
+                (from..from + n)
+                    .map(|i| bval(&format!("http://t{i}.i2p/announce")))
+                    .collect(),
+            )
+        };
+        let tiers = Value::List(vec![tier(0, 10), tier(10, 10), tier(20, 10)]);
+        let input = single_file(vec![("announce-list", tiers)]);
+        let t = MetaInfo::parse(&input).unwrap();
+        let kept: usize = t.trackers.iter().map(Vec::len).sum();
+        assert_eq!(kept, MAX_TRACKERS);
+        // The first tier whole, the second cut, the third gone: the cap
+        // counts across tiers, not per tier.
+        assert_eq!(t.trackers.len(), 2);
+        assert_eq!(t.trackers[0].len(), 10);
+        assert_eq!(t.trackers[1].len(), MAX_TRACKERS - 10);
+        assert_eq!(t.trackers[1][0], "http://t10.i2p/announce");
+        assert_eq!(t.skipped_trackers, 30 - MAX_TRACKERS);
+
+        // Exactly the cap is kept whole, and a clearnet URL does not use up
+        // a slot — it was never a candidate.
+        let mut at_cap = vec![tier(0, MAX_TRACKERS)];
+        at_cap.push(Value::List(vec![bval("http://tracker.example.org/a")]));
+        let input = single_file(vec![("announce-list", Value::List(at_cap))]);
+        let t = MetaInfo::parse(&input).unwrap();
+        assert_eq!(t.trackers.iter().map(Vec::len).sum::<usize>(), MAX_TRACKERS);
+        assert_eq!(t.skipped_trackers, 1);
     }
 
     #[test]
@@ -745,6 +880,178 @@ mod tests {
             file(10, vec!["e", "a"]),
         ]);
         MetaInfo::parse(&ok).expect("distinct paths that share prefixes are legal");
+    }
+
+    /// The bytes of a multi-file torrent with `count` one-byte files, written
+    /// directly rather than through the encoder: a hundred thousand `Value`s
+    /// is a slow way to spell a test input.
+    fn many_files(count: usize) -> Vec<u8> {
+        let total = u64::try_from(count).unwrap();
+        let pieces = total.div_ceil(u64::from(MIN_PIECE_LENGTH));
+        let mut out = Vec::new();
+        out.extend_from_slice(b"d4:infod5:filesl");
+        for i in 0..count {
+            let name = format!("f{i}");
+            let _ = write!(&mut out, "d6:lengthi1e4:pathl{}:{name}ee", name.len());
+        }
+        let _ = write!(
+            &mut out,
+            "e4:name5:album12:piece lengthi{MIN_PIECE_LENGTH}e6:pieces{}:",
+            pieces * 20
+        );
+        out.resize(out.len() + usize::try_from(pieces * 20).unwrap(), 0);
+        out.extend_from_slice(b"ee");
+        out
+    }
+
+    /// Every file is an open descriptor for as long as the torrent is hosted,
+    /// so the count is bounded here rather than discovered at `EMFILE`.
+    #[test]
+    fn caps_the_number_of_files() {
+        assert_eq!(
+            MetaInfo::parse(&many_files(MAX_FILES + 1)).err(),
+            Some(Error::Invalid("too many files"))
+        );
+        // The cap itself is a torrent, not a refusal.
+        let at_cap = MetaInfo::parse(&many_files(MAX_FILES)).expect("a torrent at the file cap");
+        assert_eq!(at_cap.files.len(), MAX_FILES);
+    }
+
+    /// More pieces than a `bitfield` message can carry is a torrent that could
+    /// never exchange one, and is refused on the count the lengths imply —
+    /// before the hash list is consulted, so the reason given is the cap.
+    #[test]
+    fn caps_the_number_of_pieces_at_what_a_bitfield_can_carry() {
+        let piece_len = i64::from(MIN_PIECE_LENGTH);
+        let torrent = |pieces: u32| {
+            encode(&dict(vec![(
+                "info",
+                dict(vec![
+                    ("name", bval("huge.bin")),
+                    ("piece length", Value::Int(piece_len)),
+                    // A short hash list on purpose: the cap has to fire on
+                    // the arithmetic, not after a 160 MiB string is checked.
+                    ("pieces", Value::Bytes(vec![0u8; 20])),
+                    ("length", Value::Int(i64::from(pieces) * piece_len)),
+                ]),
+            )]))
+        };
+        assert_eq!(
+            MetaInfo::parse(&torrent(MAX_PIECES + 1)).err(),
+            Some(Error::Invalid(
+                "more pieces than a bitfield message can carry"
+            ))
+        );
+        // At the cap the count is legal and the complaint is the ordinary one.
+        assert_eq!(
+            MetaInfo::parse(&torrent(MAX_PIECES)).err(),
+            Some(Error::Invalid("piece count disagrees with total length"))
+        );
+        // The cap is what the wire can carry: an id byte and a bit per piece.
+        assert_eq!(1 + MAX_PIECES.div_ceil(8), crate::wire::MAX_MESSAGE_LEN);
+    }
+
+    /// `A.txt` and `a.txt` are one file on a case-insensitive volume, which
+    /// is exactly the aliasing the distinct-path check exists to refuse.
+    #[test]
+    fn rejects_paths_that_collide_up_to_case() {
+        let piece_len = i64::from(MIN_PIECE_LENGTH);
+        let file = |len: i64, parts: Vec<&str>| {
+            dict(vec![
+                ("length", Value::Int(len)),
+                (
+                    "path",
+                    Value::List(parts.into_iter().map(bval).collect::<Vec<_>>()),
+                ),
+            ])
+        };
+        let torrent = |files: Vec<Value>| {
+            encode(&dict(vec![(
+                "info",
+                dict(vec![
+                    ("name", bval("album")),
+                    ("piece length", Value::Int(piece_len)),
+                    ("pieces", Value::Bytes(vec![0u8; 20])),
+                    ("files", Value::List(files)),
+                ]),
+            )]))
+        };
+        for (a, b) in [
+            (vec!["A.txt"], vec!["a.txt"]),
+            (vec!["Dir", "x"], vec!["dir", "x"]),
+            (vec!["Ärger.txt"], vec!["ärger.txt"]),
+            // A file where another entry wants a directory, up to case.
+            (vec!["A"], vec!["a", "b"]),
+        ] {
+            let input = torrent(vec![file(piece_len - 10, a.clone()), file(10, b.clone())]);
+            assert!(
+                matches!(MetaInfo::parse(&input), Err(Error::Invalid(_))),
+                "{a:?} and {b:?} were both accepted"
+            );
+        }
+        // Different names that merely share letters are still distinct.
+        let ok = torrent(vec![file(piece_len - 10, vec!["ab"]), file(10, vec!["ba"])]);
+        MetaInfo::parse(&ok).expect("distinct names");
+    }
+
+    /// A component longer than a filename, or a path longer than a path,
+    /// is refused at the torrent rather than as ENAMETOOLONG at the first
+    /// block written.
+    #[test]
+    fn rejects_over_long_components_and_paths() {
+        let piece_len = i64::from(MIN_PIECE_LENGTH);
+        let file = |parts: Vec<String>| {
+            dict(vec![
+                ("length", Value::Int(piece_len)),
+                (
+                    "path",
+                    Value::List(parts.iter().map(|p| bval(p)).collect::<Vec<_>>()),
+                ),
+            ])
+        };
+        let torrent = |name: &str, files: Vec<Value>| {
+            encode(&dict(vec![(
+                "info",
+                dict(vec![
+                    ("name", bval(name)),
+                    ("piece length", Value::Int(piece_len)),
+                    ("pieces", Value::Bytes(vec![0u8; 20])),
+                    ("files", Value::List(files)),
+                ]),
+            )]))
+        };
+
+        let long = "x".repeat(MAX_COMPONENT_BYTES + 1);
+        let fits = "x".repeat(MAX_COMPONENT_BYTES);
+        assert_eq!(
+            MetaInfo::parse(&torrent("album", vec![file(vec![long.clone()])])).err(),
+            Some(Error::Invalid(
+                "path component longer than a filename can be"
+            ))
+        );
+        // The name is a component too.
+        assert_eq!(
+            MetaInfo::parse(&torrent(&long, vec![file(vec!["a".into()])])).err(),
+            Some(Error::Invalid(
+                "path component longer than a filename can be"
+            ))
+        );
+        MetaInfo::parse(&torrent("album", vec![file(vec![fits.clone()])]))
+            .expect("a component at the limit");
+        // Bytes, not characters: a multibyte name is measured as the
+        // filesystem measures it.
+        let wide = "é".repeat(MAX_COMPONENT_BYTES / 2 + 1);
+        assert!(wide.len() > MAX_COMPONENT_BYTES);
+        assert!(MetaInfo::parse(&torrent("album", vec![file(vec![wide])])).is_err());
+
+        // Every component fits, the path does not.
+        let deep: Vec<String> = (0..=MAX_PATH_BYTES / MAX_COMPONENT_BYTES)
+            .map(|_| fits.clone())
+            .collect();
+        assert_eq!(
+            MetaInfo::parse(&torrent("album", vec![file(deep)])).err(),
+            Some(Error::Invalid("file path longer than a path can be"))
+        );
     }
 
     #[test]
