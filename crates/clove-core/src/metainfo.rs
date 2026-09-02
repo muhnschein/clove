@@ -31,6 +31,24 @@ pub const MIN_PIECE_LENGTH: u32 = 16 * 1024;
 /// Largest piece length clove accepts (128 MiB).
 pub const MAX_PIECE_LENGTH: u32 = 128 * 1024 * 1024;
 
+/// Most files a torrent may list.
+///
+/// The daemon opens every file of every hosted torrent at once, so a file is a
+/// descriptor for as long as the torrent is up, and the service units pin
+/// `RLIMIT_NOFILE` at 8192. A `.torrent` is a hostile surface (`SECURITY.md`),
+/// and one listing a few hundred thousand entries would take the SAM sockets
+/// down with it. A hundred thousand is more than any real torrent carries and
+/// still a number an operator can reason about against their limits.
+pub const MAX_FILES: usize = 100_000;
+
+/// Most pieces a torrent may have: as many as a `bitfield` message can carry.
+///
+/// The wire caps a message body at [`crate::wire::MAX_MESSAGE_LEN`], and a
+/// bitfield is one id byte followed by a bit per piece. A torrent with more
+/// pieces than that could be added but never exchange a bitfield with anyone,
+/// which is a torrent that silently never starts; refusing it here says why.
+pub const MAX_PIECES: u32 = (crate::wire::MAX_MESSAGE_LEN - 1) * 8;
+
 /// One file within a torrent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
@@ -236,6 +254,15 @@ impl MetaInfo {
 
         let (files, total_length) = parse_files(info, name)?;
         let expected_pieces = total_length.div_ceil(u64::from(piece_length));
+        // Checked on the count the lengths imply, before it is compared with
+        // the hash list: the message is then about the cap rather than about
+        // a disagreement, and the check costs nothing however long the hash
+        // list is.
+        if expected_pieces > u64::from(MAX_PIECES) {
+            return Err(Error::Invalid(
+                "more pieces than a bitfield message can carry",
+            ));
+        }
         if expected_pieces != pieces.len() as u64 {
             return Err(Error::Invalid("piece count disagrees with total length"));
         }
@@ -421,6 +448,9 @@ fn parse_files(info: &Value, name: &str) -> Result<(Vec<FileEntry>, u64), Error>
             if list.is_empty() {
                 return Err(Error::Invalid("files list is empty"));
             }
+            if list.len() > MAX_FILES {
+                return Err(Error::Invalid("too many files"));
+            }
             let mut entries = Vec::with_capacity(list.len());
             let mut total: u64 = 0;
             for file in list {
@@ -550,6 +580,7 @@ mod tests {
     use super::*;
     use crate::bencode::encode;
     use std::collections::BTreeMap;
+    use std::io::Write as _;
 
     fn bval(s: &str) -> Value {
         Value::Bytes(s.as_bytes().to_vec())
@@ -745,6 +776,75 @@ mod tests {
             file(10, vec!["e", "a"]),
         ]);
         MetaInfo::parse(&ok).expect("distinct paths that share prefixes are legal");
+    }
+
+    /// The bytes of a multi-file torrent with `count` one-byte files, written
+    /// directly rather than through the encoder: a hundred thousand `Value`s
+    /// is a slow way to spell a test input.
+    fn many_files(count: usize) -> Vec<u8> {
+        let total = u64::try_from(count).unwrap();
+        let pieces = total.div_ceil(u64::from(MIN_PIECE_LENGTH));
+        let mut out = Vec::new();
+        out.extend_from_slice(b"d4:infod5:filesl");
+        for i in 0..count {
+            let name = format!("f{i}");
+            let _ = write!(&mut out, "d6:lengthi1e4:pathl{}:{name}ee", name.len());
+        }
+        let _ = write!(
+            &mut out,
+            "e4:name5:album12:piece lengthi{MIN_PIECE_LENGTH}e6:pieces{}:",
+            pieces * 20
+        );
+        out.resize(out.len() + usize::try_from(pieces * 20).unwrap(), 0);
+        out.extend_from_slice(b"ee");
+        out
+    }
+
+    /// Every file is an open descriptor for as long as the torrent is hosted,
+    /// so the count is bounded here rather than discovered at `EMFILE`.
+    #[test]
+    fn caps_the_number_of_files() {
+        assert_eq!(
+            MetaInfo::parse(&many_files(MAX_FILES + 1)).err(),
+            Some(Error::Invalid("too many files"))
+        );
+        // The cap itself is a torrent, not a refusal.
+        let at_cap = MetaInfo::parse(&many_files(MAX_FILES)).expect("a torrent at the file cap");
+        assert_eq!(at_cap.files.len(), MAX_FILES);
+    }
+
+    /// More pieces than a `bitfield` message can carry is a torrent that could
+    /// never exchange one, and is refused on the count the lengths imply —
+    /// before the hash list is consulted, so the reason given is the cap.
+    #[test]
+    fn caps_the_number_of_pieces_at_what_a_bitfield_can_carry() {
+        let piece_len = i64::from(MIN_PIECE_LENGTH);
+        let torrent = |pieces: u32| {
+            encode(&dict(vec![(
+                "info",
+                dict(vec![
+                    ("name", bval("huge.bin")),
+                    ("piece length", Value::Int(piece_len)),
+                    // A short hash list on purpose: the cap has to fire on
+                    // the arithmetic, not after a 160 MiB string is checked.
+                    ("pieces", Value::Bytes(vec![0u8; 20])),
+                    ("length", Value::Int(i64::from(pieces) * piece_len)),
+                ]),
+            )]))
+        };
+        assert_eq!(
+            MetaInfo::parse(&torrent(MAX_PIECES + 1)).err(),
+            Some(Error::Invalid(
+                "more pieces than a bitfield message can carry"
+            ))
+        );
+        // At the cap the count is legal and the complaint is the ordinary one.
+        assert_eq!(
+            MetaInfo::parse(&torrent(MAX_PIECES)).err(),
+            Some(Error::Invalid("piece count disagrees with total length"))
+        );
+        // The cap is what the wire can carry: an id byte and a bit per piece.
+        assert_eq!(1 + MAX_PIECES.div_ceil(8), crate::wire::MAX_MESSAGE_LEN);
     }
 
     #[test]
