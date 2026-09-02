@@ -593,7 +593,7 @@ mod tests {
             method: "GET",
             target: "/announce?x=1",
             host: "tracker.i2p",
-            headers: &[("User-Agent", "clove/0.1")],
+            headers: &[("User-Agent", crate::tracker::USER_AGENT)],
             body: &[],
         };
         let s = String::from_utf8(req.encode().expect("clean fields")).unwrap();
@@ -602,7 +602,10 @@ mod tests {
         // a tracker behind a picky webserver is a bad place to be unusual.
         assert_eq!(
             s,
-            "GET /announce?x=1 HTTP/1.1\r\nHost: tracker.i2p\r\nUser-Agent: clove/0.1\r\nConnection: close\r\n\r\n"
+            format!(
+                "GET /announce?x=1 HTTP/1.1\r\nHost: tracker.i2p\r\nUser-Agent: {}\r\nConnection: close\r\n\r\n",
+                crate::tracker::USER_AGENT
+            )
         );
     }
 
