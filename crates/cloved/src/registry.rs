@@ -549,6 +549,13 @@ impl fmt::Display for AddError {
 pub(crate) enum RemoveError {
     /// No torrent with that info-hash (404).
     NotFound,
+    /// A hash pass over its files is running, outside the lock (400).
+    ///
+    /// The scan job holds no lock and opens the files with `O_CREAT`, so a
+    /// removal that deleted them out from under it would watch them come
+    /// back — laid out empty, and `fallocate`d under `preallocate yes` — and
+    /// then find nothing to publish to. Waiting is the only safe order.
+    Scanning,
     /// A filesystem error (500).
     Io(io::Error),
 }
@@ -557,6 +564,11 @@ impl fmt::Display for RemoveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RemoveError::NotFound => write!(f, "no such torrent"),
+            RemoveError::Scanning => write!(
+                f,
+                "this torrent's data is being verified; wait for that to finish before \
+                 removing it"
+            ),
             RemoveError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -1399,13 +1411,19 @@ where
         info_hash: &[u8; 20],
         delete_data: bool,
     ) -> Result<(), RemoveError> {
-        if self.pending.remove(info_hash).is_some() {
-            // A magnet still fetching: drop its URI file; the fetch thread
-            // notices the entry is gone and exits.
-            return remove_file_ok(&self.state_dir.join(format!("{}.magnet", hex(info_hash))));
+        if self.pending.contains_key(info_hash) {
+            // A magnet still fetching. The file first, then the entry, the
+            // same order as the hosted path below and for the same reason: if
+            // the unlink fails the API says so and the magnet is still there,
+            // rather than gone from memory and back again at the next start.
+            remove_file_ok(&self.state_dir.join(format!("{}.magnet", hex(info_hash))))?;
+            // The fetch thread notices the entry is gone and exits.
+            self.pending.remove(info_hash);
+            return Ok(());
         }
-        if !self.torrents.contains_key(info_hash) {
-            return Err(RemoveError::NotFound);
+        let hosted = self.torrents.get(info_hash).ok_or(RemoveError::NotFound)?;
+        if hosted.scanning {
+            return Err(RemoveError::Scanning);
         }
         // Take it offline first so nothing is writing while files disappear.
         self.stop_live(info_hash);
@@ -2870,6 +2888,82 @@ mod tests {
         let (_, other) = fixture_sized("other-name", 3 * BLOCK_LEN + 200);
         add_and_scan(&mut registry, &other);
         assert_eq!(registry.count(), 2);
+    }
+
+    /// A torrent whose files are being hashed cannot be removed until the
+    /// pass publishes: the unlocked scan job would recreate what the removal
+    /// deleted, and then find nothing to report to.
+    #[test]
+    fn a_torrent_being_verified_is_not_removable_until_the_scan_publishes() {
+        let data = TempDir::new("remove-scanning");
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
+        let (_, bytes) = fixture("scanning-remove");
+        // Registered and marked as scanning, the scan not yet run: the
+        // window `DELETE ?data=1` used to land in.
+        let (info_hash, job) = registry
+            .add_torrent(&bytes, AddOptions::default())
+            .expect("add");
+        assert!(
+            matches!(
+                registry.remove(&info_hash, true),
+                Err(RemoveError::Scanning)
+            ),
+            "a torrent being verified was removed"
+        );
+        assert_eq!(registry.count(), 1, "the refusal removed it anyway");
+        assert!(
+            data.0
+                .join(format!("state/{}.torrent", hex(&info_hash)))
+                .is_file(),
+            "the refusal deleted the state file"
+        );
+
+        // Once the pass has published, the removal goes through, files and all.
+        let scanned = job.run();
+        registry.finish_scan(&job, scanned).expect("publish");
+        registry
+            .remove(&info_hash, true)
+            .expect("remove after the scan");
+        assert_eq!(registry.count(), 0);
+        assert!(
+            !data.0.join("downloads/scanning-remove").exists(),
+            "the data was not deleted"
+        );
+    }
+
+    /// Removing a pending magnet deletes its file before its entry, so a
+    /// failed unlink leaves the magnet listed rather than gone until the
+    /// next restart brings it back.
+    #[test]
+    fn a_pending_magnet_whose_file_cannot_be_removed_stays_pending() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses directory permission checks; the unlink below would
+        // succeed and the test would prove nothing.
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipping: running as root, directory permissions are not enforced");
+            return;
+        }
+        let data = TempDir::new("remove-magnet-order");
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
+        let info_hash = registry
+            .add_magnet(&format!("magnet:?xt=urn:btih:{}", "cd".repeat(20)))
+            .expect("add magnet");
+        let state = data.0.join("state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let outcome = registry.remove(&info_hash, false);
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(outcome, Err(RemoveError::Io(_))), "{outcome:?}");
+        assert_eq!(
+            registry.pending_hashes(),
+            vec![info_hash],
+            "the magnet was dropped from memory although its file survived"
+        );
+
+        // With the directory writable again the removal completes.
+        registry.remove(&info_hash, false).expect("remove");
+        assert!(registry.pending_hashes().is_empty());
+        assert!(!state.join(format!("{}.magnet", hex(&info_hash))).exists());
     }
 
     /// The temp file is this process's own, not a fixed name any writer of

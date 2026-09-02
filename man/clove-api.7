@@ -212,6 +212,11 @@ Remove a torrent.
 With
 .Sy data=1
 its downloaded files are deleted too.
+A torrent whose data is being verified answers
+.Sy 400
+until the pass finishes: the hashing runs outside the daemon's lock and
+would recreate the files a removal deleted from under it.
+A magnet still fetching its metadata can be removed at any time.
 .It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /pause
 .It Sy POST Pa /v1/torrents/ Ns Ar info-hash Ns Pa /resume
 Take the torrent offline or bring it back.

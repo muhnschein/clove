@@ -1143,6 +1143,7 @@ fn torrent_action(
             match lock(&daemon.registry).remove(&info_hash, delete_data) {
                 Ok(()) => ok_json(),
                 Err(RemoveError::NotFound) => error(404, "no such torrent"),
+                Err(e @ RemoveError::Scanning) => error(400, &e.to_string()),
                 Err(RemoveError::Io(e)) => error(500, &format!("removing torrent: {e}")),
             }
         }
