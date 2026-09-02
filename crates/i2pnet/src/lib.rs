@@ -168,7 +168,13 @@ pub trait I2pListener {
     /// # Errors
     /// Session loss — the listener itself is finished. The supervisor (Phase D)
     /// owns re-establishment; callers treat an error as "listener gone, wait for
-    /// resurrection".
+    /// resurrection". Two things follow for an implementation. A failure that
+    /// cost one connection and not the listener — descriptor exhaustion, a peer
+    /// that hung up before it was accepted, a socket that refused an option —
+    /// is `Ok(None)`, never `Err`. And an implementation that does fail must
+    /// also end the session it belongs to, because callers stop accepting and
+    /// wait for the supervisor: a listener that dies behind a session still
+    /// reporting itself healthy is one nobody will ever rebuild.
     fn accept(&self) -> io::Result<Option<(Self::Stream, DestHash)>>;
 }
 

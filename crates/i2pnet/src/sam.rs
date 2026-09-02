@@ -876,8 +876,9 @@ pub struct SamListener {
     /// only while it is open, so this is held, never used — and dropping the
     /// listener is therefore how forwarding stops.
     _forward: TcpStream,
-    // Keeps the SAM session (and thus the destination) alive.
-    _session: Arc<SamSession>,
+    /// Keeps the SAM session (and thus the destination) alive — and is told
+    /// when the listener itself fails, see [`I2pListener::accept`] below.
+    session: Arc<SamSession>,
 }
 
 impl SamListener {
@@ -925,7 +926,7 @@ impl SamListener {
             local,
             port,
             _forward: forward,
-            _session: session,
+            session,
         })
     }
 
@@ -977,21 +978,91 @@ impl I2pListener for SamListener {
     }
 
     fn accept(&self) -> io::Result<Option<(ForwardedStream, DestHash)>> {
-        let (mut stream, _addr) = self.listener.accept()?;
-        // Bound the header read so a silent/misbehaving router cannot wedge
-        // the acceptor; then hand a blocking socket to the reader thread.
-        stream.set_read_timeout(Some(DEST_LINE_TIMEOUT))?;
-        // A header that never arrives, arrives as garbage, or belongs to
-        // something that is not the router at all says nothing about the
-        // listener: drop that connection and let the caller accept the next.
-        // Anything on the loopback forward port can produce one, including our
-        // own `poke_listener`.
-        let Ok(dest) = read_dest_line(&mut stream, MAX_DEST_LINE) else {
-            return Ok(None);
-        };
-        stream.set_read_timeout(None)?;
-        Ok(Some((ForwardedStream { inner: stream }, dest)))
+        accept_forwarded(&self.listener).map_err(|e| {
+            // An error here is the listener's, and nobody above rebuilds a
+            // listener on its own: the demux thread returns, and the session
+            // goes on reporting itself healthy with no inbound service behind
+            // it. Ending the session is what turns that into a rebuild.
+            self.session
+                .life
+                .end(&format!("the forward listener failed: {e}"));
+            e
+        })
     }
+}
+
+/// Linux's numbers for the `accept(2)` errors std gives no [`io::ErrorKind`]
+/// of their own. The daemon is Linux-only (Landlock, seccomp); anywhere else
+/// a mismatch only means the error is treated as the listener's.
+const ENFILE: i32 = 23;
+const EMFILE: i32 = 24;
+const ENOBUFS: i32 = 105;
+
+/// How long to stand back when the process or the system is out of file
+/// descriptors before accepting again. The connection is not lost — it waits
+/// in the backlog — and spinning on `EMFILE` burns the CPU that the peer
+/// threads need in order to close something.
+const FD_EXHAUSTED_PAUSE: Duration = Duration::from_millis(50);
+
+/// Sort one `accept(2)` result by who the error, if any, is about.
+///
+/// `Ok(None)` is an error that cost this one connection and says nothing
+/// about the listener: the process is out of descriptors (`EMFILE`, `ENFILE`),
+/// the kernel is out of memory or buffers (`ENOMEM`, `ENOBUFS`), the peer hung
+/// up between arriving and being accepted (`ECONNABORTED`), or a signal landed
+/// (`EINTR`). Every one of these used to end the accept loop — and with it
+/// inbound peer service for the rest of the session, while `clove status` went
+/// on saying `connected` — and descriptor exhaustion is reachable from a swarm:
+/// a thread and a socket per peer, a file per torrent. `Err` is kept for the
+/// errors that are the listener's own (`EBADF`, `EINVAL`, and anything
+/// unfamiliar), after which accepting again would only fail the same way.
+fn usable_accept(accepted: io::Result<TcpStream>) -> io::Result<Option<TcpStream>> {
+    let e = match accepted {
+        Ok(socket) => return Ok(Some(socket)),
+        Err(e) => e,
+    };
+    let out_of_descriptors = matches!(e.raw_os_error(), Some(EMFILE | ENFILE));
+    let transient = out_of_descriptors
+        || e.raw_os_error() == Some(ENOBUFS)
+        || matches!(
+            e.kind(),
+            io::ErrorKind::Interrupted
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::OutOfMemory
+        );
+    if !transient {
+        return Err(e);
+    }
+    if out_of_descriptors {
+        std::thread::sleep(FD_EXHAUSTED_PAUSE);
+    }
+    Ok(None)
+}
+
+/// One forwarded connection off `listener`, with its destination header read.
+///
+/// `Ok(None)` for anything that cost only this connection: a transient accept
+/// error ([`usable_accept`]), a socket that will not take a read timeout, or a
+/// header that never arrives, arrives as garbage, or belongs to something that
+/// is not the router at all — anything on the loopback forward port can
+/// produce one, including our own [`poke_listener`]. `Err` is the listener's.
+fn accept_forwarded(listener: &TcpListener) -> io::Result<Option<(ForwardedStream, DestHash)>> {
+    let Some(mut stream) = usable_accept(listener.accept().map(|(socket, _addr)| socket))? else {
+        return Ok(None);
+    };
+    // Bound the header read so a silent/misbehaving router cannot wedge the
+    // acceptor; then hand a blocking socket to the reader thread. A socket
+    // that refuses the option is this connection's problem, not the listener's.
+    if stream.set_read_timeout(Some(DEST_LINE_TIMEOUT)).is_err() {
+        return Ok(None);
+    }
+    let Ok(dest) = read_dest_line(&mut stream, MAX_DEST_LINE) else {
+        return Ok(None);
+    };
+    if stream.set_read_timeout(None).is_err() {
+        return Ok(None);
+    }
+    Ok(Some((ForwardedStream { inner: stream }, dest)))
 }
 
 /// Read the `SILENT=false` destination header the router prepends to a
@@ -1353,6 +1424,88 @@ mod tests {
         let mut cursor = Cursor::new(b"partial-no-newline".to_vec());
         let err = read_dest_line(&mut cursor, MAX_DEST_LINE).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// The `SILENT=false` header of a forwarded connection, and the hash the
+    /// peer behind it must be known by.
+    fn forwarded_header() -> (String, DestHash) {
+        let mut dest_bytes = vec![0x42u8; 384];
+        dest_bytes.extend_from_slice(&[0x05, 0x00, 0x04, 0x00, 0x07, 0x00, 0x00]);
+        let b64 = i2p_base64_encode(&dest_bytes);
+        let hash = DestHash::from_b64_destination(&b64).unwrap();
+        (format!("{b64} FROM_PORT=6881 TO_PORT=0\n"), hash)
+    }
+
+    /// Every accept error that cost one connection is `Ok(None)`; only the
+    /// listener's own errors are `Err`. Before this, `EMFILE` — reachable
+    /// from a swarm — ended inbound service for the rest of the session.
+    #[test]
+    fn a_transient_accept_error_costs_one_connection_not_the_listener() {
+        const EBADF: i32 = 9;
+        const EINVAL: i32 = 22;
+
+        for errno in [EMFILE, ENFILE, ENOBUFS] {
+            let got = usable_accept(Err(io::Error::from_raw_os_error(errno)));
+            assert!(matches!(got, Ok(None)), "errno {errno} ended the listener");
+        }
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::OutOfMemory,
+        ] {
+            let got = usable_accept(Err(io::Error::from(kind)));
+            assert!(matches!(got, Ok(None)), "{kind:?} ended the listener");
+        }
+        // Out of descriptors: stand back rather than spin.
+        let started = Instant::now();
+        assert!(matches!(
+            usable_accept(Err(io::Error::from_raw_os_error(EMFILE))),
+            Ok(None)
+        ));
+        assert!(
+            started.elapsed() >= FD_EXHAUSTED_PAUSE,
+            "no pause on EMFILE"
+        );
+
+        for errno in [EBADF, EINVAL] {
+            let e = usable_accept(Err(io::Error::from_raw_os_error(errno)))
+                .expect_err("a listener error was read as one bad connection");
+            assert_eq!(e.raw_os_error(), Some(errno), "the error must survive");
+        }
+        assert!(usable_accept(Err(io::Error::other("something new"))).is_err());
+    }
+
+    /// The loop as the demux runs it: `EMFILE` once, then a real forwarded
+    /// connection, which must still be accepted.
+    #[test]
+    fn an_accept_loop_survives_emfile_and_takes_the_next_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (header, expected) = forwarded_header();
+        let mut peer = TcpStream::connect(addr).unwrap();
+        peer.write_all(header.as_bytes()).unwrap();
+
+        let script = [
+            Err(io::Error::from_raw_os_error(EMFILE)),
+            listener.accept().map(|(socket, _)| socket),
+        ];
+        let mut accepted = 0;
+        for result in script {
+            match usable_accept(result) {
+                Ok(Some(_socket)) => accepted += 1,
+                Ok(None) => {}
+                Err(e) => panic!("the accept loop ended: {e}"),
+            }
+        }
+        assert_eq!(accepted, 1);
+
+        // And the whole inbound path, header included, on a fresh connection.
+        let mut peer = TcpStream::connect(addr).unwrap();
+        peer.write_all(header.as_bytes()).unwrap();
+        let (_stream, from) = accept_forwarded(&listener)
+            .expect("the listener is fine")
+            .expect("a forwarded connection with a header is usable");
+        assert_eq!(from, expected);
     }
 }
 
