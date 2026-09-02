@@ -91,6 +91,9 @@ impl Swarm {
     {
         let stop = Arc::new(StopFlag::default());
         if let Some(listener) = listener {
+            // The listener knows who we are; the torrent must, or the sweep
+            // dials the echo every tracker sends back.
+            torrent.set_local_dest(listener.local_dest());
             let torrent = Arc::clone(&torrent);
             // The acceptor is deliberately detached: it blocks in accept()
             // and ends when the listener's session dies (supervisor
@@ -666,6 +669,9 @@ pub struct InboundDemux {
     max_peers: usize,
     /// Raised on session teardown; the accept loop exits at its next accept.
     stopped: std::sync::atomic::AtomicBool,
+    /// The listener's destination, once `run` has one, handed to every
+    /// torrent registered before or after so none of them dials itself.
+    local_dest: Mutex<Option<DestHash>>,
     /// Connections currently waiting for their handshake to be read.
     pending: std::sync::atomic::AtomicUsize,
     /// The same, per destination. The global cap bounds what a flood costs
@@ -718,6 +724,7 @@ impl InboundDemux {
             torrents: Mutex::new(HashMap::new()),
             max_peers,
             stopped: std::sync::atomic::AtomicBool::new(false),
+            local_dest: Mutex::new(None),
             pending: std::sync::atomic::AtomicUsize::new(0),
             pending_by_dest: Mutex::new(HashMap::new()),
         })
@@ -747,6 +754,13 @@ impl InboundDemux {
 
     /// Serve `torrent`'s info-hash. Replaces any previous registration.
     pub fn register(&self, torrent: &Arc<Torrent>) {
+        if let Some(dest) = *self
+            .local_dest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            torrent.set_local_dest(dest);
+        }
         lock_map(&self.torrents).insert(torrent.info_hash(), Arc::clone(torrent));
     }
 
@@ -792,6 +806,14 @@ impl InboundDemux {
         L: I2pListener + Send + 'static,
         L::Stream: 'static,
     {
+        let local = listener.local_dest();
+        *self
+            .local_dest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(local);
+        for torrent in lock_map(&self.torrents).values() {
+            torrent.set_local_dest(local);
+        }
         let demux = Arc::clone(self);
         std::thread::Builder::new()
             .name("clove-demux".into())
@@ -1935,6 +1957,49 @@ mod tests {
             "shutdown took {took:?} behind a dribbling handshake"
         );
         done.store(true, Ordering::Relaxed);
+    }
+
+    /// Trackers echo the announcer, so our own destination turns up in
+    /// `known_peers` as a matter of course. The sweep must not dial it.
+    #[test]
+    fn a_swarm_never_dials_its_own_destination() {
+        let net = MockNet::new();
+        let (_seeder, leecher, _sd, _ld) = seed_and_leech();
+        let ep = net.endpoint();
+        let own = ep.dest();
+        let dialer = Arc::new(CountingDialer::new(ep.dialer(), Duration::from_millis(1)));
+
+        let swarm = Swarm::spawn(
+            Arc::clone(&leecher),
+            Arc::clone(&dialer),
+            Some(ep),
+            quick_config(),
+        );
+        // Added after the swarm exists, as a tracker reply would be.
+        leecher.add_peers(&[own]);
+        std::thread::sleep(Duration::from_millis(400));
+        swarm.shutdown();
+        assert_eq!(
+            dialer.total.load(Ordering::SeqCst),
+            0,
+            "the sweep dialled our own destination"
+        );
+        assert!(!leecher.known_peers().contains(&own));
+
+        // The demux path, which the daemon uses, tells its torrents too —
+        // those registered before it runs and those registered after.
+        let (_seeder2, early, _sd2, _ld2) = seed_and_leech_tagged(0x51);
+        let (_seeder3, late, _sd3, _ld3) = seed_and_leech_tagged(0x52);
+        let ep = net.endpoint();
+        let own = ep.dest();
+        let demux = InboundDemux::new(8);
+        demux.register(&early);
+        let _accept = demux.run(ep);
+        demux.register(&late);
+        early.add_peers(&[own]);
+        late.add_peers(&[own]);
+        assert!(!early.dial_candidates().contains(&own));
+        assert!(!late.dial_candidates().contains(&own));
     }
 
     /// Every thread the swarm starts carries a name, so `ps -T` on a daemon

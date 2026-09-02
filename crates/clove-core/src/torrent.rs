@@ -286,6 +286,11 @@ struct State {
     /// the torrent; it is never cleared by the engine, since nothing here can
     /// tell a transient `ENOSPC` from a dying disk.
     storage_error: Option<String>,
+    /// Our own destination, once whoever owns the listener tells us. Never
+    /// dialled and never remembered: trackers routinely echo the announcer
+    /// back, PEX would then advertise it, and the result is two idle
+    /// connections to ourselves per torrent.
+    local_dest: Option<DestHash>,
     /// Peers to remove once the lock is released. A handler runs under the
     /// state lock and `remove_peer` takes it, so a handler that decides a
     /// peer must go queues it here and the caller finishes the job.
@@ -316,8 +321,9 @@ impl State {
     /// nothing downgrades one. Returns whether the destination was new to us.
     fn remember_peer_from(&mut self, dest: DestHash, source: Source) -> bool {
         // A ban outlives every source: the tracker and PEX will both go on
-        // naming the destination, and neither may put it back.
-        if self.banned.contains(&dest) {
+        // naming the destination, and neither may put it back. Nor is our
+        // own destination a peer, however many trackers say so.
+        if self.banned.contains(&dest) || self.local_dest == Some(dest) {
             return false;
         }
         if let Some(existing) = self.known_peers.get_mut(&dest) {
@@ -564,6 +570,7 @@ impl Torrent {
                 banned: HashSet::new(),
                 suspicion: HashMap::new(),
                 storage_error: None,
+                local_dest: None,
                 to_drop: Vec::new(),
             }),
             done: Mutex::new(false),
@@ -711,9 +718,9 @@ impl Torrent {
     }
 
     /// The known destinations the dial sweep may try: [`known_peers`] less
-    /// any that are banned. Banning forgets a destination, so the two agree
-    /// today; the sweep consults this one so that a ban placed between a
-    /// listing and a dial still holds.
+    /// any that are banned, and less ourselves. Banning forgets a
+    /// destination, so the two agree today; the sweep consults this one so
+    /// that a ban placed between a listing and a dial still holds.
     ///
     /// [`known_peers`]: Torrent::known_peers
     #[must_use]
@@ -722,8 +729,18 @@ impl Torrent {
         st.known_peers
             .keys()
             .copied()
-            .filter(|dest| !st.banned.contains(dest))
+            .filter(|dest| !st.banned.contains(dest) && st.local_dest != Some(*dest))
             .collect()
+    }
+
+    /// Tell the torrent which destination is its own, so the dial sweep skips
+    /// it and no tracker or PEX message can add it. The swarm runner and the
+    /// inbound demux both do this from their listener; a torrent with neither
+    /// is still guarded by the handshake, which refuses our own peer id.
+    pub fn set_local_dest(&self, dest: DestHash) {
+        let mut st = lock(&self.shared.state);
+        st.local_dest = Some(dest);
+        st.known_peers.remove(&dest);
     }
 
     /// Whether `dest` is refused for the rest of this run — it served a piece
@@ -949,6 +966,9 @@ impl Torrent {
                 "peer handshaked a different torrent",
             ));
         }
+        if theirs.peer_id == self.shared.peer_id {
+            return Err(ourselves());
+        }
         // Back to blocking for the connection proper: a peer legitimately sits
         // quiet between messages, and that is the idle timeout's job.
         let _ = stream.set_timeouts(None);
@@ -979,6 +999,9 @@ impl Torrent {
         }
         if self.is_banned(remote) {
             return Err(banned());
+        }
+        if theirs.peer_id == self.shared.peer_id {
+            return Err(ourselves());
         }
         // The demux bounded the read of *their* handshake; bound our reply too,
         // so a peer that stops reading cannot hold this thread open.
@@ -1253,6 +1276,16 @@ fn banned() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
         "this destination is banned for the rest of the run",
+    )
+}
+
+/// The error a connection to ourselves is refused with. A tracker echoing
+/// the announcer is ordinary; connecting to it is not, and the peer id in the
+/// handshake is the one thing about us a router cannot have re-addressed.
+fn ourselves() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "the peer is this client: same peer id",
     )
 }
 
@@ -2543,14 +2576,61 @@ mod tests {
         );
     }
 
+    /// A torrent that reaches its own destination — trackers echo the
+    /// announcer, and nothing used to filter it — must refuse the handshake
+    /// on both ends rather than seat two idle connections to itself.
+    #[test]
+    fn a_torrent_refuses_to_attach_to_itself() {
+        let net = MockNet::new();
+        let content: Vec<u8> = (0..(3 * BLOCK_LEN))
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let meta = three_file_meta(&content);
+        let dir = TempDir::new("self");
+        let torrent = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(3),
+            Mode::RarestFirst,
+            *b"-CV0001-selfselfself",
+        );
+        let ep = net.endpoint();
+        let dest = ep.dest();
+        let accepting = Arc::clone(&torrent);
+        let accept = std::thread::spawn(move || {
+            let (stream, from) = ep.accept().unwrap();
+            accepting.attach(stream, from)
+        });
+        let stream = net
+            .endpoint()
+            .dialer()
+            .dial(dest, Duration::from_secs(5))
+            .unwrap();
+        let dialed = torrent.attach(stream, dest);
+        let accepted = accept.join().unwrap();
+        assert!(dialed.is_err(), "the dialing side attached to itself");
+        assert!(accepted.is_err(), "the accepting side attached to itself");
+        assert!(torrent.connected_peers().is_empty());
+
+        // And once told which destination is ours, no source can add it.
+        torrent.add_peers(&[dest]);
+        torrent.set_local_dest(dest);
+        torrent.add_peers(&[dest]);
+        assert!(
+            !torrent.dial_candidates().contains(&dest),
+            "our own destination was offered to the dial sweep"
+        );
+    }
+
     /// Two instances negotiate BEP 10 and one learns a third peer via `i2p_pex`.
     #[test]
     fn peers_exchange_via_i2p_pex() {
         let net = MockNet::new();
         let content = vec![7u8; 100];
         let meta = real_meta(&content);
-        let peer_id = *b"-CV0001-pexpexpexpex";
 
+        // Two clients, so two peer ids: one id on both ends is a connection
+        // to ourselves, which is refused.
         let dir_a = TempDir::new("pex-a");
         let dir_b = TempDir::new("pex-b");
         let a = Torrent::new(
@@ -2558,14 +2638,14 @@ mod tests {
             Arc::new(Storage::create(&meta, &dir_a.0, false).unwrap()),
             &Bitfield::empty(1),
             Mode::RarestFirst,
-            peer_id,
+            *b"-CV0001-pexpexpexpxa",
         );
         let b = Torrent::new(
             &meta,
             Arc::new(Storage::create(&meta, &dir_b.0, false).unwrap()),
             &Bitfield::empty(1),
             Mode::RarestFirst,
-            peer_id,
+            *b"-CV0001-pexpexpexpxb",
         );
 
         // A already knows a third peer X, which B has never seen.

@@ -784,6 +784,15 @@ describing anything clove does.
     picker keeps, and a finished torrent's messages no longer take the state
     lock to ask it.
 
+4.12 [decided] **We do not connect to ourselves.** Trackers routinely echo
+    the announcer in their peer list, and nothing filtered it (2026-09 audit,
+    L-24): the sweep dialled our own destination, both ends attached, and
+    PEX then advertised us to us. Two guards, because the daemon's torrents
+    learn their destination from a listener and a bare `Torrent` has none:
+    a handshake carrying our own peer id is refused on either end, and a
+    torrent told its destination (by the swarm runner or the inbound demux)
+    neither dials it nor lets a tracker or PEX message remember it.
+
 4.5 [decided] Magnet links (clove-core::magnet): `magnet:?xt=urn:btih:<hex
     40 | base32 32>`; `dn` and `tr` are percent-decoded, `tr` filtered to
     I2P-only like .torrent announce URLs.
