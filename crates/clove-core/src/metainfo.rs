@@ -41,6 +41,16 @@ pub const MAX_PIECE_LENGTH: u32 = 128 * 1024 * 1024;
 /// still a number an operator can reason about against their limits.
 pub const MAX_FILES: usize = 100_000;
 
+/// Most announce URLs a torrent keeps, counted across every tier.
+///
+/// Each kept URL is a naming lookup for the router and an announce per cycle
+/// for the announcer, one after another. A 2 MiB `.torrent` can carry some
+/// fifty thousand `.i2p` URLs, which is days per announce cycle and fifty
+/// thousand lookups — for a swarm reached through a handful of them at
+/// most. Sixteen covers every real announce-list; the rest are counted as
+/// skipped, the way a non-I2P URL is.
+pub const MAX_TRACKERS: usize = 16;
+
 /// Most pieces a torrent may have: as many as a `bitfield` message can carry.
 ///
 /// The wire caps a message body at [`crate::wire::MAX_MESSAGE_LEN`], and a
@@ -82,11 +92,13 @@ pub struct MetaInfo {
     pub total_length: u64,
     /// BEP 27 private flag (`info.private == 1`); common on I2P.
     pub private: bool,
-    /// Announce URL tiers (BEP 12) after the I2P-only filter. May be empty:
-    /// a torrent can still be joined via PEX or magnet paths.
+    /// Announce URL tiers (BEP 12) after the I2P-only filter, at most
+    /// [`MAX_TRACKERS`] URLs across them. May be empty: a torrent can still
+    /// be joined via PEX or magnet paths.
     pub trackers: Vec<Vec<String>>,
-    /// How many non-I2P announce URLs were dropped. The only trace they
-    /// leave: callers may log "skipped N non-I2P trackers", nothing more.
+    /// How many announce URLs were dropped — non-I2P ones, and I2P ones past
+    /// [`MAX_TRACKERS`]. The only trace they leave: callers may log "skipped
+    /// N trackers", nothing more.
     pub skipped_trackers: usize,
     /// The raw bencoded `info` dictionary these fields came from — the exact
     /// bytes the info-hash covers. Kept so we can serve BEP 9 metadata to
@@ -492,8 +504,9 @@ fn parse_files(info: &Value, name: &str) -> Result<(Vec<FileEntry>, u64), Error>
 }
 
 fn parse_trackers(root: &Value) -> Result<(Vec<Vec<String>>, usize), Error> {
-    let mut tiers = Vec::new();
+    let mut tiers: Vec<Vec<String>> = Vec::new();
     let mut skipped = 0usize;
+    let mut kept_total = 0usize;
     if let Some(list) = root.get(b"announce-list") {
         // BEP 12: list of tiers, each a list of URLs. Takes precedence
         // over the flat announce key.
@@ -509,8 +522,9 @@ fn parse_trackers(root: &Value) -> Result<(Vec<Vec<String>>, usize), Error> {
                 let url = url
                     .as_str()
                     .ok_or(Error::Invalid("announce URL is not a UTF-8 string"))?;
-                if is_i2p_tracker(url) {
+                if is_i2p_tracker(url) && kept_total < MAX_TRACKERS {
                     kept.push(url.to_owned());
+                    kept_total += 1;
                 } else {
                     skipped += 1;
                 }
@@ -726,6 +740,40 @@ mod tests {
             vec![vec!["http://good.i2p/announce".to_owned()]]
         );
         assert_eq!(t.skipped_trackers, 2);
+    }
+
+    /// Every kept URL is a naming lookup and an announce per cycle; a
+    /// torrent does not get to make that fifty thousand of each.
+    #[test]
+    fn caps_kept_trackers_across_tiers() {
+        let tier = |from: usize, n: usize| {
+            Value::List(
+                (from..from + n)
+                    .map(|i| bval(&format!("http://t{i}.i2p/announce")))
+                    .collect(),
+            )
+        };
+        let tiers = Value::List(vec![tier(0, 10), tier(10, 10), tier(20, 10)]);
+        let input = single_file(vec![("announce-list", tiers)]);
+        let t = MetaInfo::parse(&input).unwrap();
+        let kept: usize = t.trackers.iter().map(Vec::len).sum();
+        assert_eq!(kept, MAX_TRACKERS);
+        // The first tier whole, the second cut, the third gone: the cap
+        // counts across tiers, not per tier.
+        assert_eq!(t.trackers.len(), 2);
+        assert_eq!(t.trackers[0].len(), 10);
+        assert_eq!(t.trackers[1].len(), MAX_TRACKERS - 10);
+        assert_eq!(t.trackers[1][0], "http://t10.i2p/announce");
+        assert_eq!(t.skipped_trackers, 30 - MAX_TRACKERS);
+
+        // Exactly the cap is kept whole, and a clearnet URL does not use up
+        // a slot — it was never a candidate.
+        let mut at_cap = vec![tier(0, MAX_TRACKERS)];
+        at_cap.push(Value::List(vec![bval("http://tracker.example.org/a")]));
+        let input = single_file(vec![("announce-list", Value::List(at_cap))]);
+        let t = MetaInfo::parse(&input).unwrap();
+        assert_eq!(t.trackers.iter().map(Vec::len).sum::<usize>(), MAX_TRACKERS);
+        assert_eq!(t.skipped_trackers, 1);
     }
 
     #[test]

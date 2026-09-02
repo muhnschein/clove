@@ -12,7 +12,7 @@
 
 use crate::bencode::{self, Value};
 use crate::http;
-use crate::metainfo::is_i2p_tracker;
+use crate::metainfo::{MAX_TRACKERS, is_i2p_tracker};
 
 /// A parsed magnet link.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,8 +21,12 @@ pub struct Magnet {
     pub info_hash: [u8; 20],
     /// The display name (`dn=`), if given.
     pub display_name: Option<String>,
-    /// I2P announce URLs (`tr=`); non-I2P trackers are dropped.
+    /// I2P announce URLs (`tr=`), at most [`MAX_TRACKERS`] of them; non-I2P
+    /// trackers are dropped.
     pub trackers: Vec<String>,
+    /// How many `tr=` values were dropped: non-I2P ones, and I2P ones past
+    /// [`MAX_TRACKERS`] — the same accounting a `.torrent` keeps.
+    pub skipped_trackers: usize,
 }
 
 /// Why a magnet link could not be parsed.
@@ -60,6 +64,7 @@ impl Magnet {
         let mut info_hash = None;
         let mut display_name = None;
         let mut trackers = Vec::new();
+        let mut skipped_trackers = 0usize;
 
         for pair in query.split('&') {
             let Some((key, value)) = pair.split_once('=') else {
@@ -77,8 +82,12 @@ impl Magnet {
                 }
                 "tr" => {
                     let url = String::from_utf8_lossy(&http::percent_decode(value)).into_owned();
-                    if is_i2p_tracker(&url) {
+                    // Capped for the reason `metainfo` caps a torrent's: a
+                    // link is as much a stranger's text as a file is.
+                    if is_i2p_tracker(&url) && trackers.len() < MAX_TRACKERS {
                         trackers.push(url);
+                    } else {
+                        skipped_trackers += 1;
                     }
                 }
                 _ => {}
@@ -89,6 +98,7 @@ impl Magnet {
             info_hash: info_hash.ok_or(Error::NoInfoHash)?,
             display_name,
             trackers,
+            skipped_trackers,
         })
     }
 }
@@ -142,8 +152,29 @@ mod tests {
             ]
         );
         assert_eq!(m.display_name.as_deref(), Some("Some Torrent"));
-        // Only the I2P tracker survives.
+        // Only the I2P tracker survives, and the other is counted.
         assert_eq!(m.trackers, vec!["http://tracker.postman.i2p/announce"]);
+        assert_eq!(m.skipped_trackers, 1);
+    }
+
+    /// A link can carry as many `tr=` values as a file can carry URLs, and
+    /// each kept one costs the same lookup and announce.
+    #[test]
+    fn caps_kept_trackers() {
+        let mut uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".to_owned();
+        for i in 0..MAX_TRACKERS + 4 {
+            uri.push_str("&tr=http%3A%2F%2Ft");
+            uri.push_str(&i.to_string());
+            uri.push_str(".i2p%2Fannounce");
+        }
+        let m = Magnet::parse(&uri).unwrap();
+        assert_eq!(m.trackers.len(), MAX_TRACKERS);
+        assert_eq!(m.trackers[0], "http://t0.i2p/announce");
+        assert_eq!(
+            m.trackers[MAX_TRACKERS - 1],
+            format!("http://t{}.i2p/announce", MAX_TRACKERS - 1)
+        );
+        assert_eq!(m.skipped_trackers, 4);
     }
 
     #[test]
