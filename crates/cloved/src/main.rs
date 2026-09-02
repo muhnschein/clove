@@ -788,8 +788,19 @@ fn build_peer_id() -> std::io::Result<[u8; 20]> {
     Ok(id)
 }
 
+/// How long the accept loop waits after a transient failure before trying
+/// again. Long enough for a descriptor to come back, short enough that a
+/// `clove` invocation does not notice.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// How often a run of transient accept failures is worth a log line. Under
+/// descriptor exhaustion the loop spins at [`ACCEPT_RETRY_DELAY`], and ten
+/// lines a second would bury the message they are trying to deliver.
+const ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Accept loop: one thread per connection. Only a fatal accept error returns.
 fn serve(listener: &ApiListener, daemon: &Arc<Daemon>) -> Result<(), String> {
+    let mut last_complaint: Option<Instant> = None;
     loop {
         match listener.accept() {
             Ok(stream) => {
@@ -800,8 +811,42 @@ fn serve(listener: &ApiListener, daemon: &Arc<Daemon>) -> Result<(), String> {
                     }
                 });
             }
+            // Out of descriptors, or a connection that went away between
+            // arriving and being accepted. Neither says anything about the
+            // listener, and returning here — as this used to — took the
+            // whole daemon down under EMFILE: every peer dropped, and
+            // `Restart=on-failure` re-verified everything on the way back up.
+            Err(e) if accept_error_is_transient(&e) => {
+                if last_complaint.is_none_or(|at| at.elapsed() >= ACCEPT_LOG_INTERVAL) {
+                    eprintln!("cloved: accept on the control socket failed: {e}; retrying");
+                    last_complaint = Some(Instant::now());
+                }
+                std::thread::sleep(ACCEPT_RETRY_DELAY);
+            }
             Err(e) => return Err(format!("accept failed: {e}")),
         }
+    }
+}
+
+/// Whether an `accept(2)` failure describes the moment rather than the
+/// listener, and is therefore one to wait out.
+///
+/// Descriptor exhaustion (`EMFILE`, `ENFILE`), kernel memory pressure
+/// (`ENOBUFS`, `ENOMEM`), a connection reset before it was accepted
+/// (`ECONNABORTED`), a signal (`EINTR`) and a spurious wake-up (`EAGAIN`) all
+/// pass. Anything else — `EBADF`, `EINVAL`, `ENOTSOCK` — means the socket
+/// itself is gone, and there is nothing left to serve on.
+fn accept_error_is_transient(e: &std::io::Error) -> bool {
+    use rustix::io::Errno;
+    match e.kind() {
+        std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::WouldBlock => true,
+        _ => e.raw_os_error().is_some_and(|code| {
+            [Errno::MFILE, Errno::NFILE, Errno::NOBUFS, Errno::NOMEM]
+                .iter()
+                .any(|errno| errno.raw_os_error() == code)
+        }),
     }
 }
 
@@ -2393,6 +2438,35 @@ mod tests {
         // A second call reads the existing token rather than rotating it —
         // rotating would invalidate every running CLI on restart.
         assert_eq!(load_or_create_token(&dir.0).expect("reuse"), first);
+    }
+
+    // ----------------------------------------------------- accept loop
+
+    /// The accept loop's exit rule. Exhaustion and aborted handshakes are
+    /// waited out; a listener that is itself broken is the end.
+    #[test]
+    fn accept_errors_that_describe_the_moment_are_retried() {
+        use rustix::io::Errno;
+        for errno in [
+            Errno::MFILE,
+            Errno::NFILE,
+            Errno::CONNABORTED,
+            Errno::AGAIN,
+            Errno::INTR,
+            Errno::NOBUFS,
+            Errno::NOMEM,
+        ] {
+            let e = std::io::Error::from_raw_os_error(errno.raw_os_error());
+            assert!(accept_error_is_transient(&e), "{e} should be waited out");
+        }
+        for errno in [Errno::BADF, Errno::INVAL, Errno::NOTSOCK, Errno::OPNOTSUPP] {
+            let e = std::io::Error::from_raw_os_error(errno.raw_os_error());
+            assert!(!accept_error_is_transient(&e), "{e} should end the daemon");
+        }
+        // An error with no errno behind it is not something to retry into.
+        assert!(!accept_error_is_transient(&std::io::Error::other(
+            "not from the kernel"
+        )));
     }
 
     // ------------------------------------------------- instance lock
