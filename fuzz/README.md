@@ -159,6 +159,16 @@ The other dictionaries were written on the same reasoning rather than on
 per-target evidence, and most moved a target the previous reports had called
 saturated.
 
+A dictionary is `"token"` or `name="token"` per line, and inside the quotes
+libFuzzer accepts three escapes and no others: `\\`, `\"` and `\xHH`. `\r`,
+`\n` and `\t` are not among them — spell them `\x0d`, `\x0a`, `\x09`. One
+unparsable line, or one missing file, and libFuzzer exits before it fuzzes
+anything, so the cost of a typo here is a whole scheduled run and a red target
+with nothing wrong with it. `ci/check-dicts.sh` restates that grammar and runs
+on every push, where the mistake is a minute old rather than a night old; it
+carries a `--self-test` because a grammar check that has stopped matching
+prints ok forever.
+
 ## Input length
 
 `-max_len` is passed explicitly, from `max_len_for` in `ci/fuzz.sh`: **4096 for

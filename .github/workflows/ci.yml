@@ -41,6 +41,14 @@ jobs:
       # does.
       - run: cargo check --manifest-path fuzz/Cargo.toml
       - run: ./ci/check-net-deps.sh
+      # Same argument one asset over. The dictionaries are read only by the
+      # scheduled fuzz job, which passes `-dict=` for every target and dies
+      # before fuzzing anything if one file is missing or has a line libFuzzer
+      # cannot parse — so a typo in one costs a night and shows up as a red
+      # target that has nothing wrong with it. The self-test runs first,
+      # because a grammar check that has stopped matching prints ok forever.
+      - run: ./ci/check-dicts.sh --self-test
+      - run: ./ci/check-dicts.sh
       # End-to-end: drive the real binaries as an operator does. Unit tests
       # cannot see whole-process faults (the Phase-F registry deadlocks
       # passed all of them).

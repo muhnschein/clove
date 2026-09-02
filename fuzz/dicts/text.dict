@@ -4,8 +4,8 @@
 # overrides and isolates, the zero-width family, the separators and the BOM.
 "\x1b[2J"
 "\x1b]0;x\x07"
-"\r"
-"\n"
+"\x0d"
+"\x0a"
 "\x7f"
 "\xc2\x9b"
 "\xc2\x9d"
