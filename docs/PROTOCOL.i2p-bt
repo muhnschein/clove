@@ -784,6 +784,24 @@ describing anything clove does.
     picker keeps, and a finished torrent's messages no longer take the state
     lock to ask it.
 
+    clove holds itself to the same rule in the other direction: its own
+    bitfield and extension handshake are queued before the peer is seated in
+    the table, so no other thread's broadcast `have` or choke change can get
+    on the wire ahead of them.
+
+4.13 [decided] **A peer dropped for cause sits out an escalating hold.** A
+    protocol violation, an outgoing queue that filled because the peer
+    stopped reading, or `REQUEST_STRIKES` rounds of unanswered requests used
+    to cost the peer nothing: its destination stayed `Trusted` in the known
+    set and the next sweep dialled it back (2026-09 audit, L-27). Such a
+    destination is now held off the dial sweep for `MISBEHAVIOUR_BACKOFF`
+    (30s), doubling per offence to an hour; a peer that merely hung up or
+    went quiet earns no hold, and inbound connections are not refused by it
+    — that is what the ban of §4.8 is for. Alongside, the swarm's `max_peers`
+    is enforced inside the registration lock rather than only at the accept
+    and dial paths, where several connections in flight can all be told
+    there is room.
+
 4.12 [decided] **We do not connect to ourselves.** Trackers routinely echo
     the announcer in their peer list, and nothing filtered it (2026-09 audit,
     L-24): the sweep dialled our own destination, both ends attached, and

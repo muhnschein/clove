@@ -90,6 +90,9 @@ impl Swarm {
         L::Stream: 'static,
     {
         let stop = Arc::new(StopFlag::default());
+        // Binding inside the engine; the sweep's and acceptor's own checks
+        // are only there to save a dial or a handshake.
+        torrent.set_max_peers(config.max_peers);
         if let Some(listener) = listener {
             // The listener knows who we are; the torrent must, or the sweep
             // dials the echo every tracker sends back.
@@ -761,6 +764,7 @@ impl InboundDemux {
         {
             torrent.set_local_dest(dest);
         }
+        torrent.set_max_peers(self.max_peers);
         lock_map(&self.torrents).insert(torrent.info_hash(), Arc::clone(torrent));
     }
 

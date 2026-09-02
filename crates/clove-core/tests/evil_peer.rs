@@ -1292,6 +1292,133 @@ fn a_repeated_or_invalid_piece_set_message_drops_the_peer() {
     drop(polite);
 }
 
+/// A peer dropped for misbehaving used to stay `Trusted` in the known set and
+/// be dialled straight back by the next sweep. It now sits out a hold that
+/// doubles with each offence — while a peer that merely hung up gets none.
+#[test]
+fn misbehaving_peers_are_held_off_the_dial_sweep_with_an_escalating_backoff() {
+    use clove_core::torrent::MISBEHAVIOUR_BACKOFF;
+
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("backoff");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    // One endpoint, so every offence is the same destination's.
+    let offender = net.endpoint();
+    let offender_dest = offender.dest();
+    let offend = |garbage: bool| {
+        let mut stream = offender
+            .dial(dest, Duration::from_secs(5))
+            .expect("offender dial");
+        handshake(&mut stream, info_hash).expect("offender handshake");
+        let deadline = Instant::now() + DEADLINE;
+        while seeder.connected_peers().is_empty() {
+            assert!(Instant::now() < deadline, "the offender never attached");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if garbage {
+            let _ = stream.write_all(&[0xFF; 512]);
+        }
+        drop(stream);
+        let deadline = Instant::now() + DEADLINE;
+        while !seeder.connected_peers().is_empty() {
+            assert!(Instant::now() < deadline, "the offender was never dropped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    // Hanging up politely earns no hold at all.
+    offend(false);
+    assert_eq!(
+        seeder.dial_hold(offender_dest),
+        None,
+        "a peer that merely hung up was penalised"
+    );
+    assert!(seeder.dial_candidates().contains(&offender_dest));
+
+    // Garbage on the wire: the first hold, then a longer one.
+    offend(true);
+    let first = seeder
+        .dial_hold(offender_dest)
+        .expect("a protocol violation earns a hold");
+    assert!(first <= MISBEHAVIOUR_BACKOFF, "first hold {first:?}");
+    assert!(
+        seeder.known_peers().contains(&offender_dest)
+            && !seeder.dial_candidates().contains(&offender_dest),
+        "a held destination was offered to the dial sweep"
+    );
+    offend(true);
+    let second = seeder
+        .dial_hold(offender_dest)
+        .expect("a second violation earns a hold");
+    assert!(
+        second > MISBEHAVIOUR_BACKOFF && second <= 2 * MISBEHAVIOUR_BACKOFF,
+        "second hold {second:?} did not escalate from {first:?}"
+    );
+}
+
+/// The bitfield is the first thing a strict client expects to hear, and it
+/// used to be queued *after* the peer was seated in the table — a window in
+/// which any other thread's broadcast `have` or choke change could get in
+/// first. It is queued before registration now.
+#[test]
+fn our_bitfield_is_the_first_message_a_peer_hears() {
+    const PIECES: u32 = 128;
+
+    let net = MockNet::new();
+    let content: Vec<u8> = (0..(PIECES * BLOCK_LEN))
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    // A leecher mid-download, so `have` broadcasts are going out constantly
+    // while raw peers attach to it.
+    let seed_dir = TempDir::new("first-seed");
+    let seeder = seeding_torrent(&meta, &content, &seed_dir);
+    let seed_ep = net.endpoint();
+    let seed_dest = seed_ep.dest();
+    let _seed_acceptor = spawn_acceptor(&seeder, seed_ep);
+    let leech_dir = TempDir::new("first-leech");
+    let leecher = leeching_torrent(&meta, &leech_dir);
+    let leech_ep = net.endpoint();
+    let leech_dest = leech_ep.dest();
+    let _leech_acceptor = spawn_acceptor(&leecher, leech_ep);
+    let stream = net
+        .endpoint()
+        .dialer()
+        .dial(seed_dest, Duration::from_secs(5))
+        .expect("dial seeder");
+    leecher.attach(stream, seed_dest).expect("attach seeder");
+
+    let mut held = Vec::new();
+    for _ in 0..24 {
+        let mut peer = raw_peer(&net, leech_dest, info_hash);
+        let first = loop {
+            if let Some(msg) = next_message(&mut peer) {
+                break msg;
+            }
+            assert!(
+                !leecher.is_complete(),
+                "the download finished before the peers attached"
+            );
+        };
+        assert!(
+            matches!(first, Message::Bitfield(_)),
+            "the first message was {first:?}, not our bitfield"
+        );
+        held.push(peer);
+    }
+    drop(held);
+}
+
 /// A request whose range runs off the end of the piece it names. Storage bounds
 /// reads against the whole torrent, not the piece, so serving it would hand out
 /// bytes from the *next* piece — which we may not hold and have certainly not
