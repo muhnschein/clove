@@ -21,7 +21,7 @@
 
 // Layer-1 exception (SCOPE §5): this crate implements the boundary the
 // workspace clippy.toml enforces on everyone else.
-#![allow(clippy::disallowed_types, clippy::disallowed_methods)]
+#![allow(clippy::disallowed_types)]
 
 use std::io::{self, Read, Write};
 use std::time::Duration;

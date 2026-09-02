@@ -1746,7 +1746,7 @@ mod hostile_bridge_tests {
         limit: Duration,
         f: impl FnOnce() -> T + Send + 'static,
     ) -> Option<(T, Duration)> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
         let start = Instant::now();
         std::thread::spawn(move || {
             let _ = tx.send(f());
@@ -2120,7 +2120,8 @@ mod naming_tests {
     fn naming_bridge(reply: &str) -> (u16, mpsc::Receiver<String>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let (tx, rx) = mpsc::channel();
+        // Bounded, as every channel in the workspace is; a test drains far fewer.
+        let (tx, rx) = mpsc::sync_channel(16);
         let reply = reply.to_owned();
         std::thread::spawn(move || {
             while let Ok((mut sock, _)) = listener.accept() {
@@ -2142,7 +2143,7 @@ mod naming_tests {
         limit: Duration,
         f: impl FnOnce() -> T + Send + 'static,
     ) -> Option<T> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let _ = tx.send(f());
         });
@@ -2460,7 +2461,8 @@ mod session_tests {
     fn session_bridge(status: &'static str, after: AfterSession) -> (u16, mpsc::Receiver<String>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        let (tx, rx) = mpsc::channel();
+        // Bounded, as every channel in the workspace is; a test drains far fewer.
+        let (tx, rx) = mpsc::sync_channel(16);
         std::thread::spawn(move || {
             let seen = AtomicUsize::new(0);
             while let Ok((mut socket, _)) = listener.accept() {
@@ -2843,7 +2845,7 @@ mod session_tests {
 
         // Bounded, because the regression is a *hang*: before this fix
         // `wait_until_lost` simply never returned.
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
         let waiting = Arc::clone(&session);
         std::thread::spawn(move || {
             let _ = tx.send(waiting.wait_until_lost());
