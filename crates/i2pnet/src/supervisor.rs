@@ -74,14 +74,13 @@ impl ReconnectPolicy {
     /// dependency is pulled in); the delay is shortened by `roll * jitter`.
     #[must_use]
     pub fn jittered(&self, base: Duration, roll: f64) -> Duration {
-        let jitter = self.jitter.clamp(0.0, 1.0);
         // `clamp` passes NaN through, and `Duration::mul_f64` panics on it, so
-        // a roll that is not a number becomes no jitter rather than a crash.
-        let roll = if roll.is_nan() {
-            0.0
-        } else {
-            roll.clamp(0.0, 1.0)
-        };
+        // a value that is not a number becomes no jitter rather than a crash.
+        // Both inputs: `roll` is the caller's, and `jitter` is a `pub` field
+        // anyone can set from a config.
+        let unit = |x: f64| if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) };
+        let jitter = unit(self.jitter);
+        let roll = unit(roll);
         let factor = 1.0 - jitter * roll;
         base.mul_f64(factor)
     }
@@ -127,6 +126,30 @@ mod tests {
         assert_eq!(p.jittered(base, -1.0), base);
         assert_eq!(p.jittered(base, 5.0), Duration::from_secs(5));
         assert!(p.jittered(base, f64::NAN) <= base);
+    }
+
+    /// `jitter` is a `pub` field; a NaN in it used to reach `mul_f64` and
+    /// panic the supervisor at the moment it was trying to reconnect.
+    #[test]
+    fn a_nan_jitter_is_no_jitter_not_a_panic() {
+        let p = ReconnectPolicy {
+            jitter: f64::NAN,
+            ..policy()
+        };
+        let base = Duration::from_secs(10);
+        assert_eq!(p.jittered(base, 0.5), base);
+        assert_eq!(p.jittered(base, f64::NAN), base);
+        // And out of range is clamped, not stretched.
+        let p = ReconnectPolicy {
+            jitter: 7.0,
+            ..policy()
+        };
+        assert_eq!(p.jittered(base, 1.0), Duration::ZERO);
+        let p = ReconnectPolicy {
+            jitter: -1.0,
+            ..policy()
+        };
+        assert_eq!(p.jittered(base, 1.0), base);
     }
 
     #[test]
