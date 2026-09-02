@@ -38,6 +38,9 @@ pub enum Error {
     NoInfoHash,
     /// The btih value was not 40 hex or 32 base32 characters.
     BadInfoHash,
+    /// Two `xt=urn:btih:` parameters that name different hashes. A link is
+    /// one torrent; which of two it means is not ours to guess.
+    ConflictingInfoHash,
 }
 
 impl std::fmt::Display for Error {
@@ -46,6 +49,9 @@ impl std::fmt::Display for Error {
             Error::NotMagnet => f.write_str("magnet: not a magnet: URI"),
             Error::NoInfoHash => f.write_str("magnet: no xt=urn:btih: info-hash"),
             Error::BadInfoHash => f.write_str("magnet: info-hash is not 40 hex or 32 base32 chars"),
+            Error::ConflictingInfoHash => {
+                f.write_str("magnet: two xt=urn:btih: parameters name different info-hashes")
+            }
         }
     }
 }
@@ -73,7 +79,11 @@ impl Magnet {
             match key {
                 "xt" => {
                     if let Some(hash) = value.strip_prefix("urn:btih:") {
-                        info_hash = Some(parse_btih(hash)?);
+                        let hash = parse_btih(hash)?;
+                        if info_hash.is_some_and(|seen| seen != hash) {
+                            return Err(Error::ConflictingInfoHash);
+                        }
+                        info_hash = Some(hash);
                     }
                 }
                 "dn" => {
@@ -193,6 +203,25 @@ mod tests {
         let b = Magnet::parse(&b32).unwrap().info_hash;
         assert_eq!(a, [0xFF; 20]);
         assert_eq!(b, [0xFF; 20]);
+    }
+
+    /// The last of several `xt=` used to win silently; a link naming two
+    /// torrents is refused, while the same hash spelled twice — hex and
+    /// base32 of it, say — is one torrent and fine.
+    #[test]
+    fn conflicting_info_hashes_are_refused() {
+        let a = "0123456789abcdef0123456789abcdef01234567";
+        let b = "ffffffffffffffffffffffffffffffffffffffff";
+        assert_eq!(
+            Magnet::parse(&format!("magnet:?xt=urn:btih:{a}&xt=urn:btih:{b}")),
+            Err(Error::ConflictingInfoHash)
+        );
+        let same = Magnet::parse(&format!(
+            "magnet:?xt=urn:btih:{b}&xt=urn:btih:{}",
+            "7".repeat(32)
+        ))
+        .expect("one hash, two spellings");
+        assert_eq!(same.info_hash, [0xFF; 20]);
     }
 
     #[test]
