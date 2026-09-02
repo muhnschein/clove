@@ -16,7 +16,7 @@
 //!   ABI 6 — Linux 6.12, the floor in `docs/SCOPE.md` §0 — is a hard
 //!   requirement; only the ABI 9 addition is best-effort.
 //! - **seccomp** installs an *allowlist* over the syscalls in `ALLOWED`:
-//!   anything not on it returns `ENOSYS`. Four of them are narrowed by
+//!   anything not on it returns `ENOSYS`. Five of them are narrowed by
 //!   argument as well; see `argument_restricted`.
 //!
 //! The daemon was run under `strace`
@@ -526,6 +526,22 @@ mod seccomp {
                 libc::SYS_mprotect,
                 vec![SeccompRule::new(vec![masked(2, Dword, exec_mask(), 0)?])?],
             ),
+            // Naming a thread: `std::thread::Builder::name` is a
+            // `prctl(PR_SET_NAME)` on the new thread, and every thread the
+            // daemon owns starts after this filter. A name is what makes a
+            // wedged `ps -T` or a core readable, so it is worth one option of
+            // one syscall — and only that one: `prctl` is also how a process
+            // asks for `PR_SET_DUMPABLE`, `PR_SET_SECCOMP`, `PR_SET_NO_NEW_PRIVS`
+            // and the speculation controls, none of which it needs post-init.
+            (
+                libc::SYS_prctl,
+                vec![SeccompRule::new(vec![SeccompCondition::new(
+                    0,
+                    Dword,
+                    SeccompCmpOp::Eq,
+                    libc::PR_SET_NAME.try_into().unwrap_or(u64::MAX),
+                )?])?],
+            ),
         ])
     }
 
@@ -815,15 +831,29 @@ mod tests {
         assert!(entries > 0, "the directory listing came back empty");
         std::fs::remove_file(nested.join("state")).expect("unlink");
 
-        // A thread, and a channel to join it through — thread-per-peer is the
-        // engine's whole shape.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<u64>(1);
-        let worker = std::thread::spawn(move || {
-            let _ =
-                tx.send(u64::try_from(std::time::Instant::now().elapsed().as_nanos()).unwrap_or(0));
-        });
-        assert!(rx.recv().is_ok(), "a worker thread could not report back");
+        // A *named* thread, and a channel to join it through — thread-per-peer
+        // is the engine's whole shape, and every thread it spawns is named,
+        // which is a `prctl(PR_SET_NAME)` the filter has to admit. std swallows
+        // a refused `prctl` here, so the name is read back through `/proc` and
+        // compared: a filter that quietly refused it would leave the thread
+        // called after the process, and this is the only place that would show.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Option<String>>(1);
+        let worker = std::thread::Builder::new()
+            .name("clove-sandbox-test".to_owned())
+            .spawn(move || {
+                let comm = std::fs::read_to_string("/proc/thread-self/comm").ok();
+                let _ = tx.send(comm);
+            })
+            .expect("spawn a named worker thread");
+        let comm = rx.recv().expect("a worker thread could not report back");
         worker.join().expect("join a worker thread");
+        if let Some(comm) = comm {
+            // `comm` is capped at 15 bytes by the kernel, so compare the prefix.
+            assert!(
+                comm.trim_end().starts_with("clove-sandbox-t"),
+                "the thread name was not applied under the filter: {comm:?}"
+            );
+        }
 
         // The control socket. The daemon's *only* post-init operation on it is
         // `accept4` — it was bound during initialisation, and `socket(AF_UNIX)`,

@@ -334,21 +334,17 @@ fn run() -> Result<(), String> {
 /// or a registry lock is poisoned — none of them the answer to a limit being
 /// reached.
 ///
-/// `name` is what the thread should be called in `ps -T` and a core, and is
-/// not applied yet. Setting it is a `prctl(PR_SET_NAME)` on the new thread,
-/// every one of which starts after the sandbox is entered, and the post-init
-/// seccomp allowlist in `sandbox.rs` does not admit `prctl`: std swallows the
-/// `ENOSYS`, but the traced router run rightly refuses any post-init call
-/// that comes back refused. Once the allowlist admits `prctl` restricted to
-/// `PR_SET_NAME`, this becomes `.name(name.to_owned())` and nothing else
-/// changes.
+/// `name` is what the thread is called in `ps -T` and a core. Setting it is a
+/// `prctl(PR_SET_NAME)` on the new thread, and every thread here starts after
+/// the sandbox is entered, so the post-init allowlist in `sandbox.rs` admits
+/// `prctl` for that one option and no other; the traced router run is what
+/// keeps the two in step.
 fn spawn_named<F, T>(name: &str, f: F) -> std::io::Result<std::thread::JoinHandle<T>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    let _ = name;
-    std::thread::Builder::new().spawn(f)
+    std::thread::Builder::new().name(name.to_owned()).spawn(f)
 }
 
 /// Daemon state shared across connection threads.

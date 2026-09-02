@@ -119,7 +119,7 @@ socket; plus a
 allowlist: every syscall the daemon no longer needs returns
 .Er ENOSYS ,
 the answer a libc's fallback paths are written for.
-Four calls that the daemon does still need are restricted by argument as well:
+Five calls that the daemon does still need are restricted by argument as well:
 .Xr socket 2
 to
 .Dv AF_INET
@@ -137,7 +137,14 @@ and
 .Xr mmap 2
 and
 .Xr mprotect 2
-to mappings that are never writable and executable at once.
+to mappings that are never writable and executable at once;
+and
+.Xr prctl 2
+to
+.Dv PR_SET_NAME ,
+so each thread can carry a name without the rest of
+.Xr prctl 2
+coming with it.
 .Pp
 An allowlist rather than a list of refusals, because a list of refusals can only
 name what somebody thought of.
