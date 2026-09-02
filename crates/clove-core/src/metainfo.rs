@@ -206,7 +206,11 @@ impl MetaInfo {
     /// piece count disagreeing with the total length, or unsafe path
     /// components.
     pub fn parse(input: &[u8]) -> Result<Self, Error> {
-        let root = bencode::decode(input)?;
+        // One pass for both the tree and the span of the `info` entry. This
+        // used to decode twice — once for the tree and once to find the
+        // bytes — with the first tree alive throughout, which doubled the
+        // transient cost of the largest input a peer can hand us.
+        let (root, info_range) = bencode::decode_with_entry(input, b"info")?;
         let info = root
             .get(b"info")
             .ok_or(Error::Invalid("missing info dictionary"))?;
@@ -216,8 +220,7 @@ impl MetaInfo {
 
         // Hash the exact bytes: re-encoding non-canonical input would
         // change the identity i2psnark peers agreed on.
-        let info_range =
-            bencode::raw_entry(input, b"info")?.ok_or(Error::Invalid("missing info dictionary"))?;
+        let info_range = info_range.ok_or(Error::Invalid("missing info dictionary"))?;
         let raw_info: Arc<[u8]> = Arc::from(&input[info_range]);
         let info_hash = InfoHash(Sha1::digest(&raw_info).into());
 
@@ -639,6 +642,26 @@ mod tests {
         let a = MetaInfo::parse(&single_file(vec![])).unwrap();
         let b = MetaInfo::parse(&single_file(vec![("comment", bval("x"))])).unwrap();
         assert_eq!(a.info_hash, b.info_hash);
+
+        // The hash is SHA-1 over the exact `info` bytes as they sit in the
+        // input, which for a non-canonical torrent — unsorted keys, `info`
+        // ahead of `announce`, an unsorted key order inside `info` too — are
+        // not the bytes a re-encode would produce. Written by hand so that
+        // the encoder cannot have canonicalised them first.
+        let raw_info = b"d6:pieces20:\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\
+                         \x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\
+                         12:piece lengthi16384e4:name9:hello.txt6:lengthi5ee";
+        let mut input = b"d4:info".to_vec();
+        input.extend_from_slice(raw_info);
+        input.extend_from_slice(b"8:announce21:http://t.i2p/announcee");
+        let t = MetaInfo::parse(&input).expect("a non-canonical torrent parses");
+        assert_eq!(&t.raw_info[..], &raw_info[..]);
+        assert_eq!(t.info_hash.0, <[u8; 20]>::from(Sha1::digest(raw_info)));
+        assert_ne!(
+            &bencode::encode(&bencode::decode(raw_info).unwrap())[..],
+            &raw_info[..],
+            "the input has to be non-canonical for this to prove anything"
+        );
     }
 
     #[test]
