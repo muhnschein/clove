@@ -1561,6 +1561,85 @@ fn choke_rounds_run_without_any_traffic_at_all() {
     drop(held);
 }
 
+/// Interest is a five-byte message and used to run a whole choke round, so a
+/// peer flipping it drove the optimistic rotation: every third flip choked an
+/// honest peer holding a slot (discarding its outstanding requests) to make
+/// room for whoever the rotation landed on. A flip now runs a round only when
+/// there is a free slot to give, and the periodic round does the rest.
+#[test]
+fn interest_flapping_does_not_disturb_the_peers_holding_slots() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("flap");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    // No periodic rounds during the test: only message-driven ones could
+    // move a slot, which is the path under test.
+    seeder.set_choke_interval(Duration::from_secs(3600));
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    // Four peers take the four slots (each one's interest finds a free slot,
+    // so each is unchoked); a fifth is interested and waits.
+    let mut holders = Vec::new();
+    let mut flags: Vec<(Arc<AtomicBool>, Arc<AtomicBool>)> = Vec::new();
+    for _ in 0..4 {
+        let mut peer = raw_peer(&net, dest, info_hash);
+        wire::write_message(&mut peer, &Message::Interested).expect("interest");
+        let unchoked = Arc::new(AtomicBool::new(false));
+        let choked = Arc::new(AtomicBool::new(false));
+        let mut reader = peer.try_clone();
+        reader.set_timeouts(None);
+        let (u, c) = (Arc::clone(&unchoked), Arc::clone(&choked));
+        std::thread::spawn(move || {
+            while let Ok(frame) = wire::read_frame(&mut reader, wire::MAX_MESSAGE_LEN) {
+                match Message::parse(&frame) {
+                    Ok(Message::Unchoke) => u.store(true, Ordering::Relaxed),
+                    Ok(Message::Choke) => c.store(true, Ordering::Relaxed),
+                    _ => {}
+                }
+            }
+        });
+        holders.push(peer);
+        flags.push((unchoked, choked));
+    }
+    let deadline = Instant::now() + DEADLINE;
+    while !flags.iter().all(|(u, _)| u.load(Ordering::Relaxed)) {
+        assert!(
+            Instant::now() < deadline,
+            "the four holders were never unchoked"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut waiting = raw_peer(&net, dest, info_hash);
+    wire::write_message(&mut waiting, &Message::Interested).expect("interest");
+
+    // The flapper: thirty flips.
+    let mut flapper = raw_peer(&net, dest, info_hash);
+    for i in 0..30 {
+        let msg = if i % 2 == 0 {
+            Message::Interested
+        } else {
+            Message::NotInterested
+        };
+        wire::write_message(&mut flapper, &msg).expect("flip");
+    }
+    // Long enough for every flip to have been handled.
+    std::thread::sleep(Duration::from_millis(500));
+    for (i, (_, choked)) in flags.iter().enumerate() {
+        assert!(
+            !choked.load(Ordering::Relaxed),
+            "holder {i} was choked by another peer flapping its interest"
+        );
+    }
+    drop((holders, waiting, flapper));
+}
+
 /// A peer we have nothing to say to still has to hear from us. Clients drop a
 /// connection that has gone quiet for a few minutes, so without keep-alives the
 /// *other* side hangs up — and on I2P redialling costs tunnel setup, which makes

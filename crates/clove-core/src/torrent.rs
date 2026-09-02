@@ -1409,13 +1409,28 @@ impl Shared {
                 st.peers[idx].peer_choking = false;
                 fill_requests(st, idx, out);
             }
+            // Interest transitions do not run a full round: a round advances
+            // the optimistic rotation, and a peer flipping its interest could
+            // drive it — choking an honest peer, which discards its requests,
+            // every third flip. A round runs now only if there is a free slot
+            // to give the newly interested peer; otherwise it waits for the
+            // periodic one, as BEP 3 intends.
             Message::Interested => {
                 st.peers[idx].they_interested = true;
-                run_choker(st, out);
+                let unchoked = st.peers.iter().filter(|p| !p.we_choke).count();
+                if unchoked < st.choker.max_unchoked {
+                    run_choker(st, out);
+                }
             }
+            // An uninterested peer is always choked, and that needs no round:
+            // it is choked directly, which frees its slot for the next one.
             Message::NotInterested => {
-                st.peers[idx].they_interested = false;
-                run_choker(st, out);
+                let peer = &mut st.peers[idx];
+                peer.they_interested = false;
+                if !peer.we_choke {
+                    peer.we_choke = true;
+                    out.push((peer.id, peer.out.clone(), Message::Choke));
+                }
             }
             Message::Have(piece) => {
                 // Only when the bit actually changes: leaving withdraws what
