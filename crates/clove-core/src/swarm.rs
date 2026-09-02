@@ -29,9 +29,8 @@ use std::time::{Duration, Instant};
 
 use i2pnet::{DestHash, I2pDialer, I2pListener, I2pNamingLookup, I2pStream};
 
-use crate::torrent::{HANDSHAKE_TIMEOUT, MAX_CONNECTIONS_PER_DEST, Torrent};
+use crate::torrent::{self, MAX_CONNECTIONS_PER_DEST, Torrent};
 use crate::tracker;
-use crate::wire::{self, Handshake};
 
 /// Swarm-runner timing and limits. Every field exists to be tuned once live
 /// I2P behavior is measured (R5); the defaults lean generous because tunnel
@@ -644,6 +643,10 @@ pub struct InboundDemux {
     stopped: std::sync::atomic::AtomicBool,
     /// Connections currently waiting for their handshake to be read.
     pending: std::sync::atomic::AtomicUsize,
+    /// The same, per destination. The global cap bounds what a flood costs
+    /// us; this bounds what one destination may hold of it, so filling the
+    /// cap takes a swarm's worth of identities rather than one.
+    pending_by_dest: Mutex<HashMap<DestHash, usize>>,
 }
 
 /// How many connections may be waiting on their handshake at once.
@@ -653,14 +656,32 @@ pub struct InboundDemux {
 /// flood costs us. Well above any real swarm's arrival rate.
 const MAX_PENDING_HANDSHAKES: usize = 64;
 
-/// Decrements the pending count when a routing thread ends, panic included.
-struct PendingGuard(Arc<InboundDemux>);
+/// How long an inbound peer has to send its handshake, whole.
+///
+/// Shorter than the outbound [`torrent::HANDSHAKE_TIMEOUT`]: an inbound peer
+/// has already built its tunnels and reached us, so the slow part is behind
+/// it, and every second here is a second one of [`MAX_PENDING_HANDSHAKES`]
+/// is held by a connection that may never speak.
+const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Decrements the pending counts when a routing thread ends, panic included.
+struct PendingGuard {
+    demux: Arc<InboundDemux>,
+    from: DestHash,
+}
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        self.0
+        self.demux
             .pending
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let mut by_dest = lock_map(&self.demux.pending_by_dest);
+        if let Some(count) = by_dest.get_mut(&self.from) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                by_dest.remove(&self.from);
+            }
+        }
     }
 }
 
@@ -673,7 +694,30 @@ impl InboundDemux {
             max_peers,
             stopped: std::sync::atomic::AtomicBool::new(false),
             pending: std::sync::atomic::AtomicUsize::new(0),
+            pending_by_dest: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Count `from` as waiting on a handshake, or refuse: the global cap, or
+    /// [`MAX_CONNECTIONS_PER_DEST`] already pending from this destination.
+    /// The per-destination check is inside its own lock so a burst from one
+    /// destination cannot slip several past it at once.
+    fn admit_pending(&self, from: DestHash) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.pending.load(Ordering::Relaxed) >= MAX_PENDING_HANDSHAKES {
+            return false;
+        }
+        let mut by_dest = lock_map(&self.pending_by_dest);
+        let count = by_dest.entry(from).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_DEST {
+            if *count == 0 {
+                by_dest.remove(&from);
+            }
+            return false;
+        }
+        *count += 1;
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Serve `torrent`'s info-hash. Replaces any previous registration.
@@ -715,21 +759,26 @@ impl InboundDemux {
                 }
                 match accepted {
                     Ok(Some((stream, from))) => {
-                        use std::sync::atomic::Ordering;
                         // Bounded: each of these is a thread, and a peer that
                         // connects without handshaking holds one until its
-                        // timeout. Past the cap the connection is dropped,
-                        // which the dialling side sees as a refusal.
-                        if demux.pending.load(Ordering::Relaxed) >= MAX_PENDING_HANDSHAKES {
+                        // timeout. Past either cap the connection is dropped,
+                        // which the dialling side sees as a refusal. The
+                        // destination is known before a byte is read, which
+                        // is what lets one be refused before it costs a
+                        // thread.
+                        if !demux.admit_pending(from) {
                             drop(stream);
                             continue;
                         }
-                        demux.pending.fetch_add(1, Ordering::Relaxed);
+                        let guard = PendingGuard {
+                            demux: Arc::clone(&demux),
+                            from,
+                        };
                         let demux = Arc::clone(&demux);
                         // Per-connection thread: the handshake read must
                         // never stall the accept loop.
                         std::thread::spawn(move || {
-                            let _guard = PendingGuard(Arc::clone(&demux));
+                            let _guard = guard;
                             demux.route(stream, from);
                         });
                     }
@@ -742,21 +791,17 @@ impl InboundDemux {
 
     /// Read one inbound peer's handshake and attach it to its torrent.
     fn route<S: I2pStream + 'static>(&self, mut stream: S, from: DestHash) {
-        // Bound the wait for the peer's first bytes; a connection that never
-        // speaks would otherwise hold this thread for the life of the process.
+        // Bound the wait for the peer's handshake as a whole; a connection
+        // that never speaks, or speaks a byte at a time, would otherwise hold
+        // this thread — and its share of the pending cap — indefinitely.
         // Best-effort: backends without a timeout of their own ignore it.
-        let _ = stream.set_timeouts(Some(HANDSHAKE_TIMEOUT));
-        let mut buf = [0u8; wire::HANDSHAKE_LEN];
-        if stream.read_exact(&mut buf).is_err() {
-            return;
-        }
-        // Back to blocking for the peer connection proper: a peer legitimately
-        // sits quiet between messages, and cutting that off needs the
-        // keep-alive work (R5), not a timeout here.
-        let _ = stream.set_timeouts(None);
-        let Ok(theirs) = Handshake::parse(&buf) else {
+        let deadline = Instant::now() + INBOUND_HANDSHAKE_TIMEOUT;
+        let Ok(theirs) = torrent::read_handshake_until(&mut stream, deadline, &|| false) else {
             return;
         };
+        // Back to blocking for the peer connection proper: a peer legitimately
+        // sits quiet between messages, and that is the idle timeout's job.
+        let _ = stream.set_timeouts(None);
         let torrent = lock_map(&self.torrents).get(&theirs.info_hash).cloned();
         let Some(torrent) = torrent else {
             return; // unknown info-hash: drop, nothing to say
@@ -1270,6 +1315,48 @@ mod tests {
             "the demux never recovered from the flood"
         );
         swarm.shutdown();
+    }
+
+    /// The same flood from a single destination, still held open while the
+    /// honest peer connects. The cap used to be global only, so one identity
+    /// could fill it and every honest inbound peer was dropped for as long as
+    /// the silent connections lasted; now a destination may hold no more than
+    /// its share of it.
+    #[test]
+    fn one_destination_cannot_hold_the_pending_handshake_cap_against_an_honest_peer() {
+        let net = MockNet::new();
+        let (seeder, leecher, _sd, _ld) = seed_and_leech();
+
+        let seed_ep = net.endpoint();
+        let seed_dest = seed_ep.dest();
+        let demux = InboundDemux::new(8);
+        demux.register(&seeder);
+        let _accept = demux.run(seed_ep);
+
+        // One destination, the whole cap's worth of silent connections, all
+        // held open for the rest of the test. The mock's backlog refuses a
+        // dial when the demux has not drained it yet, so those are retried.
+        let flood_ep = net.endpoint();
+        let mut silent = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while silent.len() < MAX_PENDING_HANDSHAKES {
+            assert!(Instant::now() < deadline, "could not open the flood");
+            match flood_ep.dialer().dial(seed_dest, Duration::from_secs(5)) {
+                Ok(stream) => silent.push(stream),
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+
+        // With the flood still open, an honest peer must get through.
+        let ep = net.endpoint();
+        leecher.add_peers(&[seed_dest]);
+        let swarm = Swarm::dial_only(Arc::clone(&leecher), ep.dialer(), quick_config());
+        assert!(
+            leecher.wait_complete(Duration::from_secs(20)),
+            "one destination's silent connections shut the honest peer out"
+        );
+        swarm.shutdown();
+        drop(silent);
     }
 
     #[test]

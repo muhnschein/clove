@@ -93,8 +93,15 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Generous, because an I2P round trip is slow — but *finite*: `i2pnet`'s dial
 /// clears a stream's timeouts once the router answers, so without this a peer
 /// that accepts and then says nothing stalls the swarm's whole dial sweep. The
-/// bound is per read, so a peer dribbling its 68 bytes is fine.
+/// bound is on the whole exchange, not per read: a peer dribbling one byte
+/// inside each read's timeout used to renew it, and could hold the exchange
+/// open for the timeout times the 68 bytes of a handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long one read or write of a handshake may block before the deadline
+/// and the caller's stop flag are looked at again. What bounds how long a
+/// pause or shutdown waits on an attach already in flight.
+pub const HANDSHAKE_POLL: Duration = Duration::from_secs(1);
 
 /// How often [`Torrent::spawn_maintenance`] wakes to do the periodic work: fine
 /// enough to honour the intervals above to within a tick, coarse enough to be
@@ -913,8 +920,13 @@ impl Torrent {
         }
         // The demux bounded the read of *their* handshake; bound our reply too,
         // so a peer that stops reading cannot hold this thread open.
-        let _ = stream.set_timeouts(Some(HANDSHAKE_TIMEOUT));
-        stream.write_all(&self.our_handshake().encode())?;
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        write_handshake_until(
+            &mut stream,
+            &self.our_handshake().encode(),
+            deadline,
+            &|| false,
+        )?;
         let _ = stream.set_timeouts(None);
         // Counted here, not after `finish_attach`: the claim — that a remote
         // router resolved our leaseSet and carried a handshake both ways — is
@@ -1038,6 +1050,99 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
         }
         shared.remove_peer(id);
     })
+}
+
+/// The next slice of a handshake exchange: how long the next read or write may
+/// block, or why it may not happen at all.
+///
+/// `abort` is the caller's stop flag. Consulted here, between reads, so a
+/// sweep told to stop is out of a half-finished handshake within
+/// [`HANDSHAKE_POLL`] rather than at the peer's convenience.
+fn handshake_slice(deadline: Instant, abort: &dyn Fn() -> bool) -> std::io::Result<Duration> {
+    if abort() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "handshake abandoned: the swarm is stopping",
+        ));
+    }
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "peer did not complete the handshake in time",
+        ));
+    }
+    Ok(left.min(HANDSHAKE_POLL))
+}
+
+/// Whether a read or write ended because its timeout ran out rather than
+/// because the connection did — the one outcome worth trying again.
+fn timed_out(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
+/// Read a peer's 68-byte handshake by `deadline`, or until `abort` says to
+/// stop. The stream's timeout is left set; the caller clears it.
+///
+/// # Errors
+///
+/// The deadline passing, the caller aborting, end of stream, a stream error, or
+/// bytes that are not a handshake.
+pub(crate) fn read_handshake_until<S: I2pStream>(
+    stream: &mut S,
+    deadline: Instant,
+    abort: &dyn Fn() -> bool,
+) -> std::io::Result<Handshake> {
+    let mut buf = [0u8; wire::HANDSHAKE_LEN];
+    let mut filled = 0;
+    while filled < buf.len() {
+        let slice = handshake_slice(deadline, abort)?;
+        let _ = stream.set_timeouts(Some(slice));
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer hung up during the handshake",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(e) if timed_out(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Handshake::parse(&buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Write our handshake by `deadline`, or until `abort` says to stop — the
+/// same shape as the read, because a peer that accepts and never reads is the
+/// same peer with the roles swapped.
+///
+/// # Errors
+///
+/// The deadline passing, the caller aborting, or a stream error.
+fn write_handshake_until<S: I2pStream>(
+    stream: &mut S,
+    bytes: &[u8],
+    deadline: Instant,
+    abort: &dyn Fn() -> bool,
+) -> std::io::Result<()> {
+    let mut written = 0;
+    while written < bytes.len() {
+        let slice = handshake_slice(deadline, abort)?;
+        let _ = stream.set_timeouts(Some(slice));
+        match stream.write(&bytes[written..]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => written += n,
+            Err(e) if timed_out(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Stack size for a peer's reader and writer threads.
