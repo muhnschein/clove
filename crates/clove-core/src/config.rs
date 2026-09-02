@@ -38,17 +38,30 @@ impl Defaults {
     /// [`Error::NoHome`] when neither `XDG_DATA_HOME` nor `HOME` is set —
     /// there is nowhere sane to keep state, and guessing would be worse.
     pub fn from_env() -> Result<Self, Error> {
-        let data_home = match nonempty_env("XDG_DATA_HOME") {
+        Self::from_vars(|key| std::env::var(key).ok())
+    }
+
+    /// [`from_env`](Self::from_env) over any lookup, so the rules can be
+    /// tested without touching the process environment.
+    ///
+    /// The XDG base-directory spec is explicit that a relative value in any
+    /// `XDG_*` variable is invalid and must be ignored. Accepting one made
+    /// the data directory — and the Landlock rule around it — relative to
+    /// the daemon's working directory, which is wherever it was started from.
+    fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, Error> {
+        let nonempty = |key: &str| get(key).filter(|v| !v.is_empty());
+        let xdg = |key: &str| nonempty(key).filter(|v| v.starts_with('/'));
+        let data_home = match xdg("XDG_DATA_HOME") {
             Some(dir) => PathBuf::from(dir),
-            None => match nonempty_env("HOME") {
+            None => match nonempty("HOME") {
                 Some(home) => PathBuf::from(home).join(".local/share"),
                 None => return Err(Error::NoHome),
             },
         };
-        let runtime_dir = nonempty_env("XDG_RUNTIME_DIR").map(PathBuf::from);
-        let config_home = match nonempty_env("XDG_CONFIG_HOME") {
+        let runtime_dir = xdg("XDG_RUNTIME_DIR").map(PathBuf::from);
+        let config_home = match xdg("XDG_CONFIG_HOME") {
             Some(dir) => PathBuf::from(dir),
-            None => match nonempty_env("HOME") {
+            None => match nonempty("HOME") {
                 Some(home) => PathBuf::from(home).join(".config"),
                 None => return Err(Error::NoHome),
             },
@@ -66,10 +79,6 @@ impl Defaults {
     pub fn config_path(&self) -> PathBuf {
         self.config_home.join("clove/clove.conf")
     }
-}
-
-fn nonempty_env(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
 /// Validated daemon configuration.
@@ -538,6 +547,46 @@ mod tests {
         assert_eq!(c.seed_idle_minutes, 0);
         assert_eq!(c.data_dir, PathBuf::from("/home/u/.local/share/clove"));
         assert_eq!(c.api_socket, PathBuf::from("/run/user/1000/clove.sock"));
+    }
+
+    /// A relative `XDG_*` value is invalid per the spec and is ignored in
+    /// favour of the `$HOME` default. Config keys were already validated
+    /// absolute; the environment was the gap.
+    #[test]
+    fn relative_xdg_values_are_ignored() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            Defaults::from_vars(move |key| {
+                vars.iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| (*v).to_owned())
+            })
+        };
+        let d = env(&[
+            ("HOME", "/home/u"),
+            ("XDG_DATA_HOME", "foo"),
+            ("XDG_CONFIG_HOME", "./cfg"),
+            ("XDG_RUNTIME_DIR", "run"),
+        ])
+        .unwrap();
+        assert_eq!(d.data_home, PathBuf::from("/home/u/.local/share"));
+        assert_eq!(d.config_home, PathBuf::from("/home/u/.config"));
+        assert_eq!(d.runtime_dir, None);
+
+        // Absolute values are honoured, as before.
+        let d = env(&[
+            ("HOME", "/home/u"),
+            ("XDG_DATA_HOME", "/data"),
+            ("XDG_CONFIG_HOME", "/cfg"),
+            ("XDG_RUNTIME_DIR", "/run/user/1"),
+        ])
+        .unwrap();
+        assert_eq!(d.data_home, PathBuf::from("/data"));
+        assert_eq!(d.config_home, PathBuf::from("/cfg"));
+        assert_eq!(d.runtime_dir, Some(PathBuf::from("/run/user/1")));
+
+        // And with no HOME to fall back on, a relative XDG value is not a
+        // home either.
+        assert_eq!(env(&[("XDG_DATA_HOME", "foo")]).err(), Some(Error::NoHome));
     }
 
     #[test]
