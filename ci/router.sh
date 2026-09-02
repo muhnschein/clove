@@ -85,7 +85,7 @@ PY
 
 printf 'sam_address 127.0.0.1:%s\n' "$sam_port" > "$XDG_CONFIG_HOME/clove/clove.conf"
 
-python3 "$root/ci/fake-sam.py" "$sam_port" "$info_hash" 2>"$work/sam.log" &
+python3 "$root/ci/fake-sam.py" "$sam_port" "$info_hash" "$work/announce.req" 2>"$work/sam.log" &
 sam_pid=$!
 sleep 0.5
 
@@ -129,7 +129,8 @@ echo "router: session up"
 # network test over it would be blaming the wrong thing.
 sed -n 's/^cloved: sandbox:/router: daemon sandbox:/p' "$work/daemon.log"
 
-run() { timeout 20 "$clove" "$@" 2>/dev/null; }
+# Everything the CLI prints is kept: the private-key check below reads it.
+run() { timeout 20 "$clove" "$@" 2>/dev/null | tee -a "$work/cli.out"; }
 
 run add "$work/t.torrent" >/dev/null || fail "could not add a torrent"
 
@@ -164,7 +165,24 @@ while ! grep -q "dialled the forward port" "$work/sam.log" 2>/dev/null; do
 done
 echo "router: inbound forward accepted"
 
+run list >/dev/null || fail "list failed"
 run remove "$info_hash" --data >/dev/null || fail "could not remove the torrent"
+
+# 3. The private half of the session key never left the process. The bridge
+# printed a window of base64 that encodes only private key material
+# (`private_marker` in fake-sam.py); it must be in `destination.key` — or the
+# check is looking for nothing — and nowhere else: not the daemon's log, not
+# the announce the tracker received, not the CLI's output, not any other state
+# file. Each of those has carried it, or something like it, at some point in
+# this project's history (`docs/PROTOCOL.i2p-bt` §5.1c, SECURITY.md).
+marker=$(sed -n 's/^fake-sam: private marker: //p' "$work/sam.log" | head -n 1)
+[ "${#marker}" -eq 48 ] || fail "the bridge did not print a private-key marker"
+key_file=$(find "$XDG_DATA_HOME" -name destination.key | head -n 1)
+[ -n "$key_file" ] || fail "the daemon did not persist its destination key"
+grep -qF "$marker" "$key_file" || fail "destination.key does not carry the session's private key; the leak check is looking for nothing"
+leaked=$(grep -rlF --exclude=destination.key "$marker" "$XDG_DATA_HOME" "$work/daemon.log" "$work/cli.out" "$work/announce.req" 2>/dev/null)
+[ -z "$leaked" ] || fail "private key material found outside destination.key: $leaked"
+echo "router: private key stayed in destination.key"
 
 # Ask the daemon to leave. It has no TERM handler, so every thread dies by the
 # default disposition and there is no graceful path here to measure — what this

@@ -96,6 +96,7 @@ jobs:
           - resume
           - magnet
           - dest
+          - text
     steps:
       - uses: actions/checkout@v4
       # The committed seed corpus starts each run warm; this carries what the

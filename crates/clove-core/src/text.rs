@@ -184,4 +184,22 @@ mod tests {
         assert_eq!(scrub_bounded("abc", 0), "…");
         assert_eq!(scrub_bounded("", 0), "");
     }
+
+    /// The scrubber in `i2pnet` cannot call this one — the dependency runs the
+    /// other way — so it carries its own copy of the table. This is the only
+    /// place both are visible, and every character is cheap enough to check,
+    /// so the two are held identical here rather than by a comment in each.
+    #[test]
+    fn the_i2pnet_scrubber_agrees_on_every_character() {
+        let disagree: Vec<char> = (0..=0x10_FFFF_u32)
+            .filter_map(char::from_u32)
+            .filter(|&c| super::scrub_char(c) != i2pnet::sam::scrub_char(c))
+            .collect();
+        assert!(
+            disagree.is_empty(),
+            "text::scrub and i2pnet::sam::scrub_char disagree on {} characters, first {:?}",
+            disagree.len(),
+            disagree.first()
+        );
+    }
 }

@@ -52,6 +52,11 @@ import time
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 7656
 INFO_HASH = bytes.fromhex(sys.argv[2]) if len(sys.argv) > 2 else b"\x5a" * 20
+# Where to append every tracker announce the bridge receives, byte for byte.
+# `ci/router.sh` greps it for the session's private key material: the announce
+# is the one message that once carried the whole key blob to a tracker
+# (`docs/PROTOCOL.i2p-bt` §5.1c), so it is the one worth keeping in evidence.
+ANNOUNCE_DUMP = sys.argv[3] if len(sys.argv) > 3 else None
 
 # How long a played peer holds its connection open. Long enough for the daemon to
 # handshake and register it, short enough not to outlive the caller.
@@ -73,8 +78,14 @@ def key_blob(fill: int) -> bytes:
     391 bytes of destination and 288 of private material, which is the shape
     i2pd returned when this was captured. `destination_of` is the public prefix —
     the only part that may ever leave the process.
+
+    The private material is patterned rather than a repeated byte so that a
+    window of its base64 is text found nowhere else: `private_marker` hands
+    `ci/router.sh` such a window, and the script fails the run if it turns up
+    anywhere but `destination.key`.
     """
-    return bytes([fill]) * 384 + b"\x05\x00\x04" + b"\x00\x07\x00\x00" + b"\xaa" * 288
+    private = bytes((fill * 7 + i * 73 + 41) & 0xFF for i in range(288))
+    return bytes([fill]) * 384 + b"\x05\x00\x04" + b"\x00\x07\x00\x00" + private
 
 
 def destination_of(blob: bytes) -> bytes:
@@ -87,6 +98,18 @@ def b32_of(dest: bytes) -> str:
 
 
 OUR_BLOB = key_blob(0x42)  # the daemon's own session identity
+
+
+def private_marker(blob: bytes) -> str:
+    """Forty-eight base64 characters that encode only private key material.
+
+    The destination is 391 bytes, one past a multiple of three, so the base64
+    group at index 130 mixes public and private bytes; everything from group 131
+    on is private alone. Handing the script a window from there, rather than the
+    whole blob, means a grep hit is a leak of the *secret* half by construction.
+    """
+    return i2p_b64(blob)[524:572]
+
 TRACKER_DEST = destination_of(key_blob(0x11))  # what a NAMING LOOKUP resolves to
 PEER_DEST = destination_of(key_blob(0x33))  # the peer the tracker hands back
 
@@ -206,7 +229,10 @@ class Handler(socketserver.BaseRequestHandler):
                 log("serving a tracker announce")
                 try:
                     sock.settimeout(20)
-                    sock.recv(8192)  # the announce request
+                    request = sock.recv(8192)  # the announce request
+                    if ANNOUNCE_DUMP:
+                        with open(ANNOUNCE_DUMP, "ab") as dump:
+                            dump.write(request)
                     sock.sendall(announce_response())
                 except OSError:
                     pass
@@ -237,4 +263,5 @@ if __name__ == "__main__":
     log(f"listening on 127.0.0.1:{PORT}")
     log("tracker b32:", TRACKER_B32)
     log("peer b32:", PEER_B32)
+    log("private marker:", private_marker(OUR_BLOB))
     Server(("127.0.0.1", PORT), Handler).serve_forever()

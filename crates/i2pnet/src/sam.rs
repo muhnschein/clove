@@ -886,7 +886,12 @@ fn looks_like_key_material(field: &str, min: usize) -> bool {
 /// from here. The duplication is a dozen lines and the alternative is a text
 /// utility living in the crate whose entire job is sockets. Keep the two
 /// tables identical.
-pub(crate) fn scrub_char(c: char) -> char {
+///
+/// Public so that `clove-core`, which *can* see both, pins the two tables to
+/// each other over every character rather than trusting a comment to keep
+/// them in step.
+#[must_use]
+pub fn scrub_char(c: char) -> char {
     match c {
         c if c.is_control() => '.',
         // Format characters, none caught by `is_control`. The bidirectional

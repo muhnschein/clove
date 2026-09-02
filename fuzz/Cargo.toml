@@ -73,3 +73,9 @@ name = "dest"
 path = "fuzz_targets/dest.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "text"
+path = "fuzz_targets/text.rs"
+test = false
+doc = false

@@ -1,0 +1,28 @@
+# Foreign text on its way to a terminal. The target asserts a class property
+# over the output, so the tokens are the characters a terminal or a reader
+# acts on, in UTF-8: C0 and C1 controls, an escape sequence, the bidi
+# overrides and isolates, the zero-width family, the separators and the BOM.
+"\x1b[2J"
+"\x1b]0;x\x07"
+"\r"
+"\n"
+"\x7f"
+"\xc2\x9b"
+"\xc2\x9d"
+"\xc2\xad"
+"\xd8\x9c"
+"\xe2\x80\x8b"
+"\xe2\x80\x8d"
+"\xe2\x80\x8e"
+"\xe2\x80\x8f"
+"\xe2\x80\xa8"
+"\xe2\x80\xa9"
+"\xe2\x80\xae"
+"\xe2\x81\xa0"
+"\xe2\x81\xa6"
+"\xe2\x81\xa9"
+"\xef\xbb\xbf"
+"\xf3\xa0\x80\x81"
+"\xef\xb8\x8f"
+"exe"
+".tar"
