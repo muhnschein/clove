@@ -547,8 +547,10 @@ fn sweep<D>(
     // Decided up front rather than as we go: one pass over the candidates
     // with the free-slot count as its cap, so a wave can neither overshoot
     // `max_peers` nor race itself over who claimed the last slot.
+    // `dial_candidates`, not `known_peers`: a destination banned for serving
+    // bad pieces is never worth a tunnel again this run.
     let candidates: Vec<DestHash> = torrent
-        .known_peers()
+        .dial_candidates()
         .into_iter()
         .filter(|peer| !connected.contains(peer) && !retry_after.contains_key(peer))
         .take(budget)
@@ -759,6 +761,11 @@ impl InboundDemux {
         let Some(torrent) = torrent else {
             return; // unknown info-hash: drop, nothing to say
         };
+        // A banned destination gets no reply at all: the ban is the torrent's
+        // verdict on its data, and a handshake would only invite another try.
+        if torrent.is_banned(from) {
+            return;
+        }
         let connected = torrent.connected_peers();
         if connected.len() >= self.max_peers || torrent.budget().available() == 0 {
             return;

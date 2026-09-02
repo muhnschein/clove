@@ -706,6 +706,30 @@ describing anything clove does.
     rescues small cases must be *exceeded* by any test that claims to exercise
     what happens without it.
 
+4.8 [decided] **A piece that fails SHA-1 is laid at somebody's door.** Found
+    by the 2026-09 audit (H-3): a peer answering every request with rubbish of
+    the right shape was never told apart from an honest one. Its blocks reset
+    the piece, its pipeline was refilled in the same call, and with one honest
+    seeder alongside it a piece verified only when every block happened to
+    come from the honest side — a per-torrent stall by one peer, inside the
+    threat model SECURITY.md declares closed.
+
+    clove now remembers which destination wrote each block of an unverified
+    piece. On a failed verification:
+
+      - one supplier for the whole piece: it is **banned** for the rest of the
+        run — dropped, forgotten, refused at the dial sweep and the inbound
+        demux alike, and neither tracker nor PEX can put it back;
+      - several suppliers: each is counted as suspect, and any that reaches
+        `SUSPICION_LIMIT` (3) is banned. A piece that verifies credits each of
+        its suppliers one count back, which is what keeps an honest peer that
+        shared pieces with a liar from being banned in its company.
+
+    Bans are by destination, not connection, and last the run: there is no
+    persistent blocklist, so a restart gives everyone a clean slate. The count
+    is exposed (`Torrent::banned_count`) so a torrent that keeps failing pieces
+    and one that has caught the peer doing it can be told apart.
+
 4.5 [decided] Magnet links (clove-core::magnet): `magnet:?xt=urn:btih:<hex
     40 | base32 32>`; `dn` and `tr` are percent-decoded, `tr` filtered to
     I2P-only like .torrent announce URLs.

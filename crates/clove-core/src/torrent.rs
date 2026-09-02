@@ -28,7 +28,7 @@
 //! against the mock network in CI and a real router in production; peer
 //! acquisition belongs to [`crate::swarm`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -120,6 +120,17 @@ pub const MAX_KNOWN_PEERS: usize = 1024;
 /// a reconnect after a teardown we have not noticed. The cap need not be tight,
 /// only finite.
 pub const MAX_CONNECTIONS_PER_DEST: usize = 2;
+
+/// Hash failures a destination may share the blame for before it is banned.
+///
+/// A piece that fails SHA-1 with a single supplier is that supplier's doing,
+/// and it is banned on the spot. A piece several peers contributed to cannot
+/// be pinned on one of them, so each is counted as suspect instead; an honest
+/// peer caught in a liar's company earns the count back on every piece it
+/// helps verify, a liar never does. The bound is what keeps one peer serving
+/// rubbish from making a download burn bandwidth for the life of the run
+/// (`docs/PROTOCOL.i2p-bt` §4.8).
+pub const SUSPICION_LIMIT: u32 = 3;
 
 /// Outgoing message queue depth per peer before the writer applies
 /// backpressure. Bounded — no unbounded channels in the engine (SCOPE §4).
@@ -248,6 +259,21 @@ struct State {
     announces_ok: u32,
     announces_failed: u32,
     last_announce_error: Option<String>,
+    /// Who wrote each block of a piece not yet verified, keyed by
+    /// `(piece, block)`, so a failed hash can be laid at somebody's door.
+    /// Entries live from the write to the verdict; the set is bounded by the
+    /// blocks of the pieces in progress, as the picker's accounting is.
+    suppliers: HashMap<(u32, u32), DestHash>,
+    /// Destinations refused for the rest of the run: nothing is dialled,
+    /// accepted or remembered from them. See [`SUSPICION_LIMIT`].
+    banned: HashSet<DestHash>,
+    /// Failed pieces each destination shared the blame for, less the pieces
+    /// it has since helped verify.
+    suspicion: HashMap<DestHash, u32>,
+    /// Peers to remove once the lock is released. A handler runs under the
+    /// state lock and `remove_peer` takes it, so a handler that decides a
+    /// peer must go queues it here and the caller finishes the job.
+    to_drop: Vec<u64>,
 }
 
 /// Where a known destination came from, which decides whether it may be
@@ -273,6 +299,11 @@ impl State {
     /// trusted the new one is refused. A trusted sighting upgrades a PEX entry;
     /// nothing downgrades one. Returns whether the destination was new to us.
     fn remember_peer_from(&mut self, dest: DestHash, source: Source) -> bool {
+        // A ban outlives every source: the tracker and PEX will both go on
+        // naming the destination, and neither may put it back.
+        if self.banned.contains(&dest) {
+            return false;
+        }
         if let Some(existing) = self.known_peers.get_mut(&dest) {
             if source == Source::Trusted {
                 *existing = Source::Trusted;
@@ -297,6 +328,62 @@ impl State {
         }
         self.known_peers.insert(dest, source);
         true
+    }
+
+    /// Refuse `dest` for the rest of the run: forget it, and queue every
+    /// connection it holds for removal.
+    fn ban(&mut self, dest: DestHash) {
+        self.banned.insert(dest);
+        self.known_peers.remove(&dest);
+        self.suspicion.remove(&dest);
+        let held = self.peers.iter().filter(|p| p.dest == dest).map(|p| p.id);
+        self.to_drop.extend(held);
+    }
+
+    /// A piece verified: its suppliers are off the hook for it, and each one
+    /// earns back one of the failures it may have been party to.
+    fn credit_suppliers(&mut self, index: u32) {
+        let blocks = self.picker.blocks_in_piece(index);
+        for block in 0..blocks {
+            if let Some(dest) = self.suppliers.remove(&(index, block))
+                && let Some(count) = self.suspicion.get_mut(&dest)
+            {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.suspicion.remove(&dest);
+                }
+            }
+        }
+    }
+
+    /// A piece failed SHA-1: a sole supplier is banned outright; several
+    /// share the suspicion and any that reaches [`SUSPICION_LIMIT`] is banned.
+    fn blame_suppliers(&mut self, index: u32) {
+        let blocks = self.picker.blocks_in_piece(index);
+        let mut contributors: Vec<DestHash> = Vec::new();
+        for block in 0..blocks {
+            if let Some(dest) = self.suppliers.remove(&(index, block))
+                && !contributors.contains(&dest)
+            {
+                contributors.push(dest);
+            }
+        }
+        let culprits: Vec<DestHash> = match contributors.as_slice() {
+            [] => Vec::new(),
+            [only] => vec![*only],
+            many => many
+                .iter()
+                .copied()
+                .filter(|dest| {
+                    let count = self.suspicion.entry(*dest).or_insert(0);
+                    *count = count.saturating_add(1);
+                    *count >= SUSPICION_LIMIT
+                })
+                .collect(),
+        };
+        for dest in culprits {
+            self.ban(dest);
+        }
     }
 }
 
@@ -437,6 +524,10 @@ impl Torrent {
                 announces_ok: 0,
                 announces_failed: 0,
                 last_announce_error: None,
+                suppliers: HashMap::new(),
+                banned: HashSet::new(),
+                suspicion: HashMap::new(),
+                to_drop: Vec::new(),
             }),
             done: Mutex::new(false),
             done_cv: Condvar::new(),
@@ -572,6 +663,38 @@ impl Torrent {
             .keys()
             .copied()
             .collect()
+    }
+
+    /// The known destinations the dial sweep may try: [`known_peers`] less
+    /// any that are banned. Banning forgets a destination, so the two agree
+    /// today; the sweep consults this one so that a ban placed between a
+    /// listing and a dial still holds.
+    ///
+    /// [`known_peers`]: Torrent::known_peers
+    #[must_use]
+    pub fn dial_candidates(&self) -> Vec<DestHash> {
+        let st = lock(&self.shared.state);
+        st.known_peers
+            .keys()
+            .copied()
+            .filter(|dest| !st.banned.contains(dest))
+            .collect()
+    }
+
+    /// Whether `dest` is refused for the rest of this run — it served a piece
+    /// that failed SHA-1, alone or in enough company (see
+    /// [`SUSPICION_LIMIT`]). Checked before a handshake is spent on it.
+    #[must_use]
+    pub fn is_banned(&self, dest: DestHash) -> bool {
+        lock(&self.shared.state).banned.contains(&dest)
+    }
+
+    /// How many destinations this run has banned, for status: a torrent that
+    /// keeps failing pieces and a torrent that has caught the peer doing it
+    /// look the same from `downloaded` alone.
+    #[must_use]
+    pub fn banned_count(&self) -> usize {
+        lock(&self.shared.state).banned.len()
     }
 
     /// Record the outcome of one announce, for `clove show` to report: the
@@ -740,6 +863,9 @@ impl Torrent {
         mut stream: S,
         remote: DestHash,
     ) -> std::io::Result<()> {
+        if self.is_banned(remote) {
+            return Err(banned());
+        }
         // Bound the exchange (see [`HANDSHAKE_TIMEOUT`]). Best-effort: a
         // backend with no timeout of its own ignores it.
         let _ = stream.set_timeouts(Some(HANDSHAKE_TIMEOUT));
@@ -782,6 +908,9 @@ impl Torrent {
                 "peer handshaked a different torrent",
             ));
         }
+        if self.is_banned(remote) {
+            return Err(banned());
+        }
         // The demux bounded the read of *their* handshake; bound our reply too,
         // so a peer that stops reading cannot hold this thread open.
         let _ = stream.set_timeouts(Some(HANDSHAKE_TIMEOUT));
@@ -821,13 +950,18 @@ impl Torrent {
         let (tx, rx) = sync_channel::<Message>(OUTGOING_QUEUE);
 
         // Registration can refuse: [`MAX_CONNECTIONS_PER_DEST`] per
-        // destination. Refusing returns the slot and drops both halves.
-        let Some(id) = self.shared.register_peer(tx.clone(), closer, remote, slot) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "this destination already holds its share of connections",
-            ));
-        };
+        // destination, or a ban placed since the handshake. Refusing returns
+        // the slot and drops both halves.
+        let id = self
+            .shared
+            .register_peer(tx.clone(), closer, remote, slot)
+            .map_err(|refusal| match refusal {
+                Refusal::Banned => banned(),
+                Refusal::DestFull => std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "this destination already holds its share of connections",
+                ),
+            })?;
 
         // Announce our piece set, then our extension handshake if the peer
         // speaks BEP 10.
@@ -919,24 +1053,45 @@ fn peer_thread() -> std::thread::Builder {
     std::thread::Builder::new().stack_size(PEER_STACK_BYTES)
 }
 
+/// The error a banned destination is refused with, at every door.
+fn banned() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "this destination is banned for the rest of the run",
+    )
+}
+
+/// Why [`Shared::register_peer`] would not seat a connection.
+enum Refusal {
+    /// The destination already holds [`MAX_CONNECTIONS_PER_DEST`].
+    DestFull,
+    /// The destination was banned, possibly while its handshake was in flight.
+    Banned,
+}
+
 impl Shared {
-    /// Add the peer to the table and return its id, or `None` when `dest`
-    /// already holds [`MAX_CONNECTIONS_PER_DEST`] connections here.
+    /// Add the peer to the table and return its id, or the [`Refusal`]: `dest`
+    /// already holds [`MAX_CONNECTIONS_PER_DEST`] connections here, or is
+    /// banned.
     ///
-    /// The check lives *inside* the lock that pushes the entry, the only place
-    /// it can be right: two connections from one destination can be in
-    /// `finish_attach` at once. Taking `slot` by value is what returns it on
-    /// refusal, so the budget cannot leak a slot to an unregistered connection.
+    /// The checks live *inside* the lock that pushes the entry, the only place
+    /// they can be right: two connections from one destination can be in
+    /// `finish_attach` at once, and a ban can land between the handshake and
+    /// here. Taking `slot` by value is what returns it on refusal, so the
+    /// budget cannot leak a slot to an unregistered connection.
     fn register_peer(
         &self,
         out: SyncSender<Message>,
         closer: Arc<dyn I2pClose + Send + Sync>,
         dest: DestHash,
         slot: PeerSlot,
-    ) -> Option<u64> {
+    ) -> Result<u64, Refusal> {
         let mut st = lock(&self.state);
+        if st.banned.contains(&dest) {
+            return Err(Refusal::Banned);
+        }
         if st.peers.iter().filter(|p| p.dest == dest).count() >= MAX_CONNECTIONS_PER_DEST {
-            return None;
+            return Err(Refusal::DestFull);
         }
         let id = st.next_id;
         st.next_id += 1;
@@ -960,7 +1115,7 @@ impl Shared {
             pex_id: None,
             metadata_id: None,
         });
-        Some(id)
+        Ok(id)
     }
 
     /// Our BEP 10 handshake payload: advertise `i2p_pex` and `ut_metadata`, and
@@ -1005,6 +1160,7 @@ impl Shared {
     /// messages, then send them after releasing it.
     fn on_message(&self, id: u64, msg: &Message) {
         let mut out: Vec<Outgoing> = Vec::new();
+        let evict: Vec<u64>;
         {
             let mut st = lock(&self.state);
             let now = Instant::now();
@@ -1021,9 +1177,14 @@ impl Shared {
                 run_choker(&mut st, &mut out);
             }
             record_sent(&mut st, &out, now);
+            evict = std::mem::take(&mut st.to_drop);
             // Any message can move piece accounting; check while the lock is
             // still held and the state is settled.
             debug_check_state(&st);
+        }
+        // Outside the lock, as `maintain` does: `remove_peer` takes it.
+        for id in evict {
+            self.remove_peer(id);
         }
         self.send_all(out);
         self.check_done();
@@ -1052,6 +1213,7 @@ impl Shared {
                 run_choker(&mut st, &mut out);
             }
             record_sent(&mut st, &out, now);
+            idle.append(&mut st.to_drop);
             debug_check_state(&st);
         }
         // Outside the lock: remove_peer takes it, and so does the send path.
@@ -1295,18 +1457,27 @@ impl Shared {
         } else if self.storage.write_block(index, begin, block).is_ok() {
             self.downloaded
                 .fetch_add(block.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            // Remembered by destination, not connection: the verdict may come
+            // after this connection is gone, and a ban is on the identity.
+            let dest = st.peers[idx].dest;
+            st.suppliers.insert((index, block_no), dest);
             if !st.picker.block_received(index, block_no) {
                 return;
             }
             // Piece complete: verify from disk before trusting it.
-            match self.storage.verify_piece(index) {
-                Ok(true) => {
-                    st.picker.set_have(index);
-                    for peer in &st.peers {
-                        out.push((peer.id, peer.out.clone(), Message::Have(index)));
-                    }
+            if let Ok(true) = self.storage.verify_piece(index) {
+                st.picker.set_have(index);
+                st.credit_suppliers(index);
+                for peer in &st.peers {
+                    out.push((peer.id, peer.out.clone(), Message::Have(index)));
                 }
-                _ => st.picker.reset_piece(index),
+            } else {
+                st.picker.reset_piece(index);
+                // Whoever is banned here is queued for removal by the caller,
+                // and its blocks go back to the picker then; the refill below
+                // may still ask it for more, which is one wasted request
+                // rather than a leaked one.
+                st.blame_suppliers(index);
             }
         }
         fill_requests(st, idx, out);

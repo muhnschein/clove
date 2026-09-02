@@ -519,6 +519,116 @@ fn corrupt_blocks_never_become_verified_pieces() {
     honest_download_completes(&net, &meta, seed_dest, "after-liar");
 }
 
+/// A peer that accepts, mirrors the handshake, claims every piece, and answers
+/// each request with rubbish of exactly the requested length. Returns its
+/// destination; the thread ends when the engine hangs up on it.
+fn spawn_liar(net: &MockNet, info_hash: [u8; 20], num_pieces: u32) -> DestHash {
+    let liar_ep = net.endpoint();
+    let liar_dest = liar_ep.dest();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _from)) = liar_ep.accept() else {
+            return;
+        };
+        let mut buf = [0u8; wire::HANDSHAKE_LEN];
+        if stream.read_exact(&mut buf).is_err() {
+            return;
+        }
+        let ours = Handshake {
+            info_hash,
+            peer_id: *b"-XX0000-liarliarliar",
+            extensions: wire::Extensions::default(),
+        };
+        if stream.write_all(&ours.encode()).is_err() {
+            return;
+        }
+        if claim_everything(&mut stream, num_pieces).is_err() {
+            return;
+        }
+        while let Ok(frame) = wire::read_frame(&mut stream, wire::MAX_MESSAGE_LEN) {
+            if let Ok(Message::Request(req)) = Message::parse(&frame) {
+                let reply = Message::Piece {
+                    index: req.index,
+                    begin: req.begin,
+                    block: vec![0x2A; req.length as usize],
+                };
+                if wire::write_message(&mut stream, &reply).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    liar_dest
+}
+
+/// The liar and an honest seeder attached at once, which is the shape that
+/// used to be a stall: nothing recorded who supplied a failed piece, so the
+/// liar stayed connected and unchoked and every piece it touched was thrown
+/// away, for as long as it cared to keep answering. Now a piece that fails
+/// SHA-1 is laid at its suppliers' door, the liar is banned for the run, and
+/// the bytes spent finding that out are bounded.
+#[test]
+fn a_lying_peer_is_banned_and_the_download_still_completes() {
+    /// One block per piece, and enough of them that the two peers' pipelines
+    /// are both full with work left over.
+    const PIECES: u32 = 64;
+
+    let net = MockNet::new();
+    let content: Vec<u8> = (0..(PIECES * BLOCK_LEN))
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+    let num_pieces = u32::try_from(meta.pieces.len()).expect("piece count");
+    assert_eq!(num_pieces, PIECES);
+
+    let liar_dest = spawn_liar(&net, info_hash, num_pieces);
+    let seed_dir = TempDir::new("ban-seed");
+    let seeder = seeding_torrent(&meta, &content, &seed_dir);
+    let seed_ep = net.endpoint();
+    let seed_dest = seed_ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, seed_ep);
+
+    let dir = TempDir::new("ban-leech");
+    let leecher = leeching_torrent(&meta, &dir);
+    // The liar first, so it gets its pick of the pipeline.
+    for dest in [liar_dest, seed_dest] {
+        let stream = net
+            .endpoint()
+            .dialer()
+            .dial(dest, Duration::from_secs(5))
+            .expect("dial");
+        leecher.attach(stream, dest).expect("attach");
+    }
+
+    assert!(
+        leecher.wait_complete(DEADLINE),
+        "the download stalled at {}/{num_pieces} pieces with a liar attached",
+        leecher.have().count()
+    );
+    let (_, downloaded) = leecher.stats();
+    let total = content.len() as u64;
+    assert!(
+        downloaded < 3 * total,
+        "{downloaded} bytes were written to finish a {total}-byte torrent; the liar \
+         was never caught"
+    );
+    assert_eq!(leecher.banned_count(), 1, "the liar was not banned");
+    assert!(
+        leecher.is_banned(liar_dest),
+        "the wrong destination was banned"
+    );
+    assert!(
+        !leecher.connected_peers().contains(&liar_dest),
+        "a banned peer is still attached"
+    );
+    // And it stays out: neither a tracker nor PEX can put it back.
+    leecher.add_peers(&[liar_dest]);
+    assert!(
+        !leecher.dial_candidates().contains(&liar_dest),
+        "a banned destination was offered to the dial sweep again"
+    );
+}
+
 /// The endgame hands one block to more than one peer on purpose. The peer that
 /// answers second must not be able to put its bytes over a piece that already
 /// verified — in a debug build that tripped the picker's own invariant, and in
