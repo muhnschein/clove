@@ -75,6 +75,14 @@ State files are written with a temporary file, an
 and a rename, so a crash at any point leaves the previous state intact; the
 worst outcome is re-verification.
 .Pp
+There is no signal handler:
+.Dv SIGTERM
+stops the daemon by the default disposition, mid-tick.
+Nothing is corrupted, because every state write is atomic, but up to thirty
+seconds of verified progress is re-hashed on the next start and no
+.Sy stopped
+announce reaches the trackers.
+.Pp
 .Nm
 runs in the foreground and logs to standard error.
 Under a service manager, run it as an ordinary unprivileged user: it needs no

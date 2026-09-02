@@ -39,6 +39,20 @@ communicate outside I2P, or that ties an I2P identity to a network identity:
   clove to trust unverified pieces.
 - Path traversal from torrent file names.
 
+**Known limitations, stated so a report is not needed to learn them:**
+
+- The SAM `STREAM FORWARD` port on loopback is unauthenticated by the
+  protocol: any process on the same host can connect to it and present as any
+  destination. On a multi-user host that lets a local user occupy peer slots;
+  pieces are still hash-checked, so it cannot corrupt data. The API socket and
+  the data directory are `0600`/`0700` and are not affected.
+- `sam_address` accepts `localhost` and `[::1]`, but the bridge is always
+  dialled as `127.0.0.1`; a router listening only on `::1` is unreachable.
+- `cloved` has no signal handler: `SIGTERM` stops it by the default
+  disposition. State files are atomic, so nothing is corrupted; up to thirty
+  seconds of verified progress is re-hashed on the next start and no `stopped`
+  announce is sent.
+
 **Out of scope:**
 
 - Weaknesses in I2P itself, or in the router. Report those to the router
