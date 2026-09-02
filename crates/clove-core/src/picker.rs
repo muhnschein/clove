@@ -84,6 +84,11 @@ pub struct Picker {
     /// offered, never counted as outstanding, and does not stand between the
     /// torrent and being finished.
     priority: Vec<u8>,
+    /// Wanted pieces not yet held — `is_complete` is this being zero. Kept
+    /// incrementally because the engine asks after every message from every
+    /// peer, and a scan of the priority table per keep-alive was one
+    /// connection's way to hold the torrent lock on a large torrent.
+    missing_wanted: u32,
 }
 
 impl Picker {
@@ -139,6 +144,13 @@ impl Picker {
             "priority table does not span the torrent"
         );
 
+        let missing = (0..self.num_pieces)
+            .filter(|&i| self.wants(i) && !self.have.has(i))
+            .count();
+        assert_eq!(
+            self.missing_wanted as usize, missing,
+            "the wanted-and-missing count disagrees with the tables"
+        );
         assert_eq!(
             self.is_complete(),
             (0..self.num_pieces).all(|i| !self.wants(i) || self.have.has(i)),
@@ -194,7 +206,19 @@ impl Picker {
             have: Bitfield::empty(num_pieces),
             progress: BTreeMap::new(),
             priority: vec![1u8; num_pieces as usize],
+            missing_wanted: num_pieces,
         }
+    }
+
+    /// Recount [`missing_wanted`](Picker::missing_wanted) from the tables,
+    /// for the one operation that can change many pieces' wantedness at once.
+    fn recount_missing(&mut self) {
+        self.missing_wanted = u32::try_from(
+            (0..self.num_pieces)
+                .filter(|&i| self.wants(i) && !self.have.has(i))
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
     }
 
     /// Set what each piece is worth (`0` skip, `1` normal, `2` high).
@@ -212,6 +236,7 @@ impl Picker {
         for index in 0..self.num_pieces as usize {
             self.priority[index] = per_piece.get(index).copied().unwrap_or(1);
         }
+        self.recount_missing();
         self.debug_check();
     }
 
@@ -311,7 +336,7 @@ impl Picker {
     /// It still serves what it holds.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        (0..self.num_pieces).all(|i| !self.wants(i) || self.have.has(i))
+        self.missing_wanted == 0
     }
 
     /// Record that a peer holds every piece in `field` (its bitfield, or a
@@ -353,6 +378,9 @@ impl Picker {
     /// Mark piece `index` verified. Clears its block progress.
     pub fn set_have(&mut self, index: u32) {
         if index < self.num_pieces {
+            if !self.have.has(index) && self.wants(index) {
+                self.missing_wanted = self.missing_wanted.saturating_sub(1);
+            }
             self.have.set(index);
             self.progress.remove(&index);
         }
@@ -368,6 +396,9 @@ impl Picker {
     /// re-download it.
     pub fn reset_piece(&mut self, index: u32) {
         if index < self.num_pieces {
+            if self.have.has(index) && self.wants(index) {
+                self.missing_wanted = self.missing_wanted.saturating_add(1);
+            }
             self.progress.remove(&index);
             self.have.clear(index);
         }
@@ -400,6 +431,17 @@ impl Picker {
         let complete = prog.received_count() == blocks;
         self.debug_check();
         complete
+    }
+
+    /// Whether block `block` of piece `index` has already arrived and is
+    /// waiting on the rest of its piece. False for a piece we hold — its
+    /// blocks are verified, not merely received — and for one never started.
+    #[must_use]
+    pub fn is_received(&self, index: u32, block: u32) -> bool {
+        self.progress
+            .get(&index)
+            .and_then(|p| p.received.get(block as usize))
+            .is_some_and(|&r| r)
     }
 
     /// Release an in-flight block that will not arrive (timeout, reject, or
