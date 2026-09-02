@@ -1085,6 +1085,10 @@ fn add_torrent(request: &http::ServerRequest, daemon: &Arc<Daemon>) -> Response 
         }
         Err(e @ (AddError::Parse(_) | AddError::Magnet(_))) => error(400, &e.to_string()),
         Err(AddError::Duplicate) => error(409, "torrent already added"),
+        // The same status as a duplicate — it is the same answer, "this is
+        // already here" — with a message that names the clash, since the
+        // operator is looking at two different torrents.
+        Err(e @ AddError::NameClash(_)) => error(409, &e.to_string()),
         Err(AddError::Io(e)) => error(500, &format!("adding torrent: {e}")),
     }
 }

@@ -64,9 +64,12 @@ No such resource or torrent.
 .It Sy 405
 Method not allowed for that path.
 .It Sy 409
-The torrent is already added, or the given prefix matched more than one
-torrent.
-The second case carries a
+The torrent is already added, a different torrent with the same
+.Sy name
+is already hosted
+.Pq the two would share files on disk; the message names it ,
+or the given prefix matched more than one torrent.
+The last case carries a
 .Sy candidates
 array beside the
 .Sy error

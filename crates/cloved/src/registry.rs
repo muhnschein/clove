@@ -515,6 +515,15 @@ pub(crate) enum AddError {
     Magnet(magnet::Error),
     /// A torrent with this info-hash is already hosted (409).
     Duplicate,
+    /// A different torrent with the same `name` is already hosted (409).
+    ///
+    /// Files live under `downloads/<name>/…`, and storage opens them with
+    /// `O_CREAT` but not `O_EXCL`, so two torrents sharing a name share
+    /// inodes: both engines write at their own offsets, both fail
+    /// verification for ever, and the first one's data is quietly destroyed.
+    /// `check_distinct_paths` refuses exactly this *within* a torrent; this is
+    /// the same rule between them. Carries the name, scrubbed for display.
+    NameClash(String),
     /// A filesystem error (500).
     Io(io::Error),
 }
@@ -525,6 +534,11 @@ impl fmt::Display for AddError {
             AddError::Parse(e) => write!(f, "{e}"),
             AddError::Magnet(e) => write!(f, "{e}"),
             AddError::Duplicate => write!(f, "torrent already added"),
+            AddError::NameClash(name) => write!(
+                f,
+                "a hosted torrent is already named {name:?}; two torrents with one name would \
+                 share files on disk"
+            ),
             AddError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -996,6 +1010,16 @@ where
         let info_hash = meta.info_hash.0;
         if self.torrents.contains_key(&info_hash) {
             return Err(AddError::Duplicate);
+        }
+        // Not the same torrent, but the same place on disk. The name is a
+        // stranger's text on its way to a terminal and a log line, so it is
+        // scrubbed here, once, for both.
+        if self
+            .torrents
+            .values()
+            .any(|hosted| hosted.meta.name == meta.name)
+        {
+            return Err(AddError::NameClash(clove_core::text::scrub(&meta.name)));
         }
         let num_pieces = u32::try_from(meta.pieces.len()).unwrap_or(u32::MAX);
         let priorities = vec![1u8; meta.files.len()];
@@ -2110,7 +2134,13 @@ mod tests {
 
     /// Deterministic multi-piece content and a real single-file `.torrent`.
     fn fixture(name: &str) -> (Vec<u8>, Vec<u8>) {
-        let content: Vec<u8> = (0..(3 * BLOCK_LEN + 100))
+        fixture_sized(name, 3 * BLOCK_LEN + 100)
+    }
+
+    /// [`fixture`] with a chosen length, which is what makes two torrents
+    /// with the same name but different info-hashes buildable.
+    fn fixture_sized(name: &str, len: u32) -> (Vec<u8>, Vec<u8>) {
+        let content: Vec<u8> = (0..len)
             .map(|i| u8::try_from(i % 251).unwrap_or(0))
             .collect();
         let pieces: Vec<u8> = content
@@ -2789,6 +2819,57 @@ mod tests {
             !magnet_path.exists(),
             "the stale magnet file was left behind"
         );
+    }
+
+    /// Two torrents, one `name`, is two engines writing the same files at
+    /// different offsets. The second is refused, whichever door it comes in
+    /// by: a plain add, or a magnet whose metadata just arrived.
+    #[test]
+    fn a_torrent_whose_name_is_already_hosted_is_refused() {
+        let data = TempDir::new("name-clash");
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
+        let (_, first) = fixture_sized("shared-name", 3 * BLOCK_LEN + 100);
+        let (_, second) = fixture_sized("shared-name", 3 * BLOCK_LEN + 200);
+        let second_hash = MetaInfo::parse(&second).unwrap().info_hash.0;
+        add_and_scan(&mut registry, &first);
+
+        let Err(err) = registry.add_torrent(&second, AddOptions::default()) else {
+            panic!("a second torrent with the same name was added");
+        };
+        assert!(
+            matches!(&err, AddError::NameClash(name) if name == "shared-name"),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("shared-name"),
+            "the refusal does not name the clash: {err}"
+        );
+        assert_eq!(registry.count(), 1);
+        // Nothing of the refused torrent reached the state directory.
+        assert!(
+            !data
+                .0
+                .join(format!("state/{}.torrent", hex(&second_hash)))
+                .exists(),
+            "the refused torrent's metainfo was persisted"
+        );
+
+        // The magnet path goes through the same gate, and the magnet stays
+        // pending rather than being spent on a torrent that was refused.
+        registry
+            .add_magnet(&format!("magnet:?xt=urn:btih:{}", hex(&second_hash)))
+            .expect("add magnet");
+        assert!(matches!(
+            registry.complete_magnet(&second_hash, &second),
+            Err(AddError::NameClash(_))
+        ));
+        assert_eq!(registry.pending_hashes(), vec![second_hash]);
+
+        // A different name with the same shape is fine, so the check is on
+        // the name and not on something else the two have in common.
+        let (_, other) = fixture_sized("other-name", 3 * BLOCK_LEN + 200);
+        add_and_scan(&mut registry, &other);
+        assert_eq!(registry.count(), 2);
     }
 
     /// The temp file is this process's own, not a fixed name any writer of
