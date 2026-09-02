@@ -504,6 +504,15 @@ impl Parser<'_> {
 /// backslash-escaped, the shortcuts `\b \t \n \f \r` are used where they
 /// apply, and any other control character below `0x20` becomes `\u00XX`.
 /// Non-ASCII UTF-8 passes through unescaped (valid JSON).
+///
+/// Also escaped, though RFC 8259 does not require it: `DEL`, the C1 controls
+/// (`U+0080`–`U+009F`), and the line and paragraph separators. `clove --json`
+/// prints the body verbatim, and `U+009B` is a one-byte CSI that xterm-family
+/// terminals honour in UTF-8 mode — so a raw C1 in the output is a terminal
+/// escape a torrent chose, the same as a raw `ESC` would be. The separators
+/// are the two characters JSON allows that a JavaScript string literal does
+/// not, and consumers that eval instead of parse still exist. All four
+/// spellings are still valid JSON and read back as the same characters.
 fn write_string(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
@@ -515,7 +524,10 @@ fn write_string(s: &str, out: &mut String) {
             '\n' => out.push_str("\\n"),
             '\u{0C}' => out.push_str("\\f"),
             '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => {
+            c if (c as u32) < 0x20 || ('\u{7f}'..='\u{9f}').contains(&c) => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            '\u{2028}' | '\u{2029}' => {
                 let _ = write!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
@@ -589,6 +601,31 @@ mod tests {
         );
         // Non-ASCII passes through as UTF-8.
         assert_eq!(Value::from("café").encode(), "\"café\"");
+    }
+
+    /// `clove --json` prints the body as it came, and a terminal reading it
+    /// acts on a C1 control exactly as it would on `ESC`: `U+009B` alone is a
+    /// CSI. They leave the encoder as escapes, never as raw bytes — and read
+    /// back as themselves.
+    #[test]
+    fn c1_controls_and_separators_are_escaped_and_round_trip() {
+        let name = "evil\u{9b}2J\u{7f}\u{80}\u{9f}\u{2028}\u{2029}end";
+        let encoded = Value::from(name).encode();
+        assert!(
+            !encoded.chars().any(char::is_control),
+            "a control character reached the output: {encoded:?}"
+        );
+        assert!(
+            !encoded.contains(['\u{2028}', '\u{2029}']),
+            "a separator reached the output: {encoded:?}"
+        );
+        assert_eq!(
+            encoded,
+            "\"evil\\u009b2J\\u007f\\u0080\\u009f\\u2028\\u2029end\""
+        );
+        assert_eq!(parse(&encoded).unwrap(), Value::from(name));
+        // The character just past the C1 block is ordinary text.
+        assert_eq!(Value::from("\u{a0}").encode(), "\"\u{a0}\"");
     }
 
     #[test]
