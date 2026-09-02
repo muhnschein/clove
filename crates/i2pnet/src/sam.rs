@@ -863,18 +863,38 @@ fn looks_like_key_material(field: &str, min: usize) -> bool {
 
 /// One character's worth of the above.
 ///
-/// The same two families `clove_core::text::scrub` replaces, and deliberately
-/// not a call to it: `clove-core` depends on this crate, not the other way
-/// round, so the shared helper is not reachable from here. The duplication is
-/// four lines and the alternative is a text utility living in the crate whose
-/// entire job is sockets.
+/// The same characters `clove_core::text::scrub` replaces, with the same
+/// replacement, and deliberately not a call to it: `clove-core` depends on
+/// this crate, not the other way round, so the shared helper is not reachable
+/// from here. The duplication is a dozen lines and the alternative is a text
+/// utility living in the crate whose entire job is sockets. Keep the two
+/// tables identical.
 pub(crate) fn scrub_char(c: char) -> char {
     match c {
-        c if c.is_control() => '?',
-        // The bidirectional overrides and isolates draw nothing and reorder the
-        // text around them, so a bridge could make the rest of a log line read
-        // as something else. Not caught by `is_control`.
-        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '?',
+        c if c.is_control() => '.',
+        // Format characters, none caught by `is_control`. The bidirectional
+        // controls reorder the text around them, so a bridge could make the
+        // rest of a log line read as something else; the others draw nothing,
+        // so `safe.exe` and `safe\u{200b}.exe` are two names an operator can
+        // neither tell apart nor match by typing. In order: soft hyphen,
+        // Arabic letter mark, Mongolian vowel separator, the zero-width and
+        // bidi marks, line and paragraph separators, bidi embeddings and
+        // overrides, word joiner and invisible operators, bidi isolates and
+        // the deprecated format controls, variation selectors, byte-order
+        // mark, interlinear annotation, and the tag characters.
+        '\u{00ad}'
+        | '\u{061c}'
+        | '\u{180e}'
+        | '\u{200b}'..='\u{200f}'
+        | '\u{2028}'
+        | '\u{2029}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206f}'
+        | '\u{fe00}'..='\u{fe0f}'
+        | '\u{feff}'
+        | '\u{fff9}'..='\u{fffb}'
+        | '\u{e0000}'..='\u{e007f}' => '.',
         c => c,
     }
 }
@@ -1467,6 +1487,66 @@ mod tests {
             a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "{a} would need quoting in a SAM command"
         );
+    }
+
+    /// Every format character the scrubber must replace: the ones that
+    /// reorder text, and the ones that draw nothing and so make two names an
+    /// operator cannot tell apart. The list is the one `clove_core::text`
+    /// pins for its twin.
+    #[test]
+    fn invisible_and_reordering_characters_are_scrubbed() {
+        for c in [
+            '\u{00ad}',
+            '\u{061c}',
+            '\u{180e}',
+            '\u{200b}',
+            '\u{200c}',
+            '\u{200d}',
+            '\u{200e}',
+            '\u{200f}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{202a}',
+            '\u{202b}',
+            '\u{202c}',
+            '\u{202d}',
+            '\u{202e}',
+            '\u{2060}',
+            '\u{2061}',
+            '\u{2062}',
+            '\u{2063}',
+            '\u{2064}',
+            '\u{2066}',
+            '\u{2067}',
+            '\u{2068}',
+            '\u{2069}',
+            '\u{206a}',
+            '\u{206f}',
+            '\u{fe00}',
+            '\u{fe0f}',
+            '\u{feff}',
+            '\u{fff9}',
+            '\u{fffa}',
+            '\u{fffb}',
+            '\u{e0000}',
+            '\u{e0001}',
+            '\u{e0020}',
+            '\u{e007f}',
+        ] {
+            assert_eq!(scrub_char(c), '.', "U+{:04X} survived", u32::from(c));
+        }
+        // Controls, as before.
+        for c in ['\n', '\r', '\t', '\u{1b}', '\0', '\u{7f}', '\u{85}'] {
+            assert_eq!(scrub_char(c), '.', "U+{:04X} survived", u32::from(c));
+        }
+        // Ordinary text is untouched, non-ASCII included: a name that silently
+        // loses characters is one an operator cannot match either.
+        for c in ['a', ' ', 'é', 'ß', '日', '🦀', '-', '~', '='] {
+            assert_eq!(scrub_char(c), c);
+        }
+        // Two spellings become one an operator can type.
+        let name: String = "safe\u{200b}.exe".chars().map(scrub_char).collect();
+        assert_eq!(name, "safe..exe");
     }
 
     #[test]
