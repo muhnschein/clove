@@ -151,7 +151,16 @@ impl MetadataAssembler {
     /// Expected byte length of piece `index` (the last piece is short).
     #[must_use]
     pub fn piece_len(&self, index: u32) -> usize {
-        let start = index as usize * METADATA_PIECE_LEN;
+        // The index is the peer's. On a 32-bit `usize` the multiplication
+        // wraps at index 2^18, which would name a piece inside the blob
+        // that does not exist; an offset that cannot be computed is out of
+        // range, the same as one that can and is.
+        let start = usize::try_from(index)
+            .ok()
+            .and_then(|i| i.checked_mul(METADATA_PIECE_LEN));
+        let Some(start) = start else {
+            return 0;
+        };
         if start >= self.total_size {
             return 0;
         }
@@ -321,6 +330,15 @@ mod tests {
     fn assembler_rejects_bad_pieces() {
         let mut asm = MetadataAssembler::new(200).unwrap();
         assert_eq!(asm.add_piece(5, &[0; 200]), Err(Error::BadPiece)); // OOB index
+        // A huge index is out of range, not an offset that wrapped into
+        // range: `index * 16 KiB` overflows a 32-bit usize from 2^18 up.
+        // Unobservable on the 64-bit targets the tests run on, where the
+        // product simply exceeds the size; asserted here so the arithmetic
+        // stays checked.
+        for huge in [1 << 18, u32::MAX / 2, u32::MAX] {
+            assert_eq!(asm.piece_len(huge), 0, "index {huge}");
+            assert_eq!(asm.add_piece(huge, &[]), Err(Error::BadPiece));
+        }
         assert_eq!(asm.add_piece(0, &[0; 199]), Err(Error::BadPiece)); // wrong length
         assert!(asm.add_piece(0, &[0; 200]).is_ok());
     }
