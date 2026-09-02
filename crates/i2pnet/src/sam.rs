@@ -347,7 +347,12 @@ pub fn unique_nickname(base: &str) -> String {
 }
 
 /// How to bring up the SAM session.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is written by hand so that [`persistent_key`](SamConfig::persistent_key)
+/// prints as `Some(<redacted>)`: a derived one would put the whole private
+/// key blob into any `{config:?}` on an error path, which is the class of
+/// leak `SECURITY.md` ranks highest.
+#[derive(Clone)]
 pub struct SamConfig {
     /// SAM control port on `127.0.0.1`.
     pub samv3_tcp_port: u16,
@@ -376,6 +381,29 @@ impl Default for SamConfig {
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             session_timeout: DEFAULT_SESSION_TIMEOUT,
         }
+    }
+}
+
+impl std::fmt::Debug for SamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        /// Stands in for the key: `Some(<redacted>)` says a key is set,
+        /// which is all a diagnostic needs.
+        struct Redacted;
+        impl std::fmt::Debug for Redacted {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("<redacted>")
+            }
+        }
+        f.debug_struct("SamConfig")
+            .field("samv3_tcp_port", &self.samv3_tcp_port)
+            .field("nickname", &self.nickname)
+            .field(
+                "persistent_key",
+                &self.persistent_key.as_ref().map(|_| Redacted),
+            )
+            .field("probe_timeout", &self.probe_timeout)
+            .field("session_timeout", &self.session_timeout)
+            .finish()
     }
 }
 
@@ -2313,6 +2341,39 @@ mod session_tests {
             session_timeout: Duration::from_secs(5),
             persistent_key: None,
         }
+    }
+
+    /// The config holds the whole `DESTINATION=` blob, and a config is exactly
+    /// what an error path prints with `{:?}`.
+    #[test]
+    fn a_config_debug_print_redacts_the_private_key() {
+        let key = crate::addr::i2p_base64_encode(&key_blob());
+        let config = SamConfig {
+            persistent_key: Some(key.clone()),
+            ..config(7656)
+        };
+        for printed in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(!printed.contains(&key), "the key was printed: {printed}");
+            // Not even a recognisable piece of it.
+            assert!(!printed.contains(&key[..32]), "{printed}");
+            assert!(printed.contains("<redacted>"), "{printed}");
+            // The rest of the config is still worth printing.
+            assert!(printed.contains("clove-test"), "{printed}");
+            assert!(printed.contains("7656"), "{printed}");
+        }
+        // Says a key is set, without saying what it is.
+        assert!(
+            format!("{config:?}").contains("persistent_key: Some(<redacted>)"),
+            "{config:?}"
+        );
+        let transient = format!(
+            "{:?}",
+            SamConfig {
+                nickname: "clove-test".to_owned(),
+                ..SamConfig::default()
+            }
+        );
+        assert!(transient.contains("persistent_key: None"), "{transient}");
     }
 
     #[test]
