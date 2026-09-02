@@ -170,11 +170,19 @@ pub fn read_response<R: Read>(reader: &mut R, max_body: usize) -> Result<Respons
         let name = name.trim().to_ascii_lowercase();
         let value = value.trim().to_owned();
         if name == "content-length" {
-            let n: usize = value
-                .parse()
-                .map_err(|_| Error::BadResponse("bad content-length"))?;
+            let n = decimal(&value).ok_or(Error::BadResponse("bad content-length"))?;
             if n > max_body {
                 return Err(Error::BodyTooLarge);
+            }
+            // Two that agree are one header written twice, which RFC 9110
+            // §8.6 allows a reader to collapse. Two that disagree are the
+            // sender telling two stories about where the body ends, and
+            // picking either is picking a side; the request side refuses
+            // any duplicate at all, and a tracker gets the narrower refusal
+            // only because a duplicate `Content-Length` from a proxy chain
+            // is a thing that happens to honest responses.
+            if content_length.is_some_and(|seen| seen != n) {
+                return Err(Error::BadResponse("conflicting content-length"));
             }
             content_length = Some(n);
         }
@@ -267,8 +275,7 @@ fn read_chunked_body<R: Read>(reader: &mut R, max_body: usize) -> Result<Vec<u8>
         let size_text = line.split(|&b| b == b';').next().unwrap_or_default();
         let size_text = std::str::from_utf8(size_text)
             .map_err(|_| Error::BadResponse("non-UTF-8 chunk size"))?;
-        let size = usize::from_str_radix(size_text.trim(), 16)
-            .map_err(|_| Error::BadResponse("bad chunk size"))?;
+        let size = hex(size_text.trim()).ok_or(Error::BadResponse("bad chunk size"))?;
         if size == 0 {
             break;
         }
@@ -322,6 +329,28 @@ fn read_body<R: Read>(
         }
         body.extend_from_slice(&chunk[..n]);
     }
+}
+
+/// A `Content-Length` value: ASCII digits and nothing else.
+///
+/// `str::parse` also takes a leading `+`, and two parsers that disagree about
+/// whether `+5` is a length are the seed of a request-smuggling primitive.
+/// Nothing here is smuggle-able today (one request per connection, no proxy,
+/// I2P-only trackers); the strictness is so that stays true.
+fn decimal(value: &str) -> Option<usize> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// A chunk-size value: hex digits and nothing else, for the same reason as
+/// [`decimal`].
+fn hex(value: &str) -> Option<usize> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    usize::from_str_radix(value, 16).ok()
 }
 
 fn parse_status(line: &str) -> Result<u16, Error> {
@@ -476,9 +505,7 @@ pub fn read_request<R: Read>(reader: &mut R, max_body: usize) -> Result<ServerRe
             if content_length.is_some() {
                 return Err(Error::BadRequest("more than one content-length"));
             }
-            let n: usize = value
-                .parse()
-                .map_err(|_| Error::BadRequest("bad content-length"))?;
+            let n = decimal(&value).ok_or(Error::BadRequest("bad content-length"))?;
             if n > max_body {
                 return Err(Error::BodyTooLarge);
             }
@@ -710,6 +737,73 @@ mod tests {
             read_response(&mut cur, 1024),
             Err(Error::BodyTooLarge)
         ));
+    }
+
+    /// A length is digits. `str::parse` also takes `+5`, and a reader that
+    /// does is one half of a disagreement about where a body ends; the other
+    /// half is whichever proxy or server reads the same bytes differently.
+    #[test]
+    fn lengths_are_digits_and_nothing_else() {
+        for value in ["+5", "-5", "", "0x5", "5.0", "٥"] {
+            let raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {value}\r\n\r\nhello");
+            assert!(
+                matches!(
+                    read_response(&mut Cursor::new(raw.into_bytes()), 1024),
+                    Err(Error::BadResponse(_))
+                ),
+                "response accepted Content-Length {value:?}"
+            );
+            let raw = format!("POST /v1/torrents HTTP/1.1\r\nContent-Length: {value}\r\n\r\nhello");
+            assert!(
+                matches!(
+                    read_request(&mut Cursor::new(raw.into_bytes()), 1024),
+                    Err(Error::BadRequest(_))
+                ),
+                "request accepted Content-Length {value:?}"
+            );
+        }
+        // Chunk sizes are hex digits, likewise.
+        for size in ["+2", "-2", "0x2", "2g", ""] {
+            let raw = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{size}\r\nhi\r\n0\r\n\r\n"
+            );
+            assert!(
+                read_response(&mut Cursor::new(raw.into_bytes()), 1024).is_err(),
+                "accepted chunk size {size:?}"
+            );
+        }
+        // The value the header parser trims is the whitespace around the
+        // whole value, which is still fine.
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length:   5  \r\n\r\nhello";
+        assert_eq!(
+            read_response(&mut Cursor::new(raw.to_vec()), 1024)
+                .unwrap()
+                .body,
+            b"hello"
+        );
+    }
+
+    /// Two `Content-Length`s that disagree are refused on a response as they
+    /// are on a request; two that agree are one header written twice.
+    #[test]
+    fn a_response_with_conflicting_content_lengths_is_refused() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\nabcde";
+        assert!(matches!(
+            read_response(&mut Cursor::new(raw.to_vec()), 1024),
+            Err(Error::BadResponse(_))
+        ));
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 3\r\n\r\nabcde";
+        assert!(matches!(
+            read_response(&mut Cursor::new(raw.to_vec()), 1024),
+            Err(Error::BadResponse(_))
+        ));
+        let same = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nabcde";
+        assert_eq!(
+            read_response(&mut Cursor::new(same.to_vec()), 1024)
+                .unwrap()
+                .body,
+            b"abcde"
+        );
     }
 
     #[test]
