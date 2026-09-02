@@ -839,7 +839,7 @@ fn looks_like_key_material(field: &str, min: usize) -> bool {
 /// round, so the shared helper is not reachable from here. The duplication is
 /// four lines and the alternative is a text utility living in the crate whose
 /// entire job is sockets.
-fn scrub_char(c: char) -> char {
+pub(crate) fn scrub_char(c: char) -> char {
     match c {
         c if c.is_control() => '?',
         // The bidirectional overrides and isolates draw nothing and reorder the
