@@ -260,14 +260,16 @@ expect_contains "$(run list)" "paused" "pause by prefix took effect"
 run resume "$prefix" >/dev/null || fail "resume by prefix failed"
 expect_contains "$(run show "$prefix")" "$info_hash" "show by prefix"
 
-# Too short to be worth guessing from is a usage-class refusal (400 -> exit 1),
-# and a well-formed prefix matching nothing is "no such torrent".
-for bad in abc zzzz; do
+# Too short, or not hex, is not a torrent reference at all, and the CLI says
+# so before it builds a request path out of it (exit 2, usage). The daemon
+# applies the same rule to whatever reaches it; a well-formed reference that
+# matches nothing is "no such torrent" from the daemon (exit 1), below.
+for bad in abc zzzz 'abcd?data=1'; do
     set +e
     run pause "$bad" >/dev/null 2>&1
     code=$?
     set -e
-    expect_status "$code" 1 "pause with an unusable reference ($bad)"
+    expect_status "$code" 2 "pause with an unusable reference ($bad)"
 done
 
 # Both torrents share no prefix by construction (one is ab-repeated), so an

@@ -325,20 +325,30 @@ fn run() -> Result<(), String> {
     serve(&listener, &daemon)
 }
 
-/// Start a thread with a name, and hand back the failure if there is one.
+/// Start a thread, and hand back the failure if there is one.
 ///
-/// Every thread the daemon starts comes through here. The name is what
-/// `ps -T` and a core dump show. The `Result` is the point: `thread::spawn`
-/// panics when the process is out of threads or memory, and which thread
-/// that panic lands on decides whether the daemon exits, the supervisor dies
-/// silently with `router` stuck at "connected", or a registry lock is
-/// poisoned — none of them the answer to a limit being reached.
+/// Every thread the daemon starts comes through here. The `Result` is the
+/// point: `thread::spawn` panics when the process is out of threads or
+/// memory, and which thread that panic lands on decides whether the daemon
+/// exits, the supervisor dies silently with `router` stuck at "connected",
+/// or a registry lock is poisoned — none of them the answer to a limit being
+/// reached.
+///
+/// `name` is what the thread should be called in `ps -T` and a core, and is
+/// not applied yet. Setting it is a `prctl(PR_SET_NAME)` on the new thread,
+/// every one of which starts after the sandbox is entered, and the post-init
+/// seccomp allowlist in `sandbox.rs` does not admit `prctl`: std swallows the
+/// `ENOSYS`, but the traced router run rightly refuses any post-init call
+/// that comes back refused. Once the allowlist admits `prctl` restricted to
+/// `PR_SET_NAME`, this becomes `.name(name.to_owned())` and nothing else
+/// changes.
 fn spawn_named<F, T>(name: &str, f: F) -> std::io::Result<std::thread::JoinHandle<T>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    std::thread::Builder::new().name(name.to_owned()).spawn(f)
+    let _ = name;
+    std::thread::Builder::new().spawn(f)
 }
 
 /// Daemon state shared across connection threads.
@@ -2694,22 +2704,14 @@ mod tests {
 
     // ---------------------------------------------------------- threads
 
-    /// Every daemon thread carries its name, and a spawn reports its failure
-    /// as a value rather than a panic on the thread that asked.
+    /// A spawn reports its failure as a value rather than a panic on the
+    /// thread that asked, and the thread it starts runs.
     #[test]
-    fn daemon_threads_are_named_and_spawn_failures_are_values() {
-        let seen = spawn_named("named-test", || {
-            std::thread::current().name().map(str::to_owned)
-        })
-        .expect("spawn")
-        .join()
-        .expect("join");
-        assert_eq!(seen.as_deref(), Some("named-test"));
-
+    fn spawn_failures_are_values_not_panics() {
         // The shape the callers rely on: an `io::Result`, so the failure
         // path is a `match` and not an unwind through a registry lock.
-        let handle: std::io::Result<std::thread::JoinHandle<()>> = spawn_named("shape", || ());
-        handle.expect("spawn").join().expect("join");
+        let handle: std::io::Result<std::thread::JoinHandle<u32>> = spawn_named("shape", || 7);
+        assert_eq!(handle.expect("spawn").join().expect("join"), 7);
     }
 
     // ----------------------------------------------------- accept loop
