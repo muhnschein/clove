@@ -363,13 +363,20 @@ fn walk_beneath<'a>(
 /// `ELOOP` from an `O_NOFOLLOW` open and `ENOTDIR` from a non-directory in the
 /// middle of a path both mean "this name is not what a torrent's path component
 /// may be", and both arrive here as bare numbers.
+///
+/// The component is a torrent's text and this error is bound for stderr:
+/// `metainfo` refuses separators and NUL in a component and has no opinion
+/// about `ESC`, so it is scrubbed here, where the bytes become a log line.
 fn refused(component: &str, e: rustix::io::Errno) -> io::Error {
     let why = match e {
         rustix::io::Errno::LOOP => "path component is a symbolic link",
         rustix::io::Errno::NOTDIR => "path component is not a directory",
         _ => return io::Error::from(e),
     };
-    io::Error::new(io::ErrorKind::InvalidInput, format!("{component}: {why}"))
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{}: {why}", crate::text::scrub(component)),
+    )
 }
 
 /// Open (creating if absent) the file `components` names beneath `root`.
@@ -789,6 +796,46 @@ mod tests {
         assert!(
             !outside.join("escaped.bin").exists(),
             "a file was created outside the download root"
+        );
+    }
+
+    /// The refusal names the component, and the component is a stranger's
+    /// text bound for the daemon's stderr. A symlinked directory named with
+    /// an escape sequence used to put that sequence in the log on every
+    /// start; the name has to arrive scrubbed.
+    #[test]
+    fn a_refused_component_reaches_the_error_scrubbed() {
+        let dir = TempDir::new();
+        let root = dir.0.join("downloads");
+        let outside = dir.0.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let evil = "\u{1b}]0;pwned\u{7}";
+        std::os::unix::fs::symlink(&outside, root.join(evil)).unwrap();
+
+        let content: Vec<u8> = vec![7; 10];
+        let meta = meta_for(
+            vec![FileEntry {
+                path: vec![evil.into(), "a.bin".into()],
+                length: 10,
+            }],
+            16,
+            &content,
+        );
+        let Err(err) = Storage::create(&meta, &root, false) else {
+            panic!("a symlinked component must be refused");
+        };
+        let text = err.to_string();
+        assert!(
+            !text.chars().any(char::is_control),
+            "a control character reached the error text: {text:?}"
+        );
+        // Whether the kernel says ELOOP or ENOTDIR for a link opened with
+        // `O_NOFOLLOW | O_DIRECTORY` varies; the name in front of it is what
+        // this test is about.
+        assert!(
+            text.starts_with(".]0;pwned.: path component is"),
+            "the component is still named, scrubbed: {text}"
         );
     }
 
