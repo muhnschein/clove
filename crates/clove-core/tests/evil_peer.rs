@@ -1030,6 +1030,11 @@ fn a_peer_that_stops_reading_is_reclaimed_not_merely_dropped() {
 /// engine registers a peer on its own thread, so a test that attacks and
 /// immediately looks at the peer table can win that race and assert nothing at
 /// all. (It did, on the first attempt.)
+///
+/// A repeated bitfield is now a protocol violation that ends the connection
+/// (the bitfield family is legal only as the opening message), so the spam is
+/// sent in two halves: the legal opening, asserted on while the peer is
+/// attached, then the rest, asserted on after the engine has hung up on it.
 #[test]
 fn re_announcing_a_piece_set_does_not_distort_availability() {
     let net = MockNet::new();
@@ -1046,24 +1051,11 @@ fn re_announcing_a_piece_set_does_not_distort_availability() {
 
     let mut peer = raw_peer(&net, dest, info_hash);
 
-    // Every way to say "what I have" — repeatedly, and in combinations no
-    // honest peer sends.
-    let spam = |s: &mut MockStream| -> std::io::Result<()> {
-        claim_everything(s, num_pieces)?;
-        for _ in 0..200 {
-            wire::write_message(s, &Message::Have(0))?;
-        }
-        claim_everything(s, num_pieces)?;
-        wire::write_message(s, &Message::HaveAll)?;
-        wire::write_message(s, &Message::HaveNone)?;
-        wire::write_message(s, &Message::HaveAll)?;
-        for piece in 0..num_pieces {
-            wire::write_message(s, &Message::Have(piece))?;
-            wire::write_message(s, &Message::Have(piece))?;
-        }
-        wire::write_message(s, &Message::HaveNone)
-    };
-    spam(&mut peer).expect("spam");
+    // The legal opening, then `have` for a piece already claimed, many times.
+    claim_everything(&mut peer, num_pieces).expect("claim");
+    for _ in 0..200 {
+        wire::write_message(&mut peer, &Message::Have(0)).expect("have spam");
+    }
 
     // While it is still attached, one peer holding a piece counts once —
     // whatever it said and however often.
@@ -1081,16 +1073,35 @@ fn re_announcing_a_piece_set_does_not_distort_availability() {
         );
     }
 
-    // And when it leaves, everything it contributed goes with it.
-    drop(peer);
+    // Every other way to say "what I have" — repeatedly, and in combinations
+    // no honest peer sends. The first of these is the violation that ends
+    // the connection; the rest may or may not get through before it does,
+    // and the accounting must come out the same either way.
+    let spam = |s: &mut MockStream| -> std::io::Result<()> {
+        claim_everything(s, num_pieces)?;
+        wire::write_message(s, &Message::HaveAll)?;
+        wire::write_message(s, &Message::HaveNone)?;
+        wire::write_message(s, &Message::HaveAll)?;
+        for piece in 0..num_pieces {
+            wire::write_message(s, &Message::Have(piece))?;
+            wire::write_message(s, &Message::Have(piece))?;
+        }
+        wire::write_message(s, &Message::HaveNone)
+    };
+    let _ = spam(&mut peer);
+
+    // When it goes — dropped for the repeat, or hung up on — everything it
+    // contributed goes with it. The connection is held open until the engine
+    // has dropped the peer, so this is the engine's doing.
     let deadline = Instant::now() + DEADLINE;
     while !leecher.connected_peers().is_empty() {
         assert!(
             Instant::now() < deadline,
-            "the spamming peer was never cleaned up"
+            "a peer repeating its bitfield was kept"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    drop(peer);
     for piece in 0..num_pieces {
         assert_eq!(
             leecher.availability(piece),
@@ -1120,6 +1131,100 @@ fn re_announcing_a_piece_set_does_not_distort_availability() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The bitfield family is the opening message and nothing else: a repeat, a
+/// bitfield of the wrong length, and a BEP 6 message from a peer we never
+/// negotiated fast with are each a protocol violation that ends the
+/// connection. They used to be ignored (the wrong length) or honoured (the
+/// rest), each at O(pieces) under the torrent lock per five-byte message.
+#[test]
+fn a_repeated_or_invalid_piece_set_message_drops_the_peer() {
+    type Offence = Box<dyn Fn(&mut MockStream) -> std::io::Result<()>>;
+
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+    let num_pieces = u32::try_from(meta.pieces.len()).expect("piece count");
+
+    let dir = TempDir::new("strict");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    let offences: Vec<(&str, Offence)> = vec![
+        (
+            "a repeated bitfield",
+            Box::new(move |s| {
+                claim_everything(s, num_pieces)?;
+                claim_everything(s, num_pieces)
+            }),
+        ),
+        (
+            "a bitfield of the wrong length",
+            Box::new(|s| wire::write_message(s, &Message::Bitfield(vec![0xFF; 64]))),
+        ),
+        (
+            "have-all without fast negotiated",
+            Box::new(|s| wire::write_message(s, &Message::HaveAll)),
+        ),
+        (
+            "a bitfield after another message",
+            Box::new(move |s| {
+                wire::write_message(s, &Message::Interested)?;
+                claim_everything(s, num_pieces)
+            }),
+        ),
+        (
+            "allowed-fast without fast negotiated",
+            Box::new(|s| wire::write_message(s, &Message::AllowedFast(0))),
+        ),
+    ];
+    for (what, offend) in offences {
+        let mut peer = raw_peer(&net, dest, info_hash);
+        let deadline = Instant::now() + DEADLINE;
+        while seeder.connected_peers().is_empty() {
+            assert!(Instant::now() < deadline, "{what}: the peer never attached");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        offend(&mut peer).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let deadline = Instant::now() + DEADLINE;
+        while !seeder.connected_peers().is_empty() {
+            assert!(Instant::now() < deadline, "{what}: the peer was kept");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(peer);
+    }
+
+    // The extension handshake and a keep-alive *may* precede the bitfield:
+    // i2psnark and libtorrent both open with BEP 10 first.
+    let mut polite = raw_peer(&net, dest, info_hash);
+    let mut hs = BTreeMap::new();
+    hs.insert(b"m".to_vec(), Ben::Dict(BTreeMap::new()));
+    wire::write_message(&mut polite, &Message::KeepAlive).expect("keep-alive");
+    wire::write_message(
+        &mut polite,
+        &Message::Extended {
+            id: 0,
+            payload: bencode::encode(&Ben::Dict(hs)),
+        },
+    )
+    .expect("ext handshake");
+    claim_everything(&mut polite, num_pieces).expect("late but legal bitfield");
+    let deadline = Instant::now() + DEADLINE;
+    while seeder.connected_peers().is_empty() {
+        assert!(Instant::now() < deadline, "the polite peer never attached");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        seeder.connected_peers().len(),
+        1,
+        "a bitfield after the extension handshake was treated as a violation"
+    );
+    drop(polite);
 }
 
 /// A request whose range runs off the end of the piece it names. Storage bounds

@@ -762,6 +762,28 @@ describing anything clove does.
     clove and a peer may simply be guessing. `ut_metadata` is unaffected: it
     serves the info dictionary, not peers.
 
+4.11 [decided] **Three leniencies withdrawn**, each of which let a peer spend
+    the torrent lock at O(pieces) per five-byte message (2026-09 audit, M-10
+    and L-27):
+
+      - `bitfield`, `have all` and `have none` are accepted only as a peer's
+        opening message. "Opening" allows what BEP 10 and real clients put
+        first — the extension handshake (i2psnark and libtorrent both send it
+        before the bitfield) and a keep-alive — and nothing else. A repeat
+        ends the connection.
+      - A bitfield of the wrong length for the torrent ends the connection
+        rather than being ignored: it is a peer talking about some other
+        torrent.
+      - BEP 6 messages (`have all`, `have none`, `suggest`, `reject`,
+        `allowed fast`) are honoured only when *both* handshakes advertised
+        fast. clove never does, so today every one of them is a protocol
+        violation and ends the connection; the negotiation is recorded per
+        peer so wiring the extension later is one change.
+
+    Alongside, `is_complete` is an O(1) read of a wanted-and-missing count the
+    picker keeps, and a finished torrent's messages no longer take the state
+    lock to ask it.
+
 4.5 [decided] Magnet links (clove-core::magnet): `magnet:?xt=urn:btih:<hex
     40 | base32 32>`; `dn` and `tr` are percent-decoded, `tr` filtered to
     I2P-only like .torrent announce URLs.

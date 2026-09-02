@@ -422,6 +422,17 @@ struct Peer {
     closer: Arc<dyn I2pClose + Send + Sync>,
     /// Their piece set.
     has: Bitfield,
+    /// Whether anything but a keep-alive or the extension handshake has been
+    /// heard from them. The bitfield family (`bitfield`, `have all`, `have
+    /// none`) is legal only before that: BEP 3 makes it the first message,
+    /// BEP 10 lets the extension handshake precede it (i2psnark and
+    /// libtorrent both do), and a peer sending it again is either confused or
+    /// probing availability accounting. Either way it is dropped.
+    opened: bool,
+    /// Whether BEP 6 was negotiated — both sides advertised it. clove never
+    /// does, so this is false today and a fast-extension message is a
+    /// protocol violation rather than a no-op.
+    fast: bool,
     /// They are choking us.
     peer_choking: bool,
     /// We are choking them.
@@ -1007,9 +1018,13 @@ impl Torrent {
         // Registration can refuse: [`MAX_CONNECTIONS_PER_DEST`] per
         // destination, or a ban placed since the handshake. Refusing returns
         // the slot and drops both halves.
+        // BEP 6 is on only when both sides said so, and ours never does; kept
+        // as a negotiation rather than a constant so wiring it later is one
+        // change.
+        let fast = theirs.extensions.fast && self.our_handshake().extensions.fast;
         let id = self
             .shared
-            .register_peer(tx.clone(), closer, remote, slot)
+            .register_peer(tx.clone(), closer, remote, slot, fast)
             .map_err(|refusal| match refusal {
                 Refusal::Banned => banned(),
                 Refusal::DestFull => std::io::Error::new(
@@ -1254,6 +1269,7 @@ impl Shared {
         closer: Arc<dyn I2pClose + Send + Sync>,
         dest: DestHash,
         slot: PeerSlot,
+        fast: bool,
     ) -> Result<u64, Refusal> {
         let mut st = lock(&self.state);
         if st.banned.contains(&dest) {
@@ -1272,6 +1288,8 @@ impl Shared {
             out,
             closer,
             has: Bitfield::empty(self.num_pieces),
+            opened: false,
+            fast,
             peer_choking: true,
             we_choke: true,
             they_interested: false,
@@ -1417,14 +1435,26 @@ impl Shared {
         let Some(idx) = st.peers.iter().position(|p| p.id == id) else {
             return;
         };
+        let first = !st.peers[idx].opened;
+        if !matches!(msg, Message::KeepAlive | Message::Extended { id: 0, .. }) {
+            st.peers[idx].opened = true;
+        }
+        // A protocol violation ends the connection: the peer is queued for
+        // removal by the caller, and nothing below acts on the message.
+        let violation = |st: &mut State| st.to_drop.push(id);
         match msg {
-            // No-ops: keep-alive, a cancel we serve synchronously so never
-            // have queued, and fast-extension messages (BEP 6 off).
-            Message::KeepAlive
-            | Message::Cancel(_)
-            | Message::RejectRequest(_)
-            | Message::SuggestPiece(_)
-            | Message::AllowedFast(_) => {}
+            // No-ops: keep-alive, and a cancel we serve synchronously so never
+            // have queued.
+            Message::KeepAlive | Message::Cancel(_) => {}
+            // BEP 6 messages from a peer we never negotiated it with. We do
+            // not advertise fast, so a peer sending these is not following
+            // the handshake; honouring them anyway would let it cost us
+            // O(pieces) per five-byte message.
+            Message::RejectRequest(_) | Message::SuggestPiece(_) | Message::AllowedFast(_) => {
+                if !st.peers[idx].fast {
+                    violation(st);
+                }
+            }
             Message::Extended {
                 id: ext_id,
                 payload,
@@ -1479,19 +1509,29 @@ impl Shared {
                     update_interest(st, idx, out);
                 }
             }
-            Message::Bitfield(bytes) => {
-                if let Ok(field) = Bitfield::from_bytes(bytes, self.num_pieces) {
+            // Only as the opening message, and only if it fits the torrent.
+            // A repeat is not merely redundant: each one costs two passes
+            // over the piece table under the lock, and the wrong length is a
+            // peer talking about a different torrent.
+            Message::Bitfield(bytes) => match Bitfield::from_bytes(bytes, self.num_pieces) {
+                Ok(field) if first => {
                     Self::replace_piece_set(st, idx, field);
                     update_interest(st, idx, out);
                 }
-            }
-            Message::HaveAll => {
-                Self::replace_piece_set(st, idx, Bitfield::full(self.num_pieces));
-                update_interest(st, idx, out);
-            }
-            Message::HaveNone => {
-                Self::replace_piece_set(st, idx, Bitfield::empty(self.num_pieces));
-                update_interest(st, idx, out);
+                _ => violation(st),
+            },
+            Message::HaveAll | Message::HaveNone => {
+                if first && st.peers[idx].fast {
+                    let field = if matches!(msg, Message::HaveAll) {
+                        Bitfield::full(self.num_pieces)
+                    } else {
+                        Bitfield::empty(self.num_pieces)
+                    };
+                    Self::replace_piece_set(st, idx, field);
+                    update_interest(st, idx, out);
+                } else {
+                    violation(st);
+                }
             }
             Message::Request(req) => self.serve_request(st, idx, *req, out),
             Message::Piece {
@@ -1741,6 +1781,12 @@ impl Shared {
     }
 
     fn check_done(&self) {
+        // Asked after every message from every peer. Once finished there is
+        // nothing left to learn, so a seeder's traffic never takes the state
+        // lock for this again. The two locks are never held together.
+        if *lock(&self.done) {
+            return;
+        }
         if lock(&self.state).picker.is_complete() {
             let mut done = lock(&self.done);
             if !*done {
@@ -2197,7 +2243,7 @@ mod tests {
         let slot = torrent.shared.budget.claim().unwrap();
         let id = torrent
             .shared
-            .register_peer(tx, Arc::new(Quiet), dest, slot)
+            .register_peer(tx, Arc::new(Quiet), dest, slot, false)
             .ok()
             .unwrap();
         (id, rx)
