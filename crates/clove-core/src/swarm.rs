@@ -29,9 +29,8 @@ use std::time::{Duration, Instant};
 
 use i2pnet::{DestHash, I2pDialer, I2pListener, I2pNamingLookup, I2pStream};
 
-use crate::torrent::{HANDSHAKE_TIMEOUT, MAX_CONNECTIONS_PER_DEST, Torrent};
+use crate::torrent::{self, MAX_CONNECTIONS_PER_DEST, Torrent};
 use crate::tracker;
-use crate::wire::{self, Handshake};
 
 /// Swarm-runner timing and limits. Every field exists to be tuned once live
 /// I2P behavior is measured (R5); the defaults lean generous because tunnel
@@ -91,20 +90,33 @@ impl Swarm {
         L::Stream: 'static,
     {
         let stop = Arc::new(StopFlag::default());
+        // Binding inside the engine; the sweep's and acceptor's own checks
+        // are only there to save a dial or a handshake.
+        torrent.set_max_peers(config.max_peers);
         if let Some(listener) = listener {
+            // The listener knows who we are; the torrent must, or the sweep
+            // dials the echo every tracker sends back.
+            torrent.set_local_dest(listener.local_dest());
             let torrent = Arc::clone(&torrent);
             // The acceptor is deliberately detached: it blocks in accept()
             // and ends when the listener's session dies (supervisor
             // teardown), not on our stop flag.
-            std::thread::spawn(move || accept_loop(&torrent, &listener, config.max_peers));
+            let spawned = std::thread::Builder::new()
+                .name("clove-accept".into())
+                .spawn(move || accept_loop(&torrent, &listener, config.max_peers));
+            if let Err(e) = spawned {
+                eprintln!("clove: cannot start the accept thread: {e}");
+            }
         }
         let dial_stop = Arc::clone(&stop);
-        let dial_thread =
-            std::thread::spawn(move || dial_loop(&torrent, &dialer, &dial_stop, config));
-        Swarm {
-            stop,
-            dial_thread: Some(dial_thread),
-        }
+        // A thread the OS refuses leaves a swarm that accepts and does not
+        // dial. Degraded, logged, and `shutdown` has nothing to join.
+        let dial_thread = std::thread::Builder::new()
+            .name("clove-dial".into())
+            .spawn(move || dial_loop(&torrent, &dialer, &dial_stop, config))
+            .map_err(|e| eprintln!("clove: cannot start the dial thread: {e}"))
+            .ok();
+        Swarm { stop, dial_thread }
     }
 
     /// Start a dial-only swarm (no inbound listener) — e.g. before the
@@ -202,13 +214,14 @@ impl Announcer {
     {
         let stop = Arc::new(StopFlag::default());
         let loop_stop = Arc::clone(&stop);
-        let thread = std::thread::spawn(move || {
-            announce_loop(&torrent, &target, &dialer, &naming, &config, &loop_stop);
-        });
-        Announcer {
-            stop,
-            thread: Some(thread),
-        }
+        let thread = std::thread::Builder::new()
+            .name("clove-announce".into())
+            .spawn(move || {
+                announce_loop(&torrent, &target, &dialer, &naming, &config, &loop_stop);
+            })
+            .map_err(|e| eprintln!("clove: cannot start the announce thread: {e}"))
+            .ok();
+        Announcer { stop, thread }
     }
 
     /// Signal the loop to stop without waiting (it exits after any in-flight
@@ -240,34 +253,40 @@ pub fn announce_stopped<D, N>(
     D: I2pDialer + Send + 'static,
     N: I2pNamingLookup + Send + 'static,
 {
-    std::thread::spawn(move || {
-        for url in &target.urls {
-            let params = tracker::AnnounceParams {
-                info_hash,
-                peer_id,
-                uploaded: 0,
-                downloaded: 0,
-                left: 0,
-                event: tracker::Event::Stopped,
-                numwant: 0,
-                our_dest_b64: &target.our_dest_b64,
-            };
-            let Ok((host, request)) = tracker::build_announce(url, &params) else {
-                continue;
-            };
-            let Ok(dest) = naming.lookup(&host) else {
-                continue;
-            };
-            let Ok(mut stream) = dialer.dial(dest, dial_timeout) else {
-                continue;
-            };
-            // Nothing joins this thread, so an unbounded exchange here is a
-            // leak nobody is even waiting to notice: one per pause, remove and
-            // shutdown, each parked on a tracker that need only stay silent.
-            let _ = stream.set_timeouts(Some(tracker::ANNOUNCE_IO_TIMEOUT));
-            let _ = tracker::announce_over(&mut stream, &request);
-        }
-    });
+    let spawned = std::thread::Builder::new()
+        .name("clove-goodbye".into())
+        .spawn(move || {
+            for url in &target.urls {
+                let params = tracker::AnnounceParams {
+                    info_hash,
+                    peer_id,
+                    uploaded: 0,
+                    downloaded: 0,
+                    left: 0,
+                    event: tracker::Event::Stopped,
+                    numwant: 0,
+                    our_dest_b64: &target.our_dest_b64,
+                };
+                let Ok((host, request)) = tracker::build_announce(url, &params) else {
+                    continue;
+                };
+                let Ok(dest) = naming.lookup(&host) else {
+                    continue;
+                };
+                let Ok(mut stream) = dialer.dial(dest, dial_timeout) else {
+                    continue;
+                };
+                // Nothing joins this thread, so an unbounded exchange here is a
+                // leak nobody is even waiting to notice: one per pause, remove and
+                // shutdown, each parked on a tracker that need only stay silent.
+                let _ = stream.set_timeouts(Some(tracker::ANNOUNCE_IO_TIMEOUT));
+                let _ = tracker::announce_over(&mut stream, &request);
+            }
+        });
+    // Best-effort all the way down: the tracker times us out anyway.
+    if let Err(e) = spawned {
+        eprintln!("clove: cannot start the goodbye-announce thread: {e}");
+    }
 }
 
 /// Seconds since the unix epoch — the announce state machine's clock.
@@ -329,8 +348,8 @@ fn announce_loop<D, N>(
                 continue;
             }
             match announce_once(torrent, url, state, target, dialer, naming, config) {
-                Ok((interval, sent)) => {
-                    state.on_success(unix_now(), interval, sent);
+                Ok((interval, min_interval, sent)) => {
+                    state.on_success_with_min(unix_now(), interval, min_interval, sent);
                     torrent.note_announce(Ok(()));
                 }
                 // Discarding this is how a torrent came to sit at
@@ -370,7 +389,7 @@ fn announce_once<D, N>(
     dialer: &D,
     naming: &N,
     config: &AnnouncerConfig,
-) -> Result<(u32, tracker::Event), tracker::Error>
+) -> Result<(u32, Option<u32>, tracker::Event), tracker::Error>
 where
     D: I2pDialer,
     N: I2pNamingLookup,
@@ -395,7 +414,7 @@ where
     };
     let response = contact_tracker(url, &params, dialer, naming, config.dial_timeout)?;
     torrent.add_peers(&response.peers);
-    Ok((response.interval, event))
+    Ok((response.interval, response.min_interval, event))
 }
 
 /// How far an announce got before it failed. Four failures that read alike in
@@ -547,8 +566,10 @@ fn sweep<D>(
     // Decided up front rather than as we go: one pass over the candidates
     // with the free-slot count as its cap, so a wave can neither overshoot
     // `max_peers` nor race itself over who claimed the last slot.
+    // `dial_candidates`, not `known_peers`: a destination banned for serving
+    // bad pieces is never worth a tunnel again this run.
     let candidates: Vec<DestHash> = torrent
-        .known_peers()
+        .dial_candidates()
         .into_iter()
         .filter(|peer| !connected.contains(peer) && !retry_after.contains_key(peer))
         .take(budget)
@@ -567,7 +588,8 @@ fn sweep<D>(
     // which is the shape that leaked a thread per session rebuild.
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            scope.spawn(|| {
+            let worker = std::thread::Builder::new().name("clove-sweep".into());
+            let spawned = worker.spawn_scoped(scope, || {
                 loop {
                     if stop.is_raised() {
                         return;
@@ -576,14 +598,24 @@ fn sweep<D>(
                     let Some(&peer) = candidates.get(index) else {
                         return;
                     };
-                    let attached = dialer
-                        .dial(peer, config.dial_timeout)
-                        .and_then(|stream| torrent.attach(stream, peer));
+                    // Abortable: a stop raised while the handshake is in
+                    // flight is honoured within `HANDSHAKE_POLL`, so pause,
+                    // remove and shutdown do not wait on a peer that accepted
+                    // and then dribbles.
+                    let attached = dialer.dial(peer, config.dial_timeout).and_then(|stream| {
+                        torrent.attach_abortable(stream, peer, &|| stop.is_raised())
+                    });
                     if attached.is_err() {
                         lock_vec(&failed).push(peer);
                     }
                 }
             });
+            // Fewer workers is a slower wave, not a failed one; the
+            // candidates nobody reaches are simply tried next sweep.
+            if let Err(e) = spawned {
+                eprintln!("clove: cannot start a dial worker: {e}");
+                break;
+            }
         }
     });
 
@@ -640,8 +672,15 @@ pub struct InboundDemux {
     max_peers: usize,
     /// Raised on session teardown; the accept loop exits at its next accept.
     stopped: std::sync::atomic::AtomicBool,
+    /// The listener's destination, once `run` has one, handed to every
+    /// torrent registered before or after so none of them dials itself.
+    local_dest: Mutex<Option<DestHash>>,
     /// Connections currently waiting for their handshake to be read.
     pending: std::sync::atomic::AtomicUsize,
+    /// The same, per destination. The global cap bounds what a flood costs
+    /// us; this bounds what one destination may hold of it, so filling the
+    /// cap takes a swarm's worth of identities rather than one.
+    pending_by_dest: Mutex<HashMap<DestHash, usize>>,
 }
 
 /// How many connections may be waiting on their handshake at once.
@@ -651,14 +690,32 @@ pub struct InboundDemux {
 /// flood costs us. Well above any real swarm's arrival rate.
 const MAX_PENDING_HANDSHAKES: usize = 64;
 
-/// Decrements the pending count when a routing thread ends, panic included.
-struct PendingGuard(Arc<InboundDemux>);
+/// How long an inbound peer has to send its handshake, whole.
+///
+/// Shorter than the outbound [`torrent::HANDSHAKE_TIMEOUT`]: an inbound peer
+/// has already built its tunnels and reached us, so the slow part is behind
+/// it, and every second here is a second one of [`MAX_PENDING_HANDSHAKES`]
+/// is held by a connection that may never speak.
+const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Decrements the pending counts when a routing thread ends, panic included.
+struct PendingGuard {
+    demux: Arc<InboundDemux>,
+    from: DestHash,
+}
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        self.0
+        self.demux
             .pending
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let mut by_dest = lock_map(&self.demux.pending_by_dest);
+        if let Some(count) = by_dest.get_mut(&self.from) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                by_dest.remove(&self.from);
+            }
+        }
     }
 }
 
@@ -670,12 +727,44 @@ impl InboundDemux {
             torrents: Mutex::new(HashMap::new()),
             max_peers,
             stopped: std::sync::atomic::AtomicBool::new(false),
+            local_dest: Mutex::new(None),
             pending: std::sync::atomic::AtomicUsize::new(0),
+            pending_by_dest: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Count `from` as waiting on a handshake, or refuse: the global cap, or
+    /// [`MAX_CONNECTIONS_PER_DEST`] already pending from this destination.
+    /// The per-destination check is inside its own lock so a burst from one
+    /// destination cannot slip several past it at once.
+    fn admit_pending(&self, from: DestHash) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.pending.load(Ordering::Relaxed) >= MAX_PENDING_HANDSHAKES {
+            return false;
+        }
+        let mut by_dest = lock_map(&self.pending_by_dest);
+        let count = by_dest.entry(from).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_DEST {
+            if *count == 0 {
+                by_dest.remove(&from);
+            }
+            return false;
+        }
+        *count += 1;
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Serve `torrent`'s info-hash. Replaces any previous registration.
     pub fn register(&self, torrent: &Arc<Torrent>) {
+        if let Some(dest) = *self
+            .local_dest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            torrent.set_local_dest(dest);
+        }
+        torrent.set_max_peers(self.max_peers);
         lock_map(&self.torrents).insert(torrent.info_hash(), Arc::clone(torrent));
     }
 
@@ -696,69 +785,112 @@ impl InboundDemux {
     /// Run the accept loop on `listener` until its session dies (the
     /// supervisor owns re-establishment; a rebuilt session gets a fresh
     /// `run`). Returns the loop's thread handle.
+    ///
+    /// # Panics
+    ///
+    /// If the OS refuses the thread, as `std::thread::spawn` would; prefer
+    /// [`try_run`](InboundDemux::try_run), which reports it instead.
     pub fn run<L>(self: &Arc<Self>, listener: L) -> JoinHandle<()>
     where
         L: I2pListener + Send + 'static,
         L::Stream: 'static,
     {
+        self.try_run(listener)
+            .unwrap_or_else(|e| panic!("clove: cannot start the inbound accept loop: {e}"))
+    }
+
+    /// [`run`](InboundDemux::run), reporting a thread the OS would not give
+    /// us rather than panicking over it.
+    ///
+    /// # Errors
+    ///
+    /// The accept-loop thread could not be spawned; nothing is listening.
+    pub fn try_run<L>(self: &Arc<Self>, listener: L) -> io::Result<JoinHandle<()>>
+    where
+        L: I2pListener + Send + 'static,
+        L::Stream: 'static,
+    {
+        let local = listener.local_dest();
+        *self
+            .local_dest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(local);
+        for torrent in lock_map(&self.torrents).values() {
+            torrent.set_local_dest(local);
+        }
         let demux = Arc::clone(self);
-        std::thread::spawn(move || {
-            loop {
-                let accepted = listener.accept();
-                // Checked whatever came back: teardown pokes the forward port
-                // to break a blocked accept, and that poke arrives as a
-                // connection with no destination header — an `Ok(None)`.
-                if demux.stopped.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                match accepted {
-                    Ok(Some((stream, from))) => {
-                        use std::sync::atomic::Ordering;
-                        // Bounded: each of these is a thread, and a peer that
-                        // connects without handshaking holds one until its
-                        // timeout. Past the cap the connection is dropped,
-                        // which the dialling side sees as a refusal.
-                        if demux.pending.load(Ordering::Relaxed) >= MAX_PENDING_HANDSHAKES {
-                            drop(stream);
-                            continue;
-                        }
-                        demux.pending.fetch_add(1, Ordering::Relaxed);
-                        let demux = Arc::clone(&demux);
-                        // Per-connection thread: the handshake read must
-                        // never stall the accept loop.
-                        std::thread::spawn(move || {
-                            let _guard = PendingGuard(Arc::clone(&demux));
-                            demux.route(stream, from);
-                        });
+        std::thread::Builder::new()
+            .name("clove-demux".into())
+            .spawn(move || {
+                loop {
+                    let accepted = listener.accept();
+                    // Checked whatever came back: teardown pokes the forward port
+                    // to break a blocked accept, and that poke arrives as a
+                    // connection with no destination header — an `Ok(None)`.
+                    if demux.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
                     }
-                    Ok(None) => {}
-                    Err(_) => return,
+                    match accepted {
+                        Ok(Some((stream, from))) => {
+                            // Bounded: each of these is a thread, and a peer that
+                            // connects without handshaking holds one until its
+                            // timeout. Past either cap the connection is dropped,
+                            // which the dialling side sees as a refusal. The
+                            // destination is known before a byte is read, which
+                            // is what lets one be refused before it costs a
+                            // thread.
+                            if !demux.admit_pending(from) {
+                                drop(stream);
+                                continue;
+                            }
+                            let guard = PendingGuard {
+                                demux: Arc::clone(&demux),
+                                from,
+                            };
+                            let demux = Arc::clone(&demux);
+                            // Per-connection thread: the handshake read must
+                            // never stall the accept loop. Refused by the OS, the
+                            // connection is dropped like one past the cap, and
+                            // the guard gives its counts back.
+                            let spawned = std::thread::Builder::new()
+                                .name("clove-route".into())
+                                .spawn(move || {
+                                    let _guard = guard;
+                                    demux.route(stream, from);
+                                });
+                            if let Err(e) = spawned {
+                                eprintln!("clove: cannot start a handshake thread: {e}");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => return,
+                    }
                 }
-            }
-        })
+            })
     }
 
     /// Read one inbound peer's handshake and attach it to its torrent.
     fn route<S: I2pStream + 'static>(&self, mut stream: S, from: DestHash) {
-        // Bound the wait for the peer's first bytes; a connection that never
-        // speaks would otherwise hold this thread for the life of the process.
+        // Bound the wait for the peer's handshake as a whole; a connection
+        // that never speaks, or speaks a byte at a time, would otherwise hold
+        // this thread — and its share of the pending cap — indefinitely.
         // Best-effort: backends without a timeout of their own ignore it.
-        let _ = stream.set_timeouts(Some(HANDSHAKE_TIMEOUT));
-        let mut buf = [0u8; wire::HANDSHAKE_LEN];
-        if stream.read_exact(&mut buf).is_err() {
-            return;
-        }
-        // Back to blocking for the peer connection proper: a peer legitimately
-        // sits quiet between messages, and cutting that off needs the
-        // keep-alive work (R5), not a timeout here.
-        let _ = stream.set_timeouts(None);
-        let Ok(theirs) = Handshake::parse(&buf) else {
+        let deadline = Instant::now() + INBOUND_HANDSHAKE_TIMEOUT;
+        let Ok(theirs) = torrent::read_handshake_until(&mut stream, deadline, &|| false) else {
             return;
         };
+        // Back to blocking for the peer connection proper: a peer legitimately
+        // sits quiet between messages, and that is the idle timeout's job.
+        let _ = stream.set_timeouts(None);
         let torrent = lock_map(&self.torrents).get(&theirs.info_hash).cloned();
         let Some(torrent) = torrent else {
             return; // unknown info-hash: drop, nothing to say
         };
+        // A banned destination gets no reply at all: the ban is the torrent's
+        // verdict on its data, and a handshake would only invite another try.
+        if torrent.is_banned(from) {
+            return;
+        }
         let connected = torrent.connected_peers();
         if connected.len() >= self.max_peers || torrent.budget().available() == 0 {
             return;
@@ -1265,6 +1397,48 @@ mod tests {
         swarm.shutdown();
     }
 
+    /// The same flood from a single destination, still held open while the
+    /// honest peer connects. The cap used to be global only, so one identity
+    /// could fill it and every honest inbound peer was dropped for as long as
+    /// the silent connections lasted; now a destination may hold no more than
+    /// its share of it.
+    #[test]
+    fn one_destination_cannot_hold_the_pending_handshake_cap_against_an_honest_peer() {
+        let net = MockNet::new();
+        let (seeder, leecher, _sd, _ld) = seed_and_leech();
+
+        let seed_ep = net.endpoint();
+        let seed_dest = seed_ep.dest();
+        let demux = InboundDemux::new(8);
+        demux.register(&seeder);
+        let _accept = demux.run(seed_ep);
+
+        // One destination, the whole cap's worth of silent connections, all
+        // held open for the rest of the test. The mock's backlog refuses a
+        // dial when the demux has not drained it yet, so those are retried.
+        let flood_ep = net.endpoint();
+        let mut silent = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while silent.len() < MAX_PENDING_HANDSHAKES {
+            assert!(Instant::now() < deadline, "could not open the flood");
+            match flood_ep.dialer().dial(seed_dest, Duration::from_secs(5)) {
+                Ok(stream) => silent.push(stream),
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+
+        // With the flood still open, an honest peer must get through.
+        let ep = net.endpoint();
+        leecher.add_peers(&[seed_dest]);
+        let swarm = Swarm::dial_only(Arc::clone(&leecher), ep.dialer(), quick_config());
+        assert!(
+            leecher.wait_complete(Duration::from_secs(20)),
+            "one destination's silent connections shut the honest peer out"
+        );
+        swarm.shutdown();
+        drop(silent);
+    }
+
     #[test]
     fn demux_drops_unknown_info_hash() {
         let net = MockNet::new();
@@ -1730,6 +1904,159 @@ mod tests {
             0,
             "a raised stop flag must be checked before the first dial, not after"
         );
+    }
+
+    /// A peer that accepts and then hands over its handshake one byte at a
+    /// time. Each byte used to renew a per-read timeout, so the attach — and
+    /// with it the sweep, and with that `shutdown` — was held for as long as
+    /// the peer cared to dribble. The deadline is now on the exchange and the
+    /// sweep's stop flag is consulted inside it.
+    #[test]
+    fn shutdown_is_not_held_by_a_dribbling_handshake() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let net = MockNet::new();
+        let (_seeder, leecher, _sd, _ld) = seed_and_leech();
+
+        let dribbler_ep = net.endpoint();
+        let dribbler_dest = dribbler_ep.dest();
+        let done = Arc::new(AtomicBool::new(false));
+        let dribbler_done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let Ok((mut stream, _from)) = dribbler_ep.accept() else {
+                return;
+            };
+            // Never a whole handshake: one plausible byte at a time, for as
+            // long as the far side keeps the connection.
+            while !dribbler_done.load(Ordering::Relaxed) {
+                if stream.write_all(&[19]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        leecher.add_peers(&[dribbler_dest]);
+        let swarm = Swarm::dial_only(
+            Arc::clone(&leecher),
+            net.endpoint().dialer(),
+            quick_config(),
+        );
+        // Let the sweep dial and get stuck in the handshake.
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Bounded from outside, because the failure mode is a join that
+        // never returns.
+        let (report, finished) = std::sync::mpsc::sync_channel::<Duration>(1);
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            swarm.shutdown();
+            let _ = report.send(start.elapsed());
+        });
+        let took = finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("shutdown was held by a peer dribbling its handshake");
+        assert!(
+            took < Duration::from_secs(5),
+            "shutdown took {took:?} behind a dribbling handshake"
+        );
+        done.store(true, Ordering::Relaxed);
+    }
+
+    /// Trackers echo the announcer, so our own destination turns up in
+    /// `known_peers` as a matter of course. The sweep must not dial it.
+    #[test]
+    fn a_swarm_never_dials_its_own_destination() {
+        let net = MockNet::new();
+        let (_seeder, leecher, _sd, _ld) = seed_and_leech();
+        let ep = net.endpoint();
+        let own = ep.dest();
+        let dialer = Arc::new(CountingDialer::new(ep.dialer(), Duration::from_millis(1)));
+
+        let swarm = Swarm::spawn(
+            Arc::clone(&leecher),
+            Arc::clone(&dialer),
+            Some(ep),
+            quick_config(),
+        );
+        // Added after the swarm exists, as a tracker reply would be.
+        leecher.add_peers(&[own]);
+        std::thread::sleep(Duration::from_millis(400));
+        swarm.shutdown();
+        assert_eq!(
+            dialer.total.load(Ordering::SeqCst),
+            0,
+            "the sweep dialled our own destination"
+        );
+        assert!(!leecher.known_peers().contains(&own));
+
+        // The demux path, which the daemon uses, tells its torrents too —
+        // those registered before it runs and those registered after.
+        let (_seeder2, early, _sd2, _ld2) = seed_and_leech_tagged(0x51);
+        let (_seeder3, late, _sd3, _ld3) = seed_and_leech_tagged(0x52);
+        let ep = net.endpoint();
+        let own = ep.dest();
+        let demux = InboundDemux::new(8);
+        demux.register(&early);
+        let _accept = demux.run(ep);
+        demux.register(&late);
+        early.add_peers(&[own]);
+        late.add_peers(&[own]);
+        assert!(!early.dial_candidates().contains(&own));
+        assert!(!late.dial_candidates().contains(&own));
+    }
+
+    /// Every thread the swarm starts carries a name, so `ps -T` on a daemon
+    /// with a few hundred of them says what each is. Read back through
+    /// `/proc`, which is where an operator would look.
+    #[test]
+    fn swarm_threads_are_named() {
+        let net = MockNet::new();
+        let (seeder, leecher, _sd, _ld) = seed_and_leech();
+        let seed_ep = net.endpoint();
+        let seed_dest = seed_ep.dest();
+        let seed_swarm = Swarm::spawn(
+            Arc::clone(&seeder),
+            seed_ep.dialer(),
+            Some(seed_ep),
+            quick_config(),
+        );
+        leecher.add_peers(&[seed_dest]);
+        let leech_swarm = Swarm::dial_only(
+            Arc::clone(&leecher),
+            net.endpoint().dialer(),
+            quick_config(),
+        );
+        let _tick = leecher.spawn_maintenance(Duration::from_secs(1));
+        assert!(leecher.wait_complete(Duration::from_secs(20)));
+
+        let names = thread_names();
+        for expected in ["clove-dial", "clove-accept", "clove-maint"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "no thread named {expected}; found {names:?}"
+            );
+        }
+        // The peer threads have been and gone by now on the leecher's side,
+        // but the seeder still holds its end of the connection.
+        assert!(
+            names.iter().any(|n| n.starts_with("clove-peer")),
+            "no peer thread names; found {names:?}"
+        );
+        leech_swarm.shutdown();
+        seed_swarm.shutdown();
+    }
+
+    /// The `comm` of every thread in this process.
+    fn thread_names() -> Vec<String> {
+        let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+            return Vec::new();
+        };
+        tasks
+            .flatten()
+            .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+            .map(|name| name.trim_end().to_owned())
+            .collect()
     }
 
     #[test]

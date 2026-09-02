@@ -41,3 +41,10 @@
 "http://tracker.i2p/announce"
 "http://1.2.3.4:6969/announce"
 "udp://"
+
+# A second tier and a second file entry, so the cross-tier tracker cap and
+# the file cap are reachable by duplication rather than by luck.
+"13:announce-listll"
+"el"
+"5:filesld6:lengthi1e4:pathl1:aee"
+"d6:lengthi1e4:pathl1:aee"

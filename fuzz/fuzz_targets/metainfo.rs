@@ -7,6 +7,13 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(meta) = clove_core::metainfo::MetaInfo::parse(data) {
         assert!(!meta.pieces.is_empty());
         assert!(meta.piece_length > 0);
+        // The parse-time caps: descriptors, bitfield size, announce cycle.
+        assert!(meta.files.len() <= clove_core::metainfo::MAX_FILES);
+        assert!(meta.pieces.len() <= clove_core::metainfo::MAX_PIECES as usize);
+        assert!(
+            meta.trackers.iter().map(Vec::len).sum::<usize>()
+                <= clove_core::metainfo::MAX_TRACKERS
+        );
         let sum: u64 = meta.files.iter().map(|f| f.length).sum();
         assert_eq!(sum, meta.total_length);
         // Paths must be distinct and non-shadowing: two entries on one path
@@ -24,6 +31,7 @@ fuzz_target!(|data: &[u8]| {
                 // own directory.
                 assert!(part != "." && part != ".." && !part.contains('/'));
                 assert!(!part.contains('\0'));
+                assert!(part.len() <= clove_core::metainfo::MAX_COMPONENT_BYTES);
             }
         }
         for tier in &meta.trackers {

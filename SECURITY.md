@@ -39,6 +39,20 @@ communicate outside I2P, or that ties an I2P identity to a network identity:
   clove to trust unverified pieces.
 - Path traversal from torrent file names.
 
+**Known limitations, stated so a report is not needed to learn them:**
+
+- The SAM `STREAM FORWARD` port on loopback is unauthenticated by the
+  protocol: any process on the same host can connect to it and present as any
+  destination. On a multi-user host that lets a local user occupy peer slots;
+  pieces are still hash-checked, so it cannot corrupt data. The API socket and
+  the data directory are `0600`/`0700` and are not affected.
+- `sam_address` accepts `localhost` and `[::1]`, but the bridge is always
+  dialled as `127.0.0.1`; a router listening only on `::1` is unreachable.
+- `cloved` has no signal handler: `SIGTERM` stops it by the default
+  disposition. State files are atomic, so nothing is corrupted; up to thirty
+  seconds of verified progress is re-hashed on the next start and no `stopped`
+  announce is sent.
+
 **Out of scope:**
 
 - Weaknesses in I2P itself, or in the router. Report those to the router
@@ -89,6 +103,30 @@ These are enforced in the codebase and checked in CI, not merely intended:
   bidirectional overrides out of a torrent, a tracker or a SAM bridge cannot
   forge a log line or rewrite what the rest of the screen says. The stored value
   and the API's JSON keep the real name.
+
+## Where each guarantee is checked
+
+A guarantee that nothing executes is a comment. Each of the above is held by
+something that runs in CI on every push (`.github/workflows/ci.yml`) and can
+be run from a clean checkout with `make test`, `make smoke`, `make chaos` and
+`make router`; the fuzz targets run nightly. When one of these rows changes,
+change the other.
+
+| Guarantee | What enforces it |
+|---|---|
+| Only `i2pnet` may open a socket; no IP or port vocabulary in the engine | `clippy.toml` type and method bans, denied workspace-wide; `ci/check-net-deps.sh` over `Cargo.lock` and the `rustix` feature list |
+| The SAM bridge is loopback, and there is no override | `config::tests::a_sam_address_this_build_cannot_dial_is_refused`; `i2pnet::sam` carries only a port and dials `Ipv4Addr::LOCALHOST` by type |
+| Non-I2P announce URLs are dropped at parse time and never contacted | `metainfo::tests::i2p_tracker_filter`, `filters_and_counts_non_i2p_trackers`; `magnet::tests`; the `metainfo` and `magnet` fuzz targets assert every surviving tracker is an I2P URL |
+| State files are written temp-then-rename | `ci/chaos.sh`: SIGKILL storms during state writes, torn temporaries, an unwritable state directory — and it checks that each kill actually landed |
+| The post-initialisation `seccomp` allowlist, and no post-init UDP | `sandbox::tests::child_under_landlock` performs the daemon's workload under the live filter and proves `exec`, `link`, `symlink` and `socket(AF_UNIX, SOCK_DGRAM)` are refused; `ci/router.sh --trace` fails if the daemon makes any post-init call the filter refuses |
+| What the sandbox came to is reported and can be required | `main::tests::sandbox_require_refuses_an_incomplete_confinement`, `the_status_reports_the_sandbox_verdict`; `ci/router.sh` prints the verdict on every run |
+| The private key never leaves the process | `ci/router.sh` plants a marker in the bridge's key blob and fails if it appears in the daemon's log, the announce the tracker received, the CLI's output or any state file but `destination.key`; `sam::tests::a_session_publishes_its_destination_and_never_its_private_keys`, `a_config_debug_print_redacts_the_private_key` |
+| Local API: token on every request, secrets `0600` and refused otherwise | `main::tests::every_request_needs_the_token`, `authentication_precedes_routing`, `an_empty_token_authenticates_nobody`, `a_world_readable_secret_is_refused_rather_than_used`, `a_symlinked_secret_is_refused`; `ci/smoke.sh` checks the token file mode |
+| One daemon per data directory; a live control socket is never unlinked | `ci/smoke.sh` starts a second `cloved` on the same directory and expects a refusal; `api::tests::a_live_socket_is_not_taken_away_from_its_listener`, `a_stale_socket_is_replaced` |
+| One peer destination cannot take over a torrent | `evil_peer::one_destination_cannot_monopolise_the_peer_table`, and the hostile-peer suite in `crates/clove-core/tests/evil_peer.rs` (slow-loris, stop-reading, corrupt blocks, straddling requests, silent peers) |
+| PEX cannot crowd out a tracker's peers | `evil_peer::a_pex_flood_cannot_shut_out_the_trackers_peers`, `peer_exchange_stays_within_the_limit_it_enforces`; the `extensions` fuzz target asserts the PEX cap |
+| Foreign text is scrubbed wherever it becomes a terminal's input | `text::tests` (controls, bidi, format characters), `text::tests::the_i2pnet_scrubber_agrees_on_every_character` (the two scrubbers hold one table), `clove::tests::a_torrent_name_cannot_drive_the_terminal`, `sam::tests::a_forged_ok_inside_a_refusal_is_still_a_refusal_and_is_scrubbed`; the `text` fuzz target asserts the class property over arbitrary input |
+| Parsers survive hostile input | `crates/clove-core/tests/hostile.rs` (a deterministic mutation sweep on every push) and eleven `cargo-fuzz` targets with dictionaries and a committed seed corpus (`fuzz/README.md`) |
 
 If you find a way to violate one of these, that is a vulnerability by
 definition, even without a demonstrated exploit.

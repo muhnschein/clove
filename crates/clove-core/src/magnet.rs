@@ -12,7 +12,7 @@
 
 use crate::bencode::{self, Value};
 use crate::http;
-use crate::metainfo::is_i2p_tracker;
+use crate::metainfo::{MAX_TRACKERS, is_i2p_tracker};
 
 /// A parsed magnet link.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,8 +21,12 @@ pub struct Magnet {
     pub info_hash: [u8; 20],
     /// The display name (`dn=`), if given.
     pub display_name: Option<String>,
-    /// I2P announce URLs (`tr=`); non-I2P trackers are dropped.
+    /// I2P announce URLs (`tr=`), at most [`MAX_TRACKERS`] of them; non-I2P
+    /// trackers are dropped.
     pub trackers: Vec<String>,
+    /// How many `tr=` values were dropped: non-I2P ones, and I2P ones past
+    /// [`MAX_TRACKERS`] — the same accounting a `.torrent` keeps.
+    pub skipped_trackers: usize,
 }
 
 /// Why a magnet link could not be parsed.
@@ -34,6 +38,9 @@ pub enum Error {
     NoInfoHash,
     /// The btih value was not 40 hex or 32 base32 characters.
     BadInfoHash,
+    /// Two `xt=urn:btih:` parameters that name different hashes. A link is
+    /// one torrent; which of two it means is not ours to guess.
+    ConflictingInfoHash,
 }
 
 impl std::fmt::Display for Error {
@@ -42,6 +49,9 @@ impl std::fmt::Display for Error {
             Error::NotMagnet => f.write_str("magnet: not a magnet: URI"),
             Error::NoInfoHash => f.write_str("magnet: no xt=urn:btih: info-hash"),
             Error::BadInfoHash => f.write_str("magnet: info-hash is not 40 hex or 32 base32 chars"),
+            Error::ConflictingInfoHash => {
+                f.write_str("magnet: two xt=urn:btih: parameters name different info-hashes")
+            }
         }
     }
 }
@@ -60,6 +70,7 @@ impl Magnet {
         let mut info_hash = None;
         let mut display_name = None;
         let mut trackers = Vec::new();
+        let mut skipped_trackers = 0usize;
 
         for pair in query.split('&') {
             let Some((key, value)) = pair.split_once('=') else {
@@ -68,7 +79,11 @@ impl Magnet {
             match key {
                 "xt" => {
                     if let Some(hash) = value.strip_prefix("urn:btih:") {
-                        info_hash = Some(parse_btih(hash)?);
+                        let hash = parse_btih(hash)?;
+                        if info_hash.is_some_and(|seen| seen != hash) {
+                            return Err(Error::ConflictingInfoHash);
+                        }
+                        info_hash = Some(hash);
                     }
                 }
                 "dn" => {
@@ -77,8 +92,12 @@ impl Magnet {
                 }
                 "tr" => {
                     let url = String::from_utf8_lossy(&http::percent_decode(value)).into_owned();
-                    if is_i2p_tracker(&url) {
+                    // Capped for the reason `metainfo` caps a torrent's: a
+                    // link is as much a stranger's text as a file is.
+                    if is_i2p_tracker(&url) && trackers.len() < MAX_TRACKERS {
                         trackers.push(url);
+                    } else {
+                        skipped_trackers += 1;
                     }
                 }
                 _ => {}
@@ -89,6 +108,7 @@ impl Magnet {
             info_hash: info_hash.ok_or(Error::NoInfoHash)?,
             display_name,
             trackers,
+            skipped_trackers,
         })
     }
 }
@@ -142,8 +162,29 @@ mod tests {
             ]
         );
         assert_eq!(m.display_name.as_deref(), Some("Some Torrent"));
-        // Only the I2P tracker survives.
+        // Only the I2P tracker survives, and the other is counted.
         assert_eq!(m.trackers, vec!["http://tracker.postman.i2p/announce"]);
+        assert_eq!(m.skipped_trackers, 1);
+    }
+
+    /// A link can carry as many `tr=` values as a file can carry URLs, and
+    /// each kept one costs the same lookup and announce.
+    #[test]
+    fn caps_kept_trackers() {
+        let mut uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".to_owned();
+        for i in 0..MAX_TRACKERS + 4 {
+            uri.push_str("&tr=http%3A%2F%2Ft");
+            uri.push_str(&i.to_string());
+            uri.push_str(".i2p%2Fannounce");
+        }
+        let m = Magnet::parse(&uri).unwrap();
+        assert_eq!(m.trackers.len(), MAX_TRACKERS);
+        assert_eq!(m.trackers[0], "http://t0.i2p/announce");
+        assert_eq!(
+            m.trackers[MAX_TRACKERS - 1],
+            format!("http://t{}.i2p/announce", MAX_TRACKERS - 1)
+        );
+        assert_eq!(m.skipped_trackers, 4);
     }
 
     #[test]
@@ -162,6 +203,25 @@ mod tests {
         let b = Magnet::parse(&b32).unwrap().info_hash;
         assert_eq!(a, [0xFF; 20]);
         assert_eq!(b, [0xFF; 20]);
+    }
+
+    /// The last of several `xt=` used to win silently; a link naming two
+    /// torrents is refused, while the same hash spelled twice — hex and
+    /// base32 of it, say — is one torrent and fine.
+    #[test]
+    fn conflicting_info_hashes_are_refused() {
+        let a = "0123456789abcdef0123456789abcdef01234567";
+        let b = "ffffffffffffffffffffffffffffffffffffffff";
+        assert_eq!(
+            Magnet::parse(&format!("magnet:?xt=urn:btih:{a}&xt=urn:btih:{b}")),
+            Err(Error::ConflictingInfoHash)
+        );
+        let same = Magnet::parse(&format!(
+            "magnet:?xt=urn:btih:{b}&xt=urn:btih:{}",
+            "7".repeat(32)
+        ))
+        .expect("one hash, two spellings");
+        assert_eq!(same.info_hash, [0xFF; 20]);
     }
 
     #[test]

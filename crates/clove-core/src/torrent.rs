@@ -28,7 +28,7 @@
 //! against the mock network in CI and a real router in production; peer
 //! acquisition belongs to [`crate::swarm`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -93,8 +93,15 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Generous, because an I2P round trip is slow — but *finite*: `i2pnet`'s dial
 /// clears a stream's timeouts once the router answers, so without this a peer
 /// that accepts and then says nothing stalls the swarm's whole dial sweep. The
-/// bound is per read, so a peer dribbling its 68 bytes is fine.
+/// bound is on the whole exchange, not per read: a peer dribbling one byte
+/// inside each read's timeout used to renew it, and could hold the exchange
+/// open for the timeout times the 68 bytes of a handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long one read or write of a handshake may block before the deadline
+/// and the caller's stop flag are looked at again. What bounds how long a
+/// pause or shutdown waits on an attach already in flight.
+pub const HANDSHAKE_POLL: Duration = Duration::from_secs(1);
 
 /// How often [`Torrent::spawn_maintenance`] wakes to do the periodic work: fine
 /// enough to honour the intervals above to within a tick, coarse enough to be
@@ -120,6 +127,38 @@ pub const MAX_KNOWN_PEERS: usize = 1024;
 /// a reconnect after a teardown we have not noticed. The cap need not be tight,
 /// only finite.
 pub const MAX_CONNECTIONS_PER_DEST: usize = 2;
+
+/// Hash failures a destination may share the blame for before it is banned.
+///
+/// A piece that fails SHA-1 with a single supplier is that supplier's doing,
+/// and it is banned on the spot. A piece several peers contributed to cannot
+/// be pinned on one of them, so each is counted as suspect instead; an honest
+/// peer caught in a liar's company earns the count back on every piece it
+/// helps verify, a liar never does. The bound is what keeps one peer serving
+/// rubbish from making a download burn bandwidth for the life of the run
+/// (`docs/PROTOCOL.i2p-bt` §4.8).
+pub const SUSPICION_LIMIT: u32 = 3;
+
+/// Metadata pieces one peer may ask for per maintenance tick before the
+/// rest are rejected.
+///
+/// Serving a piece is 16 KiB out for a 30-byte frame in, and nothing else
+/// bounds how often a peer may ask: memory is safe (the outgoing queue is
+/// bounded) but the amplification is not. A real fetch asks for each piece
+/// once, so a whole 1 MiB info dictionary fits in one tick's allowance.
+/// A minimal counter for now; the `metadata` module is growing a proper
+/// request budget that this should hand over to.
+pub const MAX_METADATA_REQUESTS_PER_TICK: u32 = 64;
+
+/// How long a destination dropped for misbehaving sits out before the dial
+/// sweep may try it again, doubling with each offence up to
+/// [`MAX_MISBEHAVIOUR_BACKOFF`]. A protocol violation, a full outgoing queue
+/// or a run of unanswered requests used to cost a peer nothing: it stayed
+/// `Trusted` in the known set and the next sweep dialled it straight back.
+pub const MISBEHAVIOUR_BACKOFF: Duration = Duration::from_secs(30);
+
+/// The longest hold [`MISBEHAVIOUR_BACKOFF`] escalates to.
+pub const MAX_MISBEHAVIOUR_BACKOFF: Duration = Duration::from_secs(3600);
 
 /// Outgoing message queue depth per peer before the writer applies
 /// backpressure. Bounded — no unbounded channels in the engine (SCOPE §4).
@@ -216,6 +255,9 @@ struct Shared {
     /// Shared with the registry's [`MetaInfo`](crate::metainfo::MetaInfo),
     /// not copied.
     raw_info: Arc<[u8]>,
+    /// BEP 27: a private torrent's peers come from its tracker and nowhere
+    /// else. Peer exchange is neither advertised, sent nor listened to.
+    private: bool,
     state: Mutex<State>,
     done: Mutex<bool>,
     done_cv: Condvar,
@@ -248,6 +290,41 @@ struct State {
     announces_ok: u32,
     announces_failed: u32,
     last_announce_error: Option<String>,
+    /// Who wrote each block of a piece not yet verified, keyed by
+    /// `(piece, block)`, so a failed hash can be laid at somebody's door.
+    /// Entries live from the write to the verdict; the set is bounded by the
+    /// blocks of the pieces in progress, as the picker's accounting is.
+    suppliers: HashMap<(u32, u32), DestHash>,
+    /// Destinations refused for the rest of the run: nothing is dialled,
+    /// accepted or remembered from them. See [`SUSPICION_LIMIT`].
+    banned: HashSet<DestHash>,
+    /// Failed pieces each destination shared the blame for, less the pieces
+    /// it has since helped verify.
+    suspicion: HashMap<DestHash, u32>,
+    /// The last storage failure, if any: a block that could not be written or
+    /// a piece that could not be read back to verify. The download cannot
+    /// finish past one of these, so the registry surfaces it and may pause
+    /// the torrent; it is never cleared by the engine, since nothing here can
+    /// tell a transient `ENOSPC` from a dying disk.
+    storage_error: Option<String>,
+    /// Our own destination, once whoever owns the listener tells us. Never
+    /// dialled and never remembered: trackers routinely echo the announcer
+    /// back, PEX would then advertise it, and the result is two idle
+    /// connections to ourselves per torrent.
+    local_dest: Option<DestHash>,
+    /// Peers to remove once the lock is released, each with whether the
+    /// removal is for cause. A handler runs under the state lock and
+    /// `remove_peer` takes it, so a handler that decides a peer must go
+    /// queues it here and the caller finishes the job.
+    to_drop: Vec<(u64, bool)>,
+    /// Destinations dropped for misbehaving: how often, and until when the
+    /// dial sweep must leave them alone. See [`MISBEHAVIOUR_BACKOFF`].
+    offences: HashMap<DestHash, (u32, Instant)>,
+    /// The most peers this torrent will seat, the swarm's `max_peers`.
+    /// Checked inside the registration lock, where it is binding; the sweep
+    /// and the demux read `connected_peers` first, but that is advisory and
+    /// several connections can be in flight past it at once.
+    max_peers: usize,
 }
 
 /// Where a known destination came from, which decides whether it may be
@@ -273,6 +350,12 @@ impl State {
     /// trusted the new one is refused. A trusted sighting upgrades a PEX entry;
     /// nothing downgrades one. Returns whether the destination was new to us.
     fn remember_peer_from(&mut self, dest: DestHash, source: Source) -> bool {
+        // A ban outlives every source: the tracker and PEX will both go on
+        // naming the destination, and neither may put it back. Nor is our
+        // own destination a peer, however many trackers say so.
+        if self.banned.contains(&dest) || self.local_dest == Some(dest) {
+            return false;
+        }
         if let Some(existing) = self.known_peers.get_mut(&dest) {
             if source == Source::Trusted {
                 *existing = Source::Trusted;
@@ -298,6 +381,93 @@ impl State {
         self.known_peers.insert(dest, source);
         true
     }
+
+    /// Refuse `dest` for the rest of the run: forget it, and queue every
+    /// connection it holds for removal.
+    fn ban(&mut self, dest: DestHash) {
+        self.banned.insert(dest);
+        self.known_peers.remove(&dest);
+        self.suspicion.remove(&dest);
+        let held = self
+            .peers
+            .iter()
+            .filter(|p| p.dest == dest)
+            .map(|p| (p.id, true));
+        self.to_drop.extend(held);
+    }
+
+    /// Hold `dest` off the dial sweep for a while, longer each time.
+    fn penalise(&mut self, dest: DestHash, now: Instant) {
+        // Bounded like the known-peer set, and the same way a flood of
+        // offenders is handled: an entry whose hold has expired is worth
+        // less than the new one.
+        if self.offences.len() >= MAX_KNOWN_PEERS && !self.offences.contains_key(&dest) {
+            self.offences.retain(|_, (_, until)| *until > now);
+            if self.offences.len() >= MAX_KNOWN_PEERS {
+                return;
+            }
+        }
+        let (count, until) = self.offences.entry(dest).or_insert((0, now));
+        *count = count.saturating_add(1);
+        let hold = MISBEHAVIOUR_BACKOFF
+            .saturating_mul(1u32 << (*count - 1).min(16))
+            .min(MAX_MISBEHAVIOUR_BACKOFF);
+        *until = now + hold;
+    }
+
+    /// How much longer `dest` is held off the dial sweep, if it is.
+    fn held_for(&self, dest: DestHash, now: Instant) -> Option<Duration> {
+        self.offences
+            .get(&dest)
+            .map(|(_, until)| until.saturating_duration_since(now))
+            .filter(|left| !left.is_zero())
+    }
+
+    /// A piece verified: its suppliers are off the hook for it, and each one
+    /// earns back one of the failures it may have been party to.
+    fn credit_suppliers(&mut self, index: u32) {
+        let blocks = self.picker.blocks_in_piece(index);
+        for block in 0..blocks {
+            if let Some(dest) = self.suppliers.remove(&(index, block))
+                && let Some(count) = self.suspicion.get_mut(&dest)
+            {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.suspicion.remove(&dest);
+                }
+            }
+        }
+    }
+
+    /// A piece failed SHA-1: a sole supplier is banned outright; several
+    /// share the suspicion and any that reaches [`SUSPICION_LIMIT`] is banned.
+    fn blame_suppliers(&mut self, index: u32) {
+        let blocks = self.picker.blocks_in_piece(index);
+        let mut contributors: Vec<DestHash> = Vec::new();
+        for block in 0..blocks {
+            if let Some(dest) = self.suppliers.remove(&(index, block))
+                && !contributors.contains(&dest)
+            {
+                contributors.push(dest);
+            }
+        }
+        let culprits: Vec<DestHash> = match contributors.as_slice() {
+            [] => Vec::new(),
+            [only] => vec![*only],
+            many => many
+                .iter()
+                .copied()
+                .filter(|dest| {
+                    let count = self.suspicion.entry(*dest).or_insert(0);
+                    *count = count.saturating_add(1);
+                    *count >= SUSPICION_LIMIT
+                })
+                .collect(),
+        };
+        for dest in culprits {
+            self.ban(dest);
+        }
+    }
 }
 
 // The four flags are the canonical BEP 3 choke/interest state; anything other
@@ -319,6 +489,17 @@ struct Peer {
     closer: Arc<dyn I2pClose + Send + Sync>,
     /// Their piece set.
     has: Bitfield,
+    /// Whether anything but a keep-alive or the extension handshake has been
+    /// heard from them. The bitfield family (`bitfield`, `have all`, `have
+    /// none`) is legal only before that: BEP 3 makes it the first message,
+    /// BEP 10 lets the extension handshake precede it (i2psnark and
+    /// libtorrent both do), and a peer sending it again is either confused or
+    /// probing availability accounting. Either way it is dropped.
+    opened: bool,
+    /// Whether BEP 6 was negotiated — both sides advertised it. clove never
+    /// does, so this is false today and a fast-extension message is a
+    /// protocol violation rather than a no-op.
+    fast: bool,
     /// They are choking us.
     peer_choking: bool,
     /// We are choking them.
@@ -338,12 +519,23 @@ struct Peer {
     last_sent: Instant,
     /// When we last heard anything from them, for the idle timeout.
     last_seen: Instant,
-    /// Bytes served to them, the choker's ranking signal.
+    /// Bytes served to them.
     uploaded: u64,
+    /// Payload bytes they served us (solicited blocks, counted when written,
+    /// before verification).
+    downloaded: u64,
+    /// The two counters as they stood at the last choke round, so a round
+    /// ranks peers by what moved *since* — a lifetime total never decays, and
+    /// whoever was unchoked first would keep the slot for good.
+    uploaded_at_round: u64,
+    downloaded_at_round: u64,
     /// The message id the peer listens on for `i2p_pex`, once it handshakes.
     pex_id: Option<u8>,
     /// The message id the peer listens on for `ut_metadata`.
     metadata_id: Option<u8>,
+    /// Metadata pieces asked for since the last maintenance tick, against
+    /// [`MAX_METADATA_REQUESTS_PER_TICK`].
+    metadata_requests: u32,
 }
 
 /// A running maintenance tick (see [`Torrent::spawn_maintenance`]). Dropping
@@ -422,6 +614,7 @@ impl Torrent {
             num_pieces,
             max_frame,
             raw_info: Arc::clone(&meta.raw_info),
+            private: meta.private,
             state: Mutex::new(State {
                 picker,
                 choker: Choker::default(),
@@ -437,6 +630,14 @@ impl Torrent {
                 announces_ok: 0,
                 announces_failed: 0,
                 last_announce_error: None,
+                suppliers: HashMap::new(),
+                banned: HashSet::new(),
+                suspicion: HashMap::new(),
+                storage_error: None,
+                local_dest: None,
+                to_drop: Vec::new(),
+                offences: HashMap::new(),
+                max_peers: usize::MAX,
             }),
             done: Mutex::new(false),
             done_cv: Condvar::new(),
@@ -549,18 +750,26 @@ impl Torrent {
         // Weak, so a forgotten handle cannot keep the torrent (and its open
         // files) alive for the life of the process.
         let shared = Arc::downgrade(&self.shared);
-        std::thread::spawn(move || {
-            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(period);
-                if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
+        let spawned = std::thread::Builder::new()
+            .name("clove-maint".into())
+            .spawn(move || {
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(period);
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    let Some(shared) = shared.upgrade() else {
+                        return;
+                    };
+                    shared.maintain();
                 }
-                let Some(shared) = shared.upgrade() else {
-                    return;
-                };
-                shared.maintain();
-            }
-        });
+            });
+        // A thread the OS will not give us is a torrent without keep-alives
+        // or timeouts, which is degraded rather than fatal; say so and carry
+        // on, as every other spawn site does.
+        if let Err(e) = spawned {
+            eprintln!("clove: cannot start the maintenance thread: {e}");
+        }
         Maintenance { stop }
     }
 
@@ -572,6 +781,76 @@ impl Torrent {
             .keys()
             .copied()
             .collect()
+    }
+
+    /// The known destinations the dial sweep may try: [`known_peers`] less
+    /// any that are banned, and less ourselves. Banning forgets a
+    /// destination, so the two agree today; the sweep consults this one so
+    /// that a ban placed between a listing and a dial still holds.
+    ///
+    /// [`known_peers`]: Torrent::known_peers
+    #[must_use]
+    pub fn dial_candidates(&self) -> Vec<DestHash> {
+        let st = lock(&self.shared.state);
+        let now = Instant::now();
+        st.known_peers
+            .keys()
+            .copied()
+            .filter(|dest| {
+                !st.banned.contains(dest)
+                    && st.local_dest != Some(*dest)
+                    && st.held_for(*dest, now).is_none()
+            })
+            .collect()
+    }
+
+    /// How much longer the dial sweep will leave `dest` alone for
+    /// misbehaving, if it is being left alone. See [`MISBEHAVIOUR_BACKOFF`].
+    #[must_use]
+    pub fn dial_hold(&self, dest: DestHash) -> Option<Duration> {
+        lock(&self.shared.state).held_for(dest, Instant::now())
+    }
+
+    /// Cap how many peers this torrent seats at once — the swarm's
+    /// `max_peers`, made binding at registration rather than advisory at the
+    /// accept and dial paths. Peers already seated stay.
+    pub fn set_max_peers(&self, max_peers: usize) {
+        lock(&self.shared.state).max_peers = max_peers;
+    }
+
+    /// Tell the torrent which destination is its own, so the dial sweep skips
+    /// it and no tracker or PEX message can add it. The swarm runner and the
+    /// inbound demux both do this from their listener; a torrent with neither
+    /// is still guarded by the handshake, which refuses our own peer id.
+    pub fn set_local_dest(&self, dest: DestHash) {
+        let mut st = lock(&self.shared.state);
+        st.local_dest = Some(dest);
+        st.known_peers.remove(&dest);
+    }
+
+    /// Whether `dest` is refused for the rest of this run — it served a piece
+    /// that failed SHA-1, alone or in enough company (see
+    /// [`SUSPICION_LIMIT`]). Checked before a handshake is spent on it.
+    #[must_use]
+    pub fn is_banned(&self, dest: DestHash) -> bool {
+        lock(&self.shared.state).banned.contains(&dest)
+    }
+
+    /// The last storage failure this torrent hit, for status. A block that
+    /// could not be written goes back to the picker and is asked for again,
+    /// so a full disk shows up here rather than as a download that quietly
+    /// stops; a piece that could not be *read* to verify stays unverified.
+    #[must_use]
+    pub fn storage_error(&self) -> Option<String> {
+        lock(&self.shared.state).storage_error.clone()
+    }
+
+    /// How many destinations this run has banned, for status: a torrent that
+    /// keeps failing pieces and a torrent that has caught the peer doing it
+    /// look the same from `downloaded` alone.
+    #[must_use]
+    pub fn banned_count(&self) -> usize {
+        lock(&self.shared.state).banned.len()
     }
 
     /// Record the outcome of one announce, for `clove show` to report: the
@@ -737,22 +1016,43 @@ impl Torrent {
     /// Handshake I/O failure or an info-hash mismatch (wrong torrent).
     pub fn attach<S: I2pStream + 'static>(
         &self,
-        mut stream: S,
+        stream: S,
         remote: DestHash,
     ) -> std::io::Result<()> {
-        // Bound the exchange (see [`HANDSHAKE_TIMEOUT`]). Best-effort: a
-        // backend with no timeout of its own ignores it.
-        let _ = stream.set_timeouts(Some(HANDSHAKE_TIMEOUT));
-        stream.write_all(&self.our_handshake().encode())?;
-        let mut buf = [0u8; wire::HANDSHAKE_LEN];
-        stream.read_exact(&mut buf)?;
-        let theirs = Handshake::parse(&buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.attach_abortable(stream, remote, &|| false)
+    }
+
+    /// [`attach`](Torrent::attach), giving up the handshake early — within
+    /// [`HANDSHAKE_POLL`] — once `abort` returns true. What the dial sweep
+    /// uses, so a pause or shutdown is not held behind a peer that accepted
+    /// and then answers a byte at a time.
+    ///
+    /// # Errors
+    ///
+    /// As [`attach`](Torrent::attach), plus [`std::io::ErrorKind::Interrupted`]
+    /// when aborted.
+    pub fn attach_abortable<S: I2pStream + 'static>(
+        &self,
+        mut stream: S,
+        remote: DestHash,
+        abort: &dyn Fn() -> bool,
+    ) -> std::io::Result<()> {
+        if self.is_banned(remote) {
+            return Err(banned());
+        }
+        // One deadline for the whole exchange (see [`HANDSHAKE_TIMEOUT`]).
+        // Best-effort: a backend with no timeout of its own ignores it.
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        write_handshake_until(&mut stream, &self.our_handshake().encode(), deadline, abort)?;
+        let theirs = read_handshake_until(&mut stream, deadline, abort)?;
         if theirs.info_hash != self.shared.info_hash {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "peer handshaked a different torrent",
             ));
+        }
+        if theirs.peer_id == self.shared.peer_id {
+            return Err(ourselves());
         }
         // Back to blocking for the connection proper: a peer legitimately sits
         // quiet between messages, and that is the idle timeout's job.
@@ -782,10 +1082,21 @@ impl Torrent {
                 "peer handshaked a different torrent",
             ));
         }
+        if self.is_banned(remote) {
+            return Err(banned());
+        }
+        if theirs.peer_id == self.shared.peer_id {
+            return Err(ourselves());
+        }
         // The demux bounded the read of *their* handshake; bound our reply too,
         // so a peer that stops reading cannot hold this thread open.
-        let _ = stream.set_timeouts(Some(HANDSHAKE_TIMEOUT));
-        stream.write_all(&self.our_handshake().encode())?;
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        write_handshake_until(
+            &mut stream,
+            &self.our_handshake().encode(),
+            deadline,
+            &|| false,
+        )?;
         let _ = stream.set_timeouts(None);
         // Counted here, not after `finish_attach`: the claim — that a remote
         // router resolved our leaseSet and carried a handshake both ways — is
@@ -820,17 +1131,11 @@ impl Torrent {
         let (reader, writer) = stream.split()?;
         let (tx, rx) = sync_channel::<Message>(OUTGOING_QUEUE);
 
-        // Registration can refuse: [`MAX_CONNECTIONS_PER_DEST`] per
-        // destination. Refusing returns the slot and drops both halves.
-        let Some(id) = self.shared.register_peer(tx.clone(), closer, remote, slot) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "this destination already holds its share of connections",
-            ));
-        };
-
         // Announce our piece set, then our extension handshake if the peer
-        // speaks BEP 10.
+        // speaks BEP 10 — queued *before* the peer is registered, so they are
+        // the first messages on the wire. Once the peer is in the table any
+        // other thread may queue a `have` or a choke change for it, and a
+        // strict client hangs up on a bitfield that is not its first message.
         let bitfield = {
             let st = lock(&self.shared.state);
             Message::Bitfield(st.picker.have_field().as_bytes().to_vec())
@@ -842,6 +1147,28 @@ impl Torrent {
                 payload: self.shared.our_extension_handshake(),
             });
         }
+
+        // Registration can refuse: [`MAX_CONNECTIONS_PER_DEST`] per
+        // destination, the torrent's peer cap, or a ban placed since the
+        // handshake. Refusing returns the slot and drops both halves.
+        // BEP 6 is on only when both sides said so, and ours never does; kept
+        // as a negotiation rather than a constant so wiring it later is one
+        // change.
+        let fast = theirs.extensions.fast && self.our_handshake().extensions.fast;
+        let id = self
+            .shared
+            .register_peer(tx, closer, remote, slot, fast)
+            .map_err(|refusal| match refusal {
+                Refusal::Banned => banned(),
+                Refusal::DestFull => std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "this destination already holds its share of connections",
+                ),
+                Refusal::TorrentFull => std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "this torrent is at its peer limit",
+                ),
+            })?;
 
         // A thread the OS will not give us ends the connection, not the
         // torrent: drop the peer so its slot and entry go back.
@@ -874,7 +1201,7 @@ fn spawn_writer<W: std::io::Write + I2pClose + Send + 'static>(
     mut writer: W,
     rx: Receiver<Message>,
 ) -> std::io::Result<JoinHandle<()>> {
-    peer_thread().spawn(move || {
+    peer_thread("clove-peer-wr").spawn(move || {
         while let Ok(msg) = rx.recv() {
             if wire::write_message(&mut writer, &msg).is_err() {
                 break;
@@ -888,22 +1215,156 @@ fn spawn_writer<W: std::io::Write + I2pClose + Send + 'static>(
     })
 }
 
+/// Removes the reader's peer when the thread ends, however it ends.
+///
+/// The removal used to be the last statement of the loop, which a panic —
+/// an accounting assertion in a debug build, say — skipped: the entry, its
+/// budget slot and its writer all outlived the thread until the idle timeout
+/// noticed, five minutes later. Same shape as the demux's `PendingGuard`.
+struct ReaderGuard {
+    shared: Arc<Shared>,
+    id: u64,
+    /// Set when the peer broke the protocol, so the removal earns it a hold
+    /// off the dial sweep; a peer that merely hung up gets none.
+    for_cause: bool,
+}
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        if self.for_cause {
+            self.shared.remove_peer_for_cause(self.id);
+        } else {
+            self.shared.remove_peer(self.id);
+        }
+    }
+}
+
 fn spawn_reader<R: std::io::Read + Send + 'static>(
     shared: Arc<Shared>,
     id: u64,
     mut reader: R,
 ) -> std::io::Result<JoinHandle<()>> {
-    peer_thread().spawn(move || {
+    let guard = ReaderGuard {
+        shared: Arc::clone(&shared),
+        id,
+        for_cause: false,
+    };
+    peer_thread("clove-peer-rd").spawn(move || {
+        let mut guard = guard;
         // One frame buffer for the life of the connection.
         let mut body = Vec::new();
-        while wire::read_frame_into(&mut reader, shared.max_frame, &mut body).is_ok() {
-            match Message::parse(&body) {
-                Ok(msg) => shared.on_message(id, &msg),
-                Err(_) => break, // protocol violation: drop the peer
+        loop {
+            match wire::read_frame_into(&mut reader, shared.max_frame, &mut body) {
+                Ok(()) => {
+                    let Ok(msg) = Message::parse(&body) else {
+                        // Protocol violation: drop the peer.
+                        guard.for_cause = true;
+                        break;
+                    };
+                    shared.on_message(id, &msg);
+                }
+                Err(e) => {
+                    // An oversized frame is the peer's doing; end of stream
+                    // and everything else is the connection's.
+                    guard.for_cause = e.kind() == std::io::ErrorKind::InvalidData;
+                    break;
+                }
             }
         }
-        shared.remove_peer(id);
     })
+}
+
+/// The next slice of a handshake exchange: how long the next read or write may
+/// block, or why it may not happen at all.
+///
+/// `abort` is the caller's stop flag. Consulted here, between reads, so a
+/// sweep told to stop is out of a half-finished handshake within
+/// [`HANDSHAKE_POLL`] rather than at the peer's convenience.
+fn handshake_slice(deadline: Instant, abort: &dyn Fn() -> bool) -> std::io::Result<Duration> {
+    if abort() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "handshake abandoned: the swarm is stopping",
+        ));
+    }
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "peer did not complete the handshake in time",
+        ));
+    }
+    Ok(left.min(HANDSHAKE_POLL))
+}
+
+/// Whether a read or write ended because its timeout ran out rather than
+/// because the connection did — the one outcome worth trying again.
+fn timed_out(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
+/// Read a peer's 68-byte handshake by `deadline`, or until `abort` says to
+/// stop. The stream's timeout is left set; the caller clears it.
+///
+/// # Errors
+///
+/// The deadline passing, the caller aborting, end of stream, a stream error, or
+/// bytes that are not a handshake.
+pub(crate) fn read_handshake_until<S: I2pStream>(
+    stream: &mut S,
+    deadline: Instant,
+    abort: &dyn Fn() -> bool,
+) -> std::io::Result<Handshake> {
+    let mut buf = [0u8; wire::HANDSHAKE_LEN];
+    let mut filled = 0;
+    while filled < buf.len() {
+        let slice = handshake_slice(deadline, abort)?;
+        let _ = stream.set_timeouts(Some(slice));
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer hung up during the handshake",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(e) if timed_out(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Handshake::parse(&buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Write our handshake by `deadline`, or until `abort` says to stop — the
+/// same shape as the read, because a peer that accepts and never reads is the
+/// same peer with the roles swapped.
+///
+/// # Errors
+///
+/// The deadline passing, the caller aborting, or a stream error.
+fn write_handshake_until<S: I2pStream>(
+    stream: &mut S,
+    bytes: &[u8],
+    deadline: Instant,
+    abort: &dyn Fn() -> bool,
+) -> std::io::Result<()> {
+    let mut written = 0;
+    while written < bytes.len() {
+        let slice = handshake_slice(deadline, abort)?;
+        let _ = stream.set_timeouts(Some(slice));
+        match stream.write(&bytes[written..]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => written += n,
+            Err(e) if timed_out(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Stack size for a peer's reader and writer threads.
@@ -914,29 +1375,69 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
 /// [`MAX_DEPTH`](crate::bencode::MAX_DEPTH).
 const PEER_STACK_BYTES: usize = 256 * 1024;
 
-/// A builder for the threads that serve one peer connection.
-fn peer_thread() -> std::thread::Builder {
-    std::thread::Builder::new().stack_size(PEER_STACK_BYTES)
+/// A builder for the threads that serve one peer connection. Named, so a
+/// `ps -T` or a core says which of a few hundred threads is which.
+fn peer_thread(name: &str) -> std::thread::Builder {
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(PEER_STACK_BYTES)
+}
+
+/// The error a banned destination is refused with, at every door.
+fn banned() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "this destination is banned for the rest of the run",
+    )
+}
+
+/// The error a connection to ourselves is refused with. A tracker echoing
+/// the announcer is ordinary; connecting to it is not, and the peer id in the
+/// handshake is the one thing about us a router cannot have re-addressed.
+fn ourselves() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "the peer is this client: same peer id",
+    )
+}
+
+/// Why [`Shared::register_peer`] would not seat a connection.
+enum Refusal {
+    /// The destination already holds [`MAX_CONNECTIONS_PER_DEST`].
+    DestFull,
+    /// The destination was banned, possibly while its handshake was in flight.
+    Banned,
+    /// The torrent already seats its `max_peers`.
+    TorrentFull,
 }
 
 impl Shared {
-    /// Add the peer to the table and return its id, or `None` when `dest`
-    /// already holds [`MAX_CONNECTIONS_PER_DEST`] connections here.
+    /// Add the peer to the table and return its id, or the [`Refusal`]: `dest`
+    /// already holds [`MAX_CONNECTIONS_PER_DEST`] connections here, or is
+    /// banned.
     ///
-    /// The check lives *inside* the lock that pushes the entry, the only place
-    /// it can be right: two connections from one destination can be in
-    /// `finish_attach` at once. Taking `slot` by value is what returns it on
-    /// refusal, so the budget cannot leak a slot to an unregistered connection.
+    /// The checks live *inside* the lock that pushes the entry, the only place
+    /// they can be right: two connections from one destination can be in
+    /// `finish_attach` at once, and a ban can land between the handshake and
+    /// here. Taking `slot` by value is what returns it on refusal, so the
+    /// budget cannot leak a slot to an unregistered connection.
     fn register_peer(
         &self,
         out: SyncSender<Message>,
         closer: Arc<dyn I2pClose + Send + Sync>,
         dest: DestHash,
         slot: PeerSlot,
-    ) -> Option<u64> {
+        fast: bool,
+    ) -> Result<u64, Refusal> {
         let mut st = lock(&self.state);
+        if st.banned.contains(&dest) {
+            return Err(Refusal::Banned);
+        }
         if st.peers.iter().filter(|p| p.dest == dest).count() >= MAX_CONNECTIONS_PER_DEST {
-            return None;
+            return Err(Refusal::DestFull);
+        }
+        if st.peers.len() >= st.max_peers {
+            return Err(Refusal::TorrentFull);
         }
         let id = st.next_id;
         st.next_id += 1;
@@ -948,6 +1449,8 @@ impl Shared {
             out,
             closer,
             has: Bitfield::empty(self.num_pieces),
+            opened: false,
+            fast,
             peer_choking: true,
             we_choke: true,
             they_interested: false,
@@ -957,28 +1460,47 @@ impl Shared {
             last_sent: Instant::now(),
             last_seen: Instant::now(),
             uploaded: 0,
+            downloaded: 0,
+            uploaded_at_round: 0,
+            downloaded_at_round: 0,
             pex_id: None,
             metadata_id: None,
+            metadata_requests: 0,
         });
-        Some(id)
+        Ok(id)
     }
 
-    /// Our BEP 10 handshake payload: advertise `i2p_pex` and `ut_metadata`, and
-    /// the metadata size if we hold the info dictionary.
+    /// Our BEP 10 handshake payload: advertise `i2p_pex` (unless the torrent
+    /// is private) and `ut_metadata`, and the metadata size if we hold the
+    /// info dictionary.
     fn our_extension_handshake(&self) -> Vec<u8> {
         let mut ids = std::collections::BTreeMap::new();
-        ids.insert(I2P_PEX.to_owned(), OUR_PEX_ID);
+        if !self.private {
+            ids.insert(I2P_PEX.to_owned(), OUR_PEX_ID);
+        }
         ids.insert(UT_METADATA.to_owned(), OUR_METADATA_ID);
         let metadata_size = (!self.raw_info.is_empty()).then_some(self.raw_info.len());
         extension::Handshake {
             ids,
             metadata_size,
-            client: Some("clove/0.1".to_owned()),
+            client: Some(crate::tracker::USER_AGENT.to_owned()),
         }
         .encode()
     }
 
+    /// Remove a peer that did nothing wrong: it hung up, went quiet, or the
+    /// torrent is being taken down.
     fn remove_peer(&self, id: u64) {
+        self.drop_peer(id, false);
+    }
+
+    /// Remove a peer for misbehaving, which also holds its destination off
+    /// the dial sweep (see [`MISBEHAVIOUR_BACKOFF`]).
+    fn remove_peer_for_cause(&self, id: u64) {
+        self.drop_peer(id, true);
+    }
+
+    fn drop_peer(&self, id: u64, for_cause: bool) {
         let mut closer = None;
         {
             let mut st = lock(&self.state);
@@ -987,6 +1509,9 @@ impl Shared {
                 st.picker.remove_bitfield(&peer.has);
                 for (piece, block) in peer.in_flight.into_keys() {
                     st.picker.block_failed(piece, block);
+                }
+                if for_cause {
+                    st.penalise(peer.dest, Instant::now());
                 }
                 closer = Some(peer.closer);
             }
@@ -1005,6 +1530,7 @@ impl Shared {
     /// messages, then send them after releasing it.
     fn on_message(&self, id: u64, msg: &Message) {
         let mut out: Vec<Outgoing> = Vec::new();
+        let evict: Vec<(u64, bool)>;
         {
             let mut st = lock(&self.state);
             let now = Instant::now();
@@ -1021,9 +1547,14 @@ impl Shared {
                 run_choker(&mut st, &mut out);
             }
             record_sent(&mut st, &out, now);
+            evict = std::mem::take(&mut st.to_drop);
             // Any message can move piece accounting; check while the lock is
             // still held and the state is settled.
             debug_check_state(&st);
+        }
+        // Outside the lock, as `maintain` does: `remove_peer` takes it.
+        for (id, for_cause) in evict {
+            self.drop_peer(id, for_cause);
         }
         self.send_all(out);
         self.check_done();
@@ -1034,29 +1565,35 @@ impl Shared {
     /// if one is due.
     fn maintain(&self) {
         let mut out: Vec<Outgoing> = Vec::new();
-        let mut idle: Vec<u64> = Vec::new();
+        let mut drops: Vec<(u64, bool)> = Vec::new();
         {
             let mut st = lock(&self.state);
             let now = Instant::now();
             let (keepalive, timeout) = (st.keepalive_interval, st.idle_timeout);
+            for peer in &mut st.peers {
+                // A fresh metadata allowance per tick.
+                peer.metadata_requests = 0;
+            }
             for peer in &st.peers {
                 if now.duration_since(peer.last_seen) >= timeout {
-                    idle.push(peer.id);
+                    // Quiet is not misbehaviour: no hold for it.
+                    drops.push((peer.id, false));
                 } else if now.duration_since(peer.last_sent) >= keepalive {
                     out.push((peer.id, peer.out.clone(), Message::KeepAlive));
                 }
             }
-            maintain_requests(&mut st, now, &mut idle, &mut out);
+            maintain_requests(&mut st, now, &mut drops, &mut out);
             if st.last_choke_round.elapsed() >= st.choke_interval {
                 st.last_choke_round = now;
                 run_choker(&mut st, &mut out);
             }
             record_sent(&mut st, &out, now);
+            drops.append(&mut st.to_drop);
             debug_check_state(&st);
         }
         // Outside the lock: remove_peer takes it, and so does the send path.
-        for id in idle {
-            self.remove_peer(id);
+        for (id, for_cause) in drops {
+            self.drop_peer(id, for_cause);
         }
         self.send_all(out);
     }
@@ -1070,7 +1607,9 @@ impl Shared {
     fn send_all(&self, out: Vec<Outgoing>) {
         for (id, tx, msg) in out {
             if tx.try_send(msg).is_err() {
-                self.remove_peer(id);
+                // A peer that stopped reading; not one worth dialling back
+                // straight away.
+                self.remove_peer_for_cause(id);
             }
         }
     }
@@ -1080,14 +1619,27 @@ impl Shared {
         let Some(idx) = st.peers.iter().position(|p| p.id == id) else {
             return;
         };
+        let first = !st.peers[idx].opened;
+        if !matches!(msg, Message::KeepAlive | Message::Extended { id: 0, .. }) {
+            st.peers[idx].opened = true;
+        }
+        // A protocol violation ends the connection: the peer is queued for
+        // removal for cause by the caller, and nothing below acts on the
+        // message.
+        let violation = |st: &mut State| st.to_drop.push((id, true));
         match msg {
-            // No-ops: keep-alive, a cancel we serve synchronously so never
-            // have queued, and fast-extension messages (BEP 6 off).
-            Message::KeepAlive
-            | Message::Cancel(_)
-            | Message::RejectRequest(_)
-            | Message::SuggestPiece(_)
-            | Message::AllowedFast(_) => {}
+            // No-ops: keep-alive, and a cancel we serve synchronously so never
+            // have queued.
+            Message::KeepAlive | Message::Cancel(_) => {}
+            // BEP 6 messages from a peer we never negotiated it with. We do
+            // not advertise fast, so a peer sending these is not following
+            // the handshake; honouring them anyway would let it cost us
+            // O(pieces) per five-byte message.
+            Message::RejectRequest(_) | Message::SuggestPiece(_) | Message::AllowedFast(_) => {
+                if !st.peers[idx].fast {
+                    violation(st);
+                }
+            }
             Message::Extended {
                 id: ext_id,
                 payload,
@@ -1109,13 +1661,28 @@ impl Shared {
                 st.peers[idx].peer_choking = false;
                 fill_requests(st, idx, out);
             }
+            // Interest transitions do not run a full round: a round advances
+            // the optimistic rotation, and a peer flipping its interest could
+            // drive it — choking an honest peer, which discards its requests,
+            // every third flip. A round runs now only if there is a free slot
+            // to give the newly interested peer; otherwise it waits for the
+            // periodic one, as BEP 3 intends.
             Message::Interested => {
                 st.peers[idx].they_interested = true;
-                run_choker(st, out);
+                let unchoked = st.peers.iter().filter(|p| !p.we_choke).count();
+                if unchoked < st.choker.max_unchoked {
+                    run_choker(st, out);
+                }
             }
+            // An uninterested peer is always choked, and that needs no round:
+            // it is choked directly, which frees its slot for the next one.
             Message::NotInterested => {
-                st.peers[idx].they_interested = false;
-                run_choker(st, out);
+                let peer = &mut st.peers[idx];
+                peer.they_interested = false;
+                if !peer.we_choke {
+                    peer.we_choke = true;
+                    out.push((peer.id, peer.out.clone(), Message::Choke));
+                }
             }
             Message::Have(piece) => {
                 // Only when the bit actually changes: leaving withdraws what
@@ -1127,19 +1694,29 @@ impl Shared {
                     update_interest(st, idx, out);
                 }
             }
-            Message::Bitfield(bytes) => {
-                if let Ok(field) = Bitfield::from_bytes(bytes, self.num_pieces) {
+            // Only as the opening message, and only if it fits the torrent.
+            // A repeat is not merely redundant: each one costs two passes
+            // over the piece table under the lock, and the wrong length is a
+            // peer talking about a different torrent.
+            Message::Bitfield(bytes) => match Bitfield::from_bytes(bytes, self.num_pieces) {
+                Ok(field) if first => {
                     Self::replace_piece_set(st, idx, field);
                     update_interest(st, idx, out);
                 }
-            }
-            Message::HaveAll => {
-                Self::replace_piece_set(st, idx, Bitfield::full(self.num_pieces));
-                update_interest(st, idx, out);
-            }
-            Message::HaveNone => {
-                Self::replace_piece_set(st, idx, Bitfield::empty(self.num_pieces));
-                update_interest(st, idx, out);
+                _ => violation(st),
+            },
+            Message::HaveAll | Message::HaveNone => {
+                if first && st.peers[idx].fast {
+                    let field = if matches!(msg, Message::HaveAll) {
+                        Bitfield::full(self.num_pieces)
+                    } else {
+                        Bitfield::empty(self.num_pieces)
+                    };
+                    Self::replace_piece_set(st, idx, field);
+                    update_interest(st, idx, out);
+                } else {
+                    violation(st);
+                }
             }
             Message::Request(req) => self.serve_request(st, idx, *req, out),
             Message::Piece {
@@ -1182,9 +1759,17 @@ impl Shared {
                 };
                 st.peers[idx].pex_id = hs.id_for(I2P_PEX);
                 st.peers[idx].metadata_id = hs.id_for(UT_METADATA);
-                // Now their pex id is known, send them the peers we know.
-                Self::send_pex(st, idx, out);
+                // Now their pex id is known, send them the peers we know —
+                // unless the torrent is private, in which case nobody is told
+                // anything whatever the peer advertised.
+                if !self.private {
+                    Self::send_pex(st, idx, out);
+                }
             }
+            // Never advertised on a private torrent, so a message on it is a
+            // peer guessing; ignored rather than a violation, since clove's
+            // own id is public knowledge.
+            OUR_PEX_ID if self.private => {}
             OUR_PEX_ID => {
                 if let Ok(pex) = PexMessage::parse(payload) {
                     for dest in pex.added {
@@ -1242,17 +1827,26 @@ impl Shared {
         let Some(metadata_id) = st.peers[idx].metadata_id else {
             return;
         };
+        let peer = &mut st.peers[idx];
+        let allowed = peer.metadata_requests < MAX_METADATA_REQUESTS_PER_TICK;
+        peer.metadata_requests = peer.metadata_requests.saturating_add(1);
         let total = self.raw_info.len();
-        let start = piece as usize * METADATA_PIECE_LEN;
-        let reply = if self.raw_info.is_empty() || start >= total {
-            MetadataMessage::Reject { piece }
-        } else {
-            let end = (start + METADATA_PIECE_LEN).min(total);
-            MetadataMessage::Data {
-                piece,
-                total_size: u32::try_from(total).unwrap_or(u32::MAX),
-                data: self.raw_info[start..end].to_vec(),
+        // `checked_mul`: the index is the peer's, and on a 32-bit target the
+        // product wraps into a range that reads as valid.
+        let start = usize::try_from(piece)
+            .ok()
+            .and_then(|p| p.checked_mul(METADATA_PIECE_LEN))
+            .filter(|&start| allowed && start < total);
+        let reply = match start {
+            Some(start) => {
+                let end = start.saturating_add(METADATA_PIECE_LEN).min(total);
+                MetadataMessage::Data {
+                    piece,
+                    total_size: u32::try_from(total).unwrap_or(u32::MAX),
+                    data: self.raw_info[start..end].to_vec(),
+                }
             }
+            None => MetadataMessage::Reject { piece },
         };
         out.push((
             st.peers[idx].id,
@@ -1283,18 +1877,40 @@ impl Shared {
             return;
         }
         let was_requested = st.peers[idx].in_flight.remove(&(index, block_no)).is_some();
-        // Any block at all is proof the peer is still working for us, which is
-        // what strikes measure. Cleared even for a late or duplicate block.
-        st.peers[idx].strikes = 0;
+        // A block we asked for is proof the peer is working for us, which is
+        // what strikes measure. One we did not ask for is not: a peer could
+        // otherwise hold a slot and a full pipeline indefinitely on one
+        // unsolicited block per maintenance tick, answering nothing.
+        if was_requested {
+            st.peers[idx].strikes = 0;
+        }
         // A block for a piece we already hold is an endgame duplicate: another
         // peer answered first and the piece verified. Writing it would put this
         // peer's bytes over verified ones with nothing to re-verify afterwards.
         if !was_requested || st.picker.has(index) {
             // Unsolicited, already satisfied, or late; ignore the payload but
             // still keep the pipeline full below.
-        } else if self.storage.write_block(index, begin, block).is_ok() {
+        } else if st.picker.is_received(index, block_no) {
+            // A second copy of a block already on disk. Writing it would put
+            // this peer's bytes over another's with the piece unverified, so
+            // one bad copy anywhere would fail the whole piece and undo the
+            // attribution above. The request is settled either way.
+            st.picker.block_failed(index, block_no);
+        } else if let Err(e) = self.storage.write_block(index, begin, block) {
+            // The picker still counts this block as owed. Give it back, or
+            // it is never re-offered and the download stalls with nothing
+            // anywhere saying why; the error is the something.
+            st.picker.block_failed(index, block_no);
+            st.storage_error = Some(e.to_string());
+        } else {
             self.downloaded
                 .fetch_add(block.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            st.peers[idx].downloaded += block.len() as u64;
+            // Remembered by destination, not connection: the verdict may come
+            // after this connection is gone, and a ban is on the identity.
+            let dest = st.peers[idx].dest;
+            st.suppliers.insert((index, block_no), dest);
+            cancel_elsewhere(st, idx, index, begin, block_no, out);
             if !st.picker.block_received(index, block_no) {
                 return;
             }
@@ -1302,11 +1918,24 @@ impl Shared {
             match self.storage.verify_piece(index) {
                 Ok(true) => {
                     st.picker.set_have(index);
+                    st.credit_suppliers(index);
                     for peer in &st.peers {
                         out.push((peer.id, peer.out.clone(), Message::Have(index)));
                     }
                 }
-                _ => st.picker.reset_piece(index),
+                Ok(false) => {
+                    st.picker.reset_piece(index);
+                    // Whoever is banned here is queued for removal by the
+                    // caller, and its blocks go back to the picker then; the
+                    // refill below may still ask it for more, which is one
+                    // wasted request rather than a leaked one.
+                    st.blame_suppliers(index);
+                }
+                // Not a hash failure: the bytes were never read. Blaming the
+                // suppliers would ban honest peers for a bad sector, and
+                // resetting would re-download the piece for ever. It stays
+                // received and unverified, and the error is reported.
+                Err(e) => st.storage_error = Some(e.to_string()),
             }
         }
         fill_requests(st, idx, out);
@@ -1350,6 +1979,12 @@ impl Shared {
     }
 
     fn check_done(&self) {
+        // Asked after every message from every peer. Once finished there is
+        // nothing left to learn, so a seeder's traffic never takes the state
+        // lock for this again. The two locks are never held together.
+        if *lock(&self.done) {
+            return;
+        }
         if lock(&self.state).picker.is_complete() {
             let mut done = lock(&self.done);
             if !*done {
@@ -1357,6 +1992,44 @@ impl Shared {
                 self.done_cv.notify_all();
             }
         }
+    }
+}
+
+/// A block has arrived from `idx`: withdraw it from every other peer that
+/// still owes it. The endgame hands one block to several peers on purpose;
+/// without a `cancel` each of them sends it anyway — up to a pipeline's worth
+/// of duplicate transfer per peer over tunnels that are not cheap — and the
+/// copies land on top of each other. The count goes back to the picker with
+/// the request, so nothing is left owed by a peer we told not to bother.
+fn cancel_elsewhere(
+    st: &mut State,
+    idx: usize,
+    index: u32,
+    begin: u32,
+    block_no: u32,
+    out: &mut Vec<Outgoing>,
+) {
+    let length = st.picker.block_len(index, block_no);
+    for other in 0..st.peers.len() {
+        if other == idx
+            || st.peers[other]
+                .in_flight
+                .remove(&(index, block_no))
+                .is_none()
+        {
+            continue;
+        }
+        st.picker.block_failed(index, block_no);
+        let peer = &st.peers[other];
+        out.push((
+            peer.id,
+            peer.out.clone(),
+            Message::Cancel(BlockRequest {
+                index,
+                begin,
+                length,
+            }),
+        ));
     }
 }
 
@@ -1410,7 +2083,12 @@ fn update_interest(st: &mut State, idx: usize, out: &mut Vec<Outgoing>) {
 /// offer stays connected, interested, unchoked and permanently idle, with no
 /// event left that would wake it — a second way to stall, and one a single slow
 /// peer is enough to cause.
-fn maintain_requests(st: &mut State, now: Instant, idle: &mut Vec<u64>, out: &mut Vec<Outgoing>) {
+fn maintain_requests(
+    st: &mut State,
+    now: Instant,
+    drops: &mut Vec<(u64, bool)>,
+    out: &mut Vec<Outgoing>,
+) {
     let deadline = st.request_timeout;
     for idx in 0..st.peers.len() {
         let expired: Vec<(u32, u32)> = st.peers[idx]
@@ -1429,7 +2107,9 @@ fn maintain_requests(st: &mut State, now: Instant, idle: &mut Vec<u64>, out: &mu
             if peer.strikes >= REQUEST_STRIKES {
                 // Removed by the caller outside the lock, which returns
                 // whatever it still holds to the picker. No point topping up.
-                idle.push(peer.id);
+                // For cause: taking requests and answering none is the
+                // politest way to hold a slot.
+                drops.push((peer.id, true));
                 continue;
             }
         }
@@ -1470,17 +2150,31 @@ fn fill_requests(st: &mut State, idx: usize, out: &mut Vec<Outgoing>) {
 }
 
 /// Run a choke round and enqueue the resulting choke/unchoke messages.
+///
+/// The rate a peer is ranked by is what the choker's doc promises: bytes it
+/// sent *us* since the last round while we are leeching (tit-for-tat), bytes
+/// we sent *it* while seeding. Per round rather than lifetime, so a peer that
+/// was generous once does not hold a slot for ever on the strength of it.
 fn run_choker(st: &mut State, out: &mut Vec<Outgoing>) {
+    let seeding = st.picker.is_complete();
     let snapshots: Vec<PeerSnapshot> = st
         .peers
         .iter()
         .map(|p| PeerSnapshot {
             id: p.id,
             interested: p.they_interested,
-            rate: p.uploaded,
+            rate: if seeding {
+                p.uploaded.saturating_sub(p.uploaded_at_round)
+            } else {
+                p.downloaded.saturating_sub(p.downloaded_at_round)
+            },
             unchoked: !p.we_choke,
         })
         .collect();
+    for p in &mut st.peers {
+        p.uploaded_at_round = p.uploaded;
+        p.downloaded_at_round = p.downloaded;
+    }
     let decision = st.choker.plan(&snapshots);
     for id in decision.unchoke {
         if let Some(peer) = st.peers.iter_mut().find(|p| p.id == id) {
@@ -1606,7 +2300,7 @@ pub fn fetch_metadata<S: I2pStream>(
     let our_ext = extension::Handshake {
         ids,
         metadata_size: None,
-        client: Some("clove/0.1".to_owned()),
+        client: Some(crate::tracker::USER_AGENT.to_owned()),
     };
     wire::write_message(
         &mut stream,
@@ -1672,7 +2366,7 @@ pub fn fetch_metadata<S: I2pStream>(
 mod tests {
     use super::*;
     use crate::metainfo::{FileEntry, InfoHash};
-    use i2pnet::mock::MockNet;
+    use i2pnet::mock::{MockNet, MockStream};
     use i2pnet::{I2pDialer, I2pListener};
     use sha1::{Digest, Sha1};
     use std::io::{Read as _, Write as _};
@@ -1737,6 +2431,27 @@ mod tests {
         let mut root = BTreeMap::new();
         root.insert(b"info".to_vec(), Value::Dict(info));
         MetaInfo::parse(&encode(&Value::Dict(root))).unwrap()
+    }
+
+    /// A closer that closes nothing, for peers registered straight into the
+    /// table with no connection behind them.
+    struct Quiet;
+
+    impl I2pClose for Quiet {
+        fn close(&self) {}
+    }
+
+    /// Seat a peer in `torrent`'s table without a connection, returning its
+    /// id and the receiving end of its queue.
+    fn seat_peer(torrent: &Torrent, dest: DestHash) -> (u64, Receiver<Message>) {
+        let (tx, rx) = sync_channel::<Message>(OUTGOING_QUEUE);
+        let slot = torrent.shared.budget.claim().unwrap();
+        let id = torrent
+            .shared
+            .register_peer(tx, Arc::new(Quiet), dest, slot, false)
+            .ok()
+            .unwrap();
+        (id, rx)
     }
 
     /// One piece per file, so "which file was skipped" is readable off the wire.
@@ -1889,14 +2604,256 @@ mod tests {
         assert!(torrent.is_complete());
     }
 
+    /// The choker ranks by what a peer is worth to us in the role we are in:
+    /// bytes received from it while leeching, bytes sent to it while seeding —
+    /// and by the last round's traffic, not the lifetime total. The snapshot
+    /// used to hand it lifetime `uploaded` in both roles, so a leecher rewarded
+    /// the peers it had *given* the most to, for ever.
+    #[test]
+    fn choke_rounds_rank_by_role_and_by_recent_traffic() {
+        let content: Vec<u8> = (0..(3 * BLOCK_LEN))
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let meta = three_file_meta(&content);
+
+        // Leeching: one slot, two interested peers. The one we uploaded to a
+        // lot gave us nothing; the other gave us a block.
+        let dir = TempDir::new("rank-leech");
+        let leecher = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(3),
+            Mode::RarestFirst,
+            *b"-CV0001-rankrankrank",
+        );
+        let (taker, _taker_rx) = seat_peer(&leecher, DestHash([1; 32]));
+        let (giver, _giver_rx) = seat_peer(&leecher, DestHash([2; 32]));
+        let mut out = Vec::new();
+        {
+            let mut st = lock(&leecher.shared.state);
+            st.choker = Choker::new(1);
+            for p in &mut st.peers {
+                p.they_interested = true;
+                if p.id == taker {
+                    p.uploaded = 1 << 20;
+                } else {
+                    p.downloaded = u64::from(BLOCK_LEN);
+                }
+            }
+            run_choker(&mut st, &mut out);
+            assert!(
+                st.peers.iter().any(|p| p.id == giver && !p.we_choke),
+                "leeching, the peer that sent us bytes should hold the slot"
+            );
+            assert!(
+                st.peers.iter().any(|p| p.id == taker && p.we_choke),
+                "leeching, the peer we merely uploaded to should not"
+            );
+
+            // The window resets: with nothing new from anyone the two tie,
+            // and the tie breaks by id, which is the taker. A lifetime count
+            // would have kept the giver in the slot on last round's block.
+            out.clear();
+            run_choker(&mut st, &mut out);
+            assert!(
+                st.peers.iter().any(|p| p.id == taker && !p.we_choke),
+                "a round must rank by traffic since the last one, not lifetime"
+            );
+        }
+
+        // Seeding: the same two peers, and now what we send them is the
+        // signal.
+        let seed_dir = TempDir::new("rank-seed");
+        let seeder = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &seed_dir.0, false).unwrap()),
+            &Bitfield::full(3),
+            Mode::RarestFirst,
+            *b"-CV0001-rankrankrank",
+        );
+        let (served, _served_rx) = seat_peer(&seeder, DestHash([1; 32]));
+        let (_other, _other_rx) = seat_peer(&seeder, DestHash([2; 32]));
+        let mut st = lock(&seeder.shared.state);
+        st.choker = Choker::new(1);
+        for p in &mut st.peers {
+            p.they_interested = true;
+            if p.id == served {
+                p.uploaded = u64::from(BLOCK_LEN);
+            } else {
+                p.downloaded = 1 << 20;
+            }
+        }
+        run_choker(&mut st, &mut out);
+        assert!(
+            st.peers.iter().any(|p| p.id == served && !p.we_choke),
+            "seeding, the peer we are serving fastest should hold the slot"
+        );
+    }
+
+    /// A reader thread that dies by panic — an accounting assertion tripping
+    /// in a debug build — must still take its peer with it: the entry, the
+    /// budget slot it holds, and the writer waiting on its queue. The removal
+    /// used to be the loop's last statement, which a panic skipped.
+    #[test]
+    fn a_panicking_reader_still_frees_its_peer_and_budget_slot() {
+        struct Explodes;
+        impl std::io::Read for Explodes {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("reader thread blew up");
+            }
+        }
+
+        let content: Vec<u8> = (0..(3 * BLOCK_LEN))
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let meta = three_file_meta(&content);
+        let dir = TempDir::new("reader-panic");
+        let budget = PeerBudget::new(1);
+        let torrent = Torrent::with_budget(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(3),
+            Mode::RarestFirst,
+            *b"-CV0001-panicpanicpa",
+            Arc::clone(&budget),
+        );
+        let (id, _rx) = seat_peer(&torrent, DestHash([9; 32]));
+        assert_eq!(budget.in_use(), 1);
+
+        let handle = spawn_reader(Arc::clone(&torrent.shared), id, Explodes).unwrap();
+        assert!(handle.join().is_err(), "the reader was meant to panic");
+        assert!(
+            torrent.connected_peers().is_empty(),
+            "a panicking reader left its peer in the table"
+        );
+        assert_eq!(
+            budget.in_use(),
+            0,
+            "a panicking reader kept its budget slot"
+        );
+    }
+
+    /// `max_peers` is enforced inside the registration lock, where several
+    /// connections in flight at once cannot all be told there is room.
+    #[test]
+    fn max_peers_binds_at_registration_under_a_concurrent_burst() {
+        let net = MockNet::new();
+        let content: Vec<u8> = (0..(3 * BLOCK_LEN))
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let meta = three_file_meta(&content);
+        let dir = TempDir::new("max-peers");
+        let torrent = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::full(3),
+            Mode::RarestFirst,
+            *b"-CV0001-maxpeersmaxp",
+        );
+        torrent.set_max_peers(2);
+        let ep = net.endpoint();
+        let dest = ep.dest();
+        let accepting = Arc::clone(&torrent);
+        std::thread::spawn(move || {
+            while let Ok((stream, from)) = ep.accept() {
+                let torrent = Arc::clone(&accepting);
+                std::thread::spawn(move || {
+                    let _ = torrent.attach(stream, from);
+                });
+            }
+        });
+
+        // Six distinct destinations, all attaching at once.
+        let outcomes: Vec<bool> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..6u8)
+                .map(|i| {
+                    let net = net.clone();
+                    scope.spawn(move || {
+                        let ep = net.endpoint();
+                        let mut stream = ep.dial(dest, Duration::from_secs(5)).unwrap();
+                        let ours = Handshake {
+                            info_hash: meta.info_hash.0,
+                            peer_id: [i; 20],
+                            extensions: Extensions::default(),
+                        };
+                        stream.write_all(&ours.encode()).unwrap();
+                        let mut buf = [0u8; wire::HANDSHAKE_LEN];
+                        let attached = stream.read_exact(&mut buf).is_ok();
+                        // Hold the connection so a seated peer stays seated.
+                        std::thread::sleep(Duration::from_millis(400));
+                        attached
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        // The handshake reply goes out before registration, so counting
+        // replies over-approximates; the table is what must hold.
+        assert!(outcomes.iter().any(|&a| a), "nobody attached at all");
+        let _ = outcomes;
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            torrent.connected_peers().len() <= 2,
+            "{} peers seated past a limit of 2",
+            torrent.connected_peers().len()
+        );
+    }
+
+    /// A torrent that reaches its own destination — trackers echo the
+    /// announcer, and nothing used to filter it — must refuse the handshake
+    /// on both ends rather than seat two idle connections to itself.
+    #[test]
+    fn a_torrent_refuses_to_attach_to_itself() {
+        let net = MockNet::new();
+        let content: Vec<u8> = (0..(3 * BLOCK_LEN))
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let meta = three_file_meta(&content);
+        let dir = TempDir::new("self");
+        let torrent = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(3),
+            Mode::RarestFirst,
+            *b"-CV0001-selfselfself",
+        );
+        let ep = net.endpoint();
+        let dest = ep.dest();
+        let accepting = Arc::clone(&torrent);
+        let accept = std::thread::spawn(move || {
+            let (stream, from) = ep.accept().unwrap();
+            accepting.attach(stream, from)
+        });
+        let stream = net
+            .endpoint()
+            .dialer()
+            .dial(dest, Duration::from_secs(5))
+            .unwrap();
+        let dialed = torrent.attach(stream, dest);
+        let accepted = accept.join().unwrap();
+        assert!(dialed.is_err(), "the dialing side attached to itself");
+        assert!(accepted.is_err(), "the accepting side attached to itself");
+        assert!(torrent.connected_peers().is_empty());
+
+        // And once told which destination is ours, no source can add it.
+        torrent.add_peers(&[dest]);
+        torrent.set_local_dest(dest);
+        torrent.add_peers(&[dest]);
+        assert!(
+            !torrent.dial_candidates().contains(&dest),
+            "our own destination was offered to the dial sweep"
+        );
+    }
+
     /// Two instances negotiate BEP 10 and one learns a third peer via `i2p_pex`.
     #[test]
     fn peers_exchange_via_i2p_pex() {
         let net = MockNet::new();
         let content = vec![7u8; 100];
         let meta = real_meta(&content);
-        let peer_id = *b"-CV0001-pexpexpexpex";
 
+        // Two clients, so two peer ids: one id on both ends is a connection
+        // to ourselves, which is refused.
         let dir_a = TempDir::new("pex-a");
         let dir_b = TempDir::new("pex-b");
         let a = Torrent::new(
@@ -1904,14 +2861,14 @@ mod tests {
             Arc::new(Storage::create(&meta, &dir_a.0, false).unwrap()),
             &Bitfield::empty(1),
             Mode::RarestFirst,
-            peer_id,
+            *b"-CV0001-pexpexpexpxa",
         );
         let b = Torrent::new(
             &meta,
             Arc::new(Storage::create(&meta, &dir_b.0, false).unwrap()),
             &Bitfield::empty(1),
             Mode::RarestFirst,
-            peer_id,
+            *b"-CV0001-pexpexpexpxb",
         );
 
         // A already knows a third peer X, which B has never seen.
@@ -1954,6 +2911,180 @@ mod tests {
             0,
             "A learned nothing over PEX; its peers came from add_peers and \
              from the connection"
+        );
+    }
+
+    /// A raw peer speaking BEP 10 to `server`: dialled, handshaken, and with
+    /// `ut_metadata` advertised on id 3. Returns the stream, bounded reads
+    /// set, and the extension handshake clove sent back.
+    fn metadata_peer(net: &MockNet, server: &Arc<Torrent>) -> (MockStream, extension::Handshake) {
+        let ep = net.endpoint();
+        let dest = ep.dest();
+        let accepting = Arc::clone(server);
+        std::thread::spawn(move || {
+            if let Ok((stream, from)) = ep.accept() {
+                let _ = accepting.attach(stream, from);
+            }
+        });
+        let mut peer = net
+            .endpoint()
+            .dialer()
+            .dial(dest, Duration::from_secs(5))
+            .unwrap();
+        let ours = Handshake {
+            info_hash: server.info_hash(),
+            peer_id: *b"-XX0000-metametameta",
+            extensions: Extensions {
+                extended: true,
+                fast: false,
+            },
+        };
+        peer.write_all(&ours.encode()).unwrap();
+        let mut buf = [0u8; wire::HANDSHAKE_LEN];
+        peer.read_exact(&mut buf).unwrap();
+        let mut ids = std::collections::BTreeMap::new();
+        ids.insert(UT_METADATA.to_owned(), 3u8);
+        let hs = extension::Handshake {
+            ids,
+            metadata_size: None,
+            client: None,
+        };
+        wire::write_message(
+            &mut peer,
+            &Message::Extended {
+                id: 0,
+                payload: hs.encode(),
+            },
+        )
+        .unwrap();
+        peer.set_timeouts(Some(Duration::from_secs(2)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let theirs = loop {
+            assert!(Instant::now() < deadline, "no extension handshake arrived");
+            let Ok(body) = wire::read_frame(&mut peer, 1 << 20) else {
+                continue;
+            };
+            if let Ok(Message::Extended { id: 0, payload }) = Message::parse(&body) {
+                break extension::Handshake::parse(&payload).unwrap();
+            }
+        };
+        (peer, theirs)
+    }
+
+    /// The `ut_metadata` replies to `want` requests, in order.
+    fn metadata_replies(peer: &mut MockStream, want: usize) -> Vec<MetadataMessage> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut replies = Vec::new();
+        while replies.len() < want {
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {want} metadata replies arrived",
+                replies.len()
+            );
+            let Ok(body) = wire::read_frame(peer, 1 << 20) else {
+                continue;
+            };
+            if let Ok(Message::Extended { id: 3, payload }) = Message::parse(&body) {
+                replies.push(MetadataMessage::parse(&payload).unwrap());
+            }
+        }
+        replies
+    }
+
+    /// A metadata request costs the peer thirty bytes and us sixteen
+    /// kilobytes, and nothing bounded how often one peer could ask. Past the
+    /// per-tick allowance the rest are rejected until the next tick.
+    #[test]
+    fn metadata_requests_past_the_allowance_are_rejected() {
+        let net = MockNet::new();
+        let meta = real_meta(&[7u8; 100]);
+        let dir = TempDir::new("meta-budget");
+        let server = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(1),
+            Mode::RarestFirst,
+            *b"-CV0001-budgetbudget",
+        );
+        let (mut peer, _hs) = metadata_peer(&net, &server);
+        let asks = MAX_METADATA_REQUESTS_PER_TICK as usize + 20;
+        for _ in 0..asks {
+            wire::write_message(
+                &mut peer,
+                &Message::Extended {
+                    id: OUR_METADATA_ID,
+                    payload: MetadataMessage::Request { piece: 0 }.encode(),
+                },
+            )
+            .unwrap();
+        }
+        let replies = metadata_replies(&mut peer, asks);
+        let pieces_served = replies
+            .iter()
+            .filter(|r| matches!(r, MetadataMessage::Data { .. }))
+            .count();
+        assert_eq!(
+            pieces_served, MAX_METADATA_REQUESTS_PER_TICK as usize,
+            "served {pieces_served} pieces to one peer in one tick"
+        );
+        assert!(
+            replies[pieces_served..]
+                .iter()
+                .all(|r| matches!(r, MetadataMessage::Reject { .. })),
+            "requests past the allowance were not rejected"
+        );
+    }
+
+    /// A piece index that overflows `index * METADATA_PIECE_LEN` on a 32-bit
+    /// target is rejected rather than multiplied. Panic-free on every target,
+    /// which is what this asserts; the wrap it prevents needs a 32-bit
+    /// `usize` to show.
+    #[test]
+    fn an_absurd_metadata_piece_index_is_rejected() {
+        let net = MockNet::new();
+        let meta = real_meta(&[7u8; 100]);
+        let dir = TempDir::new("meta-absurd");
+        let server = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(1),
+            Mode::RarestFirst,
+            *b"-CV0001-absurdabsurd",
+        );
+        let (mut peer, _hs) = metadata_peer(&net, &server);
+        wire::write_message(
+            &mut peer,
+            &Message::Extended {
+                id: OUR_METADATA_ID,
+                payload: MetadataMessage::Request { piece: u32::MAX }.encode(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata_replies(&mut peer, 1),
+            vec![MetadataMessage::Reject { piece: u32::MAX }]
+        );
+    }
+
+    /// The client name in the extension handshake is the release, the same
+    /// string the tracker sees — not a version nothing else knows about.
+    #[test]
+    fn the_extension_handshake_names_the_release() {
+        let net = MockNet::new();
+        let meta = real_meta(&[7u8; 100]);
+        let dir = TempDir::new("meta-client");
+        let server = Torrent::new(
+            &meta,
+            Arc::new(Storage::create(&meta, &dir.0, false).unwrap()),
+            &Bitfield::empty(1),
+            Mode::RarestFirst,
+            *b"-CV0001-clientclient",
+        );
+        let (_peer, hs) = metadata_peer(&net, &server);
+        assert_eq!(hs.client.as_deref(), Some(crate::tracker::USER_AGENT));
+        assert_eq!(
+            hs.client.as_deref(),
+            Some(format!("clove/{}", crate::VERSION).as_str())
         );
     }
 

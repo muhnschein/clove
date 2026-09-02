@@ -77,18 +77,36 @@ fn content() -> Vec<u8> {
 }
 
 fn meta_for(content: &[u8]) -> MetaInfo {
+    meta_with(content, false)
+}
+
+/// [`meta_for`] with the BEP 27 `private` flag set.
+fn private_meta_for(content: &[u8]) -> MetaInfo {
+    meta_with(content, true)
+}
+
+fn meta_with(content: &[u8], private: bool) -> MetaInfo {
+    meta_shaped(content, BLOCK_LEN, private)
+}
+
+/// [`meta_for`] over pieces of `piece_length` bytes, for the cases where a
+/// piece must be more than one block.
+fn meta_shaped(content: &[u8], piece_length: u32, private: bool) -> MetaInfo {
     let pieces: Vec<u8> = content
-        .chunks(BLOCK_LEN as usize)
+        .chunks(piece_length as usize)
         .flat_map(|c| <[u8; 20]>::from(Sha1::digest(c)))
         .collect();
     let mut info = BTreeMap::new();
     info.insert(b"name".to_vec(), Ben::Bytes(b"evil".to_vec()));
-    info.insert(b"piece length".to_vec(), Ben::Int(i64::from(BLOCK_LEN)));
+    info.insert(b"piece length".to_vec(), Ben::Int(i64::from(piece_length)));
     info.insert(b"pieces".to_vec(), Ben::Bytes(pieces));
     info.insert(
         b"length".to_vec(),
         Ben::Int(i64::try_from(content.len()).expect("fixture fits in i64")),
     );
+    if private {
+        info.insert(b"private".to_vec(), Ben::Int(1));
+    }
     let mut root = BTreeMap::new();
     root.insert(b"info".to_vec(), Ben::Dict(info));
     MetaInfo::parse(&bencode::encode(&Ben::Dict(root))).expect("fixture parses")
@@ -519,6 +537,181 @@ fn corrupt_blocks_never_become_verified_pieces() {
     honest_download_completes(&net, &meta, seed_dest, "after-liar");
 }
 
+/// A peer that accepts, mirrors the handshake, claims every piece, and answers
+/// each request with rubbish of exactly the requested length. Returns its
+/// destination; the thread ends when the engine hangs up on it.
+fn spawn_liar(net: &MockNet, info_hash: [u8; 20], num_pieces: u32) -> DestHash {
+    let liar_ep = net.endpoint();
+    let liar_dest = liar_ep.dest();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _from)) = liar_ep.accept() else {
+            return;
+        };
+        let mut buf = [0u8; wire::HANDSHAKE_LEN];
+        if stream.read_exact(&mut buf).is_err() {
+            return;
+        }
+        let ours = Handshake {
+            info_hash,
+            peer_id: *b"-XX0000-liarliarliar",
+            extensions: wire::Extensions::default(),
+        };
+        if stream.write_all(&ours.encode()).is_err() {
+            return;
+        }
+        if claim_everything(&mut stream, num_pieces).is_err() {
+            return;
+        }
+        while let Ok(frame) = wire::read_frame(&mut stream, wire::MAX_MESSAGE_LEN) {
+            if let Ok(Message::Request(req)) = Message::parse(&frame) {
+                let reply = Message::Piece {
+                    index: req.index,
+                    begin: req.begin,
+                    block: vec![0x2A; req.length as usize],
+                };
+                if wire::write_message(&mut stream, &reply).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    liar_dest
+}
+
+/// The liar and an honest seeder attached at once, which is the shape that
+/// used to be a stall: nothing recorded who supplied a failed piece, so the
+/// liar stayed connected and unchoked and every piece it touched was thrown
+/// away, for as long as it cared to keep answering. Now a piece that fails
+/// SHA-1 is laid at its suppliers' door, the liar is banned for the run, and
+/// the bytes spent finding that out are bounded.
+#[test]
+fn a_lying_peer_is_banned_and_the_download_still_completes() {
+    /// One block per piece, and enough of them that the two peers' pipelines
+    /// are both full with work left over.
+    const PIECES: u32 = 64;
+
+    let net = MockNet::new();
+    let content: Vec<u8> = (0..(PIECES * BLOCK_LEN))
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+    let num_pieces = u32::try_from(meta.pieces.len()).expect("piece count");
+    assert_eq!(num_pieces, PIECES);
+
+    let liar_dest = spawn_liar(&net, info_hash, num_pieces);
+    let seed_dir = TempDir::new("ban-seed");
+    let seeder = seeding_torrent(&meta, &content, &seed_dir);
+    let seed_ep = net.endpoint();
+    let seed_dest = seed_ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, seed_ep);
+
+    let dir = TempDir::new("ban-leech");
+    let leecher = leeching_torrent(&meta, &dir);
+    // The liar first, so it gets its pick of the pipeline.
+    for dest in [liar_dest, seed_dest] {
+        let stream = net
+            .endpoint()
+            .dialer()
+            .dial(dest, Duration::from_secs(5))
+            .expect("dial");
+        leecher.attach(stream, dest).expect("attach");
+    }
+
+    assert!(
+        leecher.wait_complete(DEADLINE),
+        "the download stalled at {}/{num_pieces} pieces with a liar attached",
+        leecher.have().count()
+    );
+    let (_, downloaded) = leecher.stats();
+    let total = content.len() as u64;
+    assert!(
+        downloaded < 3 * total,
+        "{downloaded} bytes were written to finish a {total}-byte torrent; the liar \
+         was never caught"
+    );
+    assert_eq!(leecher.banned_count(), 1, "the liar was not banned");
+    assert!(
+        leecher.is_banned(liar_dest),
+        "the wrong destination was banned"
+    );
+    assert!(
+        !leecher.connected_peers().contains(&liar_dest),
+        "a banned peer is still attached"
+    );
+    // And it stays out: neither a tracker nor PEX can put it back.
+    leecher.add_peers(&[liar_dest]);
+    assert!(
+        !leecher.dial_candidates().contains(&liar_dest),
+        "a banned destination was offered to the dial sweep again"
+    );
+}
+
+/// A peer that takes requests, answers none of them, and keeps sending blocks
+/// nobody asked for. Any shape-valid block used to clear its strikes, so it
+/// could hold a slot and sixteen in-flight blocks for ever at the cost of one
+/// unsolicited block per maintenance tick. Only a *solicited* block counts.
+#[test]
+fn unsolicited_blocks_do_not_excuse_a_peer_that_never_answers() {
+    /// More pieces than a pipeline, so there is always a piece the peer can
+    /// send unasked.
+    const PIECES: u32 = 32;
+
+    let net = MockNet::new();
+    let content: Vec<u8> = (0..(PIECES * BLOCK_LEN))
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("unsolicited");
+    let leecher = leeching_torrent(&meta, &dir);
+    leecher.set_request_timeout(Duration::from_millis(200));
+    leecher.set_idle_timeout(Duration::from_secs(600));
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&leecher, ep);
+    let _tick = leecher.spawn_maintenance(Duration::from_millis(50));
+
+    let mut peer = raw_peer(&net, dest, info_hash);
+    claim_everything(&mut peer, PIECES).expect("claim");
+    let asked = read_requests(&mut peer, clove_core::torrent::PIPELINE_DEPTH);
+    let unasked = (0..PIECES)
+        .find(|p| !asked.iter().any(|r| r.index == *p))
+        .expect("a piece nobody asked for");
+
+    // Never an answer; a steady stream of blocks for a piece nobody wanted
+    // from us, each valid in shape.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flood_stop = Arc::clone(&stop);
+    let mut writer = peer.try_clone();
+    let flood = std::thread::spawn(move || {
+        while !flood_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let msg = Message::Piece {
+                index: unasked,
+                begin: 0,
+                block: vec![0x5A; BLOCK_LEN as usize],
+            };
+            if wire::write_message(&mut writer, &msg).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    });
+
+    let deadline = Instant::now() + DEADLINE;
+    while !leecher.connected_peers().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "a peer answering nothing kept its slot on the strength of unsolicited blocks"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = flood.join();
+    drop(peer);
+}
+
 /// The endgame hands one block to more than one peer on purpose. The peer that
 /// answers second must not be able to put its bytes over a piece that already
 /// verified — in a debug build that tripped the picker's own invariant, and in
@@ -625,6 +818,117 @@ fn a_late_duplicate_block_cannot_corrupt_a_verified_piece() {
     assert_eq!(
         fetched, content,
         "the file on disk is not the file we wanted"
+    );
+}
+
+/// The endgame's duplicates are meant to be raced and then *cancelled*. The
+/// cancel was never sent, so every peer holding a copy sent it — a pipeline's
+/// worth of duplicate transfer each — and a later copy was written over the
+/// first with the piece still unverified, so one bad copy failed the piece
+/// and threw away the good bytes with it.
+#[test]
+fn the_first_copy_of_a_block_cancels_the_others_and_is_not_overwritten() {
+    // Two blocks per piece, so a piece is still unverified when its second
+    // copy of the first block arrives.
+    let content = content();
+    let meta = meta_shaped(&content, 2 * BLOCK_LEN, false);
+    let info_hash = meta.info_hash.0;
+    let num_pieces = u32::try_from(meta.pieces.len()).expect("piece count");
+    let blocks = u32::try_from(content.len())
+        .expect("len")
+        .div_ceil(BLOCK_LEN);
+
+    let net = MockNet::new();
+    let dir = TempDir::new("cancel");
+    let leecher = leeching_torrent(&meta, &dir);
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&leecher, ep);
+
+    let mut honest = raw_peer(&net, dest, info_hash);
+    claim_everything(&mut honest, num_pieces).expect("honest claim");
+    let first = read_requests(&mut honest, blocks as usize);
+    let mut late = raw_peer(&net, dest, info_hash);
+    claim_everything(&mut late, num_pieces).expect("late claim");
+    let second = read_requests(&mut late, blocks as usize);
+    assert_eq!(
+        first, second,
+        "both peers should have been offered everything"
+    );
+
+    // The honest peer answers the first block of piece 0 and nothing else
+    // yet, so piece 0 stays unverified.
+    let target = first
+        .iter()
+        .find(|r| r.index == 0 && r.begin == 0)
+        .copied()
+        .expect("piece 0 block 0 was offered");
+    let good = |req: &wire::BlockRequest| {
+        let start = req.index as usize * 2 * BLOCK_LEN as usize + req.begin as usize;
+        content[start..start + req.length as usize].to_vec()
+    };
+    wire::write_message(
+        &mut honest,
+        &Message::Piece {
+            index: target.index,
+            begin: target.begin,
+            block: good(&target),
+        },
+    )
+    .expect("honest block");
+
+    // The late peer must be told not to bother.
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no cancel reached the other peer"
+        );
+        if let Some(Message::Cancel(req)) = next_message(&mut late) {
+            assert_eq!(req, target, "cancelled the wrong block");
+            break;
+        }
+    }
+
+    // It sends its copy anyway — rubbish — and then the honest peer finishes
+    // the piece. If the rubbish had gone over the good copy the piece would
+    // fail, not verify.
+    wire::write_message(
+        &mut late,
+        &Message::Piece {
+            index: target.index,
+            begin: target.begin,
+            block: vec![0xEE; target.length as usize],
+        },
+    )
+    .expect("late block");
+    std::thread::sleep(Duration::from_millis(200));
+    let rest = first
+        .iter()
+        .find(|r| r.index == 0 && r.begin == BLOCK_LEN)
+        .copied()
+        .expect("piece 0 block 1 was offered");
+    wire::write_message(
+        &mut honest,
+        &Message::Piece {
+            index: rest.index,
+            begin: rest.begin,
+            block: good(&rest),
+        },
+    )
+    .expect("honest second block");
+    let deadline = Instant::now() + DEADLINE;
+    while !leecher.have().has(0) {
+        assert!(
+            Instant::now() < deadline,
+            "piece 0 never verified: the late copy went over the first"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        leecher.banned_count(),
+        0,
+        "an honest peer was blamed for a duplicate that should have been dropped"
     );
 }
 
@@ -791,6 +1095,11 @@ fn a_peer_that_stops_reading_is_reclaimed_not_merely_dropped() {
 /// engine registers a peer on its own thread, so a test that attacks and
 /// immediately looks at the peer table can win that race and assert nothing at
 /// all. (It did, on the first attempt.)
+///
+/// A repeated bitfield is now a protocol violation that ends the connection
+/// (the bitfield family is legal only as the opening message), so the spam is
+/// sent in two halves: the legal opening, asserted on while the peer is
+/// attached, then the rest, asserted on after the engine has hung up on it.
 #[test]
 fn re_announcing_a_piece_set_does_not_distort_availability() {
     let net = MockNet::new();
@@ -807,24 +1116,11 @@ fn re_announcing_a_piece_set_does_not_distort_availability() {
 
     let mut peer = raw_peer(&net, dest, info_hash);
 
-    // Every way to say "what I have" — repeatedly, and in combinations no
-    // honest peer sends.
-    let spam = |s: &mut MockStream| -> std::io::Result<()> {
-        claim_everything(s, num_pieces)?;
-        for _ in 0..200 {
-            wire::write_message(s, &Message::Have(0))?;
-        }
-        claim_everything(s, num_pieces)?;
-        wire::write_message(s, &Message::HaveAll)?;
-        wire::write_message(s, &Message::HaveNone)?;
-        wire::write_message(s, &Message::HaveAll)?;
-        for piece in 0..num_pieces {
-            wire::write_message(s, &Message::Have(piece))?;
-            wire::write_message(s, &Message::Have(piece))?;
-        }
-        wire::write_message(s, &Message::HaveNone)
-    };
-    spam(&mut peer).expect("spam");
+    // The legal opening, then `have` for a piece already claimed, many times.
+    claim_everything(&mut peer, num_pieces).expect("claim");
+    for _ in 0..200 {
+        wire::write_message(&mut peer, &Message::Have(0)).expect("have spam");
+    }
 
     // While it is still attached, one peer holding a piece counts once —
     // whatever it said and however often.
@@ -842,16 +1138,35 @@ fn re_announcing_a_piece_set_does_not_distort_availability() {
         );
     }
 
-    // And when it leaves, everything it contributed goes with it.
-    drop(peer);
+    // Every other way to say "what I have" — repeatedly, and in combinations
+    // no honest peer sends. The first of these is the violation that ends
+    // the connection; the rest may or may not get through before it does,
+    // and the accounting must come out the same either way.
+    let spam = |s: &mut MockStream| -> std::io::Result<()> {
+        claim_everything(s, num_pieces)?;
+        wire::write_message(s, &Message::HaveAll)?;
+        wire::write_message(s, &Message::HaveNone)?;
+        wire::write_message(s, &Message::HaveAll)?;
+        for piece in 0..num_pieces {
+            wire::write_message(s, &Message::Have(piece))?;
+            wire::write_message(s, &Message::Have(piece))?;
+        }
+        wire::write_message(s, &Message::HaveNone)
+    };
+    let _ = spam(&mut peer);
+
+    // When it goes — dropped for the repeat, or hung up on — everything it
+    // contributed goes with it. The connection is held open until the engine
+    // has dropped the peer, so this is the engine's doing.
     let deadline = Instant::now() + DEADLINE;
     while !leecher.connected_peers().is_empty() {
         assert!(
             Instant::now() < deadline,
-            "the spamming peer was never cleaned up"
+            "a peer repeating its bitfield was kept"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    drop(peer);
     for piece in 0..num_pieces {
         assert_eq!(
             leecher.availability(piece),
@@ -881,6 +1196,227 @@ fn re_announcing_a_piece_set_does_not_distort_availability() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The bitfield family is the opening message and nothing else: a repeat, a
+/// bitfield of the wrong length, and a BEP 6 message from a peer we never
+/// negotiated fast with are each a protocol violation that ends the
+/// connection. They used to be ignored (the wrong length) or honoured (the
+/// rest), each at O(pieces) under the torrent lock per five-byte message.
+#[test]
+fn a_repeated_or_invalid_piece_set_message_drops_the_peer() {
+    type Offence = Box<dyn Fn(&mut MockStream) -> std::io::Result<()>>;
+
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+    let num_pieces = u32::try_from(meta.pieces.len()).expect("piece count");
+
+    let dir = TempDir::new("strict");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    let offences: Vec<(&str, Offence)> = vec![
+        (
+            "a repeated bitfield",
+            Box::new(move |s| {
+                claim_everything(s, num_pieces)?;
+                claim_everything(s, num_pieces)
+            }),
+        ),
+        (
+            "a bitfield of the wrong length",
+            Box::new(|s| wire::write_message(s, &Message::Bitfield(vec![0xFF; 64]))),
+        ),
+        (
+            "have-all without fast negotiated",
+            Box::new(|s| wire::write_message(s, &Message::HaveAll)),
+        ),
+        (
+            "a bitfield after another message",
+            Box::new(move |s| {
+                wire::write_message(s, &Message::Interested)?;
+                claim_everything(s, num_pieces)
+            }),
+        ),
+        (
+            "allowed-fast without fast negotiated",
+            Box::new(|s| wire::write_message(s, &Message::AllowedFast(0))),
+        ),
+    ];
+    for (what, offend) in offences {
+        let mut peer = raw_peer(&net, dest, info_hash);
+        let deadline = Instant::now() + DEADLINE;
+        while seeder.connected_peers().is_empty() {
+            assert!(Instant::now() < deadline, "{what}: the peer never attached");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        offend(&mut peer).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let deadline = Instant::now() + DEADLINE;
+        while !seeder.connected_peers().is_empty() {
+            assert!(Instant::now() < deadline, "{what}: the peer was kept");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(peer);
+    }
+
+    // The extension handshake and a keep-alive *may* precede the bitfield:
+    // i2psnark and libtorrent both open with BEP 10 first.
+    let mut polite = raw_peer(&net, dest, info_hash);
+    let mut hs = BTreeMap::new();
+    hs.insert(b"m".to_vec(), Ben::Dict(BTreeMap::new()));
+    wire::write_message(&mut polite, &Message::KeepAlive).expect("keep-alive");
+    wire::write_message(
+        &mut polite,
+        &Message::Extended {
+            id: 0,
+            payload: bencode::encode(&Ben::Dict(hs)),
+        },
+    )
+    .expect("ext handshake");
+    claim_everything(&mut polite, num_pieces).expect("late but legal bitfield");
+    let deadline = Instant::now() + DEADLINE;
+    while seeder.connected_peers().is_empty() {
+        assert!(Instant::now() < deadline, "the polite peer never attached");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        seeder.connected_peers().len(),
+        1,
+        "a bitfield after the extension handshake was treated as a violation"
+    );
+    drop(polite);
+}
+
+/// A peer dropped for misbehaving used to stay `Trusted` in the known set and
+/// be dialled straight back by the next sweep. It now sits out a hold that
+/// doubles with each offence — while a peer that merely hung up gets none.
+#[test]
+fn misbehaving_peers_are_held_off_the_dial_sweep_with_an_escalating_backoff() {
+    use clove_core::torrent::MISBEHAVIOUR_BACKOFF;
+
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("backoff");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    // One endpoint, so every offence is the same destination's.
+    let offender = net.endpoint();
+    let offender_dest = offender.dest();
+    let offend = |garbage: bool| {
+        let mut stream = offender
+            .dial(dest, Duration::from_secs(5))
+            .expect("offender dial");
+        handshake(&mut stream, info_hash).expect("offender handshake");
+        let deadline = Instant::now() + DEADLINE;
+        while seeder.connected_peers().is_empty() {
+            assert!(Instant::now() < deadline, "the offender never attached");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if garbage {
+            let _ = stream.write_all(&[0xFF; 512]);
+        }
+        drop(stream);
+        let deadline = Instant::now() + DEADLINE;
+        while !seeder.connected_peers().is_empty() {
+            assert!(Instant::now() < deadline, "the offender was never dropped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    // Hanging up politely earns no hold at all.
+    offend(false);
+    assert_eq!(
+        seeder.dial_hold(offender_dest),
+        None,
+        "a peer that merely hung up was penalised"
+    );
+    assert!(seeder.dial_candidates().contains(&offender_dest));
+
+    // Garbage on the wire: the first hold, then a longer one.
+    offend(true);
+    let first = seeder
+        .dial_hold(offender_dest)
+        .expect("a protocol violation earns a hold");
+    assert!(first <= MISBEHAVIOUR_BACKOFF, "first hold {first:?}");
+    assert!(
+        seeder.known_peers().contains(&offender_dest)
+            && !seeder.dial_candidates().contains(&offender_dest),
+        "a held destination was offered to the dial sweep"
+    );
+    offend(true);
+    let second = seeder
+        .dial_hold(offender_dest)
+        .expect("a second violation earns a hold");
+    assert!(
+        second > MISBEHAVIOUR_BACKOFF && second <= 2 * MISBEHAVIOUR_BACKOFF,
+        "second hold {second:?} did not escalate from {first:?}"
+    );
+}
+
+/// The bitfield is the first thing a strict client expects to hear, and it
+/// used to be queued *after* the peer was seated in the table — a window in
+/// which any other thread's broadcast `have` or choke change could get in
+/// first. It is queued before registration now.
+#[test]
+fn our_bitfield_is_the_first_message_a_peer_hears() {
+    const PIECES: u32 = 128;
+
+    let net = MockNet::new();
+    let content: Vec<u8> = (0..(PIECES * BLOCK_LEN))
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    // A leecher mid-download, so `have` broadcasts are going out constantly
+    // while raw peers attach to it.
+    let seed_dir = TempDir::new("first-seed");
+    let seeder = seeding_torrent(&meta, &content, &seed_dir);
+    let seed_ep = net.endpoint();
+    let seed_dest = seed_ep.dest();
+    let _seed_acceptor = spawn_acceptor(&seeder, seed_ep);
+    let leech_dir = TempDir::new("first-leech");
+    let leecher = leeching_torrent(&meta, &leech_dir);
+    let leech_ep = net.endpoint();
+    let leech_dest = leech_ep.dest();
+    let _leech_acceptor = spawn_acceptor(&leecher, leech_ep);
+    let stream = net
+        .endpoint()
+        .dialer()
+        .dial(seed_dest, Duration::from_secs(5))
+        .expect("dial seeder");
+    leecher.attach(stream, seed_dest).expect("attach seeder");
+
+    let mut held = Vec::new();
+    for _ in 0..24 {
+        let mut peer = raw_peer(&net, leech_dest, info_hash);
+        let first = loop {
+            if let Some(msg) = next_message(&mut peer) {
+                break msg;
+            }
+            assert!(
+                !leecher.is_complete(),
+                "the download finished before the peers attached"
+            );
+        };
+        assert!(
+            matches!(first, Message::Bitfield(_)),
+            "the first message was {first:?}, not our bitfield"
+        );
+        held.push(peer);
+    }
+    drop(held);
 }
 
 /// A request whose range runs off the end of the piece it names. Storage bounds
@@ -1025,6 +1561,91 @@ fn peer_exchange_stays_within_the_limit_it_enforces() {
             break;
         }
     }
+}
+
+/// BEP 27: a private torrent's peers come from its tracker alone. The flag
+/// used to be parsed and shown and nothing more — `i2p_pex` was advertised,
+/// the known-peer set was handed to every peer, and inbound PEX was believed
+/// — which private trackers treat as ban-worthy and which lets a non-member
+/// find the swarm. None of the three may happen now.
+#[test]
+fn a_private_torrent_neither_offers_nor_accepts_peer_exchange() {
+    use clove_core::extension::{Handshake as ExtHandshake, I2P_PEX};
+    use clove_core::pex::PexMessage;
+
+    let net = MockNet::new();
+    let content = content();
+    let meta = private_meta_for(&content);
+    assert!(meta.private, "the fixture must be a private torrent");
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("private");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    // Something to leak, if it were going to.
+    seeder.add_peers(&[DestHash([0xAB; 32]), DestHash([0xAC; 32])]);
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    let mut peer = raw_peer(&net, dest, info_hash);
+    // Advertise i2p_pex ourselves, which is what prompts a PEX send.
+    let mut m = BTreeMap::new();
+    m.insert(b"i2p_pex".to_vec(), Ben::Int(1));
+    let mut hs = BTreeMap::new();
+    hs.insert(b"m".to_vec(), Ben::Dict(m));
+    wire::write_message(
+        &mut peer,
+        &Message::Extended {
+            id: 0,
+            payload: bencode::encode(&Ben::Dict(hs)),
+        },
+    )
+    .expect("ext handshake");
+    // And send a PEX message on the id clove uses for it in public.
+    wire::write_message(
+        &mut peer,
+        &Message::Extended {
+            id: 1,
+            payload: PexMessage {
+                added: vec![DestHash([0xEE; 32])],
+                dropped: Vec::new(),
+            }
+            .encode(),
+        },
+    )
+    .expect("pex");
+
+    // Its extension handshake must not offer i2p_pex, and nothing on id 1
+    // may follow it. Read until the connection goes quiet.
+    let mut saw_handshake = false;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        match next_message(&mut peer) {
+            Some(Message::Extended { id: 0, payload }) => {
+                let hs = ExtHandshake::parse(&payload).expect("clove's own handshake parses");
+                assert_eq!(
+                    hs.id_for(I2P_PEX),
+                    None,
+                    "a private torrent advertised peer exchange"
+                );
+                saw_handshake = true;
+            }
+            Some(Message::Extended { id: 1, .. }) => {
+                panic!("a private torrent sent a peer-exchange message");
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_handshake, "no extension handshake arrived at all");
+    assert_eq!(
+        seeder.pex_learned(),
+        0,
+        "a private torrent believed an inbound PEX message"
+    );
+    assert!(
+        !seeder.known_peers().contains(&DestHash([0xEE; 32])),
+        "a PEX-supplied destination reached a private torrent's peer set"
+    );
 }
 
 /// One destination may not take the whole peer table.
@@ -1352,6 +1973,149 @@ fn choke_rounds_run_without_any_traffic_at_all() {
         std::thread::sleep(Duration::from_millis(20));
     }
     drop(held);
+}
+
+/// A block the disk will not take. The write error used to be discarded with
+/// the block still counted as owed in the picker — never re-offered, the
+/// download stalled for good in release and tripped the accounting check in
+/// debug — and nothing anywhere recorded that storage had failed.
+///
+/// The seam is a FIFO where the torrent's file should be: storage opens it
+/// like any file, and every positioned write on it fails with `ESPIPE`. Pure
+/// filesystem, so it works whoever the test runs as.
+#[test]
+fn a_block_the_disk_refuses_is_re_offered_and_the_error_is_reported() {
+    use rustix::fs::{CWD, FileType, Mode, mknodat};
+
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let num_pieces = u32::try_from(meta.pieces.len()).expect("piece count");
+
+    let seed_dir = TempDir::new("espipe-seed");
+    let seeder = seeding_torrent(&meta, &content, &seed_dir);
+    let seed_ep = net.endpoint();
+    let seed_dest = seed_ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, seed_ep);
+
+    let dir = TempDir::new("espipe-leech");
+    mknodat(
+        CWD,
+        dir.0.join("evil"),
+        FileType::Fifo,
+        Mode::from_bits_truncate(0o644),
+        0,
+    )
+    .expect("mkfifo");
+    let leecher = leeching_torrent(&meta, &dir);
+    assert!(leecher.storage_error().is_none(), "nothing has failed yet");
+    let stream = net
+        .endpoint()
+        .dialer()
+        .dial(seed_dest, Duration::from_secs(5))
+        .expect("dial seeder");
+    leecher.attach(stream, seed_dest).expect("attach");
+
+    let deadline = Instant::now() + DEADLINE;
+    while leecher.storage_error().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "blocks arrived, could not be written, and nobody was told"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Nothing verified, nothing leaked: the failed blocks went back to the
+    // picker and are being asked for again, and the peer was not dropped for
+    // our disk's failing. The engine's own accounting assertions are live
+    // throughout this, so a leaked in-flight count would have panicked the
+    // reader thread and emptied the table.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(leecher.have().count(), 0, "a piece verified on a FIFO");
+    assert_eq!(
+        leecher.connected_peers().len(),
+        1,
+        "the seeder was dropped over a local storage failure"
+    );
+    let _ = num_pieces;
+}
+
+/// Interest is a five-byte message and used to run a whole choke round, so a
+/// peer flipping it drove the optimistic rotation: every third flip choked an
+/// honest peer holding a slot (discarding its outstanding requests) to make
+/// room for whoever the rotation landed on. A flip now runs a round only when
+/// there is a free slot to give, and the periodic round does the rest.
+#[test]
+fn interest_flapping_does_not_disturb_the_peers_holding_slots() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let net = MockNet::new();
+    let content = content();
+    let meta = meta_for(&content);
+    let info_hash = meta.info_hash.0;
+
+    let dir = TempDir::new("flap");
+    let seeder = seeding_torrent(&meta, &content, &dir);
+    // No periodic rounds during the test: only message-driven ones could
+    // move a slot, which is the path under test.
+    seeder.set_choke_interval(Duration::from_secs(3600));
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&seeder, ep);
+
+    // Four peers take the four slots (each one's interest finds a free slot,
+    // so each is unchoked); a fifth is interested and waits.
+    let mut holders = Vec::new();
+    let mut flags: Vec<(Arc<AtomicBool>, Arc<AtomicBool>)> = Vec::new();
+    for _ in 0..4 {
+        let mut peer = raw_peer(&net, dest, info_hash);
+        wire::write_message(&mut peer, &Message::Interested).expect("interest");
+        let unchoked = Arc::new(AtomicBool::new(false));
+        let choked = Arc::new(AtomicBool::new(false));
+        let mut reader = peer.try_clone();
+        reader.set_timeouts(None);
+        let (u, c) = (Arc::clone(&unchoked), Arc::clone(&choked));
+        std::thread::spawn(move || {
+            while let Ok(frame) = wire::read_frame(&mut reader, wire::MAX_MESSAGE_LEN) {
+                match Message::parse(&frame) {
+                    Ok(Message::Unchoke) => u.store(true, Ordering::Relaxed),
+                    Ok(Message::Choke) => c.store(true, Ordering::Relaxed),
+                    _ => {}
+                }
+            }
+        });
+        holders.push(peer);
+        flags.push((unchoked, choked));
+    }
+    let deadline = Instant::now() + DEADLINE;
+    while !flags.iter().all(|(u, _)| u.load(Ordering::Relaxed)) {
+        assert!(
+            Instant::now() < deadline,
+            "the four holders were never unchoked"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut waiting = raw_peer(&net, dest, info_hash);
+    wire::write_message(&mut waiting, &Message::Interested).expect("interest");
+
+    // The flapper: thirty flips.
+    let mut flapper = raw_peer(&net, dest, info_hash);
+    for i in 0..30 {
+        let msg = if i % 2 == 0 {
+            Message::Interested
+        } else {
+            Message::NotInterested
+        };
+        wire::write_message(&mut flapper, &msg).expect("flip");
+    }
+    // Long enough for every flip to have been handled.
+    std::thread::sleep(Duration::from_millis(500));
+    for (i, (_, choked)) in flags.iter().enumerate() {
+        assert!(
+            !choked.load(Ordering::Relaxed),
+            "holder {i} was choked by another peer flapping its interest"
+        );
+    }
+    drop((holders, waiting, flapper));
 }
 
 /// A peer we have nothing to say to still has to hear from us. Clients drop a

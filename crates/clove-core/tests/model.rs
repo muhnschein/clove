@@ -771,10 +771,22 @@ fn choke_plans_are_always_applicable() {
 /// taken must still get a turn. With every rate equal, the ranked picks never
 /// change, so only the optimistic slot can ever unchoke the peers at the back —
 /// and if it stops rotating, they wait for ever.
+///
+/// Swept over every candidate count from one to twelve: the optimistic index
+/// used to be `round % candidates` on every third round, which visits only a
+/// third of the candidates whenever their number is a multiple of three — and
+/// the two fairness tests that existed happened to use four and two.
 #[test]
 fn every_interested_peer_gets_a_turn_eventually() {
     for slots in [1usize, 2, 4] {
-        let count = slots + 4;
+        for extra in 1..=12usize {
+            every_interested_peer_gets_a_turn_with(slots, slots + extra);
+        }
+    }
+}
+
+fn every_interested_peer_gets_a_turn_with(slots: usize, count: usize) {
+    {
         let mut choker = Choker::new(slots);
         let mut unchoked: BTreeSet<u64> = BTreeSet::new();
         let mut ever: BTreeSet<u64> = BTreeSet::new();

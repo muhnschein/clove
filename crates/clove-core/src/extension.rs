@@ -123,7 +123,7 @@ mod tests {
         let hs = Handshake {
             ids,
             metadata_size: Some(4096),
-            client: Some("clove/0.1".to_owned()),
+            client: Some(crate::tracker::USER_AGENT.to_owned()),
         };
         let parsed = Handshake::parse(&hs.encode()).unwrap();
         assert_eq!(parsed, hs);

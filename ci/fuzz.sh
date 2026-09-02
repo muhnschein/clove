@@ -19,7 +19,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-TARGETS_ALL='bencode metainfo resume json http wire tracker extensions magnet dest'
+TARGETS_ALL='bencode metainfo resume json http wire tracker extensions magnet dest text'
 SCALE=1
 QUICK=no
 SANITIZER=address
@@ -94,6 +94,10 @@ budget_for() {
         # +0 at 8x, at 80x and again at 100x, from a corpus that starts
         # them at their ceiling. Floor.
         wire|magnet|bencode|json|metainfo|http) echo 120 ;;
+        # A property target over one small function: it saturates in
+        # seconds, and what the seconds buy afterwards is the class oracle
+        # meeting characters the table forgot.
+        text) echo 120 ;;
         # +70 at 100x, all by ~1506s — and the seed that run packed starts
         # the next one at all seventy, so the floor holds on evidence.
         dest) echo 120 ;;

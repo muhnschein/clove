@@ -152,6 +152,20 @@ fn read_sam_line(
         .to_owned())
 }
 
+/// `Instant::now() + timeout`, without the panic.
+///
+/// `Instant` addition panics on overflow. No timeout here can reach that —
+/// they are constants and config values measured in seconds — but the panic
+/// would land on a peer-serving thread, so it is ruled out by construction
+/// rather than by argument. The saturating direction is "never": a deadline
+/// too far off to represent is one that would not arrive, so it is `None`,
+/// which every line reader here takes as "no whole-exchange deadline" with
+/// the socket's own per-read timeout still in force. The other direction,
+/// "now", would turn an absurdly long timeout into an immediate one.
+fn deadline_after(timeout: Duration) -> Option<Instant> {
+    Instant::now().checked_add(timeout)
+}
+
 /// Open a socket to the SAM bridge and complete the `HELLO VERSION`
 /// handshake on it, returning the socket ready for a command.
 ///
@@ -171,12 +185,26 @@ fn sam_hello(port: u16, timeout: Duration, what: &str) -> io::Result<(TcpStream,
 
     // The read timeout is per-call, so a bridge dribbling one byte just
     // inside it could hold this open indefinitely. Bound the exchange too.
-    let deadline = Instant::now() + timeout;
-    let reply = read_sam_line(&mut stream, port, MAX_HELLO_LINE, Some(deadline), what)?;
-    if !reply.starts_with("HELLO REPLY") || !reply.contains("RESULT=OK") {
+    let reply = read_sam_line(
+        &mut stream,
+        port,
+        MAX_HELLO_LINE,
+        deadline_after(timeout),
+        what,
+    )?;
+    // The result is a field, not a substring: a refusal whose MESSAGE quotes
+    // `RESULT=OK` is still a refusal. And the line reaches a terminal.
+    let result = reply
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("RESULT="))
+        .unwrap_or("MISSING");
+    if !reply.starts_with("HELLO REPLY") || result != "OK" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("SAM bridge on 127.0.0.1:{port} refused HELLO: {reply}"),
+            format!(
+                "SAM bridge on 127.0.0.1:{port} refused HELLO: {}",
+                scrub_control_line(&reply)
+            ),
         ));
     }
     Ok((stream, reply))
@@ -225,12 +253,11 @@ fn dial_stream(
     // the status read gets the caller's full timeout rather than the short
     // handshake one.
     stream.set_read_timeout(Some(timeout))?;
-    let deadline = Instant::now() + timeout;
     let status = read_sam_line(
         &mut stream,
         port,
         MAX_STATUS_LINE,
-        Some(deadline),
+        deadline_after(timeout),
         "STREAM CONNECT",
     )?;
     expect_stream_ok(&status, &format!("the stream to {}", peer.to_b32()))?;
@@ -295,7 +322,10 @@ fn expect_stream_ok(status: &str, what: &str) -> Result<(), DialFailed> {
     if !status.starts_with("STREAM STATUS") {
         return Err(DialFailed::Peer(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("SAM bridge answered with {status:?} where a STREAM STATUS belongs"),
+            format!(
+                "SAM bridge answered with {:?} where a STREAM STATUS belongs",
+                scrub_control_line(status)
+            ),
         )));
     }
     let result = status
@@ -303,13 +333,17 @@ fn expect_stream_ok(status: &str, what: &str) -> Result<(), DialFailed> {
         .find_map(|f| f.strip_prefix("RESULT="))
         .unwrap_or("MISSING");
     if result != "OK" {
+        // The router's words reach a terminal, so they are scrubbed like every
+        // other control line. `MESSAGE=` runs to the end of the line and is
+        // scrubbed as one, rather than trusted to be only a message.
         let error = io::Error::new(
             io::ErrorKind::ConnectionRefused,
             format!(
-                "router refused {what}: {result}{}",
+                "router refused {what}: {}{}",
+                result.chars().map(scrub_char).collect::<String>(),
                 status
                     .split_once("MESSAGE=")
-                    .map(|(_, m)| format!(" ({})", m.trim_matches('"')))
+                    .map(|(_, m)| format!(" ({})", scrub_control_line(m.trim_matches('"'))))
                     .unwrap_or_default()
             ),
         );
@@ -347,7 +381,12 @@ pub fn unique_nickname(base: &str) -> String {
 }
 
 /// How to bring up the SAM session.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is written by hand so that [`persistent_key`](SamConfig::persistent_key)
+/// prints as `Some(<redacted>)`: a derived one would put the whole private
+/// key blob into any `{config:?}` on an error path, which is the class of
+/// leak `SECURITY.md` ranks highest.
+#[derive(Clone)]
 pub struct SamConfig {
     /// SAM control port on `127.0.0.1`.
     pub samv3_tcp_port: u16,
@@ -376,6 +415,29 @@ impl Default for SamConfig {
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             session_timeout: DEFAULT_SESSION_TIMEOUT,
         }
+    }
+}
+
+impl std::fmt::Debug for SamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        /// Stands in for the key: `Some(<redacted>)` says a key is set,
+        /// which is all a diagnostic needs.
+        struct Redacted;
+        impl std::fmt::Debug for Redacted {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("<redacted>")
+            }
+        }
+        f.debug_struct("SamConfig")
+            .field("samv3_tcp_port", &self.samv3_tcp_port)
+            .field("nickname", &self.nickname)
+            .field(
+                "persistent_key",
+                &self.persistent_key.as_ref().map(|_| Redacted),
+            )
+            .field("probe_timeout", &self.probe_timeout)
+            .field("session_timeout", &self.session_timeout)
+            .finish()
     }
 }
 
@@ -591,6 +653,35 @@ impl SamSession {
     /// The router is unreachable, did not answer in time, refused the session,
     /// or returned a destination we cannot parse.
     pub fn connect(config: &SamConfig) -> io::Result<SamSession> {
+        // Both go into the `SESSION CREATE` line, and SAM is a line protocol
+        // of space-separated fields: a space or a newline in either is a
+        // second field, or a second command, of the sender's choosing. The
+        // nickname generator emits `[a-z0-9-]` and the daemon refuses a key
+        // file that is not base64, but the config is `pub`, and this crate
+        // trusts its callers no more than `check_lookup_name` does. Checked
+        // before any socket is opened.
+        if has_unsendable_byte(&config.nickname) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "not a nickname clove will put in a SAM command (contains a space or a \
+                     control character): {:?}",
+                    config.nickname.chars().map(scrub_char).collect::<String>()
+                ),
+            ));
+        }
+        // Not repeated in the error: it is the key.
+        if config
+            .persistent_key
+            .as_deref()
+            .is_some_and(has_unsendable_byte)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the persistent key contains a space or a control character, which cannot go \
+                 into a SAM command; is destination.key intact?",
+            ));
+        }
         let port = config.samv3_tcp_port;
         let (mut control, hello) = sam_hello(port, config.probe_timeout, "HELLO")?;
         debug_assert!(hello.contains("RESULT=OK"));
@@ -607,12 +698,11 @@ impl SamSession {
         control.write_all(command.as_bytes())?;
 
         control.set_read_timeout(Some(config.session_timeout))?;
-        let deadline = Instant::now() + config.session_timeout;
         let status = read_sam_line(
             &mut control,
             port,
             MAX_SESSION_LINE,
-            Some(deadline),
+            deadline_after(config.session_timeout),
             "SESSION CREATE",
         )?;
         let blob = parse_session_status(&status)?;
@@ -790,18 +880,43 @@ fn looks_like_key_material(field: &str, min: usize) -> bool {
 
 /// One character's worth of the above.
 ///
-/// The same two families `clove_core::text::scrub` replaces, and deliberately
-/// not a call to it: `clove-core` depends on this crate, not the other way
-/// round, so the shared helper is not reachable from here. The duplication is
-/// four lines and the alternative is a text utility living in the crate whose
-/// entire job is sockets.
-fn scrub_char(c: char) -> char {
+/// The same characters `clove_core::text::scrub` replaces, with the same
+/// replacement, and deliberately not a call to it: `clove-core` depends on
+/// this crate, not the other way round, so the shared helper is not reachable
+/// from here. The duplication is a dozen lines and the alternative is a text
+/// utility living in the crate whose entire job is sockets. Keep the two
+/// tables identical.
+///
+/// Public so that `clove-core`, which *can* see both, pins the two tables to
+/// each other over every character rather than trusting a comment to keep
+/// them in step.
+#[must_use]
+pub fn scrub_char(c: char) -> char {
     match c {
-        c if c.is_control() => '?',
-        // The bidirectional overrides and isolates draw nothing and reorder the
-        // text around them, so a bridge could make the rest of a log line read
-        // as something else. Not caught by `is_control`.
-        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '?',
+        c if c.is_control() => '.',
+        // Format characters, none caught by `is_control`. The bidirectional
+        // controls reorder the text around them, so a bridge could make the
+        // rest of a log line read as something else; the others draw nothing,
+        // so `safe.exe` and `safe\u{200b}.exe` are two names an operator can
+        // neither tell apart nor match by typing. In order: soft hyphen,
+        // Arabic letter mark, Mongolian vowel separator, the zero-width and
+        // bidi marks, line and paragraph separators, bidi embeddings and
+        // overrides, word joiner and invisible operators, bidi isolates and
+        // the deprecated format controls, variation selectors, byte-order
+        // mark, interlinear annotation, and the tag characters.
+        '\u{00ad}'
+        | '\u{061c}'
+        | '\u{180e}'
+        | '\u{200b}'..='\u{200f}'
+        | '\u{2028}'
+        | '\u{2029}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206f}'
+        | '\u{fe00}'..='\u{fe0f}'
+        | '\u{feff}'
+        | '\u{fff9}'..='\u{fffb}'
+        | '\u{e0000}'..='\u{e007f}' => '.',
         c => c,
     }
 }
@@ -876,8 +991,9 @@ pub struct SamListener {
     /// only while it is open, so this is held, never used — and dropping the
     /// listener is therefore how forwarding stops.
     _forward: TcpStream,
-    // Keeps the SAM session (and thus the destination) alive.
-    _session: Arc<SamSession>,
+    /// Keeps the SAM session (and thus the destination) alive — and is told
+    /// when the listener itself fails, see [`I2pListener::accept`] below.
+    session: Arc<SamSession>,
 }
 
 impl SamListener {
@@ -908,12 +1024,11 @@ impl SamListener {
             session.nickname
         );
         forward.write_all(command.as_bytes())?;
-        let deadline = Instant::now() + timeout;
         let status = read_sam_line(
             &mut forward,
             sam_port,
             MAX_STATUS_LINE,
-            Some(deadline),
+            deadline_after(timeout),
             "STREAM FORWARD",
         )?;
         expect_stream_ok(&status, "STREAM FORWARD")?;
@@ -925,7 +1040,7 @@ impl SamListener {
             local,
             port,
             _forward: forward,
-            _session: session,
+            session,
         })
     }
 
@@ -977,21 +1092,94 @@ impl I2pListener for SamListener {
     }
 
     fn accept(&self) -> io::Result<Option<(ForwardedStream, DestHash)>> {
-        let (mut stream, _addr) = self.listener.accept()?;
-        // Bound the header read so a silent/misbehaving router cannot wedge
-        // the acceptor; then hand a blocking socket to the reader thread.
-        stream.set_read_timeout(Some(DEST_LINE_TIMEOUT))?;
-        // A header that never arrives, arrives as garbage, or belongs to
-        // something that is not the router at all says nothing about the
-        // listener: drop that connection and let the caller accept the next.
-        // Anything on the loopback forward port can produce one, including our
-        // own `poke_listener`.
-        let Ok(dest) = read_dest_line(&mut stream, MAX_DEST_LINE) else {
-            return Ok(None);
-        };
-        stream.set_read_timeout(None)?;
-        Ok(Some((ForwardedStream { inner: stream }, dest)))
+        accept_forwarded(&self.listener).map_err(|e| {
+            // An error here is the listener's, and nobody above rebuilds a
+            // listener on its own: the demux thread returns, and the session
+            // goes on reporting itself healthy with no inbound service behind
+            // it. Ending the session is what turns that into a rebuild.
+            self.session
+                .life
+                .end(&format!("the forward listener failed: {e}"));
+            e
+        })
     }
+}
+
+/// Linux's numbers for the `accept(2)` errors std gives no [`io::ErrorKind`]
+/// of their own. The daemon is Linux-only (Landlock, seccomp); anywhere else
+/// a mismatch only means the error is treated as the listener's.
+const ENFILE: i32 = 23;
+const EMFILE: i32 = 24;
+const ENOBUFS: i32 = 105;
+
+/// How long to stand back when the process or the system is out of file
+/// descriptors before accepting again. The connection is not lost — it waits
+/// in the backlog — and spinning on `EMFILE` burns the CPU that the peer
+/// threads need in order to close something.
+const FD_EXHAUSTED_PAUSE: Duration = Duration::from_millis(50);
+
+/// Sort one `accept(2)` result by who the error, if any, is about.
+///
+/// `Ok(None)` is an error that cost this one connection and says nothing
+/// about the listener: the process is out of descriptors (`EMFILE`, `ENFILE`),
+/// the kernel is out of memory or buffers (`ENOMEM`, `ENOBUFS`), the peer hung
+/// up between arriving and being accepted (`ECONNABORTED`), or a signal landed
+/// (`EINTR`). Every one of these used to end the accept loop — and with it
+/// inbound peer service for the rest of the session, while `clove status` went
+/// on saying `connected` — and descriptor exhaustion is reachable from a swarm:
+/// a thread and a socket per peer, a file per torrent. `Err` is kept for the
+/// errors that are the listener's own (`EBADF`, `EINVAL`, and anything
+/// unfamiliar), after which accepting again would only fail the same way.
+fn usable_accept(accepted: io::Result<TcpStream>) -> io::Result<Option<TcpStream>> {
+    let e = match accepted {
+        Ok(socket) => return Ok(Some(socket)),
+        Err(e) => e,
+    };
+    let out_of_descriptors = matches!(e.raw_os_error(), Some(EMFILE | ENFILE));
+    let transient = out_of_descriptors
+        || e.raw_os_error() == Some(ENOBUFS)
+        || matches!(
+            e.kind(),
+            io::ErrorKind::Interrupted
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::OutOfMemory
+        );
+    if !transient {
+        return Err(e);
+    }
+    if out_of_descriptors {
+        std::thread::sleep(FD_EXHAUSTED_PAUSE);
+    }
+    Ok(None)
+}
+
+/// One forwarded connection off `listener`, with its destination header read.
+///
+/// `Ok(None)` for anything that cost only this connection: a transient accept
+/// error ([`usable_accept`]), a socket that will not take a read timeout, or a
+/// header that never arrives, arrives as garbage, or belongs to something that
+/// is not the router at all — anything on the loopback forward port can
+/// produce one, including our own [`poke_listener`]. `Err` is the listener's.
+fn accept_forwarded(listener: &TcpListener) -> io::Result<Option<(ForwardedStream, DestHash)>> {
+    let Some(mut stream) = usable_accept(listener.accept().map(|(socket, _addr)| socket))? else {
+        return Ok(None);
+    };
+    // Bound the header read so a silent/misbehaving router cannot wedge the
+    // acceptor; then hand a blocking socket to the reader thread. A socket
+    // that refuses the option is this connection's problem, not the listener's.
+    if stream.set_read_timeout(Some(DEST_LINE_TIMEOUT)).is_err() {
+        return Ok(None);
+    }
+    // The same budget again as a whole-line deadline: the read timeout is per
+    // byte, and a header dribbled a byte at a time is otherwise unbounded.
+    let deadline = deadline_after(DEST_LINE_TIMEOUT);
+    let Ok(dest) = read_dest_line(&mut stream, MAX_DEST_LINE, deadline) else {
+        return Ok(None);
+    };
+    if stream.set_read_timeout(None).is_err() {
+        return Ok(None);
+    }
+    Ok(Some((ForwardedStream { inner: stream }, dest)))
 }
 
 /// Read the `SILENT=false` destination header the router prepends to a
@@ -999,10 +1187,28 @@ impl I2pListener for SamListener {
 /// by space-separated `FROM_PORT`/`TO_PORT` params — up to the `\n`, and
 /// derive the peer's [`DestHash`]. Reads one byte at a time so the stream
 /// payload after the newline is left untouched for the peer's reader.
-fn read_dest_line<R: Read>(reader: &mut R, max_len: usize) -> io::Result<DestHash> {
+///
+/// `deadline` bounds the whole line, as [`read_sam_line`]'s does, and for
+/// the same reason: the socket's read timeout is per byte, so without it one
+/// byte every 29 seconds held this open for `max_len` reads — on the one
+/// acceptor thread, before any per-connection thread exists, from anything
+/// that can reach the loopback forward port. A read already in progress when
+/// the deadline passes still gets its own timeout, so the true bound is the
+/// deadline plus one read.
+fn read_dest_line<R: Read>(
+    reader: &mut R,
+    max_len: usize,
+    deadline: Option<Instant>,
+) -> io::Result<DestHash> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "forwarded stream did not finish its destination line in time",
+            ));
+        }
         if reader.read(&mut byte)? == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1153,6 +1359,13 @@ const MAX_NAMING_LINE: usize = 8192;
 /// registered hostname comes near this.
 const MAX_LOOKUP_NAME: usize = 255;
 
+/// Whether `field` holds a byte that cannot travel inside one SAM field: a
+/// space or anything below it, or DEL. SAM is a line protocol of
+/// space-separated fields, so such a byte ends the field — or the command.
+fn has_unsendable_byte(field: &str) -> bool {
+    field.bytes().any(|b| b <= 0x20 || b == 0x7f)
+}
+
 /// Refuse a name that cannot go into a `NAMING LOOKUP` as a single field.
 ///
 /// SAM is a line protocol of space-separated fields, so a name carrying a space
@@ -1176,7 +1389,7 @@ fn check_lookup_name(name: &str) -> io::Result<()> {
     if name.len() > MAX_LOOKUP_NAME {
         return Err(bad("longer than a hostname"));
     }
-    if name.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+    if has_unsendable_byte(name) {
         return Err(bad("contains a space or a control character"));
     }
     Ok(())
@@ -1203,9 +1416,13 @@ fn parse_naming_reply<'a>(reply: &'a str, name: &str) -> io::Result<&'a str> {
         .find_map(|f| f.strip_prefix("RESULT="))
         .unwrap_or("MISSING");
     if result != "OK" {
+        // The result word is the router's text too, and reaches a terminal.
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("router could not resolve {asked}: {result}"),
+            format!(
+                "router could not resolve {asked}: {}",
+                result.chars().map(scrub_char).collect::<String>()
+            ),
         ));
     }
     reply
@@ -1229,12 +1446,11 @@ fn naming_lookup(port: u16, name: &str, timeout: Duration) -> io::Result<DestHas
     let (mut stream, _) = sam_hello(port, timeout, "HELLO (for NAMING LOOKUP)")?;
     stream.write_all(format!("NAMING LOOKUP NAME={name}\n").as_bytes())?;
 
-    let deadline = Instant::now() + timeout;
     let reply = read_sam_line(
         &mut stream,
         port,
         MAX_NAMING_LINE,
-        Some(deadline),
+        deadline_after(timeout),
         "NAMING LOOKUP",
     )?;
     let value = parse_naming_reply(&reply, name)?;
@@ -1293,6 +1509,84 @@ mod tests {
         );
     }
 
+    /// Every format character the scrubber must replace: the ones that
+    /// reorder text, and the ones that draw nothing and so make two names an
+    /// operator cannot tell apart. The list is the one `clove_core::text`
+    /// pins for its twin.
+    #[test]
+    fn invisible_and_reordering_characters_are_scrubbed() {
+        for c in [
+            '\u{00ad}',
+            '\u{061c}',
+            '\u{180e}',
+            '\u{200b}',
+            '\u{200c}',
+            '\u{200d}',
+            '\u{200e}',
+            '\u{200f}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{202a}',
+            '\u{202b}',
+            '\u{202c}',
+            '\u{202d}',
+            '\u{202e}',
+            '\u{2060}',
+            '\u{2061}',
+            '\u{2062}',
+            '\u{2063}',
+            '\u{2064}',
+            '\u{2066}',
+            '\u{2067}',
+            '\u{2068}',
+            '\u{2069}',
+            '\u{206a}',
+            '\u{206f}',
+            '\u{fe00}',
+            '\u{fe0f}',
+            '\u{feff}',
+            '\u{fff9}',
+            '\u{fffa}',
+            '\u{fffb}',
+            '\u{e0000}',
+            '\u{e0001}',
+            '\u{e0020}',
+            '\u{e007f}',
+        ] {
+            assert_eq!(scrub_char(c), '.', "U+{:04X} survived", u32::from(c));
+        }
+        // Controls, as before.
+        for c in ['\n', '\r', '\t', '\u{1b}', '\0', '\u{7f}', '\u{85}'] {
+            assert_eq!(scrub_char(c), '.', "U+{:04X} survived", u32::from(c));
+        }
+        // Ordinary text is untouched, non-ASCII included: a name that silently
+        // loses characters is one an operator cannot match either.
+        for c in ['a', ' ', 'é', 'ß', '日', '🦀', '-', '~', '='] {
+            assert_eq!(scrub_char(c), c);
+        }
+        // Two spellings become one an operator can type.
+        let name: String = "safe\u{200b}.exe".chars().map(scrub_char).collect();
+        assert_eq!(name, "safe..exe");
+    }
+
+    /// `Instant + Duration` panics on overflow; a deadline is computed on
+    /// every dial, so it must saturate instead.
+    #[test]
+    fn an_unrepresentable_deadline_is_none_not_a_panic() {
+        let before = Instant::now();
+        let soon = deadline_after(Duration::from_secs(1)).expect("a second from now exists");
+        assert!(soon >= before + Duration::from_secs(1));
+        assert_eq!(deadline_after(Duration::MAX), None);
+        // And none is "no whole-exchange deadline", which the line reader
+        // honours by reading on.
+        let mut cursor = Cursor::new(b"hello\n".to_vec());
+        assert!(
+            read_dest_line(&mut cursor, MAX_DEST_LINE, deadline_after(Duration::MAX)).is_err(),
+            "not a destination"
+        );
+        assert_eq!(cursor.position(), 6, "the reader read the whole line");
+    }
+
     #[test]
     fn forwarded_stream_splits_and_carries_both_directions() {
         // A real loopback TCP pair stands in for the router-forwarded socket.
@@ -1332,7 +1626,7 @@ mod tests {
         input.extend_from_slice(b"the-bittorrent-handshake");
         let mut cursor = Cursor::new(input);
 
-        let got = read_dest_line(&mut cursor, MAX_DEST_LINE).unwrap();
+        let got = read_dest_line(&mut cursor, MAX_DEST_LINE, Some(generous())).unwrap();
         assert_eq!(got, expected);
 
         // The payload after the newline must be intact for the peer reader.
@@ -1344,15 +1638,135 @@ mod tests {
     #[test]
     fn read_dest_line_rejects_overlong_line() {
         let mut cursor = Cursor::new(vec![b'A'; 128]); // no newline, no dest
-        let err = read_dest_line(&mut cursor, 32).unwrap_err();
+        let err = read_dest_line(&mut cursor, 32, Some(generous())).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn read_dest_line_eof_before_newline() {
         let mut cursor = Cursor::new(b"partial-no-newline".to_vec());
-        let err = read_dest_line(&mut cursor, MAX_DEST_LINE).unwrap_err();
+        let err = read_dest_line(&mut cursor, MAX_DEST_LINE, Some(generous())).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A deadline no test here will reach, for the cases about something else.
+    fn generous() -> Instant {
+        Instant::now() + DEST_LINE_TIMEOUT
+    }
+
+    /// The header must arrive whole within the deadline. The per-byte socket
+    /// timeout alone let a byte every 29 s hold `accept` for `MAX_DEST_LINE`
+    /// reads — some 34 hours — on the one acceptor thread, and any local
+    /// process can reach the forward port.
+    #[test]
+    fn a_dribbled_destination_line_is_cut_off_at_the_deadline() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut dribbler = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        std::thread::spawn(move || {
+            // One byte every so often, never a newline; ends when the test
+            // drops its end of the socket.
+            while dribbler.write_all(b"A").is_ok() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        // A per-read timeout far past the deadline, so only the deadline can
+        // end this.
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let budget = Duration::from_millis(200);
+        let started = Instant::now();
+        let err = read_dest_line(&mut server, MAX_DEST_LINE, Some(started + budget)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        let took = started.elapsed();
+        assert!(took >= budget, "gave up before the deadline: {took:?}");
+        assert!(
+            took < Duration::from_secs(2),
+            "the deadline did not end the read: {took:?}"
+        );
+    }
+
+    /// The `SILENT=false` header of a forwarded connection, and the hash the
+    /// peer behind it must be known by.
+    fn forwarded_header() -> (String, DestHash) {
+        let mut dest_bytes = vec![0x42u8; 384];
+        dest_bytes.extend_from_slice(&[0x05, 0x00, 0x04, 0x00, 0x07, 0x00, 0x00]);
+        let b64 = i2p_base64_encode(&dest_bytes);
+        let hash = DestHash::from_b64_destination(&b64).unwrap();
+        (format!("{b64} FROM_PORT=6881 TO_PORT=0\n"), hash)
+    }
+
+    /// Every accept error that cost one connection is `Ok(None)`; only the
+    /// listener's own errors are `Err`. Before this, `EMFILE` — reachable
+    /// from a swarm — ended inbound service for the rest of the session.
+    #[test]
+    fn a_transient_accept_error_costs_one_connection_not_the_listener() {
+        const EBADF: i32 = 9;
+        const EINVAL: i32 = 22;
+
+        for errno in [EMFILE, ENFILE, ENOBUFS] {
+            let got = usable_accept(Err(io::Error::from_raw_os_error(errno)));
+            assert!(matches!(got, Ok(None)), "errno {errno} ended the listener");
+        }
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::OutOfMemory,
+        ] {
+            let got = usable_accept(Err(io::Error::from(kind)));
+            assert!(matches!(got, Ok(None)), "{kind:?} ended the listener");
+        }
+        // Out of descriptors: stand back rather than spin.
+        let started = Instant::now();
+        assert!(matches!(
+            usable_accept(Err(io::Error::from_raw_os_error(EMFILE))),
+            Ok(None)
+        ));
+        assert!(
+            started.elapsed() >= FD_EXHAUSTED_PAUSE,
+            "no pause on EMFILE"
+        );
+
+        for errno in [EBADF, EINVAL] {
+            let e = usable_accept(Err(io::Error::from_raw_os_error(errno)))
+                .expect_err("a listener error was read as one bad connection");
+            assert_eq!(e.raw_os_error(), Some(errno), "the error must survive");
+        }
+        assert!(usable_accept(Err(io::Error::other("something new"))).is_err());
+    }
+
+    /// The loop as the demux runs it: `EMFILE` once, then a real forwarded
+    /// connection, which must still be accepted.
+    #[test]
+    fn an_accept_loop_survives_emfile_and_takes_the_next_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (header, expected) = forwarded_header();
+        let mut peer = TcpStream::connect(addr).unwrap();
+        peer.write_all(header.as_bytes()).unwrap();
+
+        let script = [
+            Err(io::Error::from_raw_os_error(EMFILE)),
+            listener.accept().map(|(socket, _)| socket),
+        ];
+        let mut accepted = 0;
+        for result in script {
+            match usable_accept(result) {
+                Ok(Some(_socket)) => accepted += 1,
+                Ok(None) => {}
+                Err(e) => panic!("the accept loop ended: {e}"),
+            }
+        }
+        assert_eq!(accepted, 1);
+
+        // And the whole inbound path, header included, on a fresh connection.
+        let mut peer = TcpStream::connect(addr).unwrap();
+        peer.write_all(header.as_bytes()).unwrap();
+        let (_stream, from) = accept_forwarded(&listener)
+            .expect("the listener is fine")
+            .expect("a forwarded connection with a header is usable");
+        assert_eq!(from, expected);
     }
 }
 
@@ -1382,6 +1796,10 @@ mod hostile_bridge_tests {
         Flood,
         /// A well-formed refusal.
         RefuseHello,
+        /// A refusal whose `MESSAGE` quotes `RESULT=OK`, with a terminal
+        /// escape for company: a substring match reads it as acceptance, and
+        /// an unscrubbed error repeats the escape.
+        ForgeOk,
         /// A single byte every so often: inside any per-read timeout, but
         /// never finishing. Only a whole-exchange deadline stops this.
         Dribble,
@@ -1415,6 +1833,11 @@ mod hostile_bridge_tests {
                         Misbehaviour::RefuseHello => {
                             let _ = sock.write_all(b"HELLO REPLY RESULT=NOVERSION\n");
                         }
+                        Misbehaviour::ForgeOk => {
+                            let _ = sock.write_all(
+                                b"HELLO REPLY RESULT=NOVERSION MESSAGE=\"RESULT=OK\x1b[2J\"\n",
+                            );
+                        }
                         Misbehaviour::Dribble => loop {
                             if sock.write_all(b"X").is_err() {
                                 return;
@@ -1441,7 +1864,7 @@ mod hostile_bridge_tests {
         limit: Duration,
         f: impl FnOnce() -> T + Send + 'static,
     ) -> Option<(T, Duration)> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
         let start = Instant::now();
         std::thread::spawn(move || {
             let _ = tx.send(f());
@@ -1479,6 +1902,7 @@ mod hostile_bridge_tests {
             Misbehaviour::Flood,
             Misbehaviour::RefuseHello,
             Misbehaviour::Dribble,
+            Misbehaviour::ForgeOk,
         ] {
             let port = fake_bridge(how);
             let Some((result, elapsed)) = within(LIMIT, move || hello_version(port, PROBE)) else {
@@ -1505,6 +1929,7 @@ mod hostile_bridge_tests {
             Misbehaviour::Flood,
             Misbehaviour::RefuseHello,
             Misbehaviour::Dribble,
+            Misbehaviour::ForgeOk,
         ] {
             let port = fake_bridge(how);
             let config = SamConfig {
@@ -1580,6 +2005,46 @@ mod hostile_bridge_tests {
     fn a_healthy_hello_is_accepted_and_its_version_reported() {
         let port = fake_bridge(Misbehaviour::HelloThenStall);
         assert_eq!(hello_version(port, PROBE).expect("hello accepted"), "3.3");
+    }
+
+    /// `RESULT=` is a field. A refusal whose `MESSAGE` quoted `RESULT=OK`
+    /// passed the old substring check, and the raw line then reached the
+    /// error — escape sequence and all.
+    #[test]
+    fn a_forged_ok_inside_a_refusal_is_still_a_refusal_and_is_scrubbed() {
+        let port = fake_bridge(Misbehaviour::ForgeOk);
+        let e = hello_version(port, PROBE)
+            .expect_err("a refusal quoting RESULT=OK in its MESSAGE was accepted");
+        assert!(e.to_string().contains("NOVERSION"), "{e}");
+        assert!(!e.to_string().contains('\u{1b}'), "escape survived: {e}");
+    }
+
+    /// A `STREAM STATUS` is the router's text and reaches a terminal, in the
+    /// result word, the message, and the line that is not a status at all.
+    #[test]
+    fn a_stream_status_cannot_forge_a_log_line() {
+        for status in [
+            "STREAM STATUS RESULT=I2P_ERROR\u{1b}[2J MESSAGE=\"x\r\ncloved: all is well\"",
+            "\u{1b}[2Jnot a status\r\n",
+        ] {
+            let e: io::Error = expect_stream_ok(status, "the stream to a peer")
+                .expect_err("refused")
+                .into();
+            let text = e.to_string();
+            assert!(
+                !text.contains('\u{1b}') && !text.contains('\r') && !text.contains('\n'),
+                "{text:?}"
+            );
+        }
+        // What the words are for still gets through.
+        let e: io::Error = expect_stream_ok(
+            "STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"no tunnels\"",
+            "the stream to a peer",
+        )
+        .expect_err("refused")
+        .into();
+        assert!(e.to_string().contains("I2P_ERROR"), "{e}");
+        assert!(e.to_string().contains("no tunnels"), "{e}");
     }
 
     /// A bridge that speaks the outbound-dial half of SAM: `HELLO REPLY`,
@@ -1696,6 +2161,7 @@ mod hostile_bridge_tests {
             Misbehaviour::RefuseHello,
             Misbehaviour::Dribble,
             Misbehaviour::HelloThenStall,
+            Misbehaviour::ForgeOk,
         ] {
             let port = fake_bridge(how);
             let (result, took) =
@@ -1772,7 +2238,8 @@ mod naming_tests {
     fn naming_bridge(reply: &str) -> (u16, mpsc::Receiver<String>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let (tx, rx) = mpsc::channel();
+        // Bounded, as every channel in the workspace is; a test drains far fewer.
+        let (tx, rx) = mpsc::sync_channel(16);
         let reply = reply.to_owned();
         std::thread::spawn(move || {
             while let Ok((mut sock, _)) = listener.accept() {
@@ -1794,7 +2261,7 @@ mod naming_tests {
         limit: Duration,
         f: impl FnOnce() -> T + Send + 'static,
     ) -> Option<T> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let _ = tx.send(f());
         });
@@ -1927,6 +2394,22 @@ mod naming_tests {
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
 
+    /// The result word is the router's text as much as the rest of the line.
+    #[test]
+    fn a_refusal_word_cannot_forge_a_log_line() {
+        let e = parse_naming_reply(
+            "NAMING REPLY RESULT=KEY_NOT_FOUND\u{1b}[2J\r\ncloved: ok NAME=t.i2p",
+            "t.i2p",
+        )
+        .expect_err("refused");
+        let text = e.to_string();
+        assert!(text.contains("KEY_NOT_FOUND"), "{text}");
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\r') && !text.contains('\n'),
+            "{text:?}"
+        );
+    }
+
     #[test]
     fn a_reply_cannot_forge_a_log_line_or_leak_a_blob() {
         // The reply is the bridge's text and reaches an operator's terminal.
@@ -2000,6 +2483,7 @@ mod naming_tests {
             Misbehaviour::RefuseHello,
             Misbehaviour::Dribble,
             Misbehaviour::HelloThenStall,
+            Misbehaviour::ForgeOk,
         ] {
             let port = fake_bridge(how);
             let Some(result) = within(LIMIT, move || naming_lookup(port, "tracker.i2p", PROBE))
@@ -2095,7 +2579,8 @@ mod session_tests {
     fn session_bridge(status: &'static str, after: AfterSession) -> (u16, mpsc::Receiver<String>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        let (tx, rx) = mpsc::channel();
+        // Bounded, as every channel in the workspace is; a test drains far fewer.
+        let (tx, rx) = mpsc::sync_channel(16);
         std::thread::spawn(move || {
             let seen = AtomicUsize::new(0);
             while let Ok((mut socket, _)) = listener.accept() {
@@ -2160,6 +2645,39 @@ mod session_tests {
             session_timeout: Duration::from_secs(5),
             persistent_key: None,
         }
+    }
+
+    /// The config holds the whole `DESTINATION=` blob, and a config is exactly
+    /// what an error path prints with `{:?}`.
+    #[test]
+    fn a_config_debug_print_redacts_the_private_key() {
+        let key = crate::addr::i2p_base64_encode(&key_blob());
+        let config = SamConfig {
+            persistent_key: Some(key.clone()),
+            ..config(7656)
+        };
+        for printed in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(!printed.contains(&key), "the key was printed: {printed}");
+            // Not even a recognisable piece of it.
+            assert!(!printed.contains(&key[..32]), "{printed}");
+            assert!(printed.contains("<redacted>"), "{printed}");
+            // The rest of the config is still worth printing.
+            assert!(printed.contains("clove-test"), "{printed}");
+            assert!(printed.contains("7656"), "{printed}");
+        }
+        // Says a key is set, without saying what it is.
+        assert!(
+            format!("{config:?}").contains("persistent_key: Some(<redacted>)"),
+            "{config:?}"
+        );
+        let transient = format!(
+            "{:?}",
+            SamConfig {
+                nickname: "clove-test".to_owned(),
+                ..SamConfig::default()
+            }
+        );
+        assert!(transient.contains("persistent_key: None"), "{transient}");
     }
 
     #[test]
@@ -2328,6 +2846,52 @@ mod session_tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
+    /// The nickname and the key both go into `SESSION CREATE`, and the config
+    /// is `pub`: this crate checks them itself, before it dials anything.
+    #[test]
+    fn a_nickname_or_key_that_would_forge_a_command_is_refused_before_dialling() {
+        // Nothing is listening here, so a connection error would prove the
+        // check ran too late.
+        let port = {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        for nickname in [
+            "clove\nDEST GENERATE",
+            "clove SILENT=true",
+            "clove\x7f",
+            "clove\0",
+        ] {
+            let e = SamSession::connect(&SamConfig {
+                nickname: nickname.to_owned(),
+                ..config(port)
+            })
+            .map(drop)
+            .expect_err("a nickname with a control character went into a command");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+            assert!(
+                !e.to_string().contains('\n'),
+                "the newline was repeated: {e}"
+            );
+        }
+
+        let key = format!("{}\nDEST GENERATE", "A".repeat(64));
+        let e = SamSession::connect(&SamConfig {
+            persistent_key: Some(key),
+            ..config(port)
+        })
+        .map(drop)
+        .expect_err("a key with a newline went into a command");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        assert!(!e.to_string().contains("AAAA"), "the key was repeated: {e}");
+
+        // An ordinary config still reaches the socket, and finds nobody.
+        let e = SamSession::connect(&config(port))
+            .map(drop)
+            .expect_err("nothing is listening");
+        assert_ne!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+    }
+
     #[test]
     fn forwarding_asks_for_the_destination_header_and_keeps_its_socket() {
         let (port, sent) = session_bridge(ok_status(), AfterSession::Hold);
@@ -2399,7 +2963,7 @@ mod session_tests {
 
         // Bounded, because the regression is a *hang*: before this fix
         // `wait_until_lost` simply never returned.
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
         let waiting = Arc::clone(&session);
         std::thread::spawn(move || {
             let _ = tx.send(waiting.wait_until_lost());

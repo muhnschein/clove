@@ -187,6 +187,11 @@ pub(crate) struct ScanJob {
 }
 
 impl ScanJob {
+    /// The torrent this pass is for.
+    pub(crate) fn info_hash(&self) -> &[u8; 20] {
+        &self.info_hash
+    }
+
     /// Lay the files out if they are not there yet, then hash what is.
     ///
     /// Takes as long as it takes; the caller must not be holding the registry.
@@ -302,6 +307,13 @@ struct Hosted {
     known_peers: usize,
     /// Of those, how many arrived over `i2p_pex`.
     pex_peers: u64,
+    /// Destinations this run has banned for serving bytes that failed
+    /// verification (`docs/PROTOCOL.i2p-bt` §4.8). Live-only, like `peers`.
+    banned_peers: usize,
+    /// The first disk error the engine hit writing or verifying a block, if
+    /// any. A download with one of these is stalled on the operator, not on
+    /// the swarm, and `clove list` has to say so.
+    storage_error: Option<String>,
     /// Peers that reached us rather than being dialed — the live proof of the
     /// inbound `STREAM FORWARD` path (`PROTOCOL.i2p-bt` §2.5).
     inbound_peers: u64,
@@ -510,6 +522,15 @@ pub(crate) enum AddError {
     Magnet(magnet::Error),
     /// A torrent with this info-hash is already hosted (409).
     Duplicate,
+    /// A different torrent with the same `name` is already hosted (409).
+    ///
+    /// Files live under `downloads/<name>/…`, and storage opens them with
+    /// `O_CREAT` but not `O_EXCL`, so two torrents sharing a name share
+    /// inodes: both engines write at their own offsets, both fail
+    /// verification for ever, and the first one's data is quietly destroyed.
+    /// `check_distinct_paths` refuses exactly this *within* a torrent; this is
+    /// the same rule between them. Carries the name, scrubbed for display.
+    NameClash(String),
     /// A filesystem error (500).
     Io(io::Error),
 }
@@ -520,6 +541,11 @@ impl fmt::Display for AddError {
             AddError::Parse(e) => write!(f, "{e}"),
             AddError::Magnet(e) => write!(f, "{e}"),
             AddError::Duplicate => write!(f, "torrent already added"),
+            AddError::NameClash(name) => write!(
+                f,
+                "a hosted torrent is already named {name:?}; two torrents with one name would \
+                 share files on disk"
+            ),
             AddError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -530,6 +556,13 @@ impl fmt::Display for AddError {
 pub(crate) enum RemoveError {
     /// No torrent with that info-hash (404).
     NotFound,
+    /// A hash pass over its files is running, outside the lock (400).
+    ///
+    /// The scan job holds no lock and opens the files with `O_CREAT`, so a
+    /// removal that deleted them out from under it would watch them come
+    /// back — laid out empty, and `fallocate`d under `preallocate yes` — and
+    /// then find nothing to publish to. Waiting is the only safe order.
+    Scanning,
     /// A filesystem error (500).
     Io(io::Error),
 }
@@ -538,6 +571,11 @@ impl fmt::Display for RemoveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RemoveError::NotFound => write!(f, "no such torrent"),
+            RemoveError::Scanning => write!(
+                f,
+                "this torrent's data is being verified; wait for that to finish before \
+                 removing it"
+            ),
             RemoveError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -885,6 +923,8 @@ where
                 hosted.known_peers = live.torrent.known_peers().len();
                 hosted.pex_peers = live.torrent.pex_learned();
                 hosted.inbound_peers = live.torrent.inbound_peers();
+                hosted.banned_peers = live.torrent.banned_count();
+                hosted.storage_error = live.torrent.storage_error();
                 let (ok, failed, why) = live.torrent.announce_status();
                 hosted.announces_ok = ok;
                 hosted.announces_failed = failed;
@@ -992,6 +1032,16 @@ where
         if self.torrents.contains_key(&info_hash) {
             return Err(AddError::Duplicate);
         }
+        // Not the same torrent, but the same place on disk. The name is a
+        // stranger's text on its way to a terminal and a log line, so it is
+        // scrubbed here, once, for both.
+        if self
+            .torrents
+            .values()
+            .any(|hosted| hosted.meta.name == meta.name)
+        {
+            return Err(AddError::NameClash(clove_core::text::scrub(&meta.name)));
+        }
         let num_pieces = u32::try_from(meta.pieces.len()).unwrap_or(u32::MAX);
         let priorities = vec![1u8; meta.files.len()];
 
@@ -1010,6 +1060,8 @@ where
             peers: 0,
             known_peers: 0,
             pex_peers: 0,
+            banned_peers: 0,
+            storage_error: None,
             inbound_peers: 0,
             announces_ok: 0,
             announces_failed: 0,
@@ -1370,13 +1422,19 @@ where
         info_hash: &[u8; 20],
         delete_data: bool,
     ) -> Result<(), RemoveError> {
-        if self.pending.remove(info_hash).is_some() {
-            // A magnet still fetching: drop its URI file; the fetch thread
-            // notices the entry is gone and exits.
-            return remove_file_ok(&self.state_dir.join(format!("{}.magnet", hex(info_hash))));
+        if self.pending.contains_key(info_hash) {
+            // A magnet still fetching. The file first, then the entry, the
+            // same order as the hosted path below and for the same reason: if
+            // the unlink fails the API says so and the magnet is still there,
+            // rather than gone from memory and back again at the next start.
+            remove_file_ok(&self.state_dir.join(format!("{}.magnet", hex(info_hash))))?;
+            // The fetch thread notices the entry is gone and exits.
+            self.pending.remove(info_hash);
+            return Ok(());
         }
-        if !self.torrents.contains_key(info_hash) {
-            return Err(RemoveError::NotFound);
+        let hosted = self.torrents.get(info_hash).ok_or(RemoveError::NotFound)?;
+        if hosted.scanning {
+            return Err(RemoveError::Scanning);
         }
         // Take it offline first so nothing is writing while files disappear.
         self.stop_live(info_hash);
@@ -1591,6 +1649,8 @@ where
                 peers: 0,
                 known_peers: 0,
                 pex_peers: 0,
+                banned_peers: 0,
+                storage_error: None,
                 inbound_peers: 0,
                 announces_ok: 0,
                 announces_failed: 0,
@@ -1806,6 +1866,10 @@ impl Hosted {
             ("pex_peers".to_owned(), Value::UInt(self.pex_peers)),
             ("inbound_peers".to_owned(), Value::UInt(self.inbound_peers)),
             (
+                "banned_peers".to_owned(),
+                Value::UInt(u64::try_from(self.banned_peers).unwrap_or(u64::MAX)),
+            ),
+            (
                 "announces_ok".to_owned(),
                 Value::UInt(u64::from(self.announces_ok)),
             ),
@@ -1828,6 +1892,9 @@ impl Hosted {
         }
         if let Some(why) = &self.last_announce_error {
             fields.push(("last_announce_error".to_owned(), Value::from(why.clone())));
+        }
+        if let Some(why) = &self.storage_error {
+            fields.push(("storage_error".to_owned(), Value::from(why.clone())));
         }
         Value::Object(fields)
     }
@@ -2045,10 +2112,22 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 /// Write `bytes` to `path` atomically: a sibling temp file, fsynced, then
 /// renamed over `path` (atomic on the same filesystem).
+///
+/// The temp name carries this process's pid and is opened `create_new`, the
+/// way `write_private_file` in `main.rs` does it. A fixed `<path>.tmp` opened
+/// with truncation let two daemons on one data directory interleave: one
+/// truncates the temp the other has just fsynced, and the other renames the
+/// half-written file into place. The instance lock makes that pairing
+/// unlikely; this makes it harmless.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+    let tmp = PathBuf::from(format!("{}.{}.tmp", path.display(), std::process::id()));
+    // A temp left by an earlier crash of this pid would fail create_new below.
+    let _ = fs::remove_file(&tmp);
     {
-        let mut file = fs::File::create(&tmp)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
@@ -2093,7 +2172,13 @@ mod tests {
 
     /// Deterministic multi-piece content and a real single-file `.torrent`.
     fn fixture(name: &str) -> (Vec<u8>, Vec<u8>) {
-        let content: Vec<u8> = (0..(3 * BLOCK_LEN + 100))
+        fixture_sized(name, 3 * BLOCK_LEN + 100)
+    }
+
+    /// [`fixture`] with a chosen length, which is what makes two torrents
+    /// with the same name but different info-hashes buildable.
+    fn fixture_sized(name: &str, len: u32) -> (Vec<u8>, Vec<u8>) {
+        let content: Vec<u8> = (0..len)
             .map(|i| u8::try_from(i % 251).unwrap_or(0))
             .collect();
         let pieces: Vec<u8> = content
@@ -2771,6 +2856,165 @@ mod tests {
         assert!(
             !magnet_path.exists(),
             "the stale magnet file was left behind"
+        );
+    }
+
+    /// Two torrents, one `name`, is two engines writing the same files at
+    /// different offsets. The second is refused, whichever door it comes in
+    /// by: a plain add, or a magnet whose metadata just arrived.
+    #[test]
+    fn a_torrent_whose_name_is_already_hosted_is_refused() {
+        let data = TempDir::new("name-clash");
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
+        let (_, first) = fixture_sized("shared-name", 3 * BLOCK_LEN + 100);
+        let (_, second) = fixture_sized("shared-name", 3 * BLOCK_LEN + 200);
+        let second_hash = MetaInfo::parse(&second).unwrap().info_hash.0;
+        add_and_scan(&mut registry, &first);
+
+        let Err(err) = registry.add_torrent(&second, AddOptions::default()) else {
+            panic!("a second torrent with the same name was added");
+        };
+        assert!(
+            matches!(&err, AddError::NameClash(name) if name == "shared-name"),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("shared-name"),
+            "the refusal does not name the clash: {err}"
+        );
+        assert_eq!(registry.count(), 1);
+        // Nothing of the refused torrent reached the state directory.
+        assert!(
+            !data
+                .0
+                .join(format!("state/{}.torrent", hex(&second_hash)))
+                .exists(),
+            "the refused torrent's metainfo was persisted"
+        );
+
+        // The magnet path goes through the same gate, and the magnet stays
+        // pending rather than being spent on a torrent that was refused.
+        registry
+            .add_magnet(&format!("magnet:?xt=urn:btih:{}", hex(&second_hash)))
+            .expect("add magnet");
+        assert!(matches!(
+            registry.complete_magnet(&second_hash, &second),
+            Err(AddError::NameClash(_))
+        ));
+        assert_eq!(registry.pending_hashes(), vec![second_hash]);
+
+        // A different name with the same shape is fine, so the check is on
+        // the name and not on something else the two have in common.
+        let (_, other) = fixture_sized("other-name", 3 * BLOCK_LEN + 200);
+        add_and_scan(&mut registry, &other);
+        assert_eq!(registry.count(), 2);
+    }
+
+    /// A torrent whose files are being hashed cannot be removed until the
+    /// pass publishes: the unlocked scan job would recreate what the removal
+    /// deleted, and then find nothing to report to.
+    #[test]
+    fn a_torrent_being_verified_is_not_removable_until_the_scan_publishes() {
+        let data = TempDir::new("remove-scanning");
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
+        let (_, bytes) = fixture("scanning-remove");
+        // Registered and marked as scanning, the scan not yet run: the
+        // window `DELETE ?data=1` used to land in.
+        let (info_hash, job) = registry
+            .add_torrent(&bytes, AddOptions::default())
+            .expect("add");
+        assert!(
+            matches!(
+                registry.remove(&info_hash, true),
+                Err(RemoveError::Scanning)
+            ),
+            "a torrent being verified was removed"
+        );
+        assert_eq!(registry.count(), 1, "the refusal removed it anyway");
+        assert!(
+            data.0
+                .join(format!("state/{}.torrent", hex(&info_hash)))
+                .is_file(),
+            "the refusal deleted the state file"
+        );
+
+        // Once the pass has published, the removal goes through, files and all.
+        let scanned = job.run();
+        registry.finish_scan(&job, scanned).expect("publish");
+        registry
+            .remove(&info_hash, true)
+            .expect("remove after the scan");
+        assert_eq!(registry.count(), 0);
+        assert!(
+            !data.0.join("downloads/scanning-remove").exists(),
+            "the data was not deleted"
+        );
+    }
+
+    /// Removing a pending magnet deletes its file before its entry, so a
+    /// failed unlink leaves the magnet listed rather than gone until the
+    /// next restart brings it back.
+    #[test]
+    fn a_pending_magnet_whose_file_cannot_be_removed_stays_pending() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses directory permission checks; the unlink below would
+        // succeed and the test would prove nothing.
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipping: running as root, directory permissions are not enforced");
+            return;
+        }
+        let data = TempDir::new("remove-magnet-order");
+        let mut registry = Registry::<MockDialer>::open(&data.0, Limits::default()).unwrap();
+        let info_hash = registry
+            .add_magnet(&format!("magnet:?xt=urn:btih:{}", "cd".repeat(20)))
+            .expect("add magnet");
+        let state = data.0.join("state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let outcome = registry.remove(&info_hash, false);
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(outcome, Err(RemoveError::Io(_))), "{outcome:?}");
+        assert_eq!(
+            registry.pending_hashes(),
+            vec![info_hash],
+            "the magnet was dropped from memory although its file survived"
+        );
+
+        // With the directory writable again the removal completes.
+        registry.remove(&info_hash, false).expect("remove");
+        assert!(registry.pending_hashes().is_empty());
+        assert!(!state.join(format!("{}.magnet", hex(&info_hash))).exists());
+    }
+
+    /// The temp file is this process's own, not a fixed name any writer of
+    /// the same target would open with truncation.
+    #[test]
+    fn atomic_write_uses_a_private_temp_name() {
+        let data = TempDir::new("atomic-tmp");
+        let target = data.0.join("state.resume");
+        // What the old fixed name would have been. Left in place by "another
+        // writer"; if this write went through it, it would be truncated and
+        // renamed away.
+        let fixed = data.0.join("state.resume.tmp");
+        fs::write(&fixed, b"another writer's half-written temp").unwrap();
+        // And a leftover of *our* own pid, from a crash: it must not make the
+        // write fail, and it must not be trusted either.
+        let ours = data
+            .0
+            .join(format!("state.resume.{}.tmp", std::process::id()));
+        fs::write(&ours, b"stale").unwrap();
+
+        atomic_write(&target, b"the real state").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"the real state");
+        assert_eq!(
+            fs::read(&fixed).unwrap(),
+            b"another writer's half-written temp",
+            "the fixed-name temp was touched"
+        );
+        assert!(
+            !ours.exists(),
+            "the pid temp was left behind after the rename"
         );
     }
 

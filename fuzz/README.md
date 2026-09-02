@@ -80,6 +80,7 @@ beyond "did not panic":
 | `extensions` | `i2p_pex`, `ut_metadata`, BEP 10 handshake | the PEX peer cap holds |
 | `magnet` | magnet URIs | non-I2P trackers are filtered out |
 | `dest` | SAM base64 destinations and b32 labels | both codecs round trip; a truncated destination is still a whole destination |
+| `text` | every foreign string on its way to a terminal | no control, bidi, zero-width or separator character survives `scrub`; length in characters is preserved; scrubbing is idempotent |
 
 The properties matter as much as the crashes: a parser that accepts a torrent
 whose paths escape the download directory has not crashed, and is still a

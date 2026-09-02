@@ -127,7 +127,11 @@ impl Choker {
                 .filter(|id| !chosen.contains(id))
                 .collect();
             if !candidates.is_empty() {
-                let idx = usize::try_from(self.round).unwrap_or(0) % candidates.len();
+                // Indexed by the *optimistic* round, not the round: every
+                // third round with `round % len` visits only `len / 3` of the
+                // candidates whenever `len` is a multiple of three, and with
+                // a stable order the rest were never unchoked at all.
+                let idx = usize::try_from(self.round / 3).unwrap_or(0) % candidates.len();
                 let pick = candidates[idx];
                 // Free a slot by dropping the lowest-rate regular pick.
                 if chosen.len() >= self.max_unchoked {
@@ -225,5 +229,29 @@ mod tests {
         // eventually unchoked via the optimistic slot.
         assert!(unchoked_two, "slow peer never got an optimistic unchoke");
         let _ = peers;
+    }
+
+    /// The rotation must reach every candidate whatever their number. With
+    /// three candidates the old `round % len` on rounds 3, 6, 9… only ever
+    /// produced index 0.
+    #[test]
+    fn the_optimistic_slot_visits_every_candidate() {
+        for candidates in 1..=12u64 {
+            let mut choker = Choker::new(1);
+            let mut ever = HashSet::new();
+            for _ in 0..(candidates * 6) {
+                // Peer 0 is the fixed regular pick; the rest are candidates.
+                let peers: Vec<PeerSnapshot> = (0..=candidates)
+                    .map(|id| peer(id, true, u64::from(id == 0), id == 0))
+                    .collect();
+                ever.extend(choker.plan(&peers).unchoke);
+            }
+            assert_eq!(
+                ever.len() as u64,
+                candidates,
+                "{candidates} candidates: only {} were ever unchoked",
+                ever.len()
+            );
+        }
     }
 }
