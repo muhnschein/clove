@@ -867,20 +867,35 @@ impl Torrent {
     /// Handshake I/O failure or an info-hash mismatch (wrong torrent).
     pub fn attach<S: I2pStream + 'static>(
         &self,
+        stream: S,
+        remote: DestHash,
+    ) -> std::io::Result<()> {
+        self.attach_abortable(stream, remote, &|| false)
+    }
+
+    /// [`attach`](Torrent::attach), giving up the handshake early — within
+    /// [`HANDSHAKE_POLL`] — once `abort` returns true. What the dial sweep
+    /// uses, so a pause or shutdown is not held behind a peer that accepted
+    /// and then answers a byte at a time.
+    ///
+    /// # Errors
+    ///
+    /// As [`attach`](Torrent::attach), plus [`std::io::ErrorKind::Interrupted`]
+    /// when aborted.
+    pub fn attach_abortable<S: I2pStream + 'static>(
+        &self,
         mut stream: S,
         remote: DestHash,
+        abort: &dyn Fn() -> bool,
     ) -> std::io::Result<()> {
         if self.is_banned(remote) {
             return Err(banned());
         }
-        // Bound the exchange (see [`HANDSHAKE_TIMEOUT`]). Best-effort: a
-        // backend with no timeout of its own ignores it.
-        let _ = stream.set_timeouts(Some(HANDSHAKE_TIMEOUT));
-        stream.write_all(&self.our_handshake().encode())?;
-        let mut buf = [0u8; wire::HANDSHAKE_LEN];
-        stream.read_exact(&mut buf)?;
-        let theirs = Handshake::parse(&buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // One deadline for the whole exchange (see [`HANDSHAKE_TIMEOUT`]).
+        // Best-effort: a backend with no timeout of its own ignores it.
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        write_handshake_until(&mut stream, &self.our_handshake().encode(), deadline, abort)?;
+        let theirs = read_handshake_until(&mut stream, deadline, abort)?;
         if theirs.info_hash != self.shared.info_hash {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

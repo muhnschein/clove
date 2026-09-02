@@ -730,6 +730,24 @@ describing anything clove does.
     is exposed (`Torrent::banned_count`) so a torrent that keeps failing pieces
     and one that has caught the peer doing it can be told apart.
 
+4.9 [decided] **A handshake is bounded as an exchange, not per read.** Found
+    by the 2026-09 audit (H-1, H-2). Both directions used a per-read timeout,
+    which a peer renews by sending one byte inside it: 68 bytes at a byte per
+    59 seconds held an outbound attach — and the dial sweep, and every pause,
+    remove and shutdown that joins it — for over an hour, and did the same to
+    an inbound routing thread and its share of the pending-handshake cap.
+
+    Both sides now read and write the 68 bytes against one absolute deadline
+    (`HANDSHAKE_TIMEOUT`, 60s outbound; 30s inbound, since an inbound peer
+    has already built its tunnels and reached us) in slices of
+    `HANDSHAKE_POLL` (1s), and the dial sweep's stop flag is consulted
+    between slices, so a stop is observed within a second of being raised.
+    The pending-handshake cap is also counted per destination, at
+    `MAX_CONNECTIONS_PER_DEST`, checked before the handshake is read — the
+    destination is known from the forwarded connection's header before a
+    byte of BitTorrent arrives — so filling the cap takes a swarm's worth of
+    identities rather than one.
+
 4.5 [decided] Magnet links (clove-core::magnet): `magnet:?xt=urn:btih:<hex
     40 | base32 32>`; `dn` and `tr` are percent-decoded, `tr` filtered to
     I2P-only like .torrent announce URLs.

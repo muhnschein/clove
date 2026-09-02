@@ -577,9 +577,13 @@ fn sweep<D>(
                     let Some(&peer) = candidates.get(index) else {
                         return;
                     };
-                    let attached = dialer
-                        .dial(peer, config.dial_timeout)
-                        .and_then(|stream| torrent.attach(stream, peer));
+                    // Abortable: a stop raised while the handshake is in
+                    // flight is honoured within `HANDSHAKE_POLL`, so pause,
+                    // remove and shutdown do not wait on a peer that accepted
+                    // and then dribbles.
+                    let attached = dialer.dial(peer, config.dial_timeout).and_then(|stream| {
+                        torrent.attach_abortable(stream, peer, &|| stop.is_raised())
+                    });
                     if attached.is_err() {
                         lock_vec(&failed).push(peer);
                     }
@@ -1824,6 +1828,63 @@ mod tests {
             0,
             "a raised stop flag must be checked before the first dial, not after"
         );
+    }
+
+    /// A peer that accepts and then hands over its handshake one byte at a
+    /// time. Each byte used to renew a per-read timeout, so the attach — and
+    /// with it the sweep, and with that `shutdown` — was held for as long as
+    /// the peer cared to dribble. The deadline is now on the exchange and the
+    /// sweep's stop flag is consulted inside it.
+    #[test]
+    fn shutdown_is_not_held_by_a_dribbling_handshake() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let net = MockNet::new();
+        let (_seeder, leecher, _sd, _ld) = seed_and_leech();
+
+        let dribbler_ep = net.endpoint();
+        let dribbler_dest = dribbler_ep.dest();
+        let done = Arc::new(AtomicBool::new(false));
+        let dribbler_done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let Ok((mut stream, _from)) = dribbler_ep.accept() else {
+                return;
+            };
+            // Never a whole handshake: one plausible byte at a time, for as
+            // long as the far side keeps the connection.
+            while !dribbler_done.load(Ordering::Relaxed) {
+                if stream.write_all(&[19]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        leecher.add_peers(&[dribbler_dest]);
+        let swarm = Swarm::dial_only(
+            Arc::clone(&leecher),
+            net.endpoint().dialer(),
+            quick_config(),
+        );
+        // Let the sweep dial and get stuck in the handshake.
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Bounded from outside, because the failure mode is a join that
+        // never returns.
+        let (report, finished) = std::sync::mpsc::sync_channel::<Duration>(1);
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            swarm.shutdown();
+            let _ = report.send(start.elapsed());
+        });
+        let took = finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("shutdown was held by a peer dribbling its handshake");
+        assert!(
+            took < Duration::from_secs(5),
+            "shutdown took {took:?} behind a dribbling handshake"
+        );
+        done.store(true, Ordering::Relaxed);
     }
 
     #[test]
