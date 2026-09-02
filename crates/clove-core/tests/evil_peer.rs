@@ -86,13 +86,19 @@ fn private_meta_for(content: &[u8]) -> MetaInfo {
 }
 
 fn meta_with(content: &[u8], private: bool) -> MetaInfo {
+    meta_shaped(content, BLOCK_LEN, private)
+}
+
+/// [`meta_for`] over pieces of `piece_length` bytes, for the cases where a
+/// piece must be more than one block.
+fn meta_shaped(content: &[u8], piece_length: u32, private: bool) -> MetaInfo {
     let pieces: Vec<u8> = content
-        .chunks(BLOCK_LEN as usize)
+        .chunks(piece_length as usize)
         .flat_map(|c| <[u8; 20]>::from(Sha1::digest(c)))
         .collect();
     let mut info = BTreeMap::new();
     info.insert(b"name".to_vec(), Ben::Bytes(b"evil".to_vec()));
-    info.insert(b"piece length".to_vec(), Ben::Int(i64::from(BLOCK_LEN)));
+    info.insert(b"piece length".to_vec(), Ben::Int(i64::from(piece_length)));
     info.insert(b"pieces".to_vec(), Ben::Bytes(pieces));
     info.insert(
         b"length".to_vec(),
@@ -747,6 +753,117 @@ fn a_late_duplicate_block_cannot_corrupt_a_verified_piece() {
     assert_eq!(
         fetched, content,
         "the file on disk is not the file we wanted"
+    );
+}
+
+/// The endgame's duplicates are meant to be raced and then *cancelled*. The
+/// cancel was never sent, so every peer holding a copy sent it — a pipeline's
+/// worth of duplicate transfer each — and a later copy was written over the
+/// first with the piece still unverified, so one bad copy failed the piece
+/// and threw away the good bytes with it.
+#[test]
+fn the_first_copy_of_a_block_cancels_the_others_and_is_not_overwritten() {
+    // Two blocks per piece, so a piece is still unverified when its second
+    // copy of the first block arrives.
+    let content = content();
+    let meta = meta_shaped(&content, 2 * BLOCK_LEN, false);
+    let info_hash = meta.info_hash.0;
+    let num_pieces = u32::try_from(meta.pieces.len()).expect("piece count");
+    let blocks = u32::try_from(content.len())
+        .expect("len")
+        .div_ceil(BLOCK_LEN);
+
+    let net = MockNet::new();
+    let dir = TempDir::new("cancel");
+    let leecher = leeching_torrent(&meta, &dir);
+    let ep = net.endpoint();
+    let dest = ep.dest();
+    let _acceptor = spawn_acceptor(&leecher, ep);
+
+    let mut honest = raw_peer(&net, dest, info_hash);
+    claim_everything(&mut honest, num_pieces).expect("honest claim");
+    let first = read_requests(&mut honest, blocks as usize);
+    let mut late = raw_peer(&net, dest, info_hash);
+    claim_everything(&mut late, num_pieces).expect("late claim");
+    let second = read_requests(&mut late, blocks as usize);
+    assert_eq!(
+        first, second,
+        "both peers should have been offered everything"
+    );
+
+    // The honest peer answers the first block of piece 0 and nothing else
+    // yet, so piece 0 stays unverified.
+    let target = first
+        .iter()
+        .find(|r| r.index == 0 && r.begin == 0)
+        .copied()
+        .expect("piece 0 block 0 was offered");
+    let good = |req: &wire::BlockRequest| {
+        let start = req.index as usize * 2 * BLOCK_LEN as usize + req.begin as usize;
+        content[start..start + req.length as usize].to_vec()
+    };
+    wire::write_message(
+        &mut honest,
+        &Message::Piece {
+            index: target.index,
+            begin: target.begin,
+            block: good(&target),
+        },
+    )
+    .expect("honest block");
+
+    // The late peer must be told not to bother.
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no cancel reached the other peer"
+        );
+        if let Some(Message::Cancel(req)) = next_message(&mut late) {
+            assert_eq!(req, target, "cancelled the wrong block");
+            break;
+        }
+    }
+
+    // It sends its copy anyway — rubbish — and then the honest peer finishes
+    // the piece. If the rubbish had gone over the good copy the piece would
+    // fail, not verify.
+    wire::write_message(
+        &mut late,
+        &Message::Piece {
+            index: target.index,
+            begin: target.begin,
+            block: vec![0xEE; target.length as usize],
+        },
+    )
+    .expect("late block");
+    std::thread::sleep(Duration::from_millis(200));
+    let rest = first
+        .iter()
+        .find(|r| r.index == 0 && r.begin == BLOCK_LEN)
+        .copied()
+        .expect("piece 0 block 1 was offered");
+    wire::write_message(
+        &mut honest,
+        &Message::Piece {
+            index: rest.index,
+            begin: rest.begin,
+            block: good(&rest),
+        },
+    )
+    .expect("honest second block");
+    let deadline = Instant::now() + DEADLINE;
+    while !leecher.have().has(0) {
+        assert!(
+            Instant::now() < deadline,
+            "piece 0 never verified: the late copy went over the first"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        leecher.banned_count(),
+        0,
+        "an honest peer was blamed for a duplicate that should have been dropped"
     );
 }
 

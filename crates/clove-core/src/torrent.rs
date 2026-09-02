@@ -1631,6 +1631,12 @@ impl Shared {
         if !was_requested || st.picker.has(index) {
             // Unsolicited, already satisfied, or late; ignore the payload but
             // still keep the pipeline full below.
+        } else if st.picker.is_received(index, block_no) {
+            // A second copy of a block already on disk. Writing it would put
+            // this peer's bytes over another's with the piece unverified, so
+            // one bad copy anywhere would fail the whole piece and undo the
+            // attribution above. The request is settled either way.
+            st.picker.block_failed(index, block_no);
         } else if let Err(e) = self.storage.write_block(index, begin, block) {
             // The picker still counts this block as owed. Give it back, or
             // it is never re-offered and the download stalls with nothing
@@ -1645,6 +1651,7 @@ impl Shared {
             // after this connection is gone, and a ban is on the identity.
             let dest = st.peers[idx].dest;
             st.suppliers.insert((index, block_no), dest);
+            cancel_elsewhere(st, idx, index, begin, block_no, out);
             if !st.picker.block_received(index, block_no) {
                 return;
             }
@@ -1720,6 +1727,44 @@ impl Shared {
                 self.done_cv.notify_all();
             }
         }
+    }
+}
+
+/// A block has arrived from `idx`: withdraw it from every other peer that
+/// still owes it. The endgame hands one block to several peers on purpose;
+/// without a `cancel` each of them sends it anyway — up to a pipeline's worth
+/// of duplicate transfer per peer over tunnels that are not cheap — and the
+/// copies land on top of each other. The count goes back to the picker with
+/// the request, so nothing is left owed by a peer we told not to bother.
+fn cancel_elsewhere(
+    st: &mut State,
+    idx: usize,
+    index: u32,
+    begin: u32,
+    block_no: u32,
+    out: &mut Vec<Outgoing>,
+) {
+    let length = st.picker.block_len(index, block_no);
+    for other in 0..st.peers.len() {
+        if other == idx
+            || st.peers[other]
+                .in_flight
+                .remove(&(index, block_no))
+                .is_none()
+        {
+            continue;
+        }
+        st.picker.block_failed(index, block_no);
+        let peer = &st.peers[other];
+        out.push((
+            peer.id,
+            peer.out.clone(),
+            Message::Cancel(BlockRequest {
+                index,
+                begin,
+                length,
+            }),
+        ));
     }
 }
 

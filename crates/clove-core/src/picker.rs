@@ -402,6 +402,17 @@ impl Picker {
         complete
     }
 
+    /// Whether block `block` of piece `index` has already arrived and is
+    /// waiting on the rest of its piece. False for a piece we hold — its
+    /// blocks are verified, not merely received — and for one never started.
+    #[must_use]
+    pub fn is_received(&self, index: u32, block: u32) -> bool {
+        self.progress
+            .get(&index)
+            .and_then(|p| p.received.get(block as usize))
+            .is_some_and(|&r| r)
+    }
+
     /// Release an in-flight block that will not arrive (timeout, reject, or
     /// the peer disconnected), so it can be handed out again.
     pub fn block_failed(&mut self, index: u32, block: u32) {
