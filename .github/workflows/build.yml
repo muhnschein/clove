@@ -1,0 +1,44 @@
+name: Build
+
+on:
+  # `main` only: a bare `push:` beside `pull_request:` runs everything twice.
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Same rule as ci.yml: a pull request groups by branch, so a new push
+# supersedes the run in flight. Everything else falls through to `run_id`,
+# a group of one, never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+# The scan reads the tree and talks to SonarQube Cloud over SONAR_TOKEN.
+# It writes nothing back here.
+permissions:
+  contents: read
+
+jobs:
+  sonarqube:
+    name: SonarQube
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # `secrets` is not exposed to a pull request opened from a fork, so this
+    # job cannot authenticate there: it would fail every outside contribution
+    # with a red X only a maintainer could clear. Skip it instead — the push
+    # to `main` after the merge produces the analysis.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # A shallow clone costs the scanner its blame data, which is what
+          # attributes an issue to a commit and drives the new-code period.
+          fetch-depth: 0
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
