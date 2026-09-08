@@ -43,18 +43,16 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-  # The scanner does not fail on a file it cannot read: it logs a warning and
-  # analyses nothing. On the first run three of the ten shell scripts hit that
-  # — ci/fuzz.sh, ci/fuzz-coverage.sh and ci/fuzz-sanitizer-ab.sh — and one of
-  # them failed at 1:1, so the whole file was skipped. All three parse clean
-  # under `sh -n` and `bash -n`; the fault is in the analyser's parser, not the
-  # scripts. Nothing in the dashboard says so. A file that is never read
-  # reports zero issues, which is indistinguishable from a file that is clean,
-  # and the gap widens silently as the scripts grow.
+  # The scan itself passing says nothing about what it read. The scanner does
+  # not fail on a file it cannot parse — it logs one WARN and analyses
+  # nothing — and on the first run three of the ten shell scripts hit that,
+  # one of them at 1:1. Zero issues from a file nobody read looks exactly
+  # like zero issues from a clean file.
   #
-  # So: same argument as ci/check-dicts.sh, one tool over. A checker that has
-  # quietly stopped checking prints ok forever, and the only way to know is to
-  # make it say so out loud.
+  # So this reads the scan job's own log back and hands it to
+  # ci/check-scan-coverage.sh, which knows which failures are already
+  # understood and fails on anything else. The rationale, the baseline and
+  # the matcher's self-test all live in that script.
   scan-coverage:
     name: Scan coverage
     needs: sonarqube
@@ -65,6 +63,7 @@ jobs:
       # Reading the scan job's log is the whole point of this job.
       actions: read
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Fail on files the scanner could not parse
         env:
           GH_TOKEN: ${{ github.token }}
@@ -78,18 +77,8 @@ jobs:
               echo "no SonarQube job in run $RUN_ID; nothing to check" >&2
               exit 1
           fi
-          gh run view --repo "$REPO" --job "$job" --log > scan.log \
-            || gh api "repos/$REPO/actions/jobs/$job/logs" > scan.log
-          # The two shell analysers word it differently and disagree about
-          # where the file broke, so match both. Anchored on their exact
-          # phrasing to keep this from firing on ordinary log text.
-          if grep -nE "Cannot parse '|Syntax error in " scan.log; then
-              echo >&2
-              echo "The scanner could not parse the file(s) listed above, so" >&2
-              echo "it analysed nothing in them. That is a silent gap in" >&2
-              echo "coverage, not a clean result. Either restate the code in" >&2
-              echo "a form the analyser accepts, or exclude the file and say" >&2
-              echo "why in sonar-project.properties." >&2
-              exit 1
-          fi
-          echo "scan coverage: the scanner parsed every file it opened"
+          # The per-job logs endpoint, not `gh run view --log`: this job runs
+          # inside the very run it is inspecting, and that command refuses
+          # while the run is in progress — which it always will be here.
+          gh api "repos/$REPO/actions/jobs/$job/logs" > scan.log
+          ./ci/check-scan-coverage.sh scan.log

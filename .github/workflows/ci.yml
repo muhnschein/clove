@@ -56,6 +56,12 @@ jobs:
       # because a grammar check that has stopped matching prints ok forever.
       - run: ./ci/check-dicts.sh --self-test
       - run: ./ci/check-dicts.sh
+      # The scan-coverage gate in build.yml restates SonarQube's log wording,
+      # so its matcher rots exactly the way check-dicts' does — reword the
+      # WARN upstream and the gate goes green forever. The self-test is
+      # milliseconds and belongs here too, where a contributor who has never
+      # looked at build.yml still sees it break.
+      - run: ./ci/check-scan-coverage.sh --self-test
       # End-to-end: drive the real binaries as an operator does. Unit tests
       # cannot see whole-process faults (the Phase-F registry deadlocks
       # passed all of them).
