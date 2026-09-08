@@ -26,14 +26,21 @@ jobs:
     # six-hour ceiling. Tier-1 runs in well under a minute today.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # The pinned toolchain comes from rust-toolchain.toml; rustup installs
       # it (with clippy + rustfmt) on the first cargo invocation. Do not
       # `rustup update stable` here — that would defeat the pin.
       - run: rustc --version
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # `--locked` on every command that resolves dependencies: CI must build
+      # the Cargo.lock that was reviewed, not one cargo quietly updated on the
+      # runner. It has to be on all of them, not just the build — clippy runs
+      # first, and a clippy that rewrote the lockfile would leave a later
+      # `cargo build --locked` asserting against the file clippy just wrote.
+      # The fuzz crate below is deliberately excluded: `fuzz/.gitignore` keeps
+      # its `Cargo.lock` out of the tree, so `--locked` there fails outright.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
       # The fuzz crate is outside the workspace, so nothing above compiles it
       # and a changed signature in clove-core rots a target silently until the
       # nightly job trips over it (this happened to `tracker`). Checking it
@@ -49,10 +56,16 @@ jobs:
       # because a grammar check that has stopped matching prints ok forever.
       - run: ./ci/check-dicts.sh --self-test
       - run: ./ci/check-dicts.sh
+      # The scan-coverage gate in build.yml restates SonarQube's log wording,
+      # so its matcher rots exactly the way check-dicts' does — reword the
+      # WARN upstream and the gate goes green forever. The self-test is
+      # milliseconds and belongs here too, where a contributor who has never
+      # looked at build.yml still sees it break.
+      - run: ./ci/check-scan-coverage.sh --self-test
       # End-to-end: drive the real binaries as an operator does. Unit tests
       # cannot see whole-process faults (the Phase-F registry deadlocks
       # passed all of them).
-      - run: cargo build --workspace
+      - run: cargo build --workspace --locked
       - run: ./ci/smoke.sh
       # Crash and I/O-failure resilience: the temp-then-rename state promise
       # is only worth what it is tested at (SCOPE §9). Runs unprivileged here,
@@ -106,13 +119,13 @@ jobs:
           - dest
           - text
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # The committed seed corpus starts each run warm; this carries what the
       # run *discovers* to the next one. Without it every scheduled run spends
       # much of its budget rediscovering that input has to be bencode at all,
       # which is the difference between fuzzing the parser and fuzzing the
       # question of whether the input is a torrent.
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -142,13 +155,13 @@ jobs:
       # month of scheduled runs leaves nothing behind. The artifact is what
       # somebody folds into the committed seed with `make fuzz-seed`.
       - if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}
           retention-days: 30
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/
@@ -157,7 +170,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: sudo apt-get update && sudo apt-get install -y mandoc
       # The manuals are the primary user documentation (SCOPE §9); keep them
       # parsing and conventional so they cannot rot unnoticed.
@@ -169,5 +182,5 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: EmbarkStudios/cargo-deny-action@c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb # v2.1.1

@@ -33,7 +33,7 @@ jobs:
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           # A shallow clone costs the scanner its blame data, which is what
           # attributes an issue to a commit and drives the new-code period.
@@ -42,3 +42,43 @@ jobs:
         uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # The scan itself passing says nothing about what it read. The scanner does
+  # not fail on a file it cannot parse — it logs one WARN and analyses
+  # nothing — and on the first run three of the ten shell scripts hit that,
+  # one of them at 1:1. Zero issues from a file nobody read looks exactly
+  # like zero issues from a clean file.
+  #
+  # So this reads the scan job's own log back and hands it to
+  # ci/check-scan-coverage.sh, which knows which failures are already
+  # understood and fails on anything else. The rationale, the baseline and
+  # the matcher's self-test all live in that script.
+  scan-coverage:
+    name: Scan coverage
+    needs: sonarqube
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # Reading the scan job's log is the whole point of this job.
+      actions: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Fail on files the scanner could not parse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -eu
+          job=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+                  --jq '.jobs[] | select(.name == "SonarQube") | .id')
+          if [ -z "$job" ]; then
+              echo "no SonarQube job in run $RUN_ID; nothing to check" >&2
+              exit 1
+          fi
+          # The per-job logs endpoint, not `gh run view --log`: this job runs
+          # inside the very run it is inspecting, and that command refuses
+          # while the run is in progress — which it always will be here.
+          gh api "repos/$REPO/actions/jobs/$job/logs" > scan.log
+          ./ci/check-scan-coverage.sh scan.log
