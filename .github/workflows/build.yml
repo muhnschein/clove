@@ -33,7 +33,7 @@ jobs:
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           # A shallow clone costs the scanner its blame data, which is what
           # attributes an issue to a commit and drives the new-code period.
@@ -42,3 +42,54 @@ jobs:
         uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # The scanner does not fail on a file it cannot read: it logs a warning and
+  # analyses nothing. On the first run three of the ten shell scripts hit that
+  # — ci/fuzz.sh, ci/fuzz-coverage.sh and ci/fuzz-sanitizer-ab.sh — and one of
+  # them failed at 1:1, so the whole file was skipped. All three parse clean
+  # under `sh -n` and `bash -n`; the fault is in the analyser's parser, not the
+  # scripts. Nothing in the dashboard says so. A file that is never read
+  # reports zero issues, which is indistinguishable from a file that is clean,
+  # and the gap widens silently as the scripts grow.
+  #
+  # So: same argument as ci/check-dicts.sh, one tool over. A checker that has
+  # quietly stopped checking prints ok forever, and the only way to know is to
+  # make it say so out loud.
+  scan-coverage:
+    name: Scan coverage
+    needs: sonarqube
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # Reading the scan job's log is the whole point of this job.
+      actions: read
+    steps:
+      - name: Fail on files the scanner could not parse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -eu
+          job=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+                  --jq '.jobs[] | select(.name == "SonarQube") | .id')
+          if [ -z "$job" ]; then
+              echo "no SonarQube job in run $RUN_ID; nothing to check" >&2
+              exit 1
+          fi
+          gh run view --repo "$REPO" --job "$job" --log > scan.log \
+            || gh api "repos/$REPO/actions/jobs/$job/logs" > scan.log
+          # The two shell analysers word it differently and disagree about
+          # where the file broke, so match both. Anchored on their exact
+          # phrasing to keep this from firing on ordinary log text.
+          if grep -nE "Cannot parse '|Syntax error in " scan.log; then
+              echo >&2
+              echo "The scanner could not parse the file(s) listed above, so" >&2
+              echo "it analysed nothing in them. That is a silent gap in" >&2
+              echo "coverage, not a clean result. Either restate the code in" >&2
+              echo "a form the analyser accepts, or exclude the file and say" >&2
+              echo "why in sonar-project.properties." >&2
+              exit 1
+          fi
+          echo "scan coverage: the scanner parsed every file it opened"
