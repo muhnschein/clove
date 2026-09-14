@@ -5,7 +5,8 @@
 # `make chaos` for crash resilience, `make fuzz` for the parsers.
 
 .PHONY: test smoke chaos router router-trace fmt lint man-lint doc-lint fuzz \
-        fuzz-all fuzz-seed fuzz-coverage fuzz-sanitizer-ab install uninstall
+        fuzz-all fuzz-seed fuzz-coverage fuzz-sanitizer-ab container \
+        seccomp-profile install uninstall
 
 # Install layout. Override on the command line, e.g.
 #   make install PREFIX=/usr DESTDIR=$(CURDIR)/pkg
@@ -136,6 +137,28 @@ doc-lint:
 	# --all-features so the docs cover the mock network too; it is behind a
 	# feature flag and would otherwise be an unresolved link.
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+
+## The container image, for this machine's architecture. The published one is
+## built by .github/workflows/release.yml from the same file, for amd64 and
+## arm64 at once; contrib/container/README.md has the buildx line if you want
+## both locally.
+##   make container IMAGE=clove:test
+IMAGE ?= clove:dev
+container:
+	docker build -f contrib/container/Containerfile -t $(IMAGE) .
+
+## The container's syscall filter (contrib/container/seccomp/cloved.json):
+## check that the committed profile still covers everything the binaries call,
+## or regenerate it. Traces a full run against the fake SAM bridge, so it needs
+## strace; skips without it, like man-lint without mandoc.
+##
+## Regenerate against the build that is actually shipped, not target/debug —
+## the syscalls a binary makes are a property of its libc:
+##   make seccomp-profile
+##   CLOVE_BIN_DIR=target/x86_64-unknown-linux-musl/release \
+##       make seccomp-profile WRITE=1
+seccomp-profile:
+	@./ci/seccomp-profile.sh $(if $(WRITE),--write,--check)
 
 ## Install the binaries and manuals. Release build; strip nothing, so a
 ## crash report from a user still carries symbols.

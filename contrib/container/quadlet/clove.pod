@@ -1,0 +1,48 @@
+# The pod clove and its router live in: two containers, one network namespace,
+# neither of them owning it.
+#
+# This is the whole point of running clove under Quadlet rather than compose.
+# cloved dials its SAM bridge on 127.0.0.1 by construction (Layer 1,
+# docs/SCOPE.md §5), so it and the router have to share a namespace — and
+# compose can only express that as `network_mode: "service:i2pd"`, which makes
+# clove's network a *property of the i2pd container*. Restart the router there
+# and clove's namespace goes with it. Here the pod's infra container holds the
+# namespace: either container can be restarted, updated or replaced on its own,
+# and 127.0.0.1:7656 keeps meaning the same thing.
+#
+# Podman 5.0 or newer: `.pod` units, and `Pod=` in a `[Container]`, arrived
+# there. On 4.x the generator loads the container units, accepts every other
+# key in them, and rejects that one — so this is a version requirement rather
+# than a preference.
+#
+# Install (rootless):
+#
+#   mkdir -p ~/.config/containers/systemd
+#   cp contrib/container/quadlet/* ~/.config/containers/systemd/
+#   mkdir -p ~/.config/containers/seccomp
+#   cp contrib/container/seccomp/cloved.json ~/.config/containers/seccomp/
+#   # then edit SeccompProfile= in cloved.container to that path
+#   systemctl --user daemon-reload
+#   systemctl --user start i2pd cloved
+#
+# System-wide is the same with /etc/containers/systemd, /etc/containers/seccomp
+# and no --user. Rootless is the better default here: nothing in this pod wants
+# a real uid on the host.
+
+[Unit]
+Description=clove and the I2P router it speaks to
+
+[Pod]
+PodName=clove
+
+# The router's transport port, and only that. SAM stays inside the namespace —
+# publishing 7656 would put a control channel that creates I2P sessions on the
+# host's network, which is exactly what the loopback rule exists to prevent.
+#
+# i2pd is told to use this port below; without a published one the router still
+# works, but only outbound, and the swarm sees clove as unreachable.
+PublishPort=7654:7654/tcp
+PublishPort=7654:7654/udp
+
+[Install]
+WantedBy=default.target

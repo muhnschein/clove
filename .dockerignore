@@ -1,0 +1,16 @@
+# What the image build is allowed to see.
+#
+# An allowlist rather than a list of exclusions, because the cost of getting
+# it wrong runs one way: anything that reaches the context lands in the
+# builder's `COPY . .` layer, so editing a manual page or a CI script would
+# invalidate the cached build of a workspace that does not depend on it — and
+# `target/` alone is gigabytes.
+#
+# Everything the build needs is the workspace and the pins around it.
+*
+!Cargo.toml
+!Cargo.lock
+!clippy.toml
+!rust-toolchain.toml
+!crates
+crates/**/target

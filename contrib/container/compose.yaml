@@ -1,0 +1,73 @@
+# clove and an i2pd router, as one unit.
+#
+#   docker compose -f contrib/container/compose.yaml up -d
+#   docker compose -f contrib/container/compose.yaml exec clove clove list
+#
+# The shape of this file is not a style choice. cloved dials its SAM bridge on
+# 127.0.0.1 and nothing else — that is Layer 1 of the no-clearnet defence, and
+# it is enforced in the address the SAM backend builds rather than in a config
+# check you could edit around. A router in *another* container is not
+# 127.0.0.1, so the two must share one network namespace: `network_mode:
+# "service:i2pd"` puts cloved inside i2pd's, which is also why the clove
+# service declares no ports of its own and no network.
+#
+# It also couples the two containers more tightly than they deserve: clove's
+# network namespace *is* the i2pd container's, so restarting the router takes
+# clove's networking with it. Compose cannot express the alternative. Podman
+# can — ../quadlet/ runs the same two containers as peers in a pod, where the
+# pod owns the namespace and either can be restarted alone — and that is the
+# recommended arrangement. This file is for hosts that have Docker.
+#
+# The other ways to give clove a loopback router:
+#
+#   - a router on the host:            docker run --network=host ...
+#   - a router in another container:   docker run --network=container:i2pd ...
+#   - Kubernetes:                      both containers in one Pod
+#
+# Neither container publishes a port. i2pd talks to the I2P network on its own
+# and clove is driven over a unix socket inside its state volume, so nothing
+# here needs to be reachable from outside the host.
+
+services:
+  i2pd:
+    image: docker.io/purplei2p/i2pd:release-2.61.0
+    # SAM is off in a default i2pd and is the one thing clove needs from it.
+    # The bridge binds 127.0.0.1:7656, which is exactly what clove expects,
+    # so clove.conf stays empty.
+    command: ["--sam.enabled=true"]
+    volumes:
+      - i2pd-data:/home/i2pd/data
+    restart: unless-stopped
+
+  clove:
+    image: ghcr.io/muhnschein/clove:latest
+    # See the note at the top: this is what makes the router loopback.
+    network_mode: "service:i2pd"
+    depends_on:
+      - i2pd
+    volumes:
+      # Torrents, resume data, the destination key, the API token, the control
+      # socket, and the downloads themselves. A *named* volume inherits the
+      # ownership the image gives /var/lib/clove; a bind mount from the host
+      # does not, so if you swap this for a host path, chown it to 65532:65532
+      # first or the daemon will refuse to start.
+      - clove-data:/var/lib/clove
+    # The daemon writes nowhere but its state directory — it restricts itself
+    # to exactly that with Landlock once it has started — so the rest of the
+    # filesystem can be read-only, and it needs no capability at all.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      # A little over a hundred syscalls, measured from a traced run of the
+      # binaries rather than argued for; everything else is EPERM. See ../README.md and
+      # ci/seccomp-profile.sh. This is the container's counterpart to
+      # SystemCallFilter= in the systemd unit, and it is in force before the
+      # daemon has installed its own (Layer 2).
+      - seccomp:./seccomp/cloved.json
+    restart: unless-stopped
+
+volumes:
+  i2pd-data:
+  clove-data:

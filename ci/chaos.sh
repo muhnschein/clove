@@ -19,10 +19,15 @@
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-cloved="$root/target/debug/cloved"
-clove="$root/target/debug/clove"
+# Which build to drive. The debug binaries by default, because that is what
+# `cargo build --workspace` leaves and what every contributor has; CI's
+# cross-libc job points this at a release directory to run the very binaries
+# it is about to ship.
+bindir="${CLOVE_BIN_DIR:-$root/target/debug}"
+cloved="$bindir/cloved"
+clove="$bindir/clove"
 [ -x "$cloved" ] && [ -x "$clove" ] || {
-    echo "chaos: build the binaries first (cargo build --workspace)" >&2
+    echo "chaos: no cloved/clove in $bindir (cargo build --workspace)" >&2
     exit 1
 }
 

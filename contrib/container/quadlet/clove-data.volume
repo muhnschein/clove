@@ -1,0 +1,15 @@
+# Torrents, resume data, the destination key, the API token, the control
+# socket, and the downloaded data itself — everything cloved(8) calls the state
+# directory.
+#
+# A named volume takes the ownership the image gives /var/lib/clove (uid
+# 65532), which is what makes the read-only container able to write here. A
+# host path bind-mounted in its place does not: chown it to 65532:65532 first,
+# or in a rootless pod to whatever that maps to on the host (`podman unshare
+# chown 65532:65532 <path>`).
+
+[Unit]
+Description=clove state for the clove pod
+
+[Volume]
+VolumeName=clove-data

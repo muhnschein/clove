@@ -370,6 +370,12 @@ mod seccomp {
         libc::SYS_clock_gettime,
         libc::SYS_gettimeofday,
         libc::SYS_clock_nanosleep,
+        // The same sleep, spelled the way musl spells it: `thread::sleep` and
+        // the reconnect backoff become `nanosleep` there and
+        // `clock_nanosleep` under glibc. Which one the binary makes is a
+        // property of the libc it was linked against, not of what the daemon
+        // asked for, so both are on the list.
+        libc::SYS_nanosleep,
         // --- Files. The data directory: state, resume files, torrent payloads.
         libc::SYS_openat,
         libc::SYS_close,
@@ -472,6 +478,22 @@ mod seccomp {
         )?)
     }
 
+    /// `FIONBIO` as a filter operand, which is not one type everywhere: glibc
+    /// spells the request `c_ulong`, musl spells it `c_int`, and no single
+    /// literal conversion compiles against both. `try_from` does. `allow`
+    /// rather than `expect`, because the lint only fires on the half of the
+    /// world where the conversion is infallible. Fails closed like
+    /// [`masked`].
+    #[allow(
+        clippy::useless_conversion,
+        reason = "a no-op where the request is already a c_ulong, a real \
+                  conversion where it is a c_int; this is the spelling both \
+                  libcs accept"
+    )]
+    fn fionbio() -> u64 {
+        u64::try_from(libc::FIONBIO).unwrap_or(u64::MAX)
+    }
+
     /// The calls the daemon needs, but only with certain arguments.
     ///
     /// Conditions within a rule are combined with AND, rules for one syscall
@@ -507,7 +529,7 @@ mod seccomp {
                     1,
                     Qword,
                     SeccompCmpOp::Eq,
-                    libc::FIONBIO,
+                    fionbio(),
                 )?])?],
             ),
             // W^X, the semantics of `MemoryDenyWriteExecute=yes`. Not the
