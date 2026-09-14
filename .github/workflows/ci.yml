@@ -221,6 +221,17 @@ jobs:
           set -eu
           ./ci/smoke.sh
           ./ci/router.sh --trace
+      # The container seccomp profile is generated from what these binaries
+      # actually call, so it is these binaries it has to keep fitting — and a
+      # syscall the profile lacks is a daemon that dies at a moment no test
+      # reaches. The other half of this question (whether a runtime agrees
+      # with the profile) is the container job below, which starts the image
+      # under it.
+      - name: The seccomp profile still fits
+        env:
+          CLOVE_BIN_DIR: target/x86_64-unknown-linux-musl/release
+        run: ./ci/seccomp-profile.sh --check
+
       # The other architecture the image is published for. Only a compile:
       # nothing here can run it, and what breaks across architectures is the
       # syscall table the sandbox names, which is a compile-time question.
@@ -234,8 +245,14 @@ jobs:
   # A Containerfile that stopped building is a release that fails at the tag,
   # which is the worst moment to find out. This also exercises the claims the
   # image makes about itself: that it runs unprivileged on a read-only root
-  # filesystem, that a fresh named volume arrives writable by the uid inside,
-  # and that the CLI in it can reach the daemon.
+  # filesystem, under contrib/container/seccomp/cloved.json rather than the
+  # runtime's default profile, that a fresh named volume arrives writable by
+  # the uid inside, and that the CLI in it can reach the daemon.
+  #
+  # The seccomp profile is the reason the `docker exec` below is an assertion
+  # and not a convenience: the profile covers every process in the container,
+  # so a filter too narrow for the CLI breaks `clove list` and the image's own
+  # health check while leaving the daemon looking fine.
   container:
     name: Container image
     runs-on: ubuntu-latest
@@ -260,6 +277,7 @@ jobs:
           docker volume create clove-ci-data >/dev/null
           docker run -d --name clove-ci \
             --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --security-opt seccomp=contrib/container/seccomp/cloved.json \
             -v clove-ci-data:/var/lib/clove \
             clove:ci >/dev/null
           for _ in $(seq 20); do
@@ -281,5 +299,45 @@ jobs:
       # is how the answer for GitHub's runners stays visible as both move.
       - name: What the sandbox came to here
         run: docker logs clove-ci 2>&1 | grep -i 'sandbox' || true
+      # The Quadlet units are the recommended way to run this image, and
+      # nothing above touches them — the runner has Docker, not a podman pod.
+      # Quadlet's own generator settles the half that can be settled without
+      # one: that the units parse, that every key is a key podman knows, and
+      # that they generate the three services they claim to. Tolerant, like
+      # man-lint without mandoc: a runner image that drops podman must not
+      # fail the build.
+      - name: The Quadlet units generate
+        run: |
+          set -eu
+          gen=""
+          for path in /usr/libexec/podman/quadlet /usr/lib/podman/quadlet; do
+              [ -x "$path" ] && gen="$path" && break
+          done
+          if [ -z "$gen" ]; then
+              echo "quadlet: SKIP (no quadlet generator on this runner)"
+              exit 0
+          fi
+          out=$(mktemp -d)
+          QUADLET_UNIT_DIRS="$PWD/contrib/container/quadlet" \
+              "$gen" -dryrun -user > "$out/units.txt" 2> "$out/err.txt" || {
+              echo "quadlet: the generator refused the units" >&2
+              cat "$out/err.txt" >&2
+              exit 1
+          }
+          cat "$out/err.txt"
+          # The generator reports a bad key as a warning and carries on, so a
+          # clean exit is not the assertion — the units it produced are.
+          if grep -qiE 'error|unsupported key' "$out/err.txt"; then
+              echo "quadlet: the generator complained about the units" >&2
+              exit 1
+          fi
+          for unit in clove-pod.service i2pd.service cloved.service; do
+              grep -q "$unit" "$out/units.txt" || {
+                  echo "quadlet: no $unit was generated" >&2
+                  cat "$out/units.txt" >&2
+                  exit 1
+              }
+          done
+          echo "quadlet: clove-pod, i2pd and cloved all generate"
       - if: always()
         run: docker rm -f clove-ci >/dev/null 2>&1 || true

@@ -11,7 +11,14 @@
 # "service:i2pd"` puts cloved inside i2pd's, which is also why the clove
 # service declares no ports of its own and no network.
 #
-# The same reasoning covers the alternatives:
+# It also couples the two containers more tightly than they deserve: clove's
+# network namespace *is* the i2pd container's, so restarting the router takes
+# clove's networking with it. Compose cannot express the alternative. Podman
+# can — ../quadlet/ runs the same two containers as peers in a pod, where the
+# pod owns the namespace and either can be restarted alone — and that is the
+# recommended arrangement. This file is for hosts that have Docker.
+#
+# The other ways to give clove a loopback router:
 #
 #   - a router on the host:            docker run --network=host ...
 #   - a router in another container:   docker run --network=container:i2pd ...
@@ -53,6 +60,12 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+      # Under ninety syscalls, measured from a traced run of the binaries
+      # rather than argued for; everything else is EPERM. See ../README.md and
+      # ci/seccomp-profile.sh. This is the container's counterpart to
+      # SystemCallFilter= in the systemd unit, and it is in force before the
+      # daemon has installed its own (Layer 2).
+      - seccomp:./seccomp/cloved.json
     restart: unless-stopped
 
 volumes:

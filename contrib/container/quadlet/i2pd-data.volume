@@ -1,0 +1,8 @@
+# The router's own state: its identity, its netDb, its configuration. Nothing
+# clove writes lives here.
+
+[Unit]
+Description=i2pd state for the clove pod
+
+[Volume]
+VolumeName=i2pd-data

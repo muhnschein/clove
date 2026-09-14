@@ -1,0 +1,40 @@
+# The I2P router clove speaks to.
+#
+# Not clove's dependency, deliberately: there is no Requires= on it from
+# cloved.container, and none the other way. cloved treats a router that is not
+# there as a state rather than an error — it reports `waiting-for-router`,
+# backs off, and rebuilds its whole session tree when one answers (the
+# reconnect discipline in docs/SCOPE.md §4). So this container can be
+# restarted, updated or stopped underneath a running clove, which is the
+# arrangement the pod exists to allow.
+
+[Unit]
+Description=i2pd, the I2P router for the clove pod
+
+[Container]
+Image=docker.io/purplei2p/i2pd:release-2.61.0
+ContainerName=i2pd
+Pod=clove.pod
+Volume=i2pd-data.volume:/home/i2pd/data:Z
+
+# SAM is off in a stock i2pd and is the one thing clove needs from it. It binds
+# 127.0.0.1:7656 by default, which inside this pod is the address clove's
+# built-in default already points at — so clove.conf stays empty.
+#
+# --port pins the transport port to the one the pod publishes. Left out, i2pd
+# picks a random one at first start and the published port forwards nothing.
+Exec=--sam.enabled=true --port=7654
+
+# The router's own hardening is its business — this is somebody else's image
+# and its entrypoint wants to set up its data directory — but it has no reason
+# to gain privileges it was not started with.
+NoNewPrivileges=true
+
+[Service]
+Restart=always
+# A cold router builds tunnels before it is much use; nothing here should read
+# a slow first start as a failure.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

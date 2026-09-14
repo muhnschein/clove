@@ -1,0 +1,60 @@
+# clove itself.
+#
+# Three layers of confinement apply here, and they are independent:
+#
+#   Layer 1  cloved cannot speak to the clearnet by construction. Nothing in
+#            this file grants or withholds that.
+#   Layer 2  the daemon restricts itself with Landlock and seccomp once it has
+#            started (cloved(8) SECURITY). It does that on its own; `sandbox
+#            require` in clove.conf turns a failure into a refusal to start.
+#   Layer 3  this file. The systemd unit in contrib/systemd/system/ is the
+#            same layer for a host install, and the two say the same things in
+#            different vocabulary — a read-only filesystem, no capabilities, no
+#            new privileges, and a syscall filter.
+#
+# What Layer 3 cannot do here is the clearnet lock. The systemd unit has
+# IPAddressDeny=any, and the namespace this container shares is the router's,
+# which by its nature reaches the clearnet. Layer 1 still holds; the belt is
+# there, the braces are not. Run under the systemd unit if you want both.
+
+[Unit]
+Description=clove, an I2P-only BitTorrent daemon
+# Ordering only, and no Requires=: see the note in i2pd.container. If the
+# router is not up yet, clove waits for it rather than failing.
+After=i2pd.service
+
+[Container]
+Image=ghcr.io/muhnschein/clove:latest
+ContainerName=cloved
+Pod=clove.pod
+Volume=clove-data.volume:/var/lib/clove:Z
+
+# The daemon writes to its state directory and nowhere else — it takes that
+# away from itself with Landlock as soon as it has started, and this says the
+# same thing from outside, before it has.
+ReadOnly=true
+
+# It needs no capability at all: no privileged port, no device, no other uid.
+# The image already runs as 65532.
+NoNewPrivileges=true
+DropCapability=ALL
+
+# The syscall filter, which is the reason this is a container profile and not
+# just the image's own good behaviour: it is in force from the first
+# instruction — before the daemon has read its config, let alone installed its
+# own filter — and it covers every process in the container, including the
+# `clove` a health check or a `podman exec` runs.
+#
+# Generated from a traced run of the binaries by ci/seccomp-profile.sh, which
+# also reads the daemon's own allowlist so the two layers cannot drift apart.
+# Everything not on it returns EPERM.
+#
+# Rootless: copy the profile to ~/.config/containers/seccomp/cloved.json and
+# point this at that path instead.
+SeccompProfile=/etc/containers/seccomp/cloved.json
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

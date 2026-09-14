@@ -78,8 +78,11 @@ $ docker pull ghcr.io/muhnschein/clove
 
 cloved dials its SAM bridge on loopback and nothing else, so the container
 has to share a network namespace with the router rather than be networked to
-it — `--network=host` for a router on the host, or the i2pd-and-clove
-[`compose.yaml`](contrib/container/compose.yaml). See
+it. [`contrib/container/quadlet/`](contrib/container/quadlet) is the
+recommended arrangement: a podman pod holding clove and i2pd as peers, under
+systemd, with a syscall filter of clove's own —
+[`compose.yaml`](contrib/container/compose.yaml) is the Docker equivalent, and
+`--network=host` works against a router on the host. See
 [`contrib/container/README.md`](contrib/container/README.md), which also says
 what becomes of the three sandbox layers under a container runtime.
 
