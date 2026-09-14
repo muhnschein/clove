@@ -59,11 +59,18 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # Through the environment rather than interpolated into the script: a
+      # `${{ }}` expansion is pasted into the shell source before it runs, so
+      # the only safe place for a value GitHub hands you is a variable the
+      # shell expands itself.
       - name: Log in to ghcr.io
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          REGISTRY_USER: ${{ github.actor }}
         run: |
           set -eu
-          printf '%s' '${{ github.token }}' \
-            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          printf '%s' "$REGISTRY_TOKEN" \
+            | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
       # The default builder speaks to the local daemon, which holds one
       # architecture and no manifest lists. A `docker-container` builder is
       # what can produce and push a multi-architecture index.
@@ -109,10 +116,12 @@ jobs:
         env:
           VERSION: ${{ needs.guard.outputs.version }}
           DIGEST: ${{ needs.image.outputs.digest }}
+          REGISTRY_TOKEN: ${{ github.token }}
+          REGISTRY_USER: ${{ github.actor }}
         run: |
           set -eu
-          printf '%s' '${{ github.token }}' \
-            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          printf '%s' "$REGISTRY_TOKEN" \
+            | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
           mkdir -p dist
           for arch in amd64:x86_64 arm64:aarch64; do
               docker_arch=${arch%:*}
