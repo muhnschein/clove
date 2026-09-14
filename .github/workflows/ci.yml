@@ -184,3 +184,49 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: EmbarkStudios/cargo-deny-action@c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb # v2.1.1
+
+  # The published image and the release binaries are musl, and the daemon's
+  # seccomp allowlist is libc-sensitive: `thread::sleep` is `clock_nanosleep`
+  # under glibc and `nanosleep` under musl, so a list derived from one libc
+  # can refuse a syscall the other's binary makes — which is a daemon that
+  # dies on its first reconnect backoff, in the build nobody tests. So the
+  # musl build gets the same end-to-end run the gnu one gets, tracing
+  # included.
+  musl:
+    name: Static musl build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      - run: cargo build --release --workspace --locked --target x86_64-unknown-linux-musl
+      # `distroless/static` has no libc to load, so a binary that stopped
+      # being static would be an image that cannot start.
+      - name: The binaries are static
+        run: |
+          set -eu
+          for bin in cloved clove; do
+              path=target/x86_64-unknown-linux-musl/release/$bin
+              file "$path" | grep -q 'static' || {
+                  echo "$bin is not statically linked:" >&2
+                  file "$path" >&2
+                  exit 1
+              }
+          done
+      - run: sudo apt-get update && sudo apt-get install -y strace || true
+      - name: Drive the musl binaries end to end
+        env:
+          CLOVE_BIN_DIR: target/x86_64-unknown-linux-musl/release
+        run: |
+          set -eu
+          ./ci/smoke.sh
+          ./ci/router.sh --trace
+      # The other architecture the image is published for. Only a compile:
+      # nothing here can run it, and what breaks across architectures is the
+      # syscall table the sandbox names, which is a compile-time question.
+      # `rust-lld` because the runner's `cc` cannot link an aarch64 object,
+      # and the workspace has no C dependencies that would need more.
+      - name: aarch64 compiles
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+        run: cargo check --release --workspace --locked --target aarch64-unknown-linux-musl
