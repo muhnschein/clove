@@ -10,6 +10,11 @@
 # namespace: either container can be restarted, updated or replaced on its own,
 # and 127.0.0.1:7656 keeps meaning the same thing.
 #
+# Podman 5.0 or newer: `.pod` units, and `Pod=` in a `[Container]`, arrived
+# there. On 4.x the generator loads the container units, accepts every other
+# key in them, and rejects that one — so this is a version requirement rather
+# than a preference.
+#
 # Install (rootless):
 #
 #   mkdir -p ~/.config/containers/systemd

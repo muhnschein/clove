@@ -36,7 +36,8 @@ Docker-shaped compromise.
 ## Quick start: a podman pod, under systemd
 
 [`quadlet/`](quadlet) is a pod with i2pd and clove in it, as five systemd
-units. Rootless:
+units, and it wants **Podman 5.0 or newer** — `.pod` units and `Pod=` in a
+`[Container]` arrived there. Rootless:
 
 ```console
 $ mkdir -p ~/.config/containers/systemd ~/.config/containers/seccomp
@@ -53,6 +54,12 @@ Starting the two containers brings the pod up with them; there is no
 `systemctl enable` step, because Quadlet units are generated and their
 `[Install]` section is what starts them at boot. For a rootless pod that
 should survive logout, `loginctl enable-linger "$USER"`.
+
+CI runs podman's own Quadlet generator over these units where the runner has
+one new enough, and skips below 5.0 — which is where GitHub's runners are
+today. What that older generator does confirm is that every key here except
+`Pod=` is one podman knows; the pod wiring itself is checked by the version
+that has it, whenever the runner image catches up.
 
 System-wide is the same with `/etc/containers/systemd`, no `sed`, and no
 `--user`. Nothing in the pod wants a real uid on the host, so rootless is the

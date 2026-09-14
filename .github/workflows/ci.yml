@@ -348,9 +348,15 @@ jobs:
       # nothing above touches them — the runner has Docker, not a podman pod.
       # Quadlet's own generator settles the half that can be settled without
       # one: that the units parse, that every key is a key podman knows, and
-      # that they generate the three services they claim to. Tolerant, like
-      # man-lint without mandoc: a runner image that drops podman must not
-      # fail the build.
+      # that they generate the three services they claim to.
+      #
+      # It needs a podman that has pods in Quadlet at all. `.pod` units and
+      # `Pod=` in `[Container]` arrived in 5.0, and ubuntu-latest ships 4.9,
+      # whose generator loads the two container units, accepts every other key
+      # in them, and rejects `Pod=` — which is a fact about the runner rather
+      # than about these files. So this skips below 5.0, the way man-lint
+      # skips without mandoc, and starts asserting the day the runner image
+      # catches up.
       - name: The Quadlet units generate
         run: |
           set -eu
@@ -360,6 +366,17 @@ jobs:
           done
           if [ -z "$gen" ]; then
               echo "quadlet: SKIP (no quadlet generator on this runner)"
+              exit 0
+          fi
+          version=$(podman --version 2>/dev/null | awk '{print $3}')
+          case "${version%%.*}" in
+          ''|*[!0-9]*)
+              echo "quadlet: SKIP (no podman version to read: '${version:-}')"
+              exit 0
+              ;;
+          esac
+          if [ "${version%%.*}" -lt 5 ]; then
+              echo "quadlet: SKIP (podman $version; pod units need 5.0)"
               exit 0
           fi
           out=$(mktemp -d)
