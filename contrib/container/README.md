@@ -174,8 +174,8 @@ process in the container, the `clove` of a health check or a `podman exec`
 included. It is the container's answer to `SystemCallFilter=` in the systemd
 unit, down to answering `EPERM` the way that unit does.
 
-It allows a hundred syscalls. Docker's default profile allows around three
-hundred and fifty.
+It allows a little over a hundred syscalls. Docker's default profile allows
+around three hundred and fifty.
 
 It is measured rather than argued for.
 [`ci/seccomp-profile.sh`](../../ci/seccomp-profile.sh) drives both binaries
@@ -188,15 +188,22 @@ leaving a filter that kills it on a path no fixture reaches. A short reserved
 list covers what neither can give: the loader placing TLS, the sandbox
 installing itself, the runtime's `execve`.
 
-A dozen of the hundred are not clove's at all. A container profile is
+A dozen or so of them are not clove's at all. A container profile is
 installed by the runtime, in the process that is about to *become* the
 container — and that process lives a moment longer before it execs: runc and
-crun check they have not been reparented, write to the start fifo and close
-the descriptors they are done with, all in Go, whose own runtime is still
-scheduling underneath. Refuse `getppid` or `epoll_pwait` and the container
-dies before clove exists, with the runtime reporting something about a
-network namespace it could not bind-mount. None of the dozen is a capability,
-a credential, a mount or a namespace call.
+crun check they have not been reparented, resolve paths without following a
+symlink out of the container, write to the start fifo and close the
+descriptors they are done with, all in Go, whose own runtime is still
+scheduling underneath. Refuse `getppid`, `epoll_pwait` or `openat2` and the
+container dies before clove exists, with the runtime reporting something
+about a network namespace it could not bind-mount. None of them is a
+capability, a credential, a mount or a namespace call.
+
+That list came from the container job rather than from reasoning: when the
+image fails to start, the job reruns the same profile with `SCMP_ACT_LOG` in
+place of `SCMP_ACT_ERRNO` and reads the kernel's audit records back, so the
+log names each refused syscall instead of leaving a dead container and a
+message about namespaces.
 
 ```console
 $ CLOVE_BIN_DIR=target/x86_64-unknown-linux-musl/release \

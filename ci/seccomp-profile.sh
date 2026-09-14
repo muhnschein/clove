@@ -119,8 +119,17 @@ exit_group
 # it could not bind-mount, which is what the container job first saw. Nothing
 # below is reachable by a compromised cloved that could not already do worse:
 # no capability, credential, mount or namespace call is here.
+#
+# `openat2` and `fstatfs` are runc being careful rather than Go being Go: the
+# first is how it resolves a path without following a symlink out of the
+# container, the second how it checks that what it mounted is the filesystem
+# it asked for. Both came from the container job's own logging-mode rerun,
+# which is the way to extend this list — guessing at it is what produced the
+# two failures that preceded these two lines.
 RUNTIME='
 getppid
+openat2
+fstatfs
 epoll_create1
 epoll_ctl
 epoll_pwait

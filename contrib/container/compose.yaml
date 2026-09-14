@@ -60,8 +60,8 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-      # A hundred syscalls, measured from a traced run of the binaries
-      # rather than argued for; everything else is EPERM. See ../README.md and
+      # A little over a hundred syscalls, measured from a traced run of the
+      # binaries rather than argued for; everything else is EPERM. See ../README.md and
       # ci/seccomp-profile.sh. This is the container's counterpart to
       # SystemCallFilter= in the systemd unit, and it is in force before the
       # daemon has installed its own (Layer 2).
