@@ -98,12 +98,22 @@ $ docker run --rm -v ./clove.conf:/etc/clove/clove.conf:ro \
 - **Layer 1** — no clearnet by construction — is in the binary and is
   unaffected by any of this.
 - **Layer 2** — the daemon's own Landlock and `seccomp` restriction after
-  start-up — depends on the runtime letting it through. Docker's default
-  profile does not allow every kernel interface on every version, and the
-  daemon degrades to a log line rather than failing: read the `sandbox` field
-  of `clove status` (or the daemon's first lines) to see what actually
-  applied on your host. `sandbox require` in `clove.conf` turns that into a
-  refusal to start.
+  start-up — survives a container runtime, but that is a measurement rather
+  than a promise. Under Docker's *default* seccomp profile, with
+  `--cap-drop=ALL` and `--security-opt=no-new-privileges`, the daemon reports:
+
+  ```
+  sandbox   landlock enforced; unix-socket connects unrestricted (kernel below ABI 9); seccomp filter installed
+  ```
+
+  Both mechanisms applied; the unrestricted part is Landlock ABI 9, which
+  wants Linux 7.1 and is best-effort everywhere. CI starts the image and
+  prints that line on every pull request, so the claim cannot rot silently —
+  but a stricter custom profile or an older kernel can still take either
+  mechanism away, and the daemon degrades to a log line rather than failing.
+  Read the `sandbox` field of `clove status` (or the daemon's first lines) to
+  see what applied on your host. `sandbox require` in `clove.conf` turns
+  anything less than both into a refusal to start.
 - **Layer 3** — the systemd unit's confinement — has no equivalent here, and
   one piece of it cannot be reproduced at all: `IPAddressDeny=any` locks the
   service to loopback, and a container sharing i2pd's network namespace
