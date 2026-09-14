@@ -1,0 +1,193 @@
+name: Release
+
+# A tag is the trigger and the only one: pushing `v2026.8.0` publishes the
+# image and the binaries for that commit. Nothing here runs on a branch, so a
+# release cannot happen by accident.
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # A tag that disagrees with the version in the tree produces a release whose
+  # `clove --version` says something else, and the only moment that is cheap
+  # to catch is before anything is published.
+  guard:
+    name: Tag agrees with the tree
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - id: version
+        run: |
+          set -eu
+          tag=${GITHUB_REF_NAME#v}
+          # The workspace version, which every crate inherits. `clove_core`'s
+          # calver spelling of it is checked against this by a unit test, so
+          # one comparison covers both.
+          tree=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "$tag" != "$tree" ]; then
+              echo "tag $GITHUB_REF_NAME is version $tag; Cargo.toml says $tree" >&2
+              exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  # The image is the build. The release tarballs below are copied out of it
+  # rather than built again, so there is one compilation per architecture per
+  # release and the binary a user downloads is the binary the image runs.
+  image:
+    name: Image
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Log in to ghcr.io
+        run: |
+          set -eu
+          printf '%s' '${{ github.token }}' \
+            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+      # The default builder speaks to the local daemon, which holds one
+      # architecture and no manifest lists. A `docker-container` builder is
+      # what can produce and push a multi-architecture index.
+      - name: Create a builder
+        run: docker buildx create --name clove --driver docker-container --use
+      # No QEMU anywhere: the builder stage is pinned to the *build* platform
+      # and cross-compiles, and the final stage only copies files in. An image
+      # for another architecture is assembled, never executed.
+      - id: build
+        name: Build and push
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -eu
+          docker buildx build \
+            --file contrib/container/Containerfile \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "VERSION=$VERSION" \
+            --build-arg "REVISION=$GITHUB_SHA" \
+            --tag "$IMAGE:$VERSION" \
+            --tag "$IMAGE:latest" \
+            --provenance=mode=max \
+            --metadata-file metadata.json \
+            --push .
+          digest=$(python3 -c 'import json;print(json.load(open("metadata.json"))["containerimage.digest"])')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "pushed $IMAGE:$VERSION at $digest"
+
+  release:
+    name: Release
+    needs: [guard, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # `docker create` makes a container without starting one, so the arm64
+      # binaries come out of the arm64 image on an amd64 runner with nothing
+      # emulated.
+      - name: Assemble the tarballs
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -eu
+          printf '%s' '${{ github.token }}' \
+            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          mkdir -p dist
+          for arch in amd64:x86_64 arm64:aarch64; do
+              docker_arch=${arch%:*}
+              cpu=${arch#*:}
+              name="clove-$VERSION-$cpu-linux-musl"
+              root="dist/$name"
+              mkdir -p "$root/bin" "$root/man/man1" "$root/man/man5" \
+                       "$root/man/man7" "$root/man/man8" "$root/systemd"
+              cid=$(docker create --platform "linux/$docker_arch" "$IMAGE@$DIGEST")
+              docker cp "$cid:/usr/bin/cloved" "$root/bin/cloved"
+              docker cp "$cid:/usr/bin/clove" "$root/bin/clove"
+              docker rm "$cid" >/dev/null
+              cp man/clove.1 "$root/man/man1/"
+              cp man/clove.conf.5 "$root/man/man5/"
+              cp man/clove-api.7 "$root/man/man7/"
+              cp man/cloved.8 "$root/man/man8/"
+              # The unit ships with its placeholders resolved for the prefix a
+              # tarball install lands in, which is the one thing `make
+              # install` would otherwise have done for the operator.
+              sed -e 's|@BINDIR@|/usr/local/bin|g' -e 's|@SYSCONFDIR@|/etc|g' \
+                  contrib/systemd/system/clove.service > "$root/systemd/clove.service"
+              cp LICENSE README.md "$root/"
+              tar -czf "dist/$name.tar.gz" -C dist "$name"
+              rm -rf "$root"
+          done
+          (cd dist && sha256sum clove-*.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.guard.outputs.version }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -eu
+          cat > notes.md <<NOTES
+          ## Container
+
+          \`\`\`console
+          \$ docker pull $IMAGE:$VERSION
+          \`\`\`
+
+          \`linux/amd64\` and \`linux/arm64\`, digest \`$DIGEST\`. The image is
+          \`distroless/static\` with two statically linked binaries on it and
+          nothing else — see
+          [contrib/container/README.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/contrib/container/README.md)
+          for how to run it beside a router, which it has to share a network
+          namespace with.
+
+          ## Binaries
+
+          Statically linked against musl, so they run on any Linux 6.12 or
+          newer of that architecture, and unstripped, so a crash report still
+          carries symbols. They are copied out of the image above rather than
+          built separately.
+
+          \`\`\`console
+          \$ tar xzf clove-$VERSION-x86_64-linux-musl.tar.gz
+          \$ cd clove-$VERSION-x86_64-linux-musl
+          \$ sudo install -m 0755 bin/cloved bin/clove /usr/local/bin/
+          \$ sudo cp -r man/man* /usr/local/share/man/
+          \$ sudo cp systemd/clove.service /etc/systemd/system/
+          \`\`\`
+
+          Check what you downloaded against \`SHA256SUMS\`, and the image
+          against its build provenance:
+
+          \`\`\`console
+          \$ sha256sum -c SHA256SUMS --ignore-missing
+          \$ docker buildx imagetools inspect $IMAGE:$VERSION --format '{{ json .Provenance }}'
+          \`\`\`
+
+          You still need an external I2P router exposing SAMv3 on loopback.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" \
+            --title "clove $VERSION" \
+            --notes-file notes.md \
+            --verify-tag \
+            dist/clove-*.tar.gz dist/SHA256SUMS

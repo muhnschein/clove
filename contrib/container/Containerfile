@@ -1,0 +1,114 @@
+# clove as a distroless container image.
+#
+# Two stages. The first cross-compiles the workspace to a statically linked
+# musl target; the second is `distroless/static`, which carries no shell, no
+# package manager and no libc — so what ships is the two binaries, a passwd
+# entry for the unprivileged uid they run as, and nothing a compromised
+# process could pivot through.
+#
+# Build (from the repository root, which is the context):
+#
+#   docker build -f contrib/container/Containerfile -t clove:dev .
+#   make container                    # the same thing
+#
+# The builder always runs on the *build* machine's architecture and
+# cross-compiles, so an arm64 image costs no emulation. The workspace has no
+# C dependencies, which is what makes that a linker flag rather than a
+# toolchain: `rust-lld` links the target, and the musl objects rustup ships
+# beside the standard library are the whole of the C runtime.
+#
+# Both bases are pinned by digest, the same rule the workflows apply to
+# actions. To move either one:
+#
+#   docker buildx imagetools inspect docker.io/library/rust:1.94.1-bookworm
+#   docker buildx imagetools inspect gcr.io/distroless/static-debian12:nonroot
+#
+# The rust tag must keep agreeing with rust-toolchain.toml; a mismatch is a
+# silent toolchain change for anyone who builds the image rather than the
+# repository.
+
+FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.94.1-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS build
+
+# Supplied by BuildKit: the architecture the *image* is for, not the one this
+# stage runs on.
+ARG TARGETARCH
+
+WORKDIR /src
+COPY . .
+
+# What the shell below is doing, in the order it does it:
+#
+#   - Both cargo variables are spelled per target triple, in upper snake case,
+#     rather than going through RUSTFLAGS — nothing here should reach a build
+#     script, which compiles for the builder and would be linked by the same
+#     flags.
+#   - `rust-lld`, because the image's `cc` is the builder's and cannot link an
+#     aarch64 object.
+#   - Static linking is already the default for musl targets. Stating it means
+#     a future change to that default cannot quietly produce a dynamic binary
+#     in an image that has no libc to load it.
+#   - `--locked`, as everywhere else: the image is built from the reviewed
+#     Cargo.lock or not at all.
+#   - Nothing is stripped, for the reason `make install` gives: a crash report
+#     from a user is worth more than the megabyte.
+#   - The data directory is created here so that it arrives in the final image
+#     owned by the uid that runs the daemon. A named volume mounted over it
+#     inherits that ownership; a bind mount does not, and the README says so.
+RUN set -eu; \
+    case "$TARGETARCH" in \
+    amd64) target=x86_64-unknown-linux-musl ;; \
+    arm64) target=aarch64-unknown-linux-musl ;; \
+    *) echo "clove: no musl target for TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "$target"; \
+    var=$(echo "$target" | tr 'a-z-' 'A-Z_'); \
+    export "CARGO_TARGET_${var}_LINKER=rust-lld"; \
+    export "CARGO_TARGET_${var}_RUSTFLAGS=-C target-feature=+crt-static"; \
+    cargo build --release --workspace --locked --target "$target"; \
+    mkdir -p /out/usr/bin /out/var/lib/clove; \
+    cp "target/$target/release/cloved" "target/$target/release/clove" /out/usr/bin/; \
+    chmod 0700 /out/var/lib/clove
+
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+
+# Both binaries: `cloved` is what the image runs, and `clove` is how an
+# operator talks to it — `docker exec <container> clove list` needs no shell,
+# which is just as well, because there isn't one.
+COPY --from=build /out/usr/bin/cloved /usr/bin/cloved
+COPY --from=build /out/usr/bin/clove /usr/bin/clove
+COPY --from=build --chown=65532:65532 /out/var/lib/clove /var/lib/clove
+
+# An empty configuration is the working default (SCOPE §3), and it stays that
+# way here: these two variables are all that moves clove's XDG defaults to
+# paths that make sense in a container. `XDG_DATA_HOME` puts the state
+# directory — and, with no `XDG_RUNTIME_DIR` set, the control socket — under
+# /var/lib/clove; `XDG_CONFIG_HOME` makes /etc/clove/clove.conf the file both
+# binaries read if you mount one, and neither minds that it is absent.
+ENV XDG_DATA_HOME=/var/lib \
+    XDG_CONFIG_HOME=/etc
+
+VOLUME /var/lib/clove
+
+# The uid distroless calls `nonroot`. The daemon needs no privilege beyond its
+# own state directory and a loopback TCP connection to the SAM bridge.
+USER 65532:65532
+
+# Liveness, not readiness: this asks whether the daemon answers its own API,
+# which it does from the moment it starts — including while it is waiting for
+# a router. A router that is down is a state to read in `clove status`, not a
+# reason to restart the container.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
+    CMD ["/usr/bin/clove", "status"]
+
+ENTRYPOINT ["/usr/bin/cloved"]
+
+# Last, so that a new version or commit rebuilds nothing above this line.
+ARG VERSION
+ARG REVISION
+LABEL org.opencontainers.image.title="clove" \
+      org.opencontainers.image.description="An I2P-only BitTorrent client" \
+      org.opencontainers.image.licenses="ISC" \
+      org.opencontainers.image.source="https://github.com/muhnschein/clove" \
+      org.opencontainers.image.documentation="https://github.com/muhnschein/clove/blob/main/contrib/container/README.md" \
+      org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.revision="$REVISION"

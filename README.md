@@ -57,18 +57,52 @@ $ watch clove list
 
 ## Installation
 
-clove is currently built from source.
+A container image, a static binary, or a build from source — in ascending
+order of effort.
 
 ### Requirements
 
-- Rust 1.94.1 with `cargo`, `clippy`, and `rustfmt` (pinned in
-  [`rust-toolchain.toml`](rust-toolchain.toml));
 - an external i2pd or Java I2P router exposing SAMv3 over loopback; and
 - Linux 6.12 or newer, with `seccomp` and Landlock available, on `x86_64`,
   `aarch64` or `riscv64` see
   [`docs/SCOPE.md`](docs/SCOPE.md) §0).
 
-### Install binaries and man pages
+### Container
+
+```console
+$ docker pull ghcr.io/muhnschein/clove
+```
+
+`distroless/static` with two statically linked binaries on it, for
+`linux/amd64` and `linux/arm64`, published with every release.
+
+cloved dials its SAM bridge on loopback and nothing else, so the container
+has to share a network namespace with the router rather than be networked to
+it — `--network=host` for a router on the host, or the i2pd-and-clove
+[`compose.yaml`](contrib/container/compose.yaml). See
+[`contrib/container/README.md`](contrib/container/README.md), which also says
+what becomes of the three sandbox layers under a container runtime.
+
+### Prebuilt binaries
+
+Each [release](https://github.com/muhnschein/clove/releases) carries a
+tarball per architecture with both binaries, the manuals, and the systemd
+unit. They are linked statically against musl, so they do not care which
+distribution they land on, and they are copied out of the published image, so
+they are the same bytes it runs.
+
+```console
+$ tar xzf clove-2026.8.0-x86_64-linux-musl.tar.gz
+$ cd clove-2026.8.0-x86_64-linux-musl
+$ sudo install -m 0755 bin/cloved bin/clove /usr/local/bin/
+$ sudo cp -r man/man* /usr/local/share/man/
+```
+
+### From source
+
+Needs Rust 1.94.1 with `cargo`, `clippy`, and `rustfmt` — the toolchain
+pinned in [`rust-toolchain.toml`](rust-toolchain.toml), which `rustup`
+installs on the first `cargo` invocation.
 
 ```console
 # Current user
@@ -162,7 +196,9 @@ recorded in [`docs/PROTOCOL.i2p-bt`](docs/PROTOCOL.i2p-bt).
 ## Versioning
 
 Releases are named for the month they were cut in and promises nothing about
-compatibility; that promise belongs to the state format's own version, in
+compatibility; a tag of the form `v2026.8.0` is what publishes one — the
+image, the tarballs and the release notes all come from
+[`.github/workflows/release.yml`](.github/workflows/release.yml); that promise belongs to the state format's own version, in
 [`docs/STATE-FORMAT.md`](docs/STATE-FORMAT.md).
 
 ## License

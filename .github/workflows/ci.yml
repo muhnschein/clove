@@ -230,3 +230,56 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
         run: cargo check --release --workspace --locked --target aarch64-unknown-linux-musl
+
+  # A Containerfile that stopped building is a release that fails at the tag,
+  # which is the worst moment to find out. This also exercises the claims the
+  # image makes about itself: that it runs unprivileged on a read-only root
+  # filesystem, that a fresh named volume arrives writable by the uid inside,
+  # and that the CLI in it can reach the daemon.
+  container:
+    name: Container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - run: docker build -f contrib/container/Containerfile -t clove:ci .
+      - name: It runs as the unprivileged uid
+        run: |
+          set -eu
+          user=$(docker inspect --format '{{ .Config.User }}' clove:ci)
+          [ "$user" = "65532:65532" ] || {
+              echo "image runs as \"$user\", expected 65532:65532" >&2
+              exit 1
+          }
+      # No router and no host network: the container has a namespace of its
+      # own, nothing is listening on its loopback, and `waiting-for-router` is
+      # therefore the correct and asserted answer.
+      - name: It starts, and its CLI can reach it
+        run: |
+          set -eu
+          docker volume create clove-ci-data >/dev/null
+          docker run -d --name clove-ci \
+            --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            -v clove-ci-data:/var/lib/clove \
+            clove:ci >/dev/null
+          for _ in $(seq 20); do
+              if docker exec clove-ci clove status >status.txt 2>&1; then
+                  break
+              fi
+              sleep 1
+          done
+          cat status.txt
+          grep -q 'waiting-for-router' status.txt || {
+              echo "the daemon never came up in its container" >&2
+              docker logs clove-ci >&2
+              exit 1
+          }
+          docker exec clove-ci clove list >/dev/null
+      # Not an assertion: which of Layer 2's two mechanisms a container
+      # runtime lets through is a property of the host's seccomp profile and
+      # kernel, and the daemon degrades to a log line either way. Printing it
+      # is how the answer for GitHub's runners stays visible as both move.
+      - name: What the sandbox came to here
+        run: docker logs clove-ci 2>&1 | grep -i 'sandbox' || true
+      - if: always()
+        run: docker rm -f clove-ci >/dev/null 2>&1 || true
