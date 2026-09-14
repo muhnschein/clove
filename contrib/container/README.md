@@ -174,8 +174,8 @@ process in the container, the `clove` of a health check or a `podman exec`
 included. It is the container's answer to `SystemCallFilter=` in the systemd
 unit, down to answering `EPERM` the way that unit does.
 
-It allows under ninety syscalls. Docker's default profile allows around
-three hundred and fifty.
+It allows a hundred syscalls. Docker's default profile allows around three
+hundred and fifty.
 
 It is measured rather than argued for.
 [`ci/seccomp-profile.sh`](../../ci/seccomp-profile.sh) drives both binaries
@@ -187,6 +187,16 @@ that teaching the daemon a new syscall widens this profile too instead of
 leaving a filter that kills it on a path no fixture reaches. A short reserved
 list covers what neither can give: the loader placing TLS, the sandbox
 installing itself, the runtime's `execve`.
+
+A dozen of the hundred are not clove's at all. A container profile is
+installed by the runtime, in the process that is about to *become* the
+container — and that process lives a moment longer before it execs: runc and
+crun check they have not been reparented, write to the start fifo and close
+the descriptors they are done with, all in Go, whose own runtime is still
+scheduling underneath. Refuse `getppid` or `epoll_pwait` and the container
+dies before clove exists, with the runtime reporting something about a
+network namespace it could not bind-mount. None of the dozen is a capability,
+a credential, a mount or a namespace call.
 
 ```console
 $ CLOVE_BIN_DIR=target/x86_64-unknown-linux-musl/release \

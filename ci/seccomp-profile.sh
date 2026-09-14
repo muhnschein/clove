@@ -104,6 +104,38 @@ exit
 exit_group
 '
 
+# And a third: syscalls that are not clove's at all.
+#
+# A container profile is installed by the runtime, in the process that is
+# about to *become* the container — and that process goes on living for a
+# moment first. runc and crun check they have not been reparented, write to
+# the start fifo, close the file descriptors they no longer want, and only
+# then execve. That code is Go, so its runtime is also still scheduling
+# underneath: netpoll waits on epoll, the collector calls madvise, sysmon
+# sleeps. Every one of those lands on this filter.
+#
+# Refusing them does not produce a clear error — the init dies before the
+# daemon exists, and the runtime reports something about a network namespace
+# it could not bind-mount, which is what the container job first saw. Nothing
+# below is reachable by a compromised cloved that could not already do worse:
+# no capability, credential, mount or namespace call is here.
+RUNTIME='
+getppid
+epoll_create1
+epoll_ctl
+epoll_pwait
+epoll_pwait2
+close_range
+dup3
+pipe2
+readlinkat
+membarrier
+rt_sigtimedwait
+sched_getaffinity
+getrandom
+uname
+'
+
 work=$(mktemp -d)
 sam_pid=""
 daemon_pid=""
@@ -206,7 +238,8 @@ names -= {"exited", "killed", "resumed", "detached", "unfinished"}
 print("\n".join(sorted(names)))
 ')
 
-allowed=$(printf '%s\n%s\n%s\n' "$observed" "$(daemon_allowlist)" "$RESERVED" \
+allowed=$(printf '%s\n%s\n%s\n%s\n' \
+    "$observed" "$(daemon_allowlist)" "$RESERVED" "$RUNTIME" \
     | grep -v '^$' | sort -u)
 
 if [ "$mode" = write ]; then

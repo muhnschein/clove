@@ -293,6 +293,51 @@ jobs:
               exit 1
           }
           docker exec clove-ci clove list >/dev/null
+      # A seccomp denial is silent. The process dies with EPERM somewhere
+      # inside the runtime's own init and the runtime reports whatever it
+      # noticed next — the first failure here was a complaint about a network
+      # namespace it could not bind-mount, which says nothing about the
+      # syscall that caused it. So on any failure above, run the same profile
+      # again in logging mode: the kernel then names every call the profile
+      # does not allow, and the fix is a line in ci/seccomp-profile.sh.
+      - name: Which syscalls the profile refused
+        if: failure()
+        run: |
+          set -eu
+          python3 - contrib/container/seccomp/cloved.json "$RUNNER_TEMP/log.json" <<'PROF'
+          import json, sys
+          profile = json.load(open(sys.argv[1]))
+          profile["defaultAction"] = "SCMP_ACT_LOG"
+          profile.pop("defaultErrnoRet", None)
+          json.dump(profile, open(sys.argv[2], "w"))
+          PROF
+          docker rm -f clove-ci-log >/dev/null 2>&1 || true
+          docker run -d --name clove-ci-log \
+            --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --security-opt seccomp="$RUNNER_TEMP/log.json" \
+            clove:ci >/dev/null || true
+          sleep 5
+          docker exec clove-ci-log clove status >/dev/null 2>&1 || true
+          docker exec clove-ci-log clove list >/dev/null 2>&1 || true
+          sudo dmesg | grep -F 'type=1326' | tail -60 > "$RUNNER_TEMP/audit.txt" || true
+          # The audit record carries syscall numbers; the names are in the
+          # kernel headers the runner already has.
+          python3 - "$RUNNER_TEMP/audit.txt" <<'AUDIT'
+          import glob, re, sys
+          names = {}
+          for header in glob.glob("/usr/include/**/unistd_64.h", recursive=True):
+              for line in open(header):
+                  m = re.match(r"#define __NR_([a-z0-9_]+)\s+(\d+)", line)
+                  if m:
+                      names[int(m.group(2))] = m.group(1)
+          seen = sorted({int(n) for n in re.findall(r"syscall=(\d+)", open(sys.argv[1]).read())})
+          if not seen:
+              print("no seccomp audit records; the failure was something else")
+          for number in seen:
+              print(f"  {names.get(number, '?'):24} (syscall {number})")
+          AUDIT
+          docker rm -f clove-ci-log >/dev/null 2>&1 || true
+
       # Not an assertion: which of Layer 2's two mechanisms a container
       # runtime lets through is a property of the host's seccomp profile and
       # kernel, and the daemon degrades to a log line either way. Printing it
